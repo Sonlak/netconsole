@@ -48,3 +48,7 @@ prisma/*.db-journal
 # Docker volumes
 data/
 volumes/
+
+# NetConsole-specific: app archive & tmp artifacts
+netconsole-app.tar.gz
+.tmp-hello.txt

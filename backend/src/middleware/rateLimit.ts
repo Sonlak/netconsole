@@ -57,7 +57,20 @@ export function rateLimit(options: RateLimitOptions) {
 }
 
 // Pre-configured rate limiters
-export const strictRateLimit = rateLimit({ windowMs: 60 * 1000, max: 10 }); // 10 requests per minute
-export const moderateRateLimit = rateLimit({ windowMs: 60 * 1000, max: 60 }); // 60 requests per minute
-export const authRateLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 5, message: 'Too many login attempts, please try again after 15 minutes' }); // 5 attempts per 15 minutes
-export const scanRateLimit = rateLimit({ windowMs: 60 * 1000, max: 3, message: 'Too many scan requests, please wait' }); // 3 scans per minute
+// Internal lab: keep limits very high so reads from the dashboard never trip during normal use.
+export const strictRateLimit = rateLimit({ windowMs: 60 * 1000, max: 600 }); // 600 requests per minute
+export const moderateRateLimit = rateLimit({ windowMs: 60 * 1000, max: 600 }); // 600 requests per minute
+// Auth rate-limit keyed by username (or ip if no body) so NAT'd users don't share counters
+export const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  message: 'Too many login attempts, please try again after 15 minutes',
+  keyGenerator: (req) => {
+    try {
+      const u = (req.body && (req.body.username || req.body.user)) || '';
+      if (typeof u === 'string' && u.length > 0) return `user:${u}`;
+    } catch {}
+    return `ip:${req.ip || 'unknown'}`;
+  },
+}); // 200 attempts per 15 minutes per username
+export const scanRateLimit = rateLimit({ windowMs: 60 * 1000, max: 30, message: 'Too many scan requests, please wait' }); // 30 scans per minute

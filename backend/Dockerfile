@@ -20,4 +20,4 @@ ENV PORT=3000
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma db push && npm run db:seed && node dist/index.js"]
+CMD ["sh", "-c", "npx prisma db push --skip-generate && ( [ \"$SEED_ON_BOOT\" = \"true\" ] && npm run db:seed; node dist/index.js )"]

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { Form, Input, Button, Alert, Typography, Card } from 'antd';
 import { LockOutlined, UserOutlined } from '@ant-design/icons';
 import { useAuth } from '../hooks/useAuth';
@@ -8,7 +8,6 @@ const { Title, Text } = Typography;
 
 export default function LoginPage() {
   const navigate = useNavigate();
-  const location = useLocation();
   const { login, isAuthenticated, isLoading, error, clearError, mustChangePassword } = useAuth();
   const [submitting, setSubmitting] = useState(false);
 
