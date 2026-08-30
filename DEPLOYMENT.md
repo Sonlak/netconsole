@@ -97,6 +97,50 @@ sudo ./svc.sh install sonnx
 sudo ./svc.sh start
 ```
 
+#### If you're on runner ≥ v2.336.0 (no top-level `svc.sh` in tarball)
+
+Since v2.336.0, the `svc.sh` script is no longer pre-included in the tarball — it's generated from `bin/systemd.svc.sh.template`. To install the service:
+
+```bash
+cd /opt/actions-runner
+
+# Build svc.sh from template (replace placeholders for this runner)
+SVC_NAME="actions.runner.Sonlak-netconsole.vps-prod-01"
+SVC_DESC="GitHub Actions Runner (Sonlak-netconsole.vps-prod-01)"
+sed -e "s|{{SvcNameVar}}|${SVC_NAME}|g" \
+    -e "s|{{SvcDescription}}|${SVC_DESC}|g" \
+    bin/systemd.svc.sh.template > svc.sh
+chmod +x svc.sh
+
+sudo ./svc.sh install sonnx
+sudo ./svc.sh start
+```
+
+#### Always disable runner auto-update on this VPS
+
+If the runner can't reach `release-assets.githubusercontent.com` (to download new versions automatically), auto-update will hang the listener and the runner will keep an outdated version (which GitHub eventually **deprecates** — at which point you'll see `Error: Forbidden Runner version v2.319.1 is deprecated and cannot receive messages` and no jobs will run).
+
+Disable update **before** the first deploy:
+
+```bash
+# Edit /opt/actions-runner/.runner and add "disableUpdate": true
+python3 -c "
+import json
+p = '/opt/actions-runner/.runner'
+raw = open(p, 'rb').read()
+if raw[:3] == b'\xef\xbb\xbf':
+    raw = raw[3:]
+data = json.loads(raw)
+data['disableUpdate'] = True
+open(p, 'wb').write(json.dumps(data, indent=2).encode('utf-8') + b'\n')
+"
+
+# Or, better, register with the flag from the start:
+sudo -u sonnx ./config.sh --unattended --replace ... --disableupdate
+```
+
+Then manually upgrade by re-running the install steps above (replace the tarball URL with the new version).
+
 Expected output ends with:
 ```
 √ Runner successfully added
