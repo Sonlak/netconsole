@@ -52,3 +52,15 @@ volumes/
 # NetConsole-specific: app archive & tmp artifacts
 netconsole-app.tar.gz
 .tmp-hello.txt
+
+# CI/CD: GitHub Actions runner working directory on VPS
+/actions-runner/
+/_runners/
+
+# CI/CD: deploy staging directory used by .github/workflows/deploy.yml
+/opt/netconsole-deploy/
+
+# CI/CD: local runner scratch
+runner/
+*.tar.gz.runner
+
