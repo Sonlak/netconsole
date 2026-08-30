@@ -1,0 +1,166 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DeviceStatus {
+  MANAGED
+  ONLINE
+  OFFLINE
+  MAINTENANCE
+  UNKNOWN
+}
+
+enum JobType {
+  CONNECT_TEST
+  GET_CONFIG
+  GET_ARP
+  GET_MAC
+  GET_INTERFACES
+  INTERFACE_ACTION
+  MANAGED_CHECK
+  DISCOVERY_PROBE
+  APPLY_CONFIG
+  ROLLBACK_CONFIG
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+enum DiscoveryScanStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum DiscoveryResultStatus {
+  PENDING
+  PING_FAIL
+  PROBING
+  DISCOVERED
+  SYNCED
+  SKIPPED_EXISTS
+  FAILED
+}
+
+model Device {
+  id                 String       @id @default(uuid())
+  site               String
+  floor              String
+  name               String
+  ip                 String       @unique
+  status             DeviceStatus @default(UNKNOWN)
+  vendor             String
+  model              String
+  version            String
+  serial             String       @unique
+  description        String?
+  lastPingAt         DateTime?
+  lastPingMs         Int?
+  lastManagedCheckAt DateTime?
+  managedChecks      Json?
+  manageError        String?
+  uptimeSeconds      Int?
+  uptimeAt           DateTime?
+  jobs               Job[]
+  savedConfig        DeviceSavedConfig?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+}
+
+model Job {
+  id        String    @id @default(uuid())
+  deviceId  String?
+  device    Device?   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  type      JobType
+  status    JobStatus @default(PENDING)
+  payload   Json?
+  result    Json?
+  error     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([deviceId])
+  @@index([status])
+}
+
+model DiscoveryScan {
+  id         String              @id @default(uuid())
+  subnet     String
+  site       String              @default("")
+  floor      String              @default("")
+  status     DiscoveryScanStatus @default(PENDING)
+  totalHosts Int                 @default(0)
+  scanned    Int                 @default(0)
+  reachable  Int                 @default(0)
+  discovered Int                 @default(0)
+  error      String?
+  results    DiscoveryResult[]
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+}
+
+model DiscoveryResult {
+  id          String                @id @default(uuid())
+  scanId      String
+  scan        DiscoveryScan         @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  ip          String
+  status      DiscoveryResultStatus @default(PENDING)
+  pingOk      Boolean               @default(false)
+  pingMs      Int?
+  sshOk       Boolean               @default(false)
+  name        String?
+  vendor      String?
+  model       String?
+  version     String?
+  serial      String?
+  description String?
+  showRun     String?
+  error       String?
+  deviceId    String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@unique([scanId, ip])
+  @@index([scanId])
+}
+
+model DeviceSavedConfig {
+  id                String    @id @default(uuid())
+  deviceId          String    @unique
+  device            Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  role              String    @default("custom")
+  content           String    @default("")
+  committedContent  String?
+  rollbackContent   String?
+  committedAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+model User {
+  id                 String   @id @default(uuid())
+  username           String   @unique
+  email              String   @unique
+  password           String   // bcrypt hashed
+  role               UserRole @default(OPERATOR)
+  active             Boolean  @default(true)
+  mustChangePassword Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}

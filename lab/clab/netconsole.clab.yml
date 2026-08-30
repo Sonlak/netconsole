@@ -1,0 +1,169 @@
+# NetConsole lab — containerlab topology
+# Deploy (WSL/Linux): containerlab deploy -t lab/clab/netconsole.clab.yml
+# On Windows Docker Desktop, prefer: scripts/lab-up.ps1 (compose mirror of this topo)
+name: netconsole
+prefix: lab
+
+mgmt:
+  network: lab-mgmt
+  ipv4-subnet: 172.30.0.0/24
+  ipv4-gateway: 172.30.0.254
+
+topology:
+  nodes:
+    core:
+      kind: linux
+      image: netconsole-juniper-core:latest
+      binds:
+        - ../juniper-sim:/opt/juniper-sim:ro
+      env:
+        ROLE: core
+        DEVICE_HOSTNAME: lab-core
+        DEVICE_MODEL: MX204
+        DEVICE_SERIAL: JNCORE000001
+        DEVICE_VERSION: 22.4R1.10
+        DEVICE_IP_MGMT: 172.30.0.1
+        DHCP_SERVERS: 172.30.0.21 172.30.0.22
+        LAB_PASSWORD: lab123
+        REST_SCHEME: http
+        REST_PORT: "8443"
+      exec:
+        - bash /entrypoint.sh dataplane
+      mgmt-ipv4: 172.30.0.1
+      ports:
+        - 2220:22
+        - 8440:8443
+
+    jr1:
+      kind: linux
+      image: netconsole-juniper-access:latest
+      env:
+        ROLE: access
+        DEVICE_HOSTNAME: lab-jr1
+        DEVICE_MODEL: EX4300-48P
+        DEVICE_SERIAL: JN1234LAB001
+        DEVICE_VERSION: 21.4R3.4
+        DEVICE_IP_MGMT: 172.30.0.11
+        ACCESS_VLAN: "10"
+        LAB_PASSWORD: lab123
+        REST_SCHEME: http
+        REST_PORT: "8443"
+      mgmt-ipv4: 172.30.0.11
+      ports:
+        - 2221:22
+        - 8441:8443
+
+    jr2:
+      kind: linux
+      image: netconsole-juniper-access:latest
+      env:
+        ROLE: access
+        DEVICE_HOSTNAME: lab-jr2
+        DEVICE_MODEL: EX4300-48P
+        DEVICE_SERIAL: JN1234LAB002
+        DEVICE_VERSION: 21.4R3.4
+        DEVICE_IP_MGMT: 172.30.0.12
+        ACCESS_VLAN: "20"
+        LAB_PASSWORD: lab123
+        REST_SCHEME: http
+        REST_PORT: "8443"
+      mgmt-ipv4: 172.30.0.12
+      ports:
+        - 2222:22
+        - 8442:8443
+
+    jr3:
+      kind: linux
+      image: netconsole-juniper-access:latest
+      env:
+        ROLE: access
+        DEVICE_HOSTNAME: lab-jr3
+        DEVICE_MODEL: EX4300-48P
+        DEVICE_SERIAL: JN1234LAB003
+        DEVICE_VERSION: 21.4R3.4
+        DEVICE_IP_MGMT: 172.30.0.13
+        ACCESS_VLAN: "30"
+        LAB_PASSWORD: lab123
+        REST_SCHEME: http
+        REST_PORT: "8443"
+      mgmt-ipv4: 172.30.0.13
+      ports:
+        - 2223:22
+        - 8443:8443
+
+    kea1:
+      kind: linux
+      image: netconsole-kea-dhcp1:latest
+      env:
+        KEA_SERVER_NAME: kea-primary
+        KEA_SEED_LEASES: "true"
+      mgmt-ipv4: 172.30.0.21
+      ports:
+        - 8001:8000
+
+    kea2:
+      kind: linux
+      image: netconsole-kea-dhcp2:latest
+      env:
+        KEA_SERVER_NAME: kea-standby
+        KEA_SEED_LEASES: "false"
+      mgmt-ipv4: 172.30.0.22
+      ports:
+        - 8002:8000
+
+    pc10a:
+      kind: linux
+      image: netconsole-pc-vlan10-a:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan10-a
+      exec:
+        - true
+
+    pc10b:
+      kind: linux
+      image: netconsole-pc-vlan10-b:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan10-b
+
+    pc20a:
+      kind: linux
+      image: netconsole-pc-vlan20-a:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan20-a
+
+    pc20b:
+      kind: linux
+      image: netconsole-pc-vlan20-b:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan20-b
+
+    pc30a:
+      kind: linux
+      image: netconsole-pc-vlan30-a:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan30-a
+
+    pc30b:
+      kind: linux
+      image: netconsole-pc-vlan30-b:latest
+      env:
+        IFACE: eth1
+        HOSTNAME: pc-vlan30-b
+
+  links:
+    # PC -> access switches
+    - endpoints: ["pc10a:eth1", "jr1:eth1"]
+    - endpoints: ["pc10b:eth1", "jr1:eth2"]
+    - endpoints: ["pc20a:eth1", "jr2:eth1"]
+    - endpoints: ["pc20b:eth1", "jr2:eth2"]
+    - endpoints: ["pc30a:eth1", "jr3:eth1"]
+    - endpoints: ["pc30b:eth1", "jr3:eth2"]
+    # Access switches -> Juniper core (802.1Q trunks)
+    - endpoints: ["jr1:eth0", "core:eth1"]
+    - endpoints: ["jr2:eth0", "core:eth2"]
+    - endpoints: ["jr3:eth0", "core:eth3"]

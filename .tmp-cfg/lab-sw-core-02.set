@@ -1,0 +1,25 @@
+## NetConsole lab template: core
+## device SW-CORE-02  mgmt 172.30.0.12
+## Save on tool first. Commit pushes to device.
+set system host-name SW-CORE-02
+set system services ssh
+set system services netconf ssh
+set system login user admin class super-user
+set system login user admin authentication encrypted-password "$1$lab$AdminHash"
+set system root-authentication encrypted-password "$1$lab$RootHash"
+set interfaces lo0 description "router-id"
+set interfaces lo0 unit 0 family inet address 1.1.1.2/32
+set interfaces ge-0/0/0 description "mgmt lab-net"
+set interfaces ge-0/0/0 unit 0 family inet address 172.30.0.12/24
+set interfaces ge-0/0/1 description "to SW-CORE-01 OSPF A0"
+set interfaces ge-0/0/1 unit 0 family inet address 10.10.10.2/30
+set interfaces ge-0/0/2 description "to SW-DS-01 OSPF A10"
+set interfaces ge-0/0/2 unit 0 family inet address 10.10.20.17/30
+set interfaces ge-0/0/3 description "to SW-DS-02 OSPF A10"
+set interfaces ge-0/0/3 unit 0 family inet address 10.10.20.25/30
+set routing-options router-id 1.1.1.2
+set protocols ospf area 0.0.0.0 interface lo0.0 passive
+set protocols ospf area 0.0.0.0 interface ge-0/0/1.0
+set protocols ospf area 0.0.0.10 interface ge-0/0/2.0
+set protocols ospf area 0.0.0.10 interface ge-0/0/3.0
+set protocols lldp interface all

@@ -1,0 +1,59 @@
+## NetConsole lab template: dist
+## device SW-DS-01  mgmt 172.30.0.13
+## Save on tool first. Commit pushes to device.
+set system host-name SW-DS-01
+set system services ssh
+set system services netconf ssh
+set system login user admin class super-user
+set system login user admin authentication encrypted-password "$1$lab$AdminHash"
+set system root-authentication encrypted-password "$1$lab$RootHash"
+set interfaces lo0 description "router-id"
+set interfaces lo0 unit 0 family inet address 2.2.2.1/32
+set interfaces ge-0/0/0 description "mgmt lab-net"
+set interfaces ge-0/0/0 unit 0 family inet address 172.30.0.13/24
+set interfaces ge-0/0/1 description "uplink SW-CORE-01 OSPF A10"
+set interfaces ge-0/0/1 unit 0 family inet address 10.10.20.2/30
+set interfaces ge-0/0/2 description "uplink SW-CORE-02 OSPF A10"
+set interfaces ge-0/0/2 unit 0 family inet address 10.10.20.18/30
+set interfaces ge-0/0/10 description "trunk-to-access all"
+set interfaces ge-0/0/10 unit 0 family ethernet-switching interface-mode trunk
+set interfaces ge-0/0/10 unit 0 family ethernet-switching vlan members all
+set interfaces ge-0/0/11 description "trunk-ds-peer VRRP"
+set interfaces ge-0/0/11 unit 0 family ethernet-switching interface-mode trunk
+set interfaces ge-0/0/11 unit 0 family ethernet-switching vlan members all
+set vlans VLAN201 vlan-id 201
+set vlans VLAN201 l3-interface irb.201
+set interfaces irb unit 201 description "VLAN201 SVI MASTER / Root Bridge"
+set interfaces irb unit 201 family inet address 10.1.201.252/24 vrrp-group 201 virtual-address 10.1.201.254
+set interfaces irb unit 201 family inet address 10.1.201.252/24 vrrp-group 201 priority 150
+set interfaces irb unit 201 family inet address 10.1.201.252/24 vrrp-group 201 accept-data
+set interfaces irb unit 201 family inet address 10.1.201.252/24 vrrp-group 201 preempt
+set forwarding-options helpers bootp interface irb.201
+set vlans VLAN202 vlan-id 202
+set vlans VLAN202 l3-interface irb.202
+set interfaces irb unit 202 description "VLAN202 SVI MASTER / Root Bridge"
+set interfaces irb unit 202 family inet address 10.1.202.252/24 vrrp-group 202 virtual-address 10.1.202.254
+set interfaces irb unit 202 family inet address 10.1.202.252/24 vrrp-group 202 priority 150
+set interfaces irb unit 202 family inet address 10.1.202.252/24 vrrp-group 202 accept-data
+set interfaces irb unit 202 family inet address 10.1.202.252/24 vrrp-group 202 preempt
+set forwarding-options helpers bootp interface irb.202
+set vlans VLAN203 vlan-id 203
+set vlans VLAN203 l3-interface irb.203
+set interfaces irb unit 203 description "VLAN203 SVI MASTER / Root Bridge"
+set interfaces irb unit 203 family inet address 10.1.203.252/24 vrrp-group 203 virtual-address 10.1.203.254
+set interfaces irb unit 203 family inet address 10.1.203.252/24 vrrp-group 203 priority 150
+set interfaces irb unit 203 family inet address 10.1.203.252/24 vrrp-group 203 accept-data
+set interfaces irb unit 203 family inet address 10.1.203.252/24 vrrp-group 203 preempt
+set forwarding-options helpers bootp interface irb.203
+set forwarding-options helpers bootp description "DHCP relay to Kea"
+set forwarding-options helpers bootp server 172.30.0.21
+set routing-options router-id 2.2.2.1
+set protocols ospf area 0.0.0.10 interface lo0.0 passive
+set protocols ospf area 0.0.0.10 interface ge-0/0/1.0
+set protocols ospf area 0.0.0.10 interface ge-0/0/2.0
+set protocols ospf area 0.0.0.10 interface irb.201 passive
+set protocols ospf area 0.0.0.10 interface irb.202 passive
+set protocols ospf area 0.0.0.10 interface irb.203 passive
+set protocols rstp bridge-priority 4k
+set protocols rstp interface all
+set protocols lldp interface all

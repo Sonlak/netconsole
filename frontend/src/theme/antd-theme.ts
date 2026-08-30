@@ -1,0 +1,143 @@
+import { theme, type ThemeConfig } from 'antd';
+
+const DARK = {
+  layout: '#0B0F14',
+  sider: '#0D1219',
+  surface: '#111720',
+  raised: '#161D27',
+  hover: '#1A2330',
+  border: '#26303C',
+  subtle: '#1D2631',
+  text: '#E6EDF3',
+  secondary: '#9AA7B5',
+  muted: '#657384',
+  accent: '#3B82F6',
+  accentSoft: '#172A46',
+};
+
+const LIGHT = {
+  layout: '#F4F6F8',
+  sider: '#0D1219',
+  surface: '#FFFFFF',
+  raised: '#FFFFFF',
+  hover: '#F7F9FB',
+  border: '#DCE3EA',
+  subtle: '#E8EEF3',
+  text: '#17202B',
+  secondary: '#5F6D7A',
+  muted: '#7A8896',
+  accent: '#2563EB',
+  accentSoft: '#DBEAFE',
+};
+
+export function getAntdTheme(isDark: boolean): ThemeConfig {
+  const t = isDark ? DARK : LIGHT;
+  return {
+    algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
+    token: {
+      colorPrimary: t.accent,
+      colorInfo: t.accent,
+      colorSuccess: '#34d399',
+      colorWarning: '#fbbf24',
+      colorError: '#f87171',
+      colorBgLayout: t.layout,
+      colorBgContainer: t.surface,
+      colorBgElevated: t.raised,
+      colorBorder: t.border,
+      colorBorderSecondary: t.subtle,
+      colorText: t.text,
+      colorTextSecondary: t.secondary,
+      colorTextTertiary: t.muted,
+      colorLink: t.accent,
+      colorLinkHover: isDark ? '#60a5fa' : '#1d4ed8',
+      colorFillSecondary: t.hover,
+      colorPrimaryBg: t.accentSoft,
+      borderRadius: 6,
+      borderRadiusLG: 8,
+      borderRadiusSM: 6,
+      fontSize: 13,
+      fontFamily: `'Inter Variable', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`,
+      fontFamilyCode: `'JetBrains Mono', ui-monospace, monospace`,
+      controlHeight: 32,
+      controlHeightSM: 28,
+      boxShadow: 'none',
+      boxShadowSecondary: 'none',
+      boxShadowTertiary: 'none',
+    },
+    components: {
+      Layout: {
+        bodyBg: t.layout,
+        headerBg: t.surface,
+        siderBg: t.sider,
+        headerHeight: 48,
+      },
+      Card: {
+        borderRadiusLG: 8,
+        paddingLG: 16,
+        headerFontSize: 14,
+        colorBgContainer: t.surface,
+      },
+      Table: {
+        headerBg: isDark ? t.raised : t.hover,
+        headerColor: t.secondary,
+        rowHoverBg: t.hover,
+        cellFontSize: 13,
+        cellPaddingBlock: 6,
+        cellPaddingInline: 10,
+        cellPaddingBlockSM: 6,
+        cellPaddingInlineSM: 10,
+        borderColor: t.subtle,
+      },
+      Button: {
+        controlHeight: 32,
+        controlHeightSM: 28,
+        borderRadius: 6,
+        fontWeight: 500,
+        paddingInline: 12,
+        primaryShadow: 'none',
+        defaultShadow: 'none',
+        dangerShadow: 'none',
+      },
+      Input: {
+        controlHeight: 32,
+        controlHeightSM: 28,
+        borderRadius: 6,
+        activeShadow: `0 0 0 2px ${t.accentSoft}`,
+      },
+      Select: {
+        controlHeight: 32,
+        controlHeightSM: 28,
+        borderRadius: 6,
+      },
+      Statistic: {
+        titleFontSize: 11,
+        contentFontSize: 22,
+      },
+      Tabs: {
+        inkBarColor: t.accent,
+        itemColor: t.secondary,
+        itemSelectedColor: t.text,
+      },
+      Segmented: {
+        itemSelectedBg: t.raised,
+        trackBg: isDark ? '#00000040' : '#0000000a',
+      },
+      Tag: {
+        borderRadiusSM: 6,
+        fontSizeSM: 11,
+      },
+      Modal: {
+        borderRadiusLG: 10,
+        paddingContentHorizontalLG: 20,
+      },
+      Menu: {
+        darkItemBg: t.sider,
+        darkSubMenuItemBg: t.sider,
+        darkItemSelectedBg: t.accentSoft,
+        darkItemHoverBg: t.hover,
+        itemHeight: 36,
+        iconSize: 14,
+      },
+    },
+  };
+}

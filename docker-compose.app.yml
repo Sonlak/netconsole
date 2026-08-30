@@ -1,0 +1,183 @@
+# NetConsole app stack for production server.
+# Kea DHCPv4 HA with hot-standby on Docker custom bridge.
+# DHCP relay from EVE-NG should send to private NIC 10.10.20.20:67 (not public IP).
+
+networks:
+  netconsole:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.254
+
+volumes:
+  netconsole_pgdata:
+  kea_primary_leases:
+  kea_standby_leases:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: netconsole-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: netconsole
+      POSTGRES_PASSWORD: netconsole
+      POSTGRES_DB: netconsole
+    volumes:
+      - netconsole_pgdata:/var/lib/postgresql/data
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netconsole -d netconsole"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # kea-dhcp1 = primary  → HA peer = 172.31.0.11 (kea-dhcp2)
+  kea-dhcp1:
+    build:
+      context: ./lab/kea
+    container_name: netconsole-kea-primary
+    hostname: kea-primary
+    restart: unless-stopped
+    privileged: true
+    environment:
+      KEA_SERVER_NAME: kea-primary
+      KEA_SEED_LEASES: "false"
+      KEA_DATA_MAP: ""
+      KEA_HOST_OCTET: "2"
+      KEA_PRIMARY_URL: http://172.31.0.10:8000/
+      KEA_STANDBY_URL: http://172.31.0.11:8000/
+      DHCP_RELAY_VIA: "172.31.0.254"
+    volumes:
+      - kea_primary_leases:/var/lib/kea
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.10
+    ports:
+      - "10.10.20.20:67:67/udp"
+      - "10.10.20.20:8001:8000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  # kea-dhcp2 = standby → HA peer = 172.31.0.10 (kea-dhcp1)
+  kea-dhcp2:
+    build:
+      context: ./lab/kea
+    container_name: netconsole-kea-standby
+    hostname: kea-standby
+    restart: unless-stopped
+    privileged: true
+    environment:
+      KEA_SERVER_NAME: kea-standby
+      KEA_SEED_LEASES: "false"
+      KEA_DATA_MAP: ""
+      KEA_HOST_OCTET: "3"
+      KEA_PRIMARY_URL: http://172.31.0.10:8000/
+      KEA_STANDBY_URL: http://172.31.0.11:8000/
+      DHCP_RELAY_VIA: "172.31.0.254"
+    volumes:
+      - kea_standby_leases:/var/lib/kea
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.11
+    ports:
+      - "10.10.20.20:8002:8000"
+    depends_on:
+      kea-dhcp1:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  backend:
+    build:
+      context: ./backend
+    container_name: netconsole-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kea-dhcp1:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
+      PORT: 3000
+      PING_INTERVAL_SECONDS: 120
+      PING_TIMEOUT_MS: 3000
+      MAC_COLLECT_INTERVAL_SECONDS: 120
+      ARP_COLLECT_INTERVAL_SECONDS: 120
+      INTERFACES_COLLECT_INTERVAL_SECONDS: 120
+      CONFIG_COLLECT_INTERVAL_SECONDS: 300
+      LAB_SSH_ENABLED: "false"
+      LAB_SSH_USER: netconsole
+      LAB_SSH_PASSWORD: Admin@123
+      JUNOS_REST_ENABLED: "true"
+      JUNOS_REST_SCHEME: http
+      JUNOS_REST_PORT: "8443"
+      JUNOS_REST_VERIFY_TLS: "false"
+      JUNOS_REST_USER: netconsole
+      JUNOS_REST_PASSWORD: Admin@123
+      KEA_API_URL: http://172.31.0.10:8000/
+      KEA_STANDBY_API_URL: http://172.31.0.11:8000/
+      KEA_TIMEOUT_MS: "5000"
+      SEED_DISABLED: "false"
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.3
+    expose:
+      - "3000"
+
+  worker:
+    build:
+      context: ./worker
+    container_name: netconsole-worker
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    environment:
+      API_BASE_URL: http://172.31.0.3:3000/api
+      POLL_INTERVAL_SECONDS: 1
+      WORKER_NAME: netconsole-worker
+      WORKER_CONCURRENCY: "4"
+      LAB_SSH_ENABLED: "false"
+      LAB_SSH_USER: netconsole
+      LAB_SSH_PASSWORD: Admin@123
+      JUNOS_REST_ENABLED: "true"
+      JUNOS_REST_SCHEME: http
+      JUNOS_REST_PORT: "8443"
+      JUNOS_REST_VERIFY_TLS: "false"
+      JUNOS_REST_USER: netconsole
+      JUNOS_REST_PASSWORD: Admin@123
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.4
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: netconsole-frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    ports:
+      - "0.0.0.0:8443:80"
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.5

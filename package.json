@@ -1,0 +1,19 @@
+{
+  "name": "netconsole",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "npm run dev --prefix backend",
+    "lab:up": "docker compose -f docker-compose.lab.yml up -d --build",
+    "lab:down": "docker compose -f docker-compose.lab.yml down",
+    "lab:logs": "docker compose -f docker-compose.lab.yml logs -f",
+    "app:up": "docker compose -f docker-compose.app.yml up -d --build",
+    "app:down": "docker compose -f docker-compose.app.yml down",
+    "app:logs": "docker compose -f docker-compose.app.yml logs -f",
+    "build:frontend": "npm run build --prefix frontend",
+    "build:backend": "npm run build --prefix backend",
+    "db:push": "npm run db:push --prefix backend",
+    "db:seed": "npm run db:seed --prefix backend"
+  }
+}

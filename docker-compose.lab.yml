@@ -1,0 +1,511 @@
+# Blank managed lab — topology wired, NO device dataplane config.
+# Devices: mgmt IP + SSH/REST (admin/Admin@123, root/Juniper) for NetConsole manage.
+# Push OSPF/VRRP/VLAN/DHCP-relay/etc. from the app later.
+# Kea + app stack unchanged (HA on mgmt).
+
+networks:
+  lab-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.254
+
+  # Physical wiring only (no pre-assigned dataplane IPs on devices)
+  core-peer:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.10.0/29
+          gateway: 10.10.10.6
+  c1-ds1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.20.0/29
+          gateway: 10.10.20.6
+  c1-ds2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.20.8/29
+          gateway: 10.10.20.14
+  c2-ds1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.20.16/29
+          gateway: 10.10.20.22
+  c2-ds2:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.20.24/29
+          gateway: 10.10.20.30
+  vlan201:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.201.0/24
+          gateway: 10.1.201.1
+          ip_range: 10.1.201.208/28
+  vlan202:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.202.0/24
+          gateway: 10.1.202.1
+          ip_range: 10.1.202.208/28
+  vlan203:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.203.0/24
+          gateway: 10.1.203.1
+          ip_range: 10.1.203.208/28
+
+volumes:
+  netconsole_pgdata:
+  kea_primary_leases:
+  kea_standby_leases:
+  frontend_node_modules:
+
+x-dhcp-pc: &dhcp_pc
+  build:
+    context: ./lab/dhcp-client
+  restart: unless-stopped
+  cap_add: [NET_ADMIN]
+  environment:
+    IFACE: eth0
+
+x-device-creds: &device_creds
+  LAB_USER: admin
+  LAB_PASSWORD: Admin@123
+  ROOT_PASSWORD: Juniper
+  REST_SCHEME: http
+  REST_PORT: "8443"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: netconsole-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: netconsole
+      POSTGRES_PASSWORD: netconsole
+      POSTGRES_DB: netconsole
+    ports: ["5432:5432"]
+    volumes: [netconsole_pgdata:/var/lib/postgresql/data]
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netconsole -d netconsole"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  sw-core-01:
+    build:
+      context: ./lab
+      dockerfile: juniper-core/Dockerfile
+    container_name: lab-sw-core-01
+    hostname: SW-CORE-01
+    restart: unless-stopped
+    privileged: true
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-CORE-01
+      DEVICE_MODEL: vEX4
+      DEVICE_SERIAL: JNCORE000001
+      DEVICE_VERSION: 22.4R1.10
+      DEVICE_IP_MGMT: 172.30.0.11
+      DEVICE_ROLE: core
+      LOOPBACK_IP: 1.1.1.1
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.11
+        interface_name: eth0
+      core-peer:
+        interface_name: eth1
+      c1-ds1:
+        interface_name: eth2
+      c1-ds2:
+        interface_name: eth3
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sw-core-02:
+    build:
+      context: ./lab
+      dockerfile: juniper-core/Dockerfile
+    container_name: lab-sw-core-02
+    hostname: SW-CORE-02
+    restart: unless-stopped
+    privileged: true
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-CORE-02
+      DEVICE_MODEL: vEX3
+      DEVICE_SERIAL: JNCORE000002
+      DEVICE_VERSION: 22.4R1.10
+      DEVICE_IP_MGMT: 172.30.0.12
+      DEVICE_ROLE: core
+      LOOPBACK_IP: 1.1.1.2
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.12
+        interface_name: eth0
+      core-peer:
+        interface_name: eth1
+      c2-ds1:
+        interface_name: eth2
+      c2-ds2:
+        interface_name: eth3
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sw-ds-01:
+    build:
+      context: ./lab
+      dockerfile: juniper-dist/Dockerfile
+    container_name: lab-sw-ds-01
+    hostname: SW-DS-01
+    restart: unless-stopped
+    privileged: true
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-DS-01
+      DEVICE_MODEL: vEX1
+      DEVICE_SERIAL: JNDIST000001
+      DEVICE_VERSION: 21.4R3.4
+      DEVICE_IP_MGMT: 172.30.0.13
+      DEVICE_ROLE: dist
+      LOOPBACK_IP: 2.2.2.1
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.13
+        interface_name: eth0
+      c1-ds1:
+        interface_name: eth1
+      c2-ds1:
+        interface_name: eth2
+      vlan201:
+        interface_name: eth3
+      vlan202:
+        interface_name: eth4
+      vlan203:
+        interface_name: eth5
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sw-ds-02:
+    build:
+      context: ./lab
+      dockerfile: juniper-dist/Dockerfile
+    container_name: lab-sw-ds-02
+    hostname: SW-DS-02
+    restart: unless-stopped
+    privileged: true
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-DS-02
+      DEVICE_MODEL: vEX2
+      DEVICE_SERIAL: JNDIST000002
+      DEVICE_VERSION: 21.4R3.4
+      DEVICE_IP_MGMT: 172.30.0.14
+      DEVICE_ROLE: dist
+      LOOPBACK_IP: 2.2.2.2
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.14
+        interface_name: eth0
+      c1-ds2:
+        interface_name: eth1
+      c2-ds2:
+        interface_name: eth2
+      vlan201:
+        interface_name: eth3
+      vlan202:
+        interface_name: eth4
+      vlan203:
+        interface_name: eth5
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sw-as-01:
+    build:
+      context: ./lab
+      dockerfile: juniper-access/Dockerfile
+    container_name: lab-sw-as-01
+    hostname: SW-AS-01
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-AS-01
+      DEVICE_MODEL: vEX7
+      DEVICE_SERIAL: JNACC000001
+      DEVICE_VERSION: 21.4R3.4
+      DEVICE_IP_MGMT: 172.30.0.15
+      DEVICE_ROLE: access
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.15
+        interface_name: eth0
+      vlan201:
+        interface_name: eth1
+      vlan202:
+        interface_name: eth2
+      vlan203:
+        interface_name: eth3
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  sw-as-02:
+    build:
+      context: ./lab
+      dockerfile: juniper-access/Dockerfile
+    container_name: lab-sw-as-02
+    hostname: SW-AS-02
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    environment:
+      <<: *device_creds
+      DEVICE_HOSTNAME: SW-AS-02
+      DEVICE_MODEL: vEX8
+      DEVICE_SERIAL: JNACC000002
+      DEVICE_VERSION: 21.4R3.4
+      DEVICE_IP_MGMT: 172.30.0.16
+      DEVICE_ROLE: access
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.16
+        interface_name: eth0
+      vlan201:
+        interface_name: eth1
+      vlan202:
+        interface_name: eth2
+      vlan203:
+        interface_name: eth3
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket;s=socket.create_connection(('127.0.0.1',8443),3);s.close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Docker Desktop + privileged sims drop SSH banners on published ports.
+  # Non-privileged socat on 127.0.0.1 avoids WSL [::1] relay stealing localhost.
+  port-gw:
+    build:
+      context: ./lab/port-gw
+    container_name: lab-port-gw
+    hostname: port-gw
+    restart: unless-stopped
+    depends_on:
+      sw-core-01:
+        condition: service_healthy
+      sw-core-02:
+        condition: service_healthy
+      sw-ds-01:
+        condition: service_healthy
+      sw-ds-02:
+        condition: service_healthy
+      sw-as-01:
+        condition: service_healthy
+      sw-as-02:
+        condition: service_healthy
+    networks: [lab-net]
+    ports:
+      - "127.0.0.1:2221:2221"
+      - "127.0.0.1:2222:2222"
+      - "127.0.0.1:2223:2223"
+      - "127.0.0.1:2224:2224"
+      - "127.0.0.1:2225:2225"
+      - "127.0.0.1:2226:2226"
+      - "127.0.0.1:8441:8441"
+      - "127.0.0.1:8442:8442"
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:8444:8444"
+      - "127.0.0.1:8445:8445"
+      - "127.0.0.1:8446:8446"
+
+  kea-dhcp1:
+    build:
+      context: ./lab/kea
+    container_name: lab-kea-primary
+    hostname: kea-primary
+    restart: unless-stopped
+    privileged: true
+    environment:
+      KEA_SERVER_NAME: kea-primary
+      KEA_SEED_LEASES: "false"
+      KEA_DATA_MAP: ""
+      KEA_HOST_OCTET: "2"
+    volumes: [kea_primary_leases:/var/lib/kea]
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.21
+    ports: ["8001:8000"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  kea-dhcp2:
+    build:
+      context: ./lab/kea
+    container_name: lab-kea-standby
+    hostname: kea-standby
+    restart: unless-stopped
+    environment:
+      KEA_SERVER_NAME: kea-standby
+      KEA_SEED_LEASES: "false"
+      KEA_DATA_MAP: ""
+      KEA_HOST_OCTET: "3"
+    volumes: [kea_standby_leases:/var/lib/kea]
+    networks:
+      lab-net:
+        ipv4_address: 172.30.0.22
+    ports: ["8002:8000"]
+    depends_on: [kea-dhcp1]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 25
+
+  # PCs wait for DHCP after you push relay/VRRP/SVI from the app
+  vpc5:
+    <<: *dhcp_pc
+    container_name: lab-vpc5
+    hostname: VPC5
+    networks: [vlan201]
+    depends_on: [kea-dhcp1]
+
+  vpc10:
+    <<: *dhcp_pc
+    container_name: lab-vpc10
+    hostname: VPC10
+    networks: [vlan201]
+    depends_on: [kea-dhcp1]
+
+  vpc6:
+    <<: *dhcp_pc
+    container_name: lab-vpc6
+    hostname: VPC6
+    networks: [vlan202]
+    depends_on: [kea-dhcp1]
+
+  vpc11:
+    <<: *dhcp_pc
+    container_name: lab-vpc11
+    hostname: VPC11
+    networks: [vlan202]
+    depends_on: [kea-dhcp1]
+
+  vpc9:
+    <<: *dhcp_pc
+    container_name: lab-vpc9
+    hostname: VPC9
+    networks: [vlan203]
+    depends_on: [kea-dhcp1]
+
+  vpc12:
+    <<: *dhcp_pc
+    container_name: lab-vpc12
+    hostname: VPC12
+    networks: [vlan203]
+    depends_on: [kea-dhcp1]
+
+  backend:
+    build:
+      context: ./backend
+    container_name: netconsole-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sw-core-01:
+        condition: service_healthy
+      kea-dhcp1:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://netconsole:netconsole@postgres:5432/netconsole?schema=public
+      PORT: 3000
+      PING_INTERVAL_SECONDS: 120
+      PING_TIMEOUT_MS: 3000
+      LAB_SSH_ENABLED: "true"
+      LAB_SSH_USER: admin
+      LAB_SSH_PASSWORD: Admin@123
+      LAB_SSH_PORT: "22"
+      MAC_COLLECT_INTERVAL_SECONDS: "120"
+      ARP_COLLECT_INTERVAL_SECONDS: "120"
+      KEA_API_URL: http://kea-dhcp1:8000/
+      KEA_STANDBY_API_URL: http://kea-dhcp2:8000/
+      KEA_TIMEOUT_MS: "5000"
+    ports: ["3000:3000"]
+    networks: [lab-net]
+
+  worker:
+    build:
+      context: ./worker
+    container_name: netconsole-worker
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    environment:
+      API_BASE_URL: http://backend:3000/api
+      POLL_INTERVAL_SECONDS: 1
+      WORKER_NAME: netconsole-worker-lab
+      LAB_SSH_ENABLED: "true"
+      LAB_SSH_USER: admin
+      LAB_SSH_PASSWORD: Admin@123
+      LAB_SSH_PORT: "22"
+      JUNOS_REST_ENABLED: "true"
+      JUNOS_REST_SCHEME: http
+      JUNOS_REST_PORT: "8443"
+      JUNOS_REST_VERIFY_TLS: "false"
+      JUNOS_REST_USER: admin
+      JUNOS_REST_PASSWORD: Admin@123
+    networks: [lab-net]
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: netconsole-frontend
+    restart: unless-stopped
+    depends_on: [backend]
+    environment:
+      VITE_DEV_PROXY_TARGET: http://backend:3000
+      CHOKIDAR_USEPOLLING: "true"
+    ports: ["5173:5173"]
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    networks: [lab-net]

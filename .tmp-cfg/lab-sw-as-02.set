@@ -1,0 +1,31 @@
+## NetConsole lab template: access
+## device SW-AS-02  mgmt 172.30.0.16
+## Save on tool first. Commit pushes to device.
+set system host-name SW-AS-02
+set system services ssh
+set system services netconf ssh
+set system login user admin class super-user
+set system login user admin authentication encrypted-password "$1$lab$AdminHash"
+set system root-authentication encrypted-password "$1$lab$RootHash"
+set interfaces me0 description "mgmt lab-net"
+set interfaces me0 unit 0 family inet address 172.30.0.16/24
+set interfaces ge-0/0/0 description "uplink-to-SW-DS-01 trunk"
+set interfaces ge-0/0/0 unit 0 family ethernet-switching interface-mode trunk
+set interfaces ge-0/0/0 unit 0 family ethernet-switching vlan members all
+set interfaces ge-0/0/1 description "uplink-to-SW-DS-02 trunk"
+set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode trunk
+set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members all
+set interfaces ge-0/0/2 description "VPC10 vlan201"
+set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members VLAN201
+set interfaces ge-0/0/3 description "VPC11 vlan202"
+set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members VLAN202
+set interfaces ge-0/0/4 description "VPC12 vlan203"
+set interfaces ge-0/0/4 unit 0 family ethernet-switching interface-mode access
+set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members VLAN203
+set vlans VLAN201 vlan-id 201
+set vlans VLAN202 vlan-id 202
+set vlans VLAN203 vlan-id 203
+set protocols rstp interface all
+set protocols lldp interface all

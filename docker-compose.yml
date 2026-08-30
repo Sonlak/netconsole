@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: netconsole-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: netconsole
+      POSTGRES_PASSWORD: netconsole
+      POSTGRES_DB: netconsole
+    ports:
+      - "5432:5432"
+    volumes:
+      - netconsole_pgdata:/var/lib/postgresql/data
+
+volumes:
+  netconsole_pgdata:

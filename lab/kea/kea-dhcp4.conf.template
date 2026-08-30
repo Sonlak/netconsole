@@ -1,0 +1,114 @@
+{
+  "Dhcp4": {
+    "valid-lifetime": 28800,
+    "renew-timer": 14400,
+    "rebind-timer": 25200,
+    "interfaces-config": {
+      "interfaces": [ "*" ]
+    },
+    "control-socket": {
+      "socket-type": "unix",
+      "socket-name": "/var/run/kea/kea4-ctrl-socket"
+    },
+    "lease-database": {
+      "type": "memfile",
+      "persist": true,
+      "name": "/var/lib/kea/kea-leases4.csv"
+    },
+    "hooks-libraries": [
+      {
+        "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
+      },
+      {
+        "library": "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_ha.so",
+        "parameters": {
+          "high-availability": [
+            {
+              "this-server-name": "__THIS_SERVER_NAME__",
+              "mode": "hot-standby",
+              "heartbeat-delay": 10000,
+              "max-response-delay": 60000,
+              "max-ack-delay": 5000,
+              "max-unacked-clients": 0,
+              "peers": [
+                {
+                  "name": "kea-primary",
+                  "url": "__KEA_PRIMARY_URL__",
+                  "role": "primary",
+                  "auto-failover": true
+                },
+                {
+                  "name": "kea-standby",
+                  "url": "__KEA_STANDBY_URL__",
+                  "role": "standby",
+                  "auto-failover": true
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "option-data": [
+      {
+        "name": "domain-name-servers",
+        "data": "8.8.8.8, 1.1.1.1"
+      },
+      {
+        "name": "domain-name",
+        "data": "lab.netconsole.local"
+      }
+    ],
+    "subnet4": [
+      {
+        "id": 201,
+        "subnet": "10.1.201.0/24",
+        "pools": [{ "pool": "10.1.201.10 - 10.1.201.199" }],
+        "option-data": [
+          { "name": "routers", "data": "10.1.201.254" }
+        ],
+        "user-context": {
+          "site": "LAB",
+          "vlan": 201,
+          "name": "Tang-01 VLAN201",
+          "gateway": "10.1.201.254"
+        }
+      },
+      {
+        "id": 202,
+        "subnet": "10.1.202.0/24",
+        "pools": [{ "pool": "10.1.202.10 - 10.1.202.199" }],
+        "option-data": [
+          { "name": "routers", "data": "10.1.202.254" }
+        ],
+        "user-context": {
+          "site": "LAB",
+          "vlan": 202,
+          "name": "Tang-02 VLAN202",
+          "gateway": "10.1.202.254"
+        }
+      },
+      {
+        "id": 203,
+        "subnet": "10.1.203.0/24",
+        "pools": [{ "pool": "10.1.203.10 - 10.1.203.199" }],
+        "option-data": [
+          { "name": "routers", "data": "10.1.203.254" }
+        ],
+        "user-context": {
+          "site": "LAB",
+          "vlan": 203,
+          "name": "Tang-03 VLAN203",
+          "gateway": "10.1.203.254"
+        }
+      }
+    ],
+    "loggers": [
+      {
+        "name": "kea-dhcp4",
+        "severity": "INFO",
+        "output_options": [{ "output": "stdout" }]
+      }
+    ]
+  }
+}

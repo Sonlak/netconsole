@@ -1,0 +1,10 @@
+# Sample rendered config placeholder for {{ device.name }} ({{ device.ip }})
+# Site: {{ device.site }} | Floor: {{ device.floor }}
+# Vendor: {{ device.vendor }} | Model: {{ device.model }}
+#
+# TODO: Replace with real 'show running-config' output via aionet
+hostname {{ device.name }}
+!
+interface Loopback0
+ description Managed by NetConsole
+!
