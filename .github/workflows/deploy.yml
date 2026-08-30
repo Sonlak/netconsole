@@ -84,8 +84,9 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          echo "Running: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build $DEPLOY_SERVICES"
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --build $DEPLOY_SERVICES
+          # --no-deps: don't restart kea/postgres (they hold persistent state)
+          echo "Running: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES"
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
 
       - name: Wait for backend healthy
         run: |
