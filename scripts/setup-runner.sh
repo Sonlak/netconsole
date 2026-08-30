@@ -107,7 +107,7 @@ systemctl status "$SVC_NAME" --no-pager || true
 
 echo ""
 echo "============================================================"
-echo "✅ Runner installed and started"
+echo "âœ… Runner installed and started"
 echo "   Name:    $RUNNER_NAME"
 echo "   Repo:    https://github.com/$REPO/settings/actions/runners"
 echo "   Service: systemctl status $SVC_NAME"

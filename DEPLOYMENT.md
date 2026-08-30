@@ -45,7 +45,7 @@ Copy the token from the `./config.sh` command shown there.
 
 ### 4. Install runner
 
-From your **local machine** (Windows), upload & run:
+#### If VPS can reach `github.com` AND `release-assets.githubusercontent.com` (typical)
 
 ```powershell
 # Copy the helper script to VPS
@@ -62,11 +62,47 @@ sudo bash /tmp/setup-runner.sh \
     --labels "self-hosted,linux,production"
 ```
 
+#### If VPS firewall blocks `release-assets.githubusercontent.com` (this repo's case)
+
+Symptoms: `curl -fL https://github.com/actions/runner/releases/download/...` hangs after the 302 redirect to `release-assets.githubusercontent.com`, while `github.com`, `api.github.com`, and `codeload.github.com` all work.
+
+Workaround: download on a machine with full internet (your laptop), SCP to VPS:
+
+```powershell
+# On Windows - downloads 209 MB locally
+curl.exe -fL -o D:\NetConsole\downloads\actions-runner.tar.gz `
+    https://github.com/actions/runner/releases/download/v2.319.1/actions-runner-linux-x64-2.319.1.tar.gz
+
+# SCP to VPS
+scp -i $env:USERPROFILE\.ssh\id_ed25519 `
+    D:\NetConsole\downloads\actions-runner.tar.gz `
+    sonnx@42.119.165.109:/tmp/actions-runner.tar.gz
+
+# On VPS: extract, register, install service
+ssh -i $env:USERPROFILE\.ssh\id_ed25519 sonnx@42.119.165.109
+sudo mkdir -p /opt/actions-runner
+sudo chown -R sonnx:sonnx /opt/actions-runner
+sudo -u sonnx tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner
+rm -f /tmp/actions-runner.tar.gz
+
+cd /opt/actions-runner
+sudo -u sonnx ./config.sh --unattended --replace \
+    --url https://github.com/Sonlak/netconsole \
+    --token "<PASTE_TOKEN_HERE>" \
+    --name "vps-prod-01" \
+    --labels "self-hosted,linux,production" \
+    --work _work
+
+sudo ./svc.sh install sonnx
+sudo ./svc.sh start
+```
+
 Expected output ends with:
 ```
-✅ Runner installed and started
-   Name:    vps-prod-01
-   Service: systemctl status actions.runner.Sonlak-netconsole.vps-prod-01
+√ Runner successfully added
+√ Runner connection is good
+Started running service
+Listening for Jobs
 ```
 
 ### 5. Verify runner shows up on GitHub
@@ -74,6 +110,13 @@ Expected output ends with:
 Go to: **https://github.com/Sonlak/netconsole/settings/actions/runners**
 
 You should see a green dot next to `vps-prod-01`.
+
+Verify on VPS:
+```bash
+sudo systemctl status actions.runner.Sonlak-netconsole.vps-prod-01
+sudo journalctl -u actions.runner.Sonlak-netconsole.vps-prod-01 -n 20 --no-pager
+# expect: "Listening for Jobs"
+```
 
 ---
 

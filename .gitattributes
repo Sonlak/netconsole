@@ -1,0 +1,6 @@
+# Enforce LF line endings for shell scripts (Windows checkouts otherwise
+# break scripts with `set -euo pipefail` parsing)
+*.sh       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.json     text eol=lf

@@ -64,3 +64,14 @@ netconsole-app.tar.gz
 runner/
 *.tar.gz.runner
 
+# Local downloads (e.g. actions-runner.tar.gz from Windows)
+downloads/
+
+# One-off SSH helper scripts (kept locally for debugging, not for the repo)
+scripts/check_runner_state.py
+scripts/debug_download.py
+scripts/deploy_runner.py
+scripts/run_setup_runner.py
+scripts/run_setup_steps.py
+scripts/verify_runner.py
+
