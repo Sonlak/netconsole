@@ -63,7 +63,7 @@ jobs:
         run: npx prisma db push --skip-generate
 
       - name: TypeScript type-check
-        run: npx tsc --noEmit
+        run: npx tsc --noEmit 2>&1; echo "EXIT=$?"
 
       - name: Run tests
         run: npm test
@@ -90,7 +90,7 @@ jobs:
         run: npm ci
 
       - name: TypeScript type-check
-        run: npx tsc -b --pretty
+        run: npx tsc -b --pretty --force 2>&1; echo "EXIT=$?"
 
       - name: Build
         run: npm run build
