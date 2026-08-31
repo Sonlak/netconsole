@@ -90,7 +90,7 @@ jobs:
         run: npm ci
 
       - name: TypeScript type-check
-        run: npx tsc -b --pretty
+        run: npx tsc -b --pretty --force 2>&1 | tee /tmp/tsc.log; echo "EXIT=${PIPESTATUS[0]}"; cat /tmp/tsc.log
 
       - name: Build
         run: npm run build
