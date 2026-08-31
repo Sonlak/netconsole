@@ -400,18 +400,29 @@ textarea.nc-code-area {
 
 .nc-fabric {
   position: relative;
-  min-height: 560px;
-  padding: 28px 28px 36px 92px;
+  height: 640px;
+  overflow: hidden;
+  border-radius: 12px;
+  background:
+    radial-gradient(900px 320px at 50% -10%, color-mix(in srgb, var(--nc-accent) 8%, transparent), transparent 70%),
+    color-mix(in srgb, var(--nc-raised) 80%, transparent);
+  border: 1px solid var(--nc-border);
+  touch-action: none;
+  user-select: none;
+}
+
+.nc-fabric-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
 }
 
 .nc-fabric-svg {
   position: absolute;
   inset: 0;
-  width: 100%;
-  height: 100%;
   overflow: visible;
   pointer-events: none;
-  z-index: 1;
 }
 
 .nc-fabric-svg path {
@@ -419,24 +430,40 @@ textarea.nc-code-area {
   pointer-events: stroke;
 }
 
+.nc-fabric-floor-band {
+  fill: color-mix(in srgb, var(--nc-raised) 60%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
+  stroke-dasharray: 4 4;
+  stroke-width: 1;
+}
+
+.nc-fabric-floor-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  fill: var(--nc-text-muted);
+}
+
 .nc-fabric-glow {
   stroke-width: 8;
-  stroke-opacity: 0.22;
+  stroke-opacity: 0.18;
+  filter: blur(0.2px);
 }
 
 .nc-fabric-line {
-  stroke-width: 2.4;
+  stroke-width: 2;
   stroke-linecap: round;
+  transition: stroke-width 0.18s ease, opacity 0.18s ease;
 }
 
-.nc-fabric-dot {
-  stroke: var(--nc-surface);
-  stroke-width: 1.5;
+.nc-fabric-link:hover .nc-fabric-line {
+  stroke-width: 3;
 }
 
 .nc-fabric-port rect {
-  fill: var(--nc-raised);
-  stroke: var(--nc-border);
+  fill: color-mix(in srgb, var(--nc-raised) 60%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 80%, transparent);
   stroke-width: 1;
 }
 
@@ -454,108 +481,56 @@ textarea.nc-code-area {
 
 .nc-fabric-link.is-peer path {
   stroke: #8b93a7;
+  stroke-dasharray: 6 4;
 }
 
 .nc-fabric-link.is-l3 path {
   stroke: #f0a14a;
+  stroke-width: 2.6;
 }
 
 .nc-fabric-link.is-uplink path {
-  stroke: var(--nc-text-muted);
-}
-
-.nc-fabric-link.is-trunk .nc-fabric-dot {
-  fill: #5b9dff;
-}
-
-.nc-fabric-link.is-peer .nc-fabric-dot {
-  fill: #8b93a7;
-}
-
-.nc-fabric-link.is-l3 .nc-fabric-dot {
-  fill: #f0a14a;
-}
-
-.nc-fabric-link.is-uplink .nc-fabric-dot {
-  fill: var(--nc-text-muted);
-}
-
-.nc-fabric-layer {
-  position: relative;
-  z-index: 2;
-  margin: 0 0 88px;
-  padding: 6px 0;
-}
-
-.nc-fabric-layer:last-of-type {
-  margin-bottom: 8px;
-}
-
-.nc-fabric-layer-label {
-  position: absolute;
-  left: -80px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 68px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--nc-text-muted);
-  text-align: right;
-}
-
-.nc-fabric-layer::before {
-  content: '';
-  position: absolute;
-  left: -12px;
-  right: 8px;
-  top: 50%;
-  height: 1px;
-  background: color-mix(in srgb, var(--nc-border) 70%, transparent);
-  z-index: -1;
-}
-
-.nc-fabric-row {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 72px;
-}
-
-.nc-fabric-layer.is-access .nc-fabric-row {
-  gap: 56px;
+  stroke: #9aa3b6;
+  stroke-dasharray: 2 4;
 }
 
 .nc-fabric-node {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  text-align: center;
+  align-items: flex-start;
+  text-align: left;
   gap: 3px;
-  width: 176px;
-  padding: 12px 14px 11px;
+  width: 132px;
+  height: 56px;
+  padding: 8px 12px 8px 14px;
   border: 1px solid var(--nc-border);
-  border-radius: 12px;
+  border-radius: 10px;
   background: var(--nc-raised);
   color: inherit;
-  position: relative;
+  position: absolute;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  text-decoration: none;
+}
+
+.nc-fabric-node:hover {
+  border-color: color-mix(in srgb, var(--nc-accent) 60%, var(--nc-border));
+  transform: translateY(-1px);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--nc-accent) 30%, transparent),
+    0 14px 36px rgba(0, 0, 0, 0.3);
 }
 
 .nc-fabric-node::before {
   content: '';
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
+  top: 8px;
+  bottom: 8px;
   width: 3px;
   border-radius: 0 3px 3px 0;
   background: var(--nc-text-muted);
-}
-
-.nc-fabric-node:hover {
-  border-color: color-mix(in srgb, var(--nc-accent) 60%, var(--nc-border));
 }
 
 .nc-fabric-node.is-core {
@@ -585,22 +560,42 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-name {
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 700;
-  line-height: 1.25;
+  line-height: 1.2;
   letter-spacing: -0.02em;
+  color: var(--nc-text);
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .nc-fabric-ip {
-  font-size: 12px;
+  font-size: 10.5px;
   color: var(--nc-text-secondary);
   font-family: var(--font-mono), ui-monospace, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.nc-fabric-role-pill {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--nc-text-muted);
 }
 
 .nc-fabric-status {
   position: absolute;
-  right: 12px;
-  top: 12px;
+  right: 8px;
+  top: 8px;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -626,4 +621,73 @@ textarea.nc-code-area {
 .nc-fabric-status.is-purple {
   background: #a78bfa;
   box-shadow: 0 0 0 3px color-mix(in srgb, #a78bfa 22%, transparent);
+}
+
+.nc-fabric-controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 5;
+  background: color-mix(in srgb, var(--nc-raised) 80%, transparent);
+  border: 1px solid var(--nc-border);
+  border-radius: 8px;
+  padding: 4px;
+  backdrop-filter: blur(6px);
+}
+
+.nc-fabric-controls button {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--nc-text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.nc-fabric-controls button:hover {
+  background: color-mix(in srgb, var(--nc-accent) 18%, transparent);
+  color: var(--nc-text);
+}
+
+.nc-fabric-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 240px;
+  color: var(--nc-text-muted);
+  font-size: 13px;
+}
+
+.nc-fabric-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 11.5px;
+  color: var(--nc-text-secondary);
+  font-weight: 600;
+}
+
+.nc-fabric-legend-item {
+  display: inline-block;
+  width: 22px;
+  height: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+  border-radius: 2px;
+  background: var(--nc-text-muted);
+}
+
+.nc-fabric-legend-item.is-trunk { background: #5b9dff; }
+.nc-fabric-legend-item.is-peer { background: #8b93a7; transform: translateY(-1px); }
+.nc-fabric-legend-item.is-l3 { background: #f0a14a; height: 3px; }
+.nc-fabric-legend-item.is-uplink {
+  background-image: linear-gradient(to right, #9aa3b6 50%, transparent 50%);
+  background-size: 6px 100%;
+  background-repeat: repeat-x;
 }

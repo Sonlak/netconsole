@@ -123,9 +123,17 @@ export default function FabricPage() {
         className="nc-fabric-card"
         title={`${activeSite}${floorFilter ? ` · Floor ${floorFilter}` : ' · all floors'}`}
         extra={
-          <Typography.Text type="secondary">
-            {view.nodes.length} devices · {view.links.length} links
-          </Typography.Text>
+          <Space size="middle">
+            <span className="nc-fabric-legend">
+              <span className="nc-fabric-legend-item is-trunk" /> Trunk
+              <span className="nc-fabric-legend-item is-peer" /> Peer
+              <span className="nc-fabric-legend-item is-l3" /> L3
+              <span className="nc-fabric-legend-item is-uplink" /> Uplink
+            </span>
+            <Typography.Text type="secondary">
+              {view.nodes.length} devices · {view.links.length} links
+            </Typography.Text>
+          </Space>
         }
       >
         {view.nodes.length === 0 ? (

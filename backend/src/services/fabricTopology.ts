@@ -1,6 +1,28 @@
 import { JobStatus, JobType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 
+type CacheEntry = { value: unknown; expiresAt: number };
+const TTL_MS = 15_000;
+const cache = new Map<string, CacheEntry>();
+
+function getCached<T>(key: string): T | null {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt < Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.value as T;
+}
+
+function setCached<T>(key: string, value: T) {
+  cache.set(key, { value, expiresAt: Date.now() + TTL_MS });
+}
+
+export function invalidateFabricCache() {
+  cache.clear();
+}
+
 export type FabricRole = 'core' | 'dist' | 'access';
 export type FabricLinkKind = 'trunk' | 'peer' | 'l3' | 'uplink';
 
@@ -119,23 +141,47 @@ type IfaceRow = {
 };
 
 export async function getFabricTopology(site?: string) {
-  const devices = await prisma.device.findMany({
-    where: site
-      ? {
-          OR: [{ site }, { name: { startsWith: `${site}-` } }],
-        }
-      : undefined,
-    orderBy: [{ name: 'asc' }],
-    select: {
-      id: true,
-      name: true,
-      ip: true,
-      site: true,
-      floor: true,
-      status: true,
-      model: true,
-    },
-  });
+  const cacheKey = `fabric:${site || ''}`;
+  const cached = getCached<unknown>(cacheKey);
+  if (cached) return cached;
+
+  const where = site
+    ? {
+        OR: [{ site }, { name: { startsWith: `${site}-` } }],
+      }
+    : undefined;
+
+  const [devices, jobs] = await Promise.all([
+    prisma.device.findMany({
+      where,
+      orderBy: [{ name: 'asc' }],
+      select: {
+        id: true,
+        name: true,
+        ip: true,
+        site: true,
+        floor: true,
+        status: true,
+        model: true,
+      },
+    }),
+    prisma.job.findMany({
+      where: {
+        type: JobType.GET_INTERFACES,
+        status: JobStatus.SUCCESS,
+      },
+      orderBy: { updatedAt: 'desc' },
+      select: { deviceId: true, result: true, updatedAt: true },
+    }),
+  ]);
+
+  const deviceIds = new Set(devices.map((d) => d.id));
+  const latest = new Map<string, { result: unknown; updatedAt: Date }>();
+  for (const job of jobs) {
+    if (!job.deviceId || !deviceIds.has(job.deviceId)) continue;
+    if (latest.has(job.deviceId)) continue;
+    latest.set(job.deviceId, { result: job.result, updatedAt: job.updatedAt });
+  }
 
   const nodes: FabricNode[] = devices.map((device) => {
     const floorNumber = parseFloorNumber(device.name) ?? parseFloorNumber(device.floor);
@@ -152,24 +198,6 @@ export async function getFabricTopology(site?: string) {
       model: device.model || '',
     };
   });
-
-  const jobs = nodes.length
-    ? await prisma.job.findMany({
-        where: {
-          deviceId: { in: nodes.map((node) => node.id) },
-          type: JobType.GET_INTERFACES,
-          status: JobStatus.SUCCESS,
-        },
-        orderBy: { updatedAt: 'desc' },
-        select: { deviceId: true, result: true, updatedAt: true },
-      })
-    : [];
-
-  const latest = new Map<string, { result: unknown; updatedAt: Date }>();
-  for (const job of jobs) {
-    if (!job.deviceId || latest.has(job.deviceId)) continue;
-    latest.set(job.deviceId, { result: job.result, updatedAt: job.updatedAt });
-  }
 
   const merged = new Map<string, FabricLink>();
 
@@ -231,7 +259,7 @@ export async function getFabricTopology(site?: string) {
     return left.localeCompare(right, undefined, { numeric: true });
   });
 
-  return {
+  const payload = {
     site: site || null,
     nodes,
     links,
@@ -240,4 +268,6 @@ export async function getFabricTopology(site?: string) {
     linkCount: links.length,
     devicesWithPorts: latest.size,
   };
+  setCached(cacheKey, payload);
+  return payload;
 }

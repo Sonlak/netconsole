@@ -6,6 +6,7 @@ import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
 import { applyInterfaceActionSnapshot, queueGetInterfaces } from '../services/interfaces.js';
+import { invalidateFabricCache } from '../services/fabricTopology.js';
 
 export const jobsRouter = Router();
 
@@ -180,6 +181,7 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
     }
 
     res.json({ job, device });
+    if (job.type === JobType.GET_INTERFACES) invalidateFabricCache();
   } catch {
     res.status(409).json({ error: 'Job is not running' });
   }
