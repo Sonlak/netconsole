@@ -409,6 +409,20 @@ textarea.nc-code-area {
   border: 1px solid var(--nc-border);
   touch-action: none;
   user-select: none;
+  isolation: isolate;
+}
+
+.nc-fabric-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--nc-border) 40%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--nc-border) 40%, transparent) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: -1px -1px;
+  mask-image: radial-gradient(ellipse at center, #000 55%, transparent 100%);
+  pointer-events: none;
+  opacity: 0.55;
 }
 
 .nc-fabric-canvas {
@@ -416,23 +430,26 @@ textarea.nc-code-area {
   top: 0;
   left: 0;
   will-change: transform;
-}
-
-.nc-fabric-svg {
-  position: absolute;
-  inset: 0;
-  overflow: visible;
-  pointer-events: none;
+  transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .nc-fabric-svg path {
   fill: none;
+}
+
+.nc-fabric-svg .nc-fabric-link {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.nc-fabric-svg .nc-fabric-link .nc-fabric-line,
+.nc-fabric-svg .nc-fabric-link .nc-fabric-line-hit {
   pointer-events: stroke;
 }
 
 .nc-fabric-floor-band {
-  fill: color-mix(in srgb, var(--nc-raised) 60%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
+  fill: color-mix(in srgb, var(--nc-raised) 45%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 50%, transparent);
   stroke-dasharray: 4 4;
   stroke-width: 1;
 }
@@ -443,22 +460,40 @@ textarea.nc-code-area {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   fill: var(--nc-text-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
 }
 
-.nc-fabric-glow {
-  stroke-width: 8;
-  stroke-opacity: 0.18;
-  filter: blur(0.2px);
+.nc-fabric-line-hit {
+  stroke: transparent;
+  stroke-width: 18;
+  fill: none;
+  cursor: pointer;
 }
 
 .nc-fabric-line {
   stroke-width: 2;
   stroke-linecap: round;
-  transition: stroke-width 0.18s ease, opacity 0.18s ease;
+  stroke-linejoin: round;
+  transition: stroke-width 0.18s ease, opacity 0.18s ease, stroke 0.18s ease;
 }
 
-.nc-fabric-link:hover .nc-fabric-line {
+.nc-fabric-link.is-hover .nc-fabric-line {
   stroke-width: 3;
+  filter: drop-shadow(0 0 6px color-mix(in srgb, currentColor 40%, transparent));
+}
+
+.nc-fabric-link.is-down .nc-fabric-line {
+  stroke-dasharray: 4 6;
+  animation: nc-fabric-dash 1.4s linear infinite;
+  opacity: 0.55;
+}
+
+.nc-fabric-link.is-down.is-hover .nc-fabric-line {
+  opacity: 0.9;
+}
+
+@keyframes nc-fabric-dash {
+  to { stroke-dashoffset: -20; }
 }
 
 .nc-fabric-port rect {
