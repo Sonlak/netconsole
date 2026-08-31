@@ -1,12 +1,21 @@
 import { useState, useEffect, useCallback } from 'react';
-import { login as apiLogin, getCurrentUser, getToken, setToken as saveToken, removeToken, type User } from '../api/auth';
+import {
+  login as apiLogin,
+  getCurrentUser,
+  getToken,
+  setToken as saveToken,
+  removeToken,
+  getStoredUser,
+  setStoredUser,
+  removeStoredUser,
+  type User,
+} from '../api/auth';
 
 interface AuthState {
   user: User | null;
   token: string | null;
   isLoading: boolean;
   isAuthenticated: boolean;
-  mustChangePassword: boolean;
   error: string | null;
 }
 
@@ -15,50 +24,72 @@ interface LoginCredentials {
   password: string;
 }
 
-export function useAuth() {
-  const [state, setState] = useState<AuthState>({
+// Synchronous hydration from localStorage so the dashboard renders instantly.
+function hydrate(): AuthState {
+  const token = getToken();
+  const cached = getStoredUser();
+  if (token && cached) {
+    return {
+      user: cached,
+      token,
+      isLoading: false,
+      isAuthenticated: true,
+      error: null,
+    };
+  }
+  return {
     user: null,
     token: null,
-    isLoading: true,
+    isLoading: false,
     isAuthenticated: false,
-    mustChangePassword: false,
     error: null,
-  });
+  };
+}
 
-  // Check for existing token and validate on mount
+function buildUser(response: { user: { id: string; username: string; email: string; role: string; lastLoginAt?: string | null } }, fallbackCreatedAt?: string): User {
+  return {
+    id: response.user.id,
+    username: response.user.username,
+    email: response.user.email,
+    role: response.user.role,
+    active: true,
+    lastLoginAt: response.user.lastLoginAt ?? null,
+    createdAt: fallbackCreatedAt ?? new Date().toISOString(),
+  };
+}
+
+export function useAuth() {
+  const [state, setState] = useState<AuthState>(hydrate);
+
+  // Background verify on mount — UI already hydrated, no spinner needed.
   useEffect(() => {
-    const validateToken = async () => {
-      const token = getToken();
-      if (!token) {
-        setState((s) => ({ ...s, isLoading: false }));
-        return;
-      }
+    const token = getToken();
+    if (!token) return;
 
-      try {
-        const { user } = await getCurrentUser();
-        setState({
-          user,
-          token,
-          isLoading: false,
-          isAuthenticated: true,
-          mustChangePassword: user.mustChangePassword === true,
-          error: null,
-        });
-      } catch {
-        // Token invalid or expired
+    let cancelled = false;
+    getCurrentUser()
+      .then(({ user }) => {
+        if (cancelled) return;
+        setStoredUser(user);
+        setState((s) => ({ ...s, user }));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Token invalid or expired → clear and drop back to login screen.
         removeToken();
+        removeStoredUser();
         setState({
           user: null,
           token: null,
           isLoading: false,
           isAuthenticated: false,
-          mustChangePassword: false,
           error: null,
         });
-      }
-    };
+      });
 
-    validateToken();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const login = useCallback(async (credentials: LoginCredentials) => {
@@ -66,21 +97,13 @@ export function useAuth() {
     try {
       const response = await apiLogin(credentials);
       saveToken(response.token);
-      const mustChange = response.user.mustChangePassword === true;
+      const user = buildUser(response);
+      setStoredUser(user);
       setState({
-        user: {
-          id: response.user.id,
-          username: response.user.username,
-          email: response.user.email,
-          role: response.user.role,
-          active: true,
-          mustChangePassword: mustChange,
-          createdAt: new Date().toISOString(),
-        },
+        user,
         token: response.token,
         isLoading: false,
         isAuthenticated: true,
-        mustChangePassword: mustChange,
         error: null,
       });
       return true;
@@ -95,22 +118,14 @@ export function useAuth() {
     }
   }, []);
 
-  const markPasswordChanged = useCallback(() => {
-    setState((s) => ({
-      ...s,
-      mustChangePassword: false,
-      user: s.user ? { ...s.user, mustChangePassword: false } : s.user,
-    }));
-  }, []);
-
   const logout = useCallback(() => {
     removeToken();
+    removeStoredUser();
     setState({
       user: null,
       token: null,
       isLoading: false,
       isAuthenticated: false,
-      mustChangePassword: false,
       error: null,
     });
   }, []);
@@ -124,6 +139,5 @@ export function useAuth() {
     login,
     logout,
     clearError,
-    markPasswordChanged,
   };
 }

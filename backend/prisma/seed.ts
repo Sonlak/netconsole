@@ -113,15 +113,12 @@ async function main() {
       password: hashedPassword,
       role: 'ADMIN',
       active: true,
-      mustChangePassword: true,
     },
     update: {
       password: hashedPassword,
-      mustChangePassword: true,
     },
   });
   console.log(`Admin user: ${admin.username} (password: ${adminPassword})`);
-  console.log('NOTE: mustChangePassword=true — user must change password on first login');
 
   // Generate worker token for reference
   const jwtSecret = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'CHANGE_ME_IN_PRODUCTION';

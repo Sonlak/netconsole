@@ -154,13 +154,15 @@ enum UserRole {
 }
 
 model User {
-  id                 String   @id @default(uuid())
-  username           String   @unique
-  email              String   @unique
-  password           String   // bcrypt hashed
-  role               UserRole @default(OPERATOR)
-  active             Boolean  @default(true)
-  mustChangePassword Boolean  @default(false)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id                 String    @id @default(uuid())
+  username           String    @unique
+  email              String    @unique
+  password           String    // bcrypt hashed
+  role               UserRole  @default(OPERATOR)
+  active             Boolean   @default(true)
+  mustChangePassword Boolean   @default(false)
+  lastLoginAt        DateTime?
+  lastLoginIp        String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
 }

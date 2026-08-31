@@ -9,7 +9,7 @@ interface ProtectedRouteProps {
 }
 
 export function ProtectedRoute({ children, requiredRoles }: ProtectedRouteProps) {
-  const { isAuthenticated, isLoading, user, mustChangePassword } = useAuth();
+  const { isAuthenticated, isLoading, user } = useAuth();
   const location = useLocation();
 
   if (isLoading) {
@@ -22,16 +22,6 @@ export function ProtectedRoute({ children, requiredRoles }: ProtectedRouteProps)
 
   if (!isAuthenticated) {
     return <Navigate to="/login" state={{ from: location.pathname }} replace />;
-  }
-
-  // Force change-password screen — block access to anything else until cleared.
-  if (mustChangePassword && location.pathname !== '/change-password-required') {
-    return <Navigate to="/change-password-required" replace />;
-  }
-
-  // If user is already on the change-password page but flag is cleared, send them to dashboard.
-  if (!mustChangePassword && location.pathname === '/change-password-required') {
-    return <Navigate to="/" replace />;
   }
 
   if (requiredRoles && user && !requiredRoles.includes(user.role)) {

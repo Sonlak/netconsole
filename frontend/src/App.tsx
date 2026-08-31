@@ -6,7 +6,6 @@ import { PageLoader } from './components/common/PageLoader';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import AppLayout from './layouts/AppLayout';
 import LoginPage from './pages/LoginPage';
-import ChangePasswordRequiredPage from './pages/ChangePasswordRequiredPage';
 import DashboardPage from './pages/DashboardPage';
 
 const DevicesPage = lazy(() => import('./pages/DevicesPage'));
@@ -28,14 +27,6 @@ export default function App() {
         <Suspense fallback={<PageLoader />}>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
-            <Route
-              path="/change-password-required"
-              element={
-                <ProtectedRoute>
-                  <ChangePasswordRequiredPage />
-                </ProtectedRoute>
-              }
-            />
             <Route
               element={
                 <ProtectedRoute>

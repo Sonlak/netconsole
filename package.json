@@ -15,5 +15,25 @@
     "build:backend": "npm run build --prefix backend",
     "db:push": "npm run db:push --prefix backend",
     "db:seed": "npm run db:seed --prefix backend"
+  },
+  "description": "Tool network for TAI LOC BANK",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sonlak/netconsole.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Sonlak/netconsole/issues"
+  },
+  "homepage": "https://github.com/Sonlak/netconsole#readme",
+  "devDependencies": {
+    "embedded-postgres": "^18.4.0-beta.17"
+  },
+  "allowScripts": {
+    "@embedded-postgres/windows-x64@18.4.0-beta.17": true
   }
 }
