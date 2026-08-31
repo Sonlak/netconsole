@@ -33,13 +33,20 @@ type EdgePath = {
   p2: Pt;
 };
 
-const NODE_W = 132;
-const NODE_H = 56;
-const NODE_GAP_X = 36;
-const FLOOR_GAP_Y = 36;
-const DIST_GAP_Y = 64;
-const CORE_GAP_Y = 72;
-const MARGIN = { top: 56, right: 56, bottom: 56, left: 56 };
+const NODE_W = 152;
+const NODE_H = 64;
+const NODE_GAP_X = 56;
+const FLOOR_GAP_Y = 84;
+const DIST_GAP_Y = 96;
+const CORE_GAP_Y = 96;
+const MARGIN = { top: 72, right: 72, bottom: 72, left: 72 };
+
+const KIND_COLOR: Record<FabricLinkKind, string> = {
+  trunk: '#5b9dff',
+  peer: '#8b93a7',
+  l3: '#f0a14a',
+  uplink: '#9aa3b6',
+};
 
 function portLabel(text: string) {
   return text?.trim() || '—';
@@ -61,47 +68,45 @@ function anchorPoint(box: Box, side: Anchor): Pt {
   }
 }
 
+/**
+ * Use an orthogonal routing instead of cubic curves so links never cross each
+ * other diagonally. The path leaves the source anchor horizontally/vertically,
+ * bends at the midpoint, then approaches the destination anchor — keeping each
+ * segment parallel and readable even when many links share a pair of nodes.
+ */
 function edgePath(p1: Pt, p2: Pt, sideA: Anchor, sideB: Anchor) {
-  const reach = (p: Pt, q: Pt, side: Anchor) => {
-    const minReach = 28;
-    if (side === 'left' || side === 'right') return Math.max(minReach, Math.abs(p.x - q.x) / 2);
-    return Math.max(minReach, Math.abs(p.y - q.y) / 2);
+  const elbow = (p: Pt, side: Anchor, reach: number): Pt => {
+    if (side === 'left' || side === 'right') return { x: p.x + (side === 'left' ? -reach : reach), y: p.y };
+    return { x: p.x, y: p.y + (side === 'top' ? -reach : reach) };
   };
-  const r1 = reach(p1, p2, sideA);
-  const r2 = reach(p2, p1, sideB);
-  const c1 = steer(p1, sideA, r1);
-  const c2 = steer(p2, sideB, r2);
-  return `M ${p1.x} ${p1.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p2.x} ${p2.y}`;
-}
-
-function steer(p: Pt, side: Anchor, reach: number): Pt {
-  switch (side) {
-    case 'right': return { x: p.x + reach, y: p.y };
-    case 'left': return { x: p.x - reach, y: p.y };
-    case 'bottom': return { x: p.x, y: p.y + reach };
-    case 'top': return { x: p.x, y: p.y - reach };
-  }
+  const minReach = 32;
+  const r1 = Math.max(minReach, Math.abs((sideA === 'left' || sideA === 'right') ? p1.x - p2.x : p1.y - p2.y) / 2);
+  const r2 = Math.max(minReach, Math.abs((sideB === 'left' || sideB === 'right') ? p1.x - p2.x : p1.y - p2.y) / 2);
+  const e1 = elbow(p1, sideA, r1);
+  const e2 = elbow(p2, sideB, r2);
+  return `M ${p1.x} ${p1.y} L ${e1.x} ${e1.y} L ${e2.x} ${e2.y} L ${p2.x} ${p2.y}`;
 }
 
 function edgeMid(p1: Pt, p2: Pt): Pt {
   return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
 }
 
+function peerSignature(link: FabricLink) {
+  return [link.fromDeviceId, link.toDeviceId].sort().join('::');
+}
+
 function edgeBundleOffset(link: FabricLink, allLinks: FabricLink[]): number {
-  const peers = allLinks.filter(
-    (l) =>
-      (l.fromDeviceId === link.fromDeviceId && l.toDeviceId === link.toDeviceId) ||
-      (l.fromDeviceId === link.toDeviceId && l.toDeviceId === link.fromDeviceId),
-  );
+  const sig = peerSignature(link);
+  const peers = allLinks.filter((l) => peerSignature(l) === sig);
   const idx = peers.findIndex((l) => l.id === link.id);
   if (idx < 0) return 0;
   const fan = peers.length;
-  const spread = Math.min(14, 3 + fan * 2);
+  const spread = Math.min(18, 4 + fan * 3);
   return (idx - (fan - 1) / 2) * spread;
 }
 
-function applyBundle(mid: Pt, p1: Pt, p2: Pt, offset: number): { p1: Pt; p2: Pt; mid: Pt } {
-  if (!offset) return { p1, p2, mid };
+function applyBundle(p1: Pt, p2: Pt, offset: number): { p1: Pt; p2: Pt; mid: Pt } {
+  if (!offset) return { p1, p2, mid: edgeMid(p1, p2) };
   const dx = p2.x - p1.x;
   const dy = p2.y - p1.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -135,9 +140,8 @@ function layoutNodes(nodes: FabricNode[]) {
     if (bucket.length) grouped.push({ floor: current, list: bucket });
   }
 
-  const maxAccessRow = Math.max(8, ...grouped.map((g) => g.list.length));
-  const colsNeeded = maxAccessRow;
-  const contentW = MARGIN.left + MARGIN.right + colsNeeded * NODE_W + (colsNeeded - 1) * NODE_GAP_X;
+  const maxRowCount = Math.max(1, cores.length, dists.length, ...grouped.map((g) => g.list.length));
+  const contentW = MARGIN.left + MARGIN.right + maxRowCount * NODE_W + (maxRowCount - 1) * NODE_GAP_X;
   const xForCol = (col: number, total: number) => {
     const groupWidth = total * NODE_W + (total - 1) * NODE_GAP_X;
     const start = (contentW - groupWidth) / 2;
@@ -222,10 +226,20 @@ function FabricNodeCard({ node, box }: { node: FabricNode; box: Box }) {
   );
 }
 
-function PortLabel({ x, y, text, anchor }: { x: number; y: number; text: string; anchor: 'start' | 'middle' | 'end' }) {
+function PortLabel({
+  x,
+  y,
+  text,
+  anchor,
+}: {
+  x: number;
+  y: number;
+  text: string;
+  anchor: 'start' | 'middle' | 'end';
+}) {
   const label = portLabel(text);
-  const width = Math.max(48, label.length * 6.6 + 12);
-  const height = 16;
+  const width = Math.max(56, label.length * 6.8 + 14);
+  const height = 18;
   const rx = anchor === 'middle' ? x - width / 2 : anchor === 'end' ? x - width : x;
   const ry = y - height / 2;
   return (
@@ -242,6 +256,7 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
   const wrapRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const [hoverEdge, setHoverEdge] = useState<string | null>(null);
 
   const layout = useMemo(() => layoutNodes(nodes), [nodes]);
   const nodeIndex = useMemo(() => {
@@ -252,21 +267,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
   const edges = useMemo<EdgePath[]>(() => {
     const out: EdgePath[] = [];
-    for (let i = 0; i < links.length; i++) {
-      const link = links[i];
+    for (const link of links) {
       const a = nodeIndex[link.fromDeviceId];
       const b = nodeIndex[link.toDeviceId];
       if (!a || !b) continue;
       const sideA = pickAnchor(a.box, b.box);
       const sideB = pickAnchor(b.box, a.box);
-      let p1 = anchorPoint(a.box, sideA);
-      let p2 = anchorPoint(b.box, sideB);
-      const bundleOffset = edgeBundleOffset(link, links);
-      const bundled = applyBundle(edgeMid(p1, p2), p1, p2, bundleOffset);
-      p1 = bundled.p1;
-      p2 = bundled.p2;
-      const d = edgePath(p1, p2, sideA, sideB);
-      out.push({ link, d, mid: bundled.mid, fromAnchor: sideA, toAnchor: sideB, p1, p2 });
+      const raw1 = anchorPoint(a.box, sideA);
+      const raw2 = anchorPoint(b.box, sideB);
+      const offset = edgeBundleOffset(link, links);
+      const bundled = applyBundle(raw1, raw2, offset);
+      const d = edgePath(bundled.p1, bundled.p2, sideA, sideB);
+      out.push({ link, d, mid: bundled.mid, fromAnchor: sideA, toAnchor: sideB, p1: bundled.p1, p2: bundled.p2 });
     }
     return out;
   }, [links, nodeIndex]);
@@ -305,6 +317,7 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
   const startDrag = (event: React.PointerEvent) => {
     if (event.button !== 0) return;
+    if ((event.target as Element).closest('.nc-fabric-node, .nc-fabric-link')) return;
     (event.target as Element).setPointerCapture?.(event.pointerId);
     dragRef.current = { startX: event.clientX, startY: event.clientY, baseX: viewport.x, baseY: viewport.y };
   };
@@ -344,6 +357,8 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
         <button type="button" onClick={fitToView} title="Fit to view">⤢</button>
       </div>
 
+      <div className="nc-fabric-grid" />
+
       <div
         className="nc-fabric-canvas"
         style={{
@@ -360,30 +375,33 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
           viewBox={`0 0 ${layout.totalWidth} ${layout.totalHeight}`}
         >
           <defs>
-            <marker id="nc-arrow-trunk" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
-              <path d="M 0 0 L 8 4 L 0 8 z" fill="#5b9dff" />
-            </marker>
-            <marker id="nc-arrow-peer" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
-              <path d="M 0 0 L 8 4 L 0 8 z" fill="#8b93a7" />
-            </marker>
-            <marker id="nc-arrow-l3" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
-              <path d="M 0 0 L 8 4 L 0 8 z" fill="#f0a14a" />
-            </marker>
-            <marker id="nc-arrow-uplink" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
-              <path d="M 0 0 L 8 4 L 0 8 z" fill="#9aa3b6" />
-            </marker>
+            {(Object.keys(KIND_COLOR) as FabricLinkKind[]).map((kind) => (
+              <marker
+                key={`nc-arrow-${kind}`}
+                id={`nc-arrow-${kind}`}
+                viewBox="0 0 8 8"
+                refX="6"
+                refY="4"
+                markerWidth="6"
+                markerHeight="6"
+                orient="auto"
+              >
+                <path d="M 0 0 L 8 4 L 0 8 z" fill={KIND_COLOR[kind]} />
+              </marker>
+            ))}
           </defs>
 
           {layout.groups.length > 0 && (
             <g className="nc-fabric-floor-bands">
               {layout.groups.map((group) => {
-                const sample = layout.positioned.find((p) => group.list.includes(p.node));
-                if (!sample) return null;
-                const left = Math.min(...group.list.map((n) => nodeIndex[n.id]?.box.x ?? 0)) - 18;
-                const right =
-                  Math.max(...group.list.map((n) => (nodeIndex[n.id]?.box.x ?? 0) + NODE_W)) + 18;
-                const top = sample.box.y - 18;
-                const bottom = sample.box.y + NODE_H + 18;
+                const positions = group.list
+                  .map((n) => nodeIndex[n.id]?.box)
+                  .filter((b): b is Box => Boolean(b));
+                if (!positions.length) return null;
+                const left = Math.min(...positions.map((b) => b.x)) - 24;
+                const right = Math.max(...positions.map((b) => b.x + b.w)) + 24;
+                const top = Math.min(...positions.map((b) => b.y)) - 24;
+                const bottom = Math.max(...positions.map((b) => b.y + b.h)) + 24;
                 return (
                   <g key={`band-${group.floor}`}>
                     <rect
@@ -391,15 +409,10 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                       y={top}
                       width={right - left}
                       height={bottom - top}
-                      rx={14}
+                      rx={16}
                       className="nc-fabric-floor-band"
                     />
-                    <text
-                      x={left + 12}
-                      y={top + 18}
-                      className="nc-fabric-floor-label"
-                      dominantBaseline="middle"
-                    >
+                    <text x={left + 14} y={top + 18} className="nc-fabric-floor-label" dominantBaseline="middle">
                       {group.floor}
                     </text>
                   </g>
@@ -410,24 +423,52 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
           {edges.map((edge) => {
             const marker = `nc-arrow-${edge.link.kind}`;
+            const isDown = edge.link.operStatus === 'down';
+            const isHover = hoverEdge === edge.link.id;
             return (
-              <g key={edge.link.id} className={`nc-fabric-link is-${edge.link.kind}`}>
-                <path className="nc-fabric-glow" d={edge.d} markerEnd={`url(#${marker})`} />
+              <g
+                key={edge.link.id}
+                className={`nc-fabric-link is-${edge.link.kind}${isDown ? ' is-down' : ''}${isHover ? ' is-hover' : ''}`}
+                onPointerEnter={() => setHoverEdge(edge.link.id)}
+                onPointerLeave={() => setHoverEdge((current) => (current === edge.link.id ? null : current))}
+              >
+                <path className="nc-fabric-line-hit" d={edge.d} />
                 <path className="nc-fabric-line" d={edge.d} markerEnd={`url(#${marker})`} />
+                {isHover && <path className="nc-fabric-line-emph" d={edge.d} markerEnd={`url(#${marker})`} />}
                 <title>
                   {edge.link.fromName} {edge.link.fromPort} — {edge.link.toName} {edge.link.toPort}
                   {edge.link.note ? `\n${edge.link.note}` : ''}
-                  {edge.link.operStatus === 'down' ? '\nLINK DOWN' : ''}
+                  {isDown ? '\nLINK DOWN' : ''}
                 </title>
                 {edge.fromAnchor === 'right' || edge.fromAnchor === 'left' ? (
-                  <PortLabel x={edge.p1.x + (edge.fromAnchor === 'right' ? 6 : -6)} y={edge.p1.y - 9} text={edge.link.fromPort} anchor={edge.fromAnchor === 'right' ? 'start' : 'end'} />
+                  <PortLabel
+                    x={edge.p1.x + (edge.fromAnchor === 'right' ? 6 : -6)}
+                    y={edge.p1.y - 10}
+                    text={edge.link.fromPort}
+                    anchor={edge.fromAnchor === 'right' ? 'start' : 'end'}
+                  />
                 ) : (
-                  <PortLabel x={edge.p1.x} y={edge.p1.y + (edge.fromAnchor === 'bottom' ? 14 : -14)} text={edge.link.fromPort} anchor="middle" />
+                  <PortLabel
+                    x={edge.p1.x}
+                    y={edge.p1.y + (edge.fromAnchor === 'bottom' ? 16 : -16)}
+                    text={edge.link.fromPort}
+                    anchor="middle"
+                  />
                 )}
                 {edge.toAnchor === 'right' || edge.toAnchor === 'left' ? (
-                  <PortLabel x={edge.p2.x + (edge.toAnchor === 'right' ? 6 : -6)} y={edge.p2.y - 9} text={edge.link.toPort} anchor={edge.toAnchor === 'right' ? 'start' : 'end'} />
+                  <PortLabel
+                    x={edge.p2.x + (edge.toAnchor === 'right' ? 6 : -6)}
+                    y={edge.p2.y - 10}
+                    text={edge.link.toPort}
+                    anchor={edge.toAnchor === 'right' ? 'start' : 'end'}
+                  />
                 ) : (
-                  <PortLabel x={edge.p2.x} y={edge.p2.y + (edge.toAnchor === 'bottom' ? 14 : -14)} text={edge.link.toPort} anchor="middle" />
+                  <PortLabel
+                    x={edge.p2.x}
+                    y={edge.p2.y + (edge.toAnchor === 'bottom' ? 16 : -16)}
+                    text={edge.link.toPort}
+                    anchor="middle"
+                  />
                 )}
               </g>
             );
