@@ -82,7 +82,7 @@ def pick_next_job(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
         interactive = 0 if job.get("type") in INTERACTIVE_JOB_TYPES else 1
         return (interactive, str(job.get("createdAt") or ""))
 
-    return sorted(jobs, key=sort_key)[0]
+    return min(jobs, key=sort_key)
 
 
 def process_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -111,7 +111,7 @@ def run_job(payload: dict[str, Any]) -> None:
             client.complete_job(job_id, error=str(exc))
         except Exception:
             logger.exception("Could not report failure for job %s", job_id)
-    except Exception as exc:  # noqa: BLE001 - worker boundary
+    except Exception as exc:
         logger.exception("Job %s failed", job_id)
         try:
             client.complete_job(job_id, error=str(exc))

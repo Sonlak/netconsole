@@ -91,7 +91,7 @@ def _set_commands(config: str) -> list[str]:
     commands: list[str] = []
     for line in config.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith("!"):
+        if not stripped or stripped.startswith(("#", "!")):
             continue
         commands.append(stripped)
     return commands
@@ -346,7 +346,10 @@ class GetMacTask(BaseTask):
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
         from netconsole_worker.config import settings
-        from netconsole_worker.junos_rest import compact_raw, fetch_ethernet_switching_table
+        from netconsole_worker.junos_rest import (
+            compact_raw,
+            fetch_ethernet_switching_table,
+        )
         from netconsole_worker.parsers.mac_table_rpc import parse_mac_table_rpc
         from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
         from netconsole_worker.ssh_client import run_ssh_command
@@ -448,7 +451,10 @@ class GetInterfacesTask(BaseTask):
             parse_interface_information_rpc,
             parse_interfaces_terse,
         )
-        from netconsole_worker.parsers.vlan_rpc import apply_vlan_membership, parse_vlan_information_rpc
+        from netconsole_worker.parsers.vlan_rpc import (
+            apply_vlan_membership,
+            parse_vlan_information_rpc,
+        )
         from netconsole_worker.ssh_client import run_ssh_command
 
         rest_error: str | None = None
@@ -667,9 +673,7 @@ class InterfaceActionTask(BaseTask):
             raise RuntimeError(rest_error or "Interface actions require JUNOS_REST or LAB_SSH")
 
         commands: list[str] = []
-        if action == "shut":
-            commands = commands_for_action(action, iface)
-        elif action == "no-shut":
+        if action == "shut" or action == "no-shut":
             commands = commands_for_action(action, iface)
         elif action == "show-run":
             commands = [f"show configuration interfaces {iface}"]
@@ -694,8 +698,7 @@ class InterfaceActionTask(BaseTask):
             outputs.append({"command": command, "output": output})
             lowered = output.lower().strip()
             if action != "show-run" and (
-                lowered.startswith("error:")
-                or lowered.startswith("unknown command")
+                lowered.startswith(("error:", "unknown command"))
                 or "traceback (most recent call last)" in lowered
             ):
                 raise RuntimeError(output.strip() or f"Command failed: {command}")

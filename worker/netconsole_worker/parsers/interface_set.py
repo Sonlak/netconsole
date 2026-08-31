@@ -149,7 +149,7 @@ def filter_interface_set_lines(config: str, iface: str) -> str:
     prefix = f"set interfaces {physical}"
     lines: list[str] = []
     for line in (config or "").splitlines():
-        if line == prefix or line.startswith(prefix + " ") or line.startswith(prefix + "."):
+        if line == prefix or line.startswith((prefix + " ", prefix + ".")):
             lines.append(line)
     return "\n".join(lines).strip()
 

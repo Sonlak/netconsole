@@ -34,7 +34,7 @@ def parse_configuration_set(payload: Any) -> str:
 
     if isinstance(payload, str):
         text = html.unescape(payload).strip()
-        if text.startswith("set ") or text.startswith("delete "):
+        if text.startswith(("set ", "delete ")):
             return text
     return ""
 

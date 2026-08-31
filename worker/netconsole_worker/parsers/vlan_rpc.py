@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from netconsole_worker.parsers.junos_leaf import local_name, parse_xml_root, xml_child_text
+from netconsole_worker.parsers.junos_leaf import (
+    local_name,
+    parse_xml_root,
+    xml_child_text,
+)
 
 _UNIT_RE = re.compile(r"\.\d+$")
 

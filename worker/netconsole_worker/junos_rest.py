@@ -284,9 +284,8 @@ def apply_set_configuration(
     timeout: float = 45.0,
     log: str = "NetConsole interface action",
 ) -> dict[str, Any]:
-    from xml.sax.saxutils import escape
-
     import time
+    from xml.sax.saxutils import escape
 
     _ = log
 
