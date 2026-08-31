@@ -45,9 +45,9 @@ coverage/
 prisma/*.db
 prisma/*.db-journal
 
-# Docker volumes
-data/
-volumes/
+# Docker volumes (only at repo root, not nested source folders)
+/data/
+/volumes/
 
 # NetConsole-specific: app archive & tmp artifacts
 netconsole-app.tar.gz
