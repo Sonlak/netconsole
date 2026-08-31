@@ -32,8 +32,8 @@ class WorkerClient:
 
     def fetch_pending_jobs(self, limit: int = 1) -> list[dict[str, Any]]:
         response = self.client.get(
-            f"{self.base_url}/jobs",
-            params={"status": "PENDING", "forWorker": "1", "limit": max(1, limit)},
+            f"{self.base_url}/jobs/queue",
+            params={"limit": max(1, limit)},
             headers=self._headers,
         )
         response.raise_for_status()

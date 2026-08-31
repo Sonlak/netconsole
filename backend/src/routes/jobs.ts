@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { JobStatus, JobType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import { verifyToken } from '../middleware/auth.js';
+import { authMiddleware, verifyToken } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
@@ -40,47 +40,12 @@ const INTERACTIVE_JOB_TYPES: JobType[] = [
 
 const REFRESH_JOB_TYPES: JobType[] = [JobType.GET_CONFIG, JobType.GET_INTERFACES];
 
-jobsRouter.get('/', workerAuth, async (req, res) => {
+// User-facing: list recent jobs for the dashboard/jobs page. Requires any authenticated user.
+jobsRouter.get('/', authMiddleware, async (req, res) => {
   const status =
     typeof req.query.status === 'string' && req.query.status in JobStatus
       ? (req.query.status as JobStatus)
       : undefined;
-  const forWorker = req.query.forWorker === '1' || req.query.forWorker === 'true';
-
-  if (forWorker) {
-    const include = {
-      device: {
-        select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
-      },
-    };
-    const take = Math.min(Math.max(Number(req.query.limit) || 1, 1), 16);
-    const picked: Array<{ id: string }> = [];
-    const seen: string[] = [];
-
-    const pull = async (typeFilter?: JobType[]) => {
-      if (picked.length >= take) return;
-      const rows = await prisma.job.findMany({
-        where: {
-          status: JobStatus.PENDING,
-          ...(typeFilter ? { type: { in: typeFilter } } : {}),
-          ...(seen.length ? { id: { notIn: seen } } : {}),
-        },
-        include,
-        orderBy: { createdAt: 'asc' },
-        take: take - picked.length,
-      });
-      for (const row of rows) {
-        seen.push(row.id);
-        picked.push(row);
-      }
-    };
-
-    await pull(INTERACTIVE_JOB_TYPES);
-    await pull(REFRESH_JOB_TYPES);
-    await pull();
-    res.json(picked);
-    return;
-  }
 
   const jobs = await prisma.job.findMany({
     where: status ? { status } : undefined,
@@ -94,6 +59,41 @@ jobsRouter.get('/', workerAuth, async (req, res) => {
   });
 
   res.json(jobs);
+});
+
+// Worker-only: claim the next pending job(s). Requires `role: "worker"`.
+jobsRouter.get('/queue', workerAuth, async (req, res) => {
+  const include = {
+    device: {
+      select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
+    },
+  };
+  const take = Math.min(Math.max(Number(req.query.limit) || 1, 1), 16);
+  const picked: Array<{ id: string }> = [];
+  const seen: string[] = [];
+
+  const pull = async (typeFilter?: JobType[]) => {
+    if (picked.length >= take) return;
+    const rows = await prisma.job.findMany({
+      where: {
+        status: JobStatus.PENDING,
+        ...(typeFilter ? { type: { in: typeFilter } } : {}),
+        ...(seen.length ? { id: { notIn: seen } } : {}),
+      },
+      include,
+      orderBy: { createdAt: 'asc' },
+      take: take - picked.length,
+    });
+    for (const row of rows) {
+      seen.push(row.id);
+      picked.push(row);
+    }
+  };
+
+  await pull(INTERACTIVE_JOB_TYPES);
+  await pull(REFRESH_JOB_TYPES);
+  await pull();
+  res.json(picked);
 });
 
 jobsRouter.get('/:id', async (req, res) => {

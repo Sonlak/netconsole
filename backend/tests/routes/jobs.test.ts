@@ -74,25 +74,35 @@ describe('worker auth on /jobs endpoints', () => {
     return jwt.sign({ sub: 'admin', role: 'ADMIN' }, process.env.JWT_SECRET!, { expiresIn: '1h' });
   }
 
-  it('GET /jobs?forWorker=1 returns 401 without a token', async () => {
-    const res = await fetch(`${baseUrl}/?forWorker=1`);
+  it('GET /jobs/queue returns 401 without a token', async () => {
+    const res = await fetch(`${baseUrl}/queue`);
     expect(res.status).toBe(401);
     const body = await res.json();
     expect(body.error).toMatch(/worker credentials required/i);
   });
 
-  it('GET /jobs?forWorker=1 returns 401 with a non-worker bearer token', async () => {
-    const res = await fetch(`${baseUrl}/?forWorker=1`, {
+  it('GET /jobs/queue returns 401 with a non-worker bearer token', async () => {
+    const res = await fetch(`${baseUrl}/queue`, {
       headers: { Authorization: `Bearer ${makeAdminToken()}` },
     });
     // Admin token is not a worker token
     expect(res.status).toBe(401);
   });
 
-  it('GET /jobs?forWorker=1 returns 200 with a valid worker bearer token', async () => {
+  it('GET /jobs/queue returns 200 with a valid worker bearer token', async () => {
     jobFindMany.mockResolvedValue([]);
-    const res = await fetch(`${baseUrl}/?forWorker=1`, {
+    const res = await fetch(`${baseUrl}/queue`, {
       headers: { Authorization: `Bearer ${makeWorkerToken()}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body)).toBe(true);
+  });
+
+  it('GET /jobs returns 200 with an authenticated user token', async () => {
+    jobFindMany.mockResolvedValue([]);
+    const res = await fetch(`${baseUrl}/`, {
+      headers: { Authorization: `Bearer ${makeAdminToken()}` },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
