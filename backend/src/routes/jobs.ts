@@ -1,11 +1,33 @@
 import { Router } from 'express';
 import { JobStatus, JobType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
+import { verifyToken } from '../middleware/auth.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
 import { applyInterfaceActionSnapshot, queueGetInterfaces } from '../services/interfaces.js';
 
 export const jobsRouter = Router();
+
+/**
+ * Worker-only auth. Accepts a Bearer JWT signed with JWT_SECRET whose payload
+ * has `role: "worker"`. Returns 401 otherwise.
+ */
+const workerAuth = (req: AuthenticatedRequest, res: import('express').Response, next: import('express').NextFunction): void => {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized: worker credentials required' });
+    return;
+  }
+  const token = header.slice(7);
+  const payload = verifyToken(token);
+  if (!payload || payload.role !== 'worker') {
+    res.status(401).json({ error: 'Unauthorized: worker credentials required' });
+    return;
+  }
+  req.user = payload;
+  next();
+};
 
 const INTERACTIVE_JOB_TYPES: JobType[] = [
   JobType.INTERFACE_ACTION,
@@ -18,7 +40,7 @@ const INTERACTIVE_JOB_TYPES: JobType[] = [
 
 const REFRESH_JOB_TYPES: JobType[] = [JobType.GET_CONFIG, JobType.GET_INTERFACES];
 
-jobsRouter.get('/', async (req, res) => {
+jobsRouter.get('/', workerAuth, async (req, res) => {
   const status =
     typeof req.query.status === 'string' && req.query.status in JobStatus
       ? (req.query.status as JobStatus)
@@ -92,10 +114,10 @@ jobsRouter.get('/:id', async (req, res) => {
   res.json(job);
 });
 
-jobsRouter.patch('/:id/claim', async (req, res) => {
+jobsRouter.patch('/:id/claim', workerAuth, async (req, res) => {
   try {
     const job = await prisma.job.update({
-      where: { id: req.params.id, status: JobStatus.PENDING },
+      where: { id: String(req.params.id), status: JobStatus.PENDING },
       data: { status: JobStatus.RUNNING },
       include: { device: true },
     });
@@ -105,12 +127,12 @@ jobsRouter.patch('/:id/claim', async (req, res) => {
   }
 });
 
-jobsRouter.patch('/:id/complete', async (req, res) => {
+jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
   const { result, error } = req.body as { result?: unknown; error?: string };
 
   try {
     const job = await prisma.job.update({
-      where: { id: req.params.id, status: JobStatus.RUNNING },
+      where: { id: String(req.params.id), status: JobStatus.RUNNING },
       data: {
         status: error ? JobStatus.FAILED : JobStatus.SUCCESS,
         result:

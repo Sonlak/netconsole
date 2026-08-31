@@ -1,14 +1,21 @@
+# Runs on every push (including feature branches) and every PR targeting main.
+# CI must pass before merging into main.
 # =============================================================================
-# NetConsole CI - lint, test, build (no deploy)
-# Runs on every push to main and every PR to main
+name: CI
+
+# Runs on every push to any branch and every PR targeting main.
+# CI must pass before merging into main.
+# GitHub Actions branch filter `**` matches all branch names.
 # =============================================================================
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - '**'
   pull_request:
-    branches: [main]
+    branches:
+      - '**'
 
 # Cancel in-progress runs for the same branch / PR
 concurrency:

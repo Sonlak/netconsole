@@ -1,38 +1,27 @@
 # =============================================================================
-# NetConsole Deploy - auto-deploy to production VPS via self-hosted runner
+# NetConsole Rollback - deploy a previous tag to production VPS
+# Use case: latest deploy broke production, revert to last known-good tag.
 #
-# Triggers:
-#   1. Push a version tag: git tag v0.3.0 && git push --tags
-#      → Always deploys the tagged commit.
+# How to use:
+#   GitHub → Actions → Rollback → Run workflow
+#   Enter a tag like v0.2.0 and the runner will deploy that exact commit.
 #
-#   2. Push directly to main (after PR merge with branch protection)
-#      → Auto-deploys the latest main. Requires branch protection on main
-#        so only reviewed PRs can trigger this.
-#
-#   3. Manual: GitHub Actions UI → Deploy → Run workflow
-#      → Deploys any ref you choose.
-#
-# NOTE: Do NOT push directly to main without a PR review — this will
-# trigger a production deploy immediately. Enable branch protection:
-#   Settings → Branches → main → "Protect matching branches"
-#   → Require pull request before merging: ON
-#   → Require status checks to pass before merging: ON  (add "CI" check)
-#   → Do NOT allow force pushes
+# The script will refuse to deploy a ref that doesn't exist locally OR
+# a ref that is not tagged (must be an exact version tag like v*.*.*).
 # =============================================================================
-name: Deploy
+name: Rollback
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref to deploy (branch / tag / sha). Default: main"
-        required: false
-        default: "main"
+      tag:
+        description: "Tag to roll back to (must match v*.*.*, e.g. v0.2.0)"
+        required: true
+        type: string
+      confirm:
+        description: 'Type "ROLLBACK" to confirm. This will deploy immediately.'
+        required: true
+        type: string
 
 concurrency:
   group: deploy-production
@@ -45,43 +34,69 @@ env:
   DEPLOY_SERVICES: "backend worker frontend"
 
 jobs:
-  deploy:
-    name: Deploy to production
+  rollback:
+    name: Rollback to ${{ inputs.tag }}
     runs-on: self-hosted
     timeout-minutes: 25
-
     steps:
-      - name: Display deployment info
+      - name: Confirm intent
         run: |
-          echo "## 🚀 Deploy starting" >> $GITHUB_STEP_SUMMARY
-          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.confirm }}" != "ROLLBACK" ]; then
+            echo "❌ Confirmation text must be exactly ROLLBACK. Got: ${{ inputs.confirm }}"
+            exit 1
+          fi
+
+      - name: Validate tag format
+        run: |
+          TAG="${{ inputs.tag }}"
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Tag must match v*.*.* pattern (e.g. v0.2.0). Got: $TAG"
+            exit 1
+          fi
+
+      - name: Display rollback info
+        run: |
+          echo "## ⏪ Rollback starting" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target tag:** ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner:** $(hostname)" >> $GITHUB_STEP_SUMMARY
           echo "- **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
 
-      - name: Checkout source
+      - name: Checkout target tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
           path: src
+
+      - name: Verify tag exists locally and matches input
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git describe --tags --exact-match HEAD)
+          if [ "$ACTUAL" != "${{ inputs.tag }}" ]; then
+            echo "❌ HEAD is at '$ACTUAL' but requested '${{ inputs.tag }}'"
+            exit 1
+          fi
+          echo "✅ HEAD is exactly at tag $ACTUAL"
 
       - name: Show commit log
         working-directory: src
         run: |
-          echo "## Last 5 commits" >> $GITHUB_STEP_SUMMARY
+          echo "## Last 5 commits at ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           git log --oneline -5 >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      - name: Backup current release marker
+        run: |
+          set -euo pipefail
+          CURRENT=$(git -C src describe --tags --always 2>/dev/null || echo "none")
+          echo "Previous deploy was: $CURRENT"
+          echo "PREVIOUS_DEPLOY=$CURRENT" >> $GITHUB_ENV
+
       - name: Sync source to ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          echo "Syncing $GITHUB_WORKSPACE/src -> $DEPLOY_DIR"
-
-          # Preserve user-managed files & gitignored artefacts on the server.
-          # --delete ensures removed files in repo are also removed from server,
-          # but excludes below protect data we want to keep across deploys.
           rsync -a --delete \
             --exclude '.git/' \
             --exclude '.git' \
@@ -95,23 +110,21 @@ jobs:
             --exclude 'logs/' \
             ./src/ "$DEPLOY_DIR/"
 
-          echo "--- Synced. DEPLOY_DIR contents:"
-          ls -la "$DEPLOY_DIR" | head -25
+          echo "## Synced contents" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la "$DEPLOY_DIR" | head -25 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          # --no-deps: don't restart kea/postgres (they hold persistent state)
-          echo "Running: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES"
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
 
       - name: Wait for backend healthy
         run: |
           set -euo pipefail
-          echo "Probing backend /api/health via container network..."
           for i in $(seq 1 40); do
-            # Backend container's bridge IP (deterministic from compose ipam)
             if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
               echo "✅ Backend healthy after ${i} attempt(s)"
               exit 0
@@ -134,32 +147,18 @@ jobs:
             echo "✅ Frontend OK (HTTP $code)"
           else
             echo "❌ Frontend returned HTTP $code"
-            echo "--- Frontend log ---"
             docker logs --tail 30 netconsole-frontend || true
             exit 1
           fi
 
-      - name: Verify kea + postgres untouched
-        run: |
-          # These services hold persistent state; deploy should NOT recreate them.
-          echo "Checking persistent services are unchanged..."
-          docker ps \
-            --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
-            --filter "name=netconsole-kea-primary" \
-            --filter "name=netconsole-kea-standby" \
-            --filter "name=netconsole-postgres" \
-            --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
-
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
-          set -euo pipefail
-          echo "## 🎉 Deployment complete" >> $GITHUB_STEP_SUMMARY
+          echo "## ⏪ Rollback complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Now running: \`${{ inputs.tag }}\` (was: \`${{ env.PREVIOUS_DEPLOY }}\`)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Container status" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
           echo '```' >> $GITHUB_STEP_SUMMARY
-
-          echo "----- Final docker compose ps -----"
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps

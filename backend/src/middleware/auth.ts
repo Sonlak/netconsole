@@ -7,20 +7,38 @@ export interface JwtPayload {
   role: string;
 }
 
+/**
+ * Loose payload shape used by `verifyToken`. Workers may sign tokens that only
+ * have `sub` + `role` (no `userId` / `username`), and we want to accept those.
+ */
+export interface JwtPayloadLoose {
+  userId?: string;
+  sub?: string;
+  username?: string;
+  role?: string;
+}
+
 export interface AuthenticatedRequest extends Request {
-  user?: JwtPayload;
+  user?: JwtPayload | JwtPayloadLoose;
 }
 
 const JWT_SECRET: string = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'CHANGE_ME_IN_PRODUCTION';
 const JWT_EXPIRES_IN: string = process.env.JWT_EXPIRES_IN || '24h';
 
 export function signToken(payload: JwtPayload): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN as `${number}${'s' | 'm' | 'h' | 'd'}` | `${number}d` });
+  return jwt.sign(payload, JWT_SECRET, {
+    expiresIn: JWT_EXPIRES_IN as `${number}${'s' | 'm' | 'h' | 'd'}` | `${number}d`,
+  });
 }
 
-export function verifyToken(token: string): JwtPayload | null {
+export function verifyToken(token: string): JwtPayloadLoose | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as JwtPayload;
+    const decoded = jwt.verify(token, JWT_SECRET) as JwtPayloadLoose;
+    // Normalize: map `sub` -> `userId` so older / worker tokens still work
+    if (!decoded.userId && decoded.sub) {
+      decoded.userId = decoded.sub;
+    }
+    return decoded;
   } catch {
     return null;
   }
@@ -53,7 +71,7 @@ export function requireRole(...roles: string[]) {
       return;
     }
 
-    if (!roles.includes(req.user.role)) {
+    if (!req.user.role || !roles.includes(req.user.role)) {
       res.status(403).json({ error: 'Forbidden: Insufficient permissions' });
       return;
     }
