@@ -576,6 +576,14 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                   rx={14}
                   className="nc-fabric-floor-band"
                 />
+                <text
+                  x={band.left + 16}
+                  y={band.top + 18}
+                  className="nc-fabric-floor-label"
+                  dominantBaseline="middle"
+                >
+                  {band.floor}
+                </text>
               </g>
             ))}
           </g>
