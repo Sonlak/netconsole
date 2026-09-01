@@ -413,6 +413,61 @@ textarea.nc-code-area {
   isolation: isolate;
 }
 
+.nc-fabric-tier-rail {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 132px;
+  height: 100%;
+  pointer-events: none;
+  z-index: 4;
+  padding-top: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.nc-fabric-tier-pill {
+  position: absolute;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  height: 38px;
+  padding: 0 16px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--nc-border) 70%, transparent);
+  background: color-mix(in srgb, var(--nc-raised) 86%, transparent);
+  color: var(--nc-text);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  white-space: nowrap;
+  transform: translateY(-50%);
+  transition: top 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.nc-fabric-tier-pill.is-core {
+  background: color-mix(in srgb, #5b9dff 28%, var(--nc-raised));
+  border-color: color-mix(in srgb, #5b9dff 60%, var(--nc-border));
+  color: #eaf2ff;
+}
+
+.nc-fabric-tier-pill.is-dist {
+  background: color-mix(in srgb, #a78bfa 28%, var(--nc-raised));
+  border-color: color-mix(in srgb, #a78bfa 60%, var(--nc-border));
+  color: #efe6ff;
+}
+
+.nc-fabric-tier-pill.is-access {
+  background: color-mix(in srgb, #34d399 28%, var(--nc-raised));
+  border-color: color-mix(in srgb, #34d399 60%, var(--nc-border));
+  color: #d5fbe9;
+}
+
 .nc-fabric-grid {
   position: absolute;
   inset: 0;
@@ -468,48 +523,6 @@ textarea.nc-code-area {
   text-transform: uppercase;
   fill: var(--nc-text-muted);
   font-family: var(--font-mono), ui-monospace, monospace;
-}
-
-.nc-fabric-tier-row rect {
-  fill: color-mix(in srgb, var(--nc-raised) 70%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
-  stroke-width: 1;
-}
-
-.nc-fabric-tier-row.is-core rect {
-  fill: color-mix(in srgb, #5b9dff 14%, var(--nc-raised));
-  stroke: color-mix(in srgb, #5b9dff 30%, var(--nc-border));
-}
-
-.nc-fabric-tier-row.is-dist rect {
-  fill: color-mix(in srgb, #a78bfa 14%, var(--nc-raised));
-  stroke: color-mix(in srgb, #a78bfa 30%, var(--nc-border));
-}
-
-.nc-fabric-tier-row.is-access rect {
-  fill: color-mix(in srgb, #34d399 14%, var(--nc-raised));
-  stroke: color-mix(in srgb, #34d399 30%, var(--nc-border));
-}
-
-.nc-fabric-tier-row text {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  fill: var(--nc-text);
-  font-family: var(--font-mono), ui-monospace, monospace;
-}
-
-.nc-fabric-tier-row.is-core text {
-  fill: #cfe1ff;
-}
-
-.nc-fabric-tier-row.is-dist text {
-  fill: #e1d6ff;
-}
-
-.nc-fabric-tier-row.is-access text {
-  fill: #c5f3df;
 }
 
 .nc-fabric-line-hit {
