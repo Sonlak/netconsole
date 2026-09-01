@@ -53,14 +53,14 @@ type NodeLayout = {
 
 const NODE_W = 224;
 const NODE_H = 92;
-const PORT_STUB = 32;
+const PORT_STUB = 36;
 const PORT_LABEL_GAP = 6;
 const FLOOR_GAP_Y = 76;
-const TIER_GAP_Y = 124;
-const NODE_GAP_X = 56;
-const MARGIN_X = 88;
+const TIER_GAP_Y = 132;
+const NODE_GAP_X = 64;
+const MARGIN_X = 56;
 const MARGIN_Y = 96;
-const TIER_LABEL_W = 132;
+const RAIL_WIDTH = 132;
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk: '#5b9dff',
@@ -101,32 +101,34 @@ function buildPortEnd(box: Box, side: Anchor, idx: number, total: number, portNa
   let stubEnd: Pt;
   let labelPos: Pt;
   let labelAnchor: 'start' | 'middle' | 'end' = 'middle';
-  const labelSize = { w: Math.max(72, (portName?.length || 4) * 7.6 + 18), h: 22 };
+  const labelSize = { w: Math.max(64, (portName?.length || 4) * 6.8 + 14), h: 20 };
 
   switch (side) {
     case 'right':
       anchor = { x: box.x + box.w, y: box.y + off };
       stubEnd = { x: box.x + box.w + PORT_STUB, y: anchor.y };
-      labelPos = { x: stubEnd.x + PORT_LABEL_GAP, y: stubEnd.y };
-      labelAnchor = 'start';
-      labelSize.w = Math.max(72, (portName?.length || 4) * 7.6 + 18);
+      // Horizontal stub: place label ABOVE the stub end so it doesn't overlap the next node.
+      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
+      labelAnchor = 'middle';
       break;
     case 'left':
       anchor = { x: box.x, y: box.y + off };
       stubEnd = { x: box.x - PORT_STUB, y: anchor.y };
-      labelPos = { x: stubEnd.x - PORT_LABEL_GAP, y: stubEnd.y };
-      labelAnchor = 'end';
+      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
+      labelAnchor = 'middle';
       break;
     case 'bottom':
       anchor = { x: box.x + off, y: box.y + box.h };
       stubEnd = { x: anchor.x, y: box.y + box.h + PORT_STUB };
-      labelPos = { x: stubEnd.x, y: stubEnd.y + PORT_LABEL_GAP + labelSize.h };
+      // Vertical stub: place label BELOW the stub end (between this node and the next row).
+      labelPos = { x: stubEnd.x, y: stubEnd.y + PORT_LABEL_GAP };
       labelAnchor = 'middle';
       break;
     case 'top':
       anchor = { x: box.x + off, y: box.y };
       stubEnd = { x: anchor.x, y: box.y - PORT_STUB };
-      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - 4 };
+      // Vertical stub: place label ABOVE the stub end (between previous row and this node).
+      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
       labelAnchor = 'middle';
       break;
   }
@@ -422,12 +424,11 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
   const fitToView = () => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const w = wrap.clientWidth || 1;
+    const w = (wrap.clientWidth || 1) - RAIL_WIDTH;
     const h = wrap.clientHeight || 1;
     const scale = Math.min(1, Math.min(w / layout.totalWidth, h / layout.totalHeight));
-    const leftMargin = MARGIN_X; // leave room for tier labels on the left
     setViewport({
-      x: Math.max(leftMargin, (w - layout.totalWidth * scale) / 2) + TIER_LABEL_W * 0.4,
+      x: RAIL_WIDTH + Math.max(0, (w - layout.totalWidth * scale) / 2),
       y: 28,
       scale,
     });
@@ -575,27 +576,6 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                   rx={14}
                   className="nc-fabric-floor-band"
                 />
-                <text
-                  x={band.right - 14}
-                  y={band.top + 18}
-                  className="nc-fabric-floor-label"
-                  dominantBaseline="middle"
-                  textAnchor="end"
-                >
-                  {band.floor}
-                </text>
-              </g>
-            ))}
-          </g>
-
-          {/* Tier labels (left margin) */}
-          <g className="nc-fabric-tiers">
-            {tierLabels.map((tier) => (
-              <g key={`tier-${tier.label}`} className={`nc-fabric-tier-row is-${tier.tone}`}>
-                <rect x={12} y={tier.y - 18} width={TIER_LABEL_W - 24} height={36} rx={8} />
-                <text x={(TIER_LABEL_W - 24) / 2 + 12} y={tier.y + 1} textAnchor="middle" dominantBaseline="middle">
-                  {tier.label}
-                </text>
               </g>
             ))}
           </g>
@@ -666,6 +646,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
           <FabricNodeCard key={item.node.id} node={item.node} box={item.box} />
         ))}
       </div>
+
+      <aside className="nc-fabric-tier-rail" aria-hidden="true">
+        {tierLabels.map((tier) => (
+          <div
+            key={`rail-${tier.label}`}
+            className={`nc-fabric-tier-pill is-${tier.tone}`}
+            style={{ top: viewport.y + tier.y * viewport.scale }}
+          >
+            {tier.label}
+          </div>
+        ))}
+      </aside>
     </div>
   );
 }
