@@ -33,13 +33,13 @@ type EdgePath = {
   p2: Pt;
 };
 
-const NODE_W = 152;
-const NODE_H = 64;
-const NODE_GAP_X = 56;
-const FLOOR_GAP_Y = 84;
-const DIST_GAP_Y = 96;
-const CORE_GAP_Y = 96;
-const MARGIN = { top: 72, right: 72, bottom: 72, left: 72 };
+const NODE_W = 168;
+const NODE_H = 72;
+const NODE_GAP_X = 64;
+const FLOOR_GAP_Y = 140;
+const DIST_GAP_Y = 150;
+const CORE_GAP_Y = 160;
+const MARGIN = { top: 80, right: 80, bottom: 80, left: 80 };
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk: '#5b9dff',
@@ -101,7 +101,7 @@ function edgeBundleOffset(link: FabricLink, allLinks: FabricLink[]): number {
   const idx = peers.findIndex((l) => l.id === link.id);
   if (idx < 0) return 0;
   const fan = peers.length;
-  const spread = Math.min(18, 4 + fan * 3);
+  const spread = Math.min(28, 6 + fan * 4);
   return (idx - (fan - 1) / 2) * spread;
 }
 
@@ -238,13 +238,13 @@ function PortLabel({
   anchor: 'start' | 'middle' | 'end';
 }) {
   const label = portLabel(text);
-  const width = Math.max(56, label.length * 6.8 + 14);
-  const height = 18;
+  const width = Math.max(64, label.length * 7.4 + 16);
+  const height = 20;
   const rx = anchor === 'middle' ? x - width / 2 : anchor === 'end' ? x - width : x;
   const ry = y - height / 2;
   return (
     <g className="nc-fabric-port" transform={`translate(${rx}, ${ry})`}>
-      <rect width={width} height={height} rx={4} />
+      <rect width={width} height={height} rx={5} />
       <text x={width / 2} y={height / 2 + 1} textAnchor="middle" dominantBaseline="middle">
         {label}
       </text>
