@@ -400,11 +400,12 @@ textarea.nc-code-area {
 
 .nc-fabric {
   position: relative;
-  height: 640px;
+  height: 720px;
   overflow: hidden;
   border-radius: 12px;
   background:
-    radial-gradient(900px 320px at 50% -10%, color-mix(in srgb, var(--nc-accent) 8%, transparent), transparent 70%),
+    radial-gradient(900px 320px at 18% -10%, color-mix(in srgb, var(--nc-accent) 8%, transparent), transparent 70%),
+    radial-gradient(700px 280px at 92% 110%, color-mix(in srgb, #a78bfa 6%, transparent), transparent 70%),
     color-mix(in srgb, var(--nc-raised) 80%, transparent);
   border: 1px solid var(--nc-border);
   touch-action: none;
@@ -443,13 +444,19 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-svg .nc-fabric-link .nc-fabric-line,
-.nc-fabric-svg .nc-fabric-link .nc-fabric-line-hit {
+.nc-fabric-svg .nc-fabric-link .nc-fabric-line-hit,
+.nc-fabric-svg .nc-fabric-link .nc-fabric-stub {
   pointer-events: stroke;
 }
 
+.nc-fabric-stub {
+  stroke-linecap: round;
+  opacity: 0.92;
+}
+
 .nc-fabric-floor-band {
-  fill: color-mix(in srgb, var(--nc-raised) 45%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 50%, transparent);
+  fill: color-mix(in srgb, var(--nc-raised) 40%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
   stroke-dasharray: 4 4;
   stroke-width: 1;
 }
@@ -457,10 +464,52 @@ textarea.nc-code-area {
 .nc-fabric-floor-label {
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
   fill: var(--nc-text-muted);
   font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.nc-fabric-tier-row rect {
+  fill: color-mix(in srgb, var(--nc-raised) 70%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
+  stroke-width: 1;
+}
+
+.nc-fabric-tier-row.is-core rect {
+  fill: color-mix(in srgb, #5b9dff 14%, var(--nc-raised));
+  stroke: color-mix(in srgb, #5b9dff 30%, var(--nc-border));
+}
+
+.nc-fabric-tier-row.is-dist rect {
+  fill: color-mix(in srgb, #a78bfa 14%, var(--nc-raised));
+  stroke: color-mix(in srgb, #a78bfa 30%, var(--nc-border));
+}
+
+.nc-fabric-tier-row.is-access rect {
+  fill: color-mix(in srgb, #34d399 14%, var(--nc-raised));
+  stroke: color-mix(in srgb, #34d399 30%, var(--nc-border));
+}
+
+.nc-fabric-tier-row text {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  fill: var(--nc-text);
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.nc-fabric-tier-row.is-core text {
+  fill: #cfe1ff;
+}
+
+.nc-fabric-tier-row.is-dist text {
+  fill: #e1d6ff;
+}
+
+.nc-fabric-tier-row.is-access text {
+  fill: #c5f3df;
 }
 
 .nc-fabric-line-hit {
@@ -471,23 +520,22 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-line {
-  stroke-width: 2.5;
+  fill: none;
   stroke-linecap: round;
   stroke-linejoin: round;
-  transition: stroke-width 0.18s ease, opacity 0.18s ease, stroke 0.18s ease;
+  transition: stroke-width 0.18s ease, opacity 0.18s ease;
 }
 
 .nc-fabric-line-emph {
-  stroke-width: 4;
+  fill: none;
   stroke-linecap: round;
   stroke-linejoin: round;
-  fill: none;
   opacity: 0.85;
   pointer-events: none;
+  filter: drop-shadow(0 0 8px currentColor);
 }
 
 .nc-fabric-link.is-hover .nc-fabric-line {
-  stroke-width: 3.5;
   filter: drop-shadow(0 0 6px color-mix(in srgb, currentColor 50%, transparent));
 }
 
@@ -506,36 +554,17 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-port rect {
-  fill: color-mix(in srgb, var(--nc-raised) 92%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 90%, transparent);
+  fill: color-mix(in srgb, var(--nc-surface) 96%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 80%, transparent);
   stroke-width: 1;
 }
 
 .nc-fabric-port text {
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 650;
   font-family: var(--font-mono), ui-monospace, monospace;
   fill: var(--nc-text);
   letter-spacing: -0.03em;
-}
-
-.nc-fabric-link.is-trunk path {
-  stroke: #5b9dff;
-}
-
-.nc-fabric-link.is-peer path {
-  stroke: #8b93a7;
-  stroke-dasharray: 6 4;
-}
-
-.nc-fabric-link.is-l3 path {
-  stroke: #f0a14a;
-  stroke-width: 2.6;
-}
-
-.nc-fabric-link.is-uplink path {
-  stroke: #9aa3b6;
-  stroke-dasharray: 2 4;
 }
 
 .nc-fabric-node {
@@ -543,68 +572,82 @@ textarea.nc-code-area {
   flex-direction: column;
   align-items: flex-start;
   text-align: left;
-  gap: 3px;
-  width: 152px;
-  height: 64px;
-  padding: 10px 14px 10px 16px;
+  gap: 4px;
+  width: 224px;
+  height: 92px;
+  padding: 14px 16px 14px 18px;
   border: 1px solid var(--nc-border);
-  border-radius: 12px;
-  background: var(--nc-raised);
+  border-radius: 14px;
+  background: linear-gradient(180deg, var(--nc-raised) 0%, color-mix(in srgb, var(--nc-raised) 85%, var(--nc-surface)) 100%);
   color: inherit;
   position: absolute;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, #ffffff 4%, transparent) inset,
+    0 14px 36px rgba(0, 0, 0, 0.32);
   cursor: pointer;
   transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
   text-decoration: none;
+  overflow: hidden;
 }
 
 .nc-fabric-node:hover {
-  border-color: color-mix(in srgb, var(--nc-accent) 60%, var(--nc-border));
-  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--nc-accent) 70%, var(--nc-border));
+  transform: translateY(-2px);
   box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--nc-accent) 30%, transparent),
-    0 14px 36px rgba(0, 0, 0, 0.3);
+    0 0 0 1px color-mix(in srgb, var(--nc-accent) 35%, transparent),
+    0 0 28px color-mix(in srgb, var(--nc-accent) 25%, transparent),
+    0 18px 44px rgba(0, 0, 0, 0.36);
 }
 
 .nc-fabric-node::before {
   content: '';
   position: absolute;
   left: 0;
-  top: 8px;
-  bottom: 8px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
+  top: 10px;
+  bottom: 10px;
+  width: 4px;
+  border-radius: 0 4px 4px 0;
   background: var(--nc-text-muted);
 }
 
 .nc-fabric-node.is-core {
-  border-color: color-mix(in srgb, #5b9dff 45%, var(--nc-border));
+  border-color: color-mix(in srgb, #5b9dff 55%, var(--nc-border));
+  background: linear-gradient(180deg, color-mix(in srgb, #5b9dff 10%, var(--nc-raised)) 0%, var(--nc-raised) 100%);
   box-shadow:
-    0 0 0 1px color-mix(in srgb, #5b9dff 18%, transparent),
-    0 12px 30px rgba(0, 0, 0, 0.28);
+    0 0 0 1px color-mix(in srgb, #5b9dff 22%, transparent),
+    0 14px 30px rgba(0, 0, 0, 0.28);
 }
 
 .nc-fabric-node.is-core::before {
-  background: #5b9dff;
+  background: linear-gradient(180deg, #5b9dff 0%, #7eb6ff 100%);
 }
 
 .nc-fabric-node.is-dist {
-  border-color: color-mix(in srgb, #a78bfa 45%, var(--nc-border));
+  border-color: color-mix(in srgb, #a78bfa 55%, var(--nc-border));
+  background: linear-gradient(180deg, color-mix(in srgb, #a78bfa 10%, var(--nc-raised)) 0%, var(--nc-raised) 100%);
   box-shadow:
-    0 0 0 1px color-mix(in srgb, #a78bfa 16%, transparent),
-    0 12px 30px rgba(0, 0, 0, 0.28);
+    0 0 0 1px color-mix(in srgb, #a78bfa 22%, transparent),
+    0 14px 30px rgba(0, 0, 0, 0.28);
 }
 
 .nc-fabric-node.is-dist::before {
-  background: #a78bfa;
+  background: linear-gradient(180deg, #a78bfa 0%, #c4b1ff 100%);
+}
+
+.nc-fabric-node.is-access {
+  border-color: color-mix(in srgb, #34d399 45%, var(--nc-border));
+  background: linear-gradient(180deg, color-mix(in srgb, #34d399 8%, var(--nc-raised)) 0%, var(--nc-raised) 100%);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, #34d399 16%, transparent),
+    0 14px 30px rgba(0, 0, 0, 0.28);
 }
 
 .nc-fabric-node.is-access::before {
-  background: #34d399;
+  background: linear-gradient(180deg, #34d399 0%, #5ee6b1 100%);
 }
 
 .nc-fabric-name {
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 700;
   line-height: 1.2;
   letter-spacing: -0.02em;
@@ -616,7 +659,7 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-ip {
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--nc-text-secondary);
   font-family: var(--font-mono), ui-monospace, monospace;
   white-space: nowrap;
@@ -627,44 +670,64 @@ textarea.nc-code-area {
 
 .nc-fabric-role-pill {
   position: absolute;
-  bottom: 4px;
-  right: 6px;
-  font-size: 8.5px;
+  bottom: 6px;
+  right: 8px;
+  font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--nc-text-muted);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--nc-surface) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--nc-border) 80%, transparent);
+}
+
+.nc-fabric-node.is-core .nc-fabric-role-pill {
+  color: #cfe1ff;
+  border-color: color-mix(in srgb, #5b9dff 35%, var(--nc-border));
+}
+
+.nc-fabric-node.is-dist .nc-fabric-role-pill {
+  color: #e1d6ff;
+  border-color: color-mix(in srgb, #a78bfa 35%, var(--nc-border));
+}
+
+.nc-fabric-node.is-access .nc-fabric-role-pill {
+  color: #c5f3df;
+  border-color: color-mix(in srgb, #34d399 35%, var(--nc-border));
 }
 
 .nc-fabric-status {
   position: absolute;
-  right: 8px;
-  top: 8px;
-  width: 7px;
-  height: 7px;
+  right: 10px;
+  top: 10px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
   background: var(--nc-text-muted);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc-text-muted) 18%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc-text-muted) 22%, transparent);
 }
 
 .nc-fabric-status.is-success {
   background: #34d399;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #34d399 22%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #34d399 28%, transparent);
+  animation: nc-pulse 2.2s ease-in-out infinite;
 }
 
 .nc-fabric-status.is-error {
   background: #f87171;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #f87171 22%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #f87171 28%, transparent);
 }
 
 .nc-fabric-status.is-warning {
   background: #fbbf24;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #fbbf24 22%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #fbbf24 28%, transparent);
 }
 
 .nc-fabric-status.is-purple {
   background: #a78bfa;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #a78bfa 22%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #a78bfa 28%, transparent);
 }
 
 .nc-fabric-controls {
