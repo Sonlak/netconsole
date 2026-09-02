@@ -46,9 +46,14 @@ import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types
 
 const NODE_W      = 228;
 const NODE_H      = 96;
-const PORT_STUB   = 8;            // short stub from node edge to clear the border
+// Stubs must extend past the port label rect so the line itself is
+// visible. Port label for `left/right` is ~34px wide and ~20px tall,
+// sitting at offset (LABEL_OFFSET=14, 22) above the node midline. Stub
+// needs to clear that.
+const PORT_STUB   = 18;
+const LABEL_OFFSET = 18;           // how far above the node midline a port label sits
 const PORT_INSET  = 18;           // ports inset from node corners along the edge
-const TIER_GAP    = 220;          // vertical gap between two tiers
+const TIER_GAP    = 232;          // vertical gap between two tiers
 const NODE_GAP_X  = 72;           // horizontal gap between sibling nodes
 const MARGIN_X    = 60;
 const MARGIN_Y    = 110;
@@ -208,9 +213,11 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     items.sort((a, b) => a.target - b.target || a.idx - b.idx);
 
     // Wider same-tier gap so the link between two sibling nodes is
-    // actually visible. Was NODE_W + NODE_GAP_X + 24 = 324, bumped to 392
-    // so the right-edge clearance on a 228-wide card is ~164 px.
-    const spacing = NODE_W + NODE_GAP_X + 92;
+    // clearly visible. Each card is 228 px wide; the gap-to-the-link is
+    // (spacing - NODE_W) / 2 either side of center, so spacing = 472 →
+    // ~122 px clear space between two same-tier cards before the line
+    // begins.
+    const spacing = NODE_W + NODE_GAP_X + 172;
     const n = items.length;
     for (let i = 0; i < n; i++) {
       const offset = (i - (n - 1) / 2) * spacing;
@@ -275,8 +282,10 @@ function buildPortEnd(
   const anchor  = portAnchorOnEdge(box, side, idx, total);
   const stubEnd = stubFromAnchor(anchor, side, PORT_STUB);
 
-  // Label sits in a quiet zone beside the stub so it never sits on the
-  // diagonal line itself.
+  // Label sits in a quiet zone BESIDE the line so it never sits on the
+  // diagonal itself. For left/right (same-tier horizontal) ports, the
+  // line goes horizontally so we offset the label vertically — above the
+  // node midline — instead of stacking it on top of the line.
   let labelPos: Pt;
   let labelAnchor: 'start' | 'middle' | 'end' = 'middle';
   switch (side) {
@@ -290,11 +299,15 @@ function buildPortEnd(
       labelAnchor = 'middle';
       break;
     case 'left':
-      labelPos = { x: anchor.x - PORT_STUB - 6, y: anchor.y };
+      // Place label ABOVE the horizontal line that exits the left edge,
+      // not on top of it. offsetY = -(node midline padding + half label
+      // height) so the 20px-tall pill clears the line that runs through
+      // the node midline.
+      labelPos = { x: anchor.x - PORT_STUB - 6, y: anchor.y - LABEL_OFFSET };
       labelAnchor = 'end';
       break;
     case 'right':
-      labelPos = { x: anchor.x + PORT_STUB + 6, y: anchor.y };
+      labelPos = { x: anchor.x + PORT_STUB + 6, y: anchor.y - LABEL_OFFSET };
       labelAnchor = 'start';
       break;
   }
