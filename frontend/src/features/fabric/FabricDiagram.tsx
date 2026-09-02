@@ -581,12 +581,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
 
   // Compute canvas bounding box from the actual boxMap extents so
   // pan/zoom and tier bands are accurate.
-  const allBoxes = Object.values(boxMap);
-  const totalWidth  = allBoxes.length > 0
-    ? Math.max(...allBoxes.map((b) => b.x + b.w)) + MARGIN_X
+  const placed = Object.values(boxMap);
+  const totalWidth  = placed.length > 0
+    ? Math.max(...placed.map((b) => b.x + b.w)) + MARGIN_X
     : 0;
-  const totalHeight = allBoxes.length > 0
-    ? Math.max(...allBoxes.map((b) => b.y + b.h)) + MARGIN_Y
+  const totalHeight = placed.length > 0
+    ? Math.max(...placed.map((b) => b.y + b.h)) + MARGIN_Y
     : 0;
 
   return {
