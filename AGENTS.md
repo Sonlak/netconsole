@@ -749,3 +749,22 @@ ode sanity-rank3.mjs from the frontend dir.
 - **Status at end of session**: pushed to main, deploy running.
   Next: visually verify in browser, then back-fill any remaining
   visual quirks (e.g. busY lane spacing for the 2nd-hop fans).
+
+### 2026-09-03 00:32 — AGENTS.md update request from user
+- User asked to summarize the fabric topology work into AGENTS.md so
+  future agent sessions have the context to deploy or troubleshoot.
+- Verified all 3 commits are on origin/main:
+  - 48322fd fix(fabric): spread 2 same-rank cores; side-by-side siblings
+  - bfb8b8 fix(fabric): center the whole graph on one axis so cores and dists align
+  - 2bdc8d0 docs(agents): log fabric centering + side-by-side siblings session
+- The previous session log entry (2026-09-03 00:18) already covers the
+  full context: bug descriptions, fixes A/B/C, verification results,
+  and lessons for the next agent.
+- **No code changes** this turn — just confirmation that the doc is
+  in place and the deploy pipeline will pick up the layout changes
+  via the existing CI → self-hosted runner flow.
+- **Status at end of session**: AGENTS.md up to date with all fabric
+  layout history. Next agent reading this file will have full context
+  on the dagre + BFS + whole-graph-centring approach, the side-by-
+  side siblings rule for 2-sibling cases, and the sanity-test
+  invariants.
