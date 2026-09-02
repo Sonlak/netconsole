@@ -282,6 +282,20 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
    like a layout bug. If you ever see a stray access node sitting alone
    at the right edge of the canvas, the device record is missing a
    `floor` value.
+10. **Same-rank peer edges must NOT be fed to dagre** — feeding
+    `CORE-02 → CORE-01` (or `DS-01 → DS-02`, `ACCESS → ACCESS`) makes
+    dagre rank the sink one tier below the source. Both cores (or both
+    dists) must sit side by side at the same rank. Skip same-rank edges
+    when building the dagre graph; the SVG link rendering reads
+    `link.fromDeviceId` / `link.toDeviceId` directly so the link is still
+    drawn, it just does not influence rank. See commit `9b58053`.
+11. **`TierLayout.y` is a pixel Y, not a rank integer** — the dagre
+    rewrite changed `y` from rank-integer to top-left pixel Y. Any
+    filter like `layout.tiers.find((tl) => tl.y === t.rank)` is a
+    silently-broken regression (it always returns 0 results because
+    pixel-y ≠ rank-number). If you ever see tier bands or tier rail
+    labels disappear, that filter pattern is the first place to look.
+    See commit `330b7f0`.
 
 ---
 
@@ -542,3 +556,55 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
     the node id, which means it gets its own column → looks like a
     bug. Ensure `FabricNode.floor` is always populated for access
     devices.
+### 2026-09-02 23:21 — FabricDiagram: peer-edge bug + silent tier-band loss (two bugs)
+- User added LAB-F3-AS-03 (9th device); complained the layout was wrong
+  AND that I had "thrown away" the colored tier bands.
+- **Bug A — same-rank peer edges were sinking one core to rank 1.**
+  The dagre graph was fed every link (including CORE-02 -> CORE-01,
+  DS-01 -> DS-02). Dagre's longest-path ranker saw the core-core edge,
+  treated CORE-02 as the source (rank 0) and CORE-01 as the sink (rank 1).
+  Result: CORE-02 floated at the top, CORE-01 sat one tier below.
+  Fix: in layoutNodes, only feed edges where romRank !== toRank.
+  Same-rank links are still drawn (the SVG link rendering reads
+  link.fromDeviceId / link.toDeviceId directly), they're just excluded
+  from dagre's rank assignment. Commit 9b58053.
+- **Bug B — tier background bands were silently missing since commit
+  e32b460 (the dagre rewrite).** Found while verifying Bug A's fix.
+  Root cause in FabricDiagram.tsx:
+  `	s
+  .filter((t) => (layout.tiers.find((tl) => tl.y === t.rank)?.nodes.length ?? 0) > 0)
+  `
+  This compares a **pixel Y coordinate** (	l.y is set to
+  	ierNodes[t.rank][0].box.y) to a **rank integer** (	.rank is 0,1,2,3).
+  They are never equal, so the filter always returned 0 results — bands
+  were never rendered. The user thought I had "thrown them away" because
+  they had been missing for several days without anyone noticing.
+  Fix: use direct index lookup layout.tiers[t.rank] instead of .find.
+  Commit 330b7f0.
+- Build clean, deploy clean (CI + Deploy both green). Verified in browser:
+  - 9 devices / 14 links rendered
+  - CORE band (blue), DISTRIBUTION band (purple), ACCESS L1 band (green),
+    ACCESS L2 band (lighter green) all visible again
+  - F6-CORE-01 and F6-CORE-02 sit **side by side** at rank 0
+  - F6-DS-01 / F6-DS-02 at rank 1
+  - F1-AS-01 / F2-AS-01 / F3-AS-01 at rank 2
+  - F3-AS-02 / F3-AS-03 at rank 3
+- **Lessons for next agent (general):**
+  - When a layout/render change ships, **always visually verify in the
+    browser before saying "it works"**. Tests + green CI are necessary
+    but not sufficient for visual output. The dagre rewrite was "verified"
+    via rontend/sanity.mjs only — that script only checks canvas
+    dimensions and node counts, NOT whether bands/rails are drawn.
+  - **When refactoring types, re-check every place that consumed the
+    old field**. TierLayout.y used to be the rank integer; the dagre
+    rewrite changed it to a pixel Y but left a stray
+    .find(tl.y === t.rank) filter behind. When renaming or retyping
+    a field, grep the whole file for uses.
+  - **User-reported "you removed X"** should be taken seriously even if
+    your recent diff did not touch X. It can mean X broke silently in a
+    much earlier change. Treat it as a regression hunt, not a feature
+    request.
+  - For the next fabric session: if the user reports "band is gone" or
+    "label missing" — first check layout.tiers, 	ierMeta, and any
+    filter that derives one from the other. The bug pattern is almost
+    always a .find(...) with the wrong predicate.
