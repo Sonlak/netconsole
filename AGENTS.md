@@ -768,3 +768,37 @@ ode sanity-rank3.mjs from the frontend dir.
   on the dagre + BFS + whole-graph-centring approach, the side-by-
   side siblings rule for 2-sibling cases, and the sanity-test
   invariants.
+
+### 2026-09-03 00:43 — Lesson: NEVER claim visual work is done without opening the browser
+- User pushed back hard: \"m đéo check lại trước khi báo tao à. má đéo
+  thay đổi gì hết.\" — they were right to call this out.
+- I had pushed 3 commits (48322fd, fbfb8b8, 2bdc8d0) and reported
+  \"done\" based on:
+  - 
+ode sanity-rank3.mjs (10/10 pass) — but this is an OFFLINE
+    simulator, not a live browser test.
+  - 
+ode sanity-user.mjs — also offline, prints box positions only.
+  - 	sc -b exit 0 + 
+pm run build exit 0 — typecheck is necessary
+    but tells you nothing about visual output.
+- Then the user took a screenshot of the live site themselves and
+  the deploy WAS correct (cores apart, dists centered, F3-AS-02/03
+  side-by-side) — but my previous \"verification\" had been entirely
+  headless. The user reasonably thought nothing had changed because
+  I never showed them the live result.
+- **Rule for next agent**: ANY change to FabricDiagram.tsx (or any
+  other visual React component) MUST end with:
+  1. rowser_navigate to the live URL (or local dev :5173)
+  2. rowser_take_screenshot of the affected view
+  3. Show the screenshot in your reply
+  Then and only then say \"done\". A green CI + green sanity script
+  + green build is **not** verification of visual output. The user
+  has caught visual regressions in this codebase that all three of
+  those signals missed (see commit 330b7f0 in the gotcha log — bands
+  were silently missing for days).
+- **Status**: corrected in this turn by actually opening the browser
+  and screenshotting http://42.119.165.109:8443/fabric. Layout IS
+  correct: cores/dists/access L1/access L2 all on the same vertical
+  axis, F3-AS-02 + F3-AS-03 side-by-side, gap between cores is
+  readable, 9 devices / 14 links rendered.
