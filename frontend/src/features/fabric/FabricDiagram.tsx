@@ -151,6 +151,9 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
 
   const childrenOf = buildChildrenOf(nodes, links);
 
+  // Canvas width is the WIDEST tier row plus margins. Each tier band,
+  // however, is drawn to its own bounding box (see tierBands below) so
+  // small tiers don't get a giant empty band around them.
   const maxTierCount = Math.max(1, ...TIER_ORDER.map((r) => buckets[r].length));
   const tierWidth = maxTierCount * NODE_W + Math.max(0, maxTierCount - 1) * NODE_GAP_X;
   const totalWidth = MARGIN_X * 2 + tierWidth;
@@ -164,7 +167,7 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
 
   const boxMap: Record<string, Box> = {};
 
-  // ACCESS row — evenly placed
+  // ACCESS row — evenly placed, anchored to its own width (left-aligned to MARGIN_X).
   const accessNodes = buckets.access;
   if (accessNodes.length > 0) {
     const rowWidth = accessNodes.length * NODE_W + Math.max(0, accessNodes.length - 1) * NODE_GAP_X;
@@ -180,23 +183,34 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     const tierNodes = buckets[role];
     if (tierNodes.length === 0) return;
 
+    // Anchor the tier to the X-bbox of its children so a 2-node tier
+    // doesn't sprawl across the entire access row.
+    const childBoxes = tierNodes
+      .flatMap((n) => childrenOf[n.id] || [])
+      .map((c) => boxMap[c.id])
+      .filter(Boolean);
+    const childLeft  = childBoxes.length > 0 ? Math.min(...childBoxes.map((b) => b.x)) : MARGIN_X;
+    const childRight = childBoxes.length > 0 ? Math.max(...childBoxes.map((b) => b.x + b.w)) : MARGIN_X + tierWidth;
+    const tierLeft   = Math.max(MARGIN_X, childLeft - 80);
+    const tierRight  = Math.min(MARGIN_X + tierWidth - NODE_W, childRight - NODE_W + 80);
+
     const items = tierNodes.map((node, idx) => {
       const children = (childrenOf[node.id] || []).filter((c) => c.role === childRole);
       let target: number;
       if (children.length > 0) {
         target = children.reduce((acc, c) => acc + (boxMap[c.id]?.x ?? 0), 0) / children.length;
       } else {
-        const n = tierNodes.length;
-        target = n === 1
-          ? MARGIN_X + (tierWidth - NODE_W) / 2
-          : MARGIN_X + idx * (tierWidth - NODE_W) / (n - 1);
+        target = (tierLeft + tierRight) / 2;
       }
       return { id: node.id, target, idx };
     });
 
     items.sort((a, b) => a.target - b.target || a.idx - b.idx);
 
-    const spacing = NODE_W + NODE_GAP_X + 24;
+    // Wider same-tier gap so the link between two sibling nodes is
+    // actually visible. Was NODE_W + NODE_GAP_X + 24 = 324, bumped to 392
+    // so the right-edge clearance on a 228-wide card is ~164 px.
+    const spacing = NODE_W + NODE_GAP_X + 92;
     const n = items.length;
     for (let i = 0; i < n; i++) {
       const offset = (i - (n - 1) / 2) * spacing;
@@ -539,16 +553,26 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     .filter((t) => t.nodes.length > 0)
     .map((t) => ({ label: ROLE_LABEL[t.role].toUpperCase(), tone: t.role, y: t.y + NODE_H / 2 }));
 
-  // Tier background bands
+  // Tier background bands — each band hugs its OWN nodes' X-bbox plus a
+  // small padding. Empty space between tiers stays the canvas background,
+  // not part of any band.
   const tierBands = layout.tiers
     .filter((t) => t.nodes.length > 0)
-    .map((t) => ({
-      role: t.role,
-      left:  MARGIN_X - 24,
-      right: layout.totalWidth - MARGIN_X + 24,
-      top:   t.y - 14,
-      bot:   t.y + NODE_H + 14,
-    }));
+    .map((t) => {
+      const xs = t.nodes.map((n) => n.box.x);
+      const xe = t.nodes.map((n) => n.box.x + n.box.w);
+      const xLeft  = Math.min(...xs);
+      const xRight = Math.max(...xe);
+      const PAD_X = 24;
+      const PAD_Y = 18;
+      return {
+        role:  t.role,
+        left:  xLeft - PAD_X,
+        right: xRight + PAD_X,
+        top:   t.y - PAD_Y,
+        bot:   t.y + NODE_H + PAD_Y,
+      };
+    });
 
   return (
     <div
