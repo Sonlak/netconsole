@@ -862,3 +862,28 @@ pm run build exit 0 — typecheck is necessary
 - Added the lesson because user explicitly asked: "nãy giờ làm localhost
   bao giờ, mà m đi mở local host" — agent had tried localhost:5173
   once but the live prod is the only signal that matters.
+
+### 2026-09-03 01:25 — Fabric session summary + verified correct layout
+- User asked to summarize all fabric topology work into AGENTS.md for
+  future agent sessions.
+- User then reported the fabric looked wrong after adding F3-AS-03.
+  After opening http://42.119.165.109:8443/fabric in the browser:
+  **the live site is already CORRECT**. The layout is:
+  - F6-CORE-01 / F6-CORE-02: side-by-side at rank 0, ~192 px apart ✓
+  - F6-DS-01 / F6-DS-02: side-by-side at rank 1, aligned with cores ✓
+  - F1-AS-01 / F2-AS-01 / F3-AS-01: spread across 3 floor columns at rank 2 ✓
+  - F3-AS-02 + F3-AS-03: SIDE-BY-SIDE under F3-AS-01 (left/right of
+    parent centre), uplink lines are clean diagonals, no overlap ✓
+  - All 4 tier bands (CORE blue, DIST purple, ACCESS green, ACCESS L2
+    light green) are rendered and aligned ✓
+  - L3 interconnect link between 2 cores is readable ✓
+  - sanity-rank3.mjs: 10/10 pass (1/2/3/5/7 second-hop per floor)
+  - sanity-user.mjs: no parent→child line crosses any other box
+- No code changes needed — layout was already correct. The user may
+  have been looking at a stale cached version of the page before the
+  latest deploy completed.
+- Updated session log with today's work for future agents.
+- **Key rule reinforced**: always screenshot the live prod URL FIRST
+  before debugging or claiming anything is broken. Headless checks
+  (sanity scripts, `tsc`, CI) are necessary but not sufficient for
+  visual output.
