@@ -591,30 +591,34 @@ textarea.nc-code-area {
   opacity: 0.85;
 }
 
+.nc-fabric-port {
+  pointer-events: none;
+}
+
 .nc-fabric-port .nc-fabric-port-bg {
-  fill: color-mix(in srgb, var(--nc-surface) 94%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 70%, transparent);
+  fill: var(--nc-surface);
+  stroke: var(--nc-border);
   stroke-width: 1;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.12));
+  transition: fill 0.12s ease, stroke 0.12s ease;
 }
 
 .nc-fabric-port .nc-fabric-port-text {
-  font-size: 10.5px;
-  font-weight: 650;
+  font-size: 12px;
+  font-weight: 700;
   font-family: var(--font-mono), ui-monospace, monospace;
-  fill: var(--nc-text-muted);
-  letter-spacing: -0.02em;
-  opacity: 0.85;
-  transition: opacity 0.12s ease, fill 0.12s ease;
-}
-
-.nc-fabric-link.is-hover .nc-fabric-port .nc-fabric-port-text {
   fill: var(--nc-text);
-  opacity: 1;
+  letter-spacing: -0.01em;
+  transition: fill 0.12s ease;
 }
 
 .nc-fabric-link.is-hover .nc-fabric-port .nc-fabric-port-bg {
-  fill: color-mix(in srgb, var(--nc-surface) 99%, transparent);
-  stroke: color-mix(in srgb, var(--nc-border) 100%, transparent);
+  fill: color-mix(in srgb, var(--nc-accent) 12%, var(--nc-surface));
+  stroke: color-mix(in srgb, var(--nc-accent) 60%, var(--nc-border));
+}
+
+.nc-fabric-link.is-hover .nc-fabric-port .nc-fabric-port-text {
+  fill: color-mix(in srgb, var(--nc-accent) 80%, var(--nc-text));
 }
 
 /* Legacy selectors kept for any residual markup. */

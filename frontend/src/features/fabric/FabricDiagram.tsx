@@ -265,22 +265,22 @@ function buildPortEnd(
   // diagonal line itself.
   let labelPos: Pt;
   let labelAnchor: 'start' | 'middle' | 'end' = 'middle';
-  const LABEL_OFFSET = 4;
   switch (side) {
     case 'top':
-      labelPos = { x: anchor.x, y: anchor.y - PORT_STUB - 14 };
+      // pill is 20px tall → push it 22px above the stub end
+      labelPos = { x: anchor.x, y: anchor.y - PORT_STUB - 22 };
       labelAnchor = 'middle';
       break;
     case 'bottom':
-      labelPos = { x: anchor.x, y: anchor.y + PORT_STUB + 14 };
+      labelPos = { x: anchor.x, y: anchor.y + PORT_STUB + 22 };
       labelAnchor = 'middle';
       break;
     case 'left':
-      labelPos = { x: anchor.x - PORT_STUB - LABEL_OFFSET, y: anchor.y };
+      labelPos = { x: anchor.x - PORT_STUB - 6, y: anchor.y };
       labelAnchor = 'end';
       break;
     case 'right':
-      labelPos = { x: anchor.x + PORT_STUB + LABEL_OFFSET, y: anchor.y };
+      labelPos = { x: anchor.x + PORT_STUB + 6, y: anchor.y };
       labelAnchor = 'start';
       break;
   }
@@ -338,30 +338,33 @@ function FabricNodeCard({ node, box }: { node: FabricNode; box: Box }) {
 }
 
 function PortLabel({ end }: { end: PortEnd }) {
-  const label = end.portName?.trim() || '—';
-  const PAD_X = 5;
-  const CHAR_W = 6.2;
-  const H = 14;
-  const w = Math.max(22, label.length * CHAR_W + PAD_X * 2);
+  const label = end.portName?.trim();
+  // Skip empty port names — they add noise without telling the user anything.
+  if (!label) return null;
+
+  const PAD_X = 9;
+  const CHAR_W = 6.6;
+  const H = 20;
+  const w = Math.max(34, label.length * CHAR_W + PAD_X * 2);
 
   let x = end.labelPos.x;
   let y = end.labelPos.y;
-  if (end.labelAnchor === 'end')   x -= w;
+  if (end.labelAnchor === 'end')     x -= w;
   else if (end.labelAnchor === 'start') x += 0;
-  else                              x -= w / 2;
+  else                                x -= w / 2;
 
   const rectY = y - H / 2;
   const textX = end.labelPos.x;
-  const textY = y + 0.5;
+  const textY = y;
 
   return (
     <g className="nc-fabric-port">
-      <rect x={x} y={rectY} width={w} height={H} rx={4} className="nc-fabric-port-bg" />
+      <rect x={x} y={rectY} width={w} height={H} rx={6} className="nc-fabric-port-bg" />
       <text
         x={textX}
         y={textY}
         textAnchor={end.labelAnchor}
-        dominantBaseline="middle"
+        dominantBaseline="central"
         className="nc-fabric-port-text"
       >
         {label}
