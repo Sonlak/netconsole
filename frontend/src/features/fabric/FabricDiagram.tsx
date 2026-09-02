@@ -329,9 +329,16 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     const fl = node.floor || node.id;
 
     if (r === 2) {
-      // First-hop: compact to FLOOR_COL_WIDE column, stay on rank-2 Y
+      // First-hop: compact to FLOOR_COL_WIDE column, stay on rank-2 Y.
+      // If multiple first-hop nodes share the same floor (e.g. two access
+      // switches on one floor), spread them horizontally so they don't
+      // overlap at the same X coordinate.
       const col = floorColIdx[fl] ?? 0;
-      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2;
+      const fhNodesInFloor = rank2Nodes.filter((n) => n.floor === node.floor);
+      const fhIdx = fhNodesInFloor.indexOf(node);
+      const FH_OFFSETS = [-50, 0, 50, -25, 25, -12, 12]; // up to 7 first-hop nodes
+      const fhOffset = FH_OFFSETS[fhIdx % FH_OFFSETS.length] ?? 0;
+      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2 + fhOffset;
       y = rank2Y - NODE_H / 2;
     } else if (r === 3) {
       // Second-hop: compact to same column, stack vertically.
