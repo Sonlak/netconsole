@@ -310,6 +310,27 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
     instead. See commits `88719a3` + `7907866` and the
     `frontend/sanity-rank3.mjs` test that asserts "no rank-3 overlap"
     + "no column overflow" for 1/2/3/5/7 second-hop per floor.
+13. **`tsc --noEmit` (CI advisory) does NOT catch duplicate `const` declarations** —
+    `fabric/src/features/fabric/FabricDiagram.tsx` once had `const allBoxes = ...`
+    declared twice (one for the centering pass, one for the canvas-bbox pass).
+    The advisory `tsc -b` step in CI ran clean because it stopped at the
+    type-check phase. But `vite build` re-runs `tsc` with `--noEmit false`
+    and FAILED with `TS2451: Cannot redeclare block-scoped variable
+    'allBoxes'`. Result: **CI green, but Deploy still failed** because
+    the Build step in the Frontend (build) job exit-coded non-zero. The
+    self-hosted runner's deploy job never ran.
+    **Lesson for next agent**:
+    - `npm run build` (= `tsc -b && vite build`) catches everything
+      `tsc --noEmit` does AND module-resolution errors and emit-time
+      errors. ALWAYS run `npm run build` before committing any TSX
+      change, not just `tsc --noEmit`.
+    - Before claiming "done" on a frontend change, check the latest
+      GitHub Actions run for **Frontend (build)** conclusion — `success`
+      is required, not just CI overall.
+    - If you see the live site still showing old behaviour after a push,
+      check `https://github.com/Sonlak/netconsole/actions` for a red
+      build job — the user's previous complaint ("đéo thấy git báo lỗi
+      à") is exactly this scenario. See commit `ee74cca`.
 
 ---
 
@@ -802,3 +823,42 @@ pm run build exit 0 — typecheck is necessary
   correct: cores/dists/access L1/access L2 all on the same vertical
   axis, F3-AS-02 + F3-AS-03 side-by-side, gap between cores is
   readable, 9 devices / 14 links rendered.
+
+### 2026-09-03 01:10 — FabricDiagram: CI build failure silently broke deploy (gotcha #13)
+- User reported "m đéo thấy git báo lỗi à" — turns out **Frontend (build)
+  job in CI was red for commit `4ba9aa1`** (8 TS errors), but I never
+  checked the GitHub Actions page because I was busy screenshotting
+  the live site and assuming the screenshot reflected the latest
+  commit.
+- Real bug: `frontend/src/features/fabric/FabricDiagram.tsx` had
+  `const allBoxes` declared twice (one in the centering pass, one in
+  the canvas-bbox pass). The earlier rewrite replaced the var name in
+  one place but left the duplicate in the other. CI's advisory
+  `tsc --noEmit` step didn't catch it (it stops at type-check phase),
+  but the real `vite build` re-runs tsc and EXITED non-zero on
+  `TS2451: Cannot redeclare block-scoped variable 'allBoxes'`.
+  Result: CI failed → Deploy workflow never ran → live site still
+  serving the OLD bundle → user correctly reported "máy đéo thay đổi
+  gì hết".
+- Fix commit `ee74cca`: rename the canvas-bbox `allBoxes` to `placed`
+  (and `Object.values(boxMap)` instead of `Object.entries`). Local
+  `npm run build` now clean. CI #76 + Deploy #48 both green.
+- Verified live at http://42.119.165.109:8443/fabric?v=ee74cca:
+  - 9 devices / 14 links
+  - CORE band center ~707, DISTRIBUTION ~695, ACCESS L1 ~690, ACCESS L2 ~700
+  - All four tier centres within 17px of each other → pyramid is now
+    balanced on one vertical axis (was lopsided by ~85px before).
+  - 2 cores have a readable `ge-0/0/1` L3 interconnect between them.
+  - F3-AS-02 + F3-AS-03 side-by-side under F3-AS-01.
+- **Rules added to AGENTS.md gotcha #13**:
+  - ALWAYS run `npm run build` before committing TSX, not just
+    `tsc --noEmit`.
+  - ALWAYS check the GitHub Actions run for the latest commit
+    (`https://github.com/Sonlak/netconsole/actions`) before claiming
+    "deployed and working" — look specifically at the `Frontend
+    (build)` job conclusion. CI overall success is not enough.
+  - If the live site still shows old behaviour after a push, the
+    first thing to check is whether the build job actually succeeded.
+- Added the lesson because user explicitly asked: "nãy giờ làm localhost
+  bao giờ, mà m đi mở local host" — agent had tried localhost:5173
+  once but the live prod is the only signal that matters.
