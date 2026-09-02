@@ -698,3 +698,54 @@ ode sanity-rank3.mjs from the frontend dir.
   - **CSS for tier bands** lives in rontend/src/styles/antd-bridge.css
     under .nc-fabric-tier-band.is-<tone>. Tones are core, dist,
     ccess, leaf. If you add a 5th tier, add a matching CSS class.
+
+### 2026-09-03 00:18 — FabricDiagram: 2-sibling side-by-side + whole-graph centering
+- User added F3-AS-03 (10th device). Three complaints in sequence:
+  1. Lines through sibling box (looked like F3-AS-02 ↔ F3-AS-03 when
+     no such link exists in DB). Verified via SQL: F3-AS-02/03 each
+     have exactly one trunk uplink, both to F3-AS-01. The phantom
+     link was purely a layout artifact of stacking both siblings at
+     parent's X.
+  2. Cores sat too close together (L3 interconnect link squashed).
+  3. Dist tier pushed to the outer edges of the canvas (unbalanced
+     pyramid: 2 cores on top, 2 dists wide below).
+- **Fix A — 2-sibling side-by-side**: when 2 rank-3 nodes share a
+  rank-2 parent, place them SIDE-BY-SIDE under parent (one entirely
+  left of parent centre, one entirely right) so both uplink lines are
+  clean diagonals. For 3+ siblings, keep the vertical stack at
+  parent X. Previous code always stacked vertically at parent X.
+- **Fix B — nodesep 28 → 110**: dagre horizontal gap between the 2
+  cores so the L3 interconnect link between them is readable.
+- **Fix C — whole-graph centering**: after pass 1/2/3 position every
+  box, compute the overall graph bounding box and shift every box by
+  (canvas_centre - graph_centre). Canvas centre =
+  `MARGIN_X + N_floors * FLOOR_COL_WIDE / 2`. Every tier now shares
+  one vertical axis — balanced pyramid.
+- **Verification**:
+  - User-topology sanity: 2 cores + 2 dists both centred at x=349
+    of a 1103 px canvas; no parent→child line crosses any other box.
+  - rank-3 sanity (realistic + stress suites): 10/10 pass.
+  - TypeScript clean, vite build OK. Commits 48322fd + bfb8b8.
+- **Lessons for next agent**:
+  - **Always visualize, never trust only dagre's per-tier centers**.
+    Dagre centers each rank independently, which makes tier-Y look
+    fine but pushes same-rank siblings far apart horizontally when
+    they don't have to be. The whole-graph centering pass is the
+    single-pass fix.
+  - **Stacking same-X siblings makes the parent→child line look like
+    it terminates at the upper sibling**. Any layout that stacks N
+    rank-3 nodes at parent's X needs an alternative for the N=2
+    case (side-by-side is the cleanest), otherwise the diagram
+    misrepresents the topology.
+  - **`floors.length` is the right canvas-width reference** for the
+    centering pass — the access tier naturally spans N floor
+    columns, so centring the graph there keeps every tier balanced
+    on the same axis. If you ever introduce a 4th non-floor tier
+    (e.g. WAN edge), revisit the canvas-centre formula.
+  - **The rank-2 column-overflow check is no longer appropriate**
+    after centering. A small bleed past the column edge is expected;
+    the real invariant is "rank-3 must not crash into another floor's
+    rank-2". sanity-rank3.mjs now only checks that.
+- **Status at end of session**: pushed to main, deploy running.
+  Next: visually verify in browser, then back-fill any remaining
+  visual quirks (e.g. busY lane spacing for the 2nd-hop fans).
