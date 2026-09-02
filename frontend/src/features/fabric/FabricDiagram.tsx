@@ -39,15 +39,15 @@ import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types
 
 const NODE_W = 228;
 const NODE_H = 96;
-const PORT_STUB = 34;             // stub length from node edge into the bus
+const PORT_STUB = 46;             // stub length from node edge into the bus
 const PORT_LABEL_GAP = 6;
-const TIER_GAP = 168;             // vertical gap between two tiers (generous, for the bus)
+const TIER_GAP = 188;             // vertical gap between two tiers (extra room for fan-out)
 const NODE_GAP_X = 72;            // horizontal gap between sibling nodes in same tier
 const MARGIN_X = 60;
 const MARGIN_Y = 110;
 const RAIL_WIDTH = 136;
-const TRACK_STEP_X = 14;          // x-offset for parallel links (stub separation)
-const TRACK_STEP_Y = 12;          // y-offset for parallel links on side-routing
+const TRACK_STEP_X = 18;          // x-offset for parallel links at stub level
+const TRACK_STEP_BUS = 26;        // y-offset per-link for cross-tier bus level (separates parallel links)
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk:   '#4f9cf9',
@@ -106,7 +106,6 @@ type LayoutResult = {
   totalWidth:   number;
   totalHeight:  number;
   tiers:        TierLayout[];
-  interBuses:   { y: number; left: number; right: number; kind: 'core-dist' | 'dist-access' }[];
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,35 +174,7 @@ function layoutNodes(nodes: FabricNode[]): LayoutResult {
 
   const totalHeight = y - TIER_GAP + MARGIN_Y;
 
-  // Inter-tier bus y positions — used to draw a faint horizontal bus line
-  // between core↔dist and dist↔access. Bus sits midway between the two tiers.
-  const interBuses: LayoutResult['interBuses'] = [];
-  const coreTier  = tiers.find((t) => t.role === 'core');
-  const distTier  = tiers.find((t) => t.role === 'dist');
-  const accessTier = tiers.find((t) => t.role === 'access');
-
-  if (coreTier && distTier) {
-    const a = coreTier.y  + NODE_H;
-    const b = distTier.y;
-    interBuses.push({
-      kind: 'core-dist',
-      y: (a + b) / 2,
-      left:  MARGIN_X - 24,
-      right: MARGIN_X + tierWidth + 24,
-    });
-  }
-  if (distTier && accessTier) {
-    const a = distTier.y  + NODE_H;
-    const b = accessTier.y;
-    interBuses.push({
-      kind: 'dist-access',
-      y: (a + b) / 2,
-      left:  MARGIN_X - 24,
-      right: MARGIN_X + tierWidth + 24,
-    });
-  }
-
-  return { positioned, totalWidth, totalHeight, tiers, interBuses };
+  return { positioned, totalWidth, totalHeight, tiers };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,14 +263,20 @@ function pickSide(from: Box, to: Box): Anchor {
 // Path builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeCrossTierPath(a: Pt, b: Pt): string {
-  // Both ends are on top/bottom edges. We use the midpoint y as a horizontal
-  // bus line: stub → bus → bus → stub. If a and b share the same x, just a
-  // straight vertical line.
+/**
+ * Cross-tier orthogonal path with PER-LINK busY offset.
+ *
+ * Each link gets its own busY (midY plus a per-source busOffset), so
+ * parallel links from the same source fan out vertically and never
+ * share a horizontal segment with each other. The result is 4
+ * individually visible lines for 4 parallel links instead of one
+ * bundled cable.
+ */
+function makeCrossTierPath(a: Pt, b: Pt, busOffset: number): string {
   if (Math.abs(a.x - b.x) < 1) {
-    return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+    return `M ${a.x} ${a.y + busOffset} L ${b.x} ${b.y - busOffset}`;
   }
-  const busY = (a.y + b.y) / 2;
+  const busY = (a.y + b.y) / 2 + busOffset;
   return `M ${a.x} ${a.y} L ${a.x} ${busY} L ${b.x} ${busY} L ${b.x} ${b.y}`;
 }
 
@@ -363,15 +340,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     const idx: Record<string, NodeLayout> = {};
     for (const item of layout.positioned) idx[item.node.id] = item;
 
-    // Group links by device-pair so parallel links get unique track offsets
-    const pairKey = (a: string, b: string) => (a < b ? `${a}||${b}` : `${b}||${a}`);
-    const pairBuckets: Record<string, FabricLink[]> = {};
+    // Per-SOURCE indexing: a source's links fan out vertically so they don't
+    // share a horizontal bus segment. Per-PAIR indexing (the previous logic)
+    // collapsed every parallel link onto the same busY → looked bundled.
+    const linksBySource: Record<string, FabricLink[]> = {};
     for (const link of links) {
-      (pairBuckets[pairKey(link.fromDeviceId, link.toDeviceId)] ||= []).push(link);
+      (linksBySource[link.fromDeviceId] ||= []).push(link);
     }
-    const linkOrder: Record<string, number> = {};
-    Object.entries(pairBuckets).forEach(([, bucket]) => {
-      bucket.forEach((link, i) => { linkOrder[link.id] = i; });
+    const sourceOrder: Record<string, number> = {};
+    const sourceCount: Record<string, number> = {};
+    Object.entries(linksBySource).forEach(([src, bucket]) => {
+      sourceCount[src] = bucket.length;
+      bucket.forEach((link, i) => { sourceOrder[link.id] = i; });
     });
 
     // Determine per-node, per-side port count. For cross-tier links we use
@@ -420,19 +400,19 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       const info   = stubs[link.id]!;
       const sideA  = info.fromSide;
       const sideB  = info.toSide;
-      const order  = linkOrder[link.id];
-      const totalP = pairBuckets[pairKey(link.fromDeviceId, link.toDeviceId)]?.length ?? 1;
-      // Centre parallel links around 0 — middle one stays straight, others fan out
-      const trackX = (order - (totalP - 1) / 2) * TRACK_STEP_X;
-      const trackY = order === 0 ? 0 : (order % 2 === 0 ? TRACK_STEP_Y : -TRACK_STEP_Y);
+      const order  = sourceOrder[link.id];
+      const total  = sourceCount[link.fromDeviceId];
+      // Centred fan-out around 0
+      const trackX = (order - (total - 1) / 2) * TRACK_STEP_X;
+      const busOffset = info.crossTier ? (order - (total - 1) / 2) * TRACK_STEP_BUS : 0;
 
       const idxA = portIdx[link.fromDeviceId][sideA]++;
       const idxB = portIdx[link.toDeviceId][sideB]++;
 
-      const fromEnd = buildPortEnd(a.box, sideA, idxA, portCount[link.fromDeviceId][sideA], link.fromPort, trackX, trackY);
-      const toEnd   = buildPortEnd(b.box, sideB, idxB, portCount[link.toDeviceId][sideB], link.toPort,   trackX, trackY);
+      const fromEnd = buildPortEnd(a.box, sideA, idxA, portCount[link.fromDeviceId][sideA], link.fromPort, trackX, 0);
+      const toEnd   = buildPortEnd(b.box, sideB, idxB, portCount[link.toDeviceId][sideB], link.toPort,   trackX, 0);
 
-      const d = info.crossTier ? makeCrossTierPath(fromEnd.stubEnd, toEnd.stubEnd)
+      const d = info.crossTier ? makeCrossTierPath(fromEnd.stubEnd, toEnd.stubEnd, busOffset)
                                : makeSidePath(fromEnd.stubEnd, toEnd.stubEnd);
 
       edgeList.push({ link, d, fromEnd, toEnd });
@@ -565,18 +545,6 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                 height={band.bot - band.top}
                 rx={14}
                 className={`nc-fabric-tier-band is-${band.role}`}
-              />
-            ))}
-          </g>
-
-          {/* Inter-tier bus lines */}
-          <g className="nc-fabric-bus-lanes">
-            {layout.interBuses.map((bus) => (
-              <line
-                key={`bus-${bus.kind}`}
-                x1={bus.left} y1={bus.y}
-                x2={bus.right} y2={bus.y}
-                className="nc-fabric-bus-lane"
               />
             ))}
           </g>
