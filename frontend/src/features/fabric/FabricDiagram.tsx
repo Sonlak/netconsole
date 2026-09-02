@@ -244,8 +244,24 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   const { rankById, tiers: tierMeta } = inferTiers(nodes, links);
 
   // 2) Build a dagre graph. Dagre assigns ranks (top-to-bottom) via
-  //    longest-path, which correctly puts cores at rank 0, dists at
-  //    rank 1, first-hop at rank 2, second-hop at rank 3.
+  //    longest-path from a SOURCE node to a SINK node. Dagre picks
+  //    sources = nodes with NO incoming edges, sinks = nodes with NO
+  //    outgoing edges.
+  //
+  //    The DB stores edges as `local-port → remote-port` per device
+  //    (the description parser records the local port as `from`).
+  //    That means in practice an access switch's uplink to a dist is
+  //    stored as `access → dist`, and a dist's downlink to a core is
+  //    stored as `dist → core`. If we feed those edges to dagre as-is,
+  //    dagre will treat the access switch as the SOURCE (rank 0, top
+  //    of canvas) and the core as a sink (rank N, bottom) — the
+  //    pyramid flips upside-down.
+  //
+  //    Fix: use our BFS-inferred rank to **normalize** every edge so
+  //    it always points parent → child (lower rank → higher rank).
+  //    The link's from/to/port fields stay unchanged (we still need
+  //    those to label the ports correctly); only the dagre edge is
+  //    flipped when needed.
   const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
   g.setGraph({
     rankdir: 'TB',
@@ -262,7 +278,13 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   }
   for (const link of links) {
     if (!g.hasNode(link.fromDeviceId) || !g.hasNode(link.toDeviceId)) continue;
-    g.setEdge(link.fromDeviceId, link.toDeviceId, { id: link.id });
+    const fromRank = rankById.get(link.fromDeviceId) ?? 0;
+    const toRank   = rankById.get(link.toDeviceId)   ?? 0;
+    // Always point parent (lower rank) → child (higher rank). If the
+    // DB stored the link child→parent, flip it for dagre only.
+    const parentId = fromRank <= toRank ? link.fromDeviceId : link.toDeviceId;
+    const childId  = fromRank <= toRank ? link.toDeviceId   : link.fromDeviceId;
+    g.setEdge(parentId, childId, { id: link.id });
   }
 
   dagre.layout(g);
