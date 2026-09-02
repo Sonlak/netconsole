@@ -531,6 +531,11 @@ textarea.nc-code-area {
   stroke: color-mix(in srgb, #34d399 32%, transparent);
 }
 
+.nc-fabric-tier-band.is-leaf {
+  fill: color-mix(in srgb, #6ee7b7 4%, transparent);
+  stroke: color-mix(in srgb, #6ee7b7 20%, transparent);
+}
+
 /* Bus lane — horizontal routing channel between tiers */
 .nc-fabric-bus-lane {
   stroke: color-mix(in srgb, var(--nc-border) 36%, transparent);

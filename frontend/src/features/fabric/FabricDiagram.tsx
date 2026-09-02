@@ -36,6 +36,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import dagre from 'dagre';
 import { deviceStatusMeta } from '@/design/status';
 import type { DeviceStatus } from '@/types/device';
 import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types/fabric';
@@ -54,7 +55,7 @@ const PORT_STUB   = 18;
 const LABEL_OFFSET = 18;           // how far above the node midline a port label sits
 const PORT_INSET  = 18;           // ports inset from node corners along the edge
 const TIER_GAP    = 232;          // vertical gap between two tiers
-const NODE_GAP_X  = 72;           // horizontal gap between sibling nodes
+// (NODE_GAP_X was the old heuristic spacing — dagre now uses nodesep.)
 const MARGIN_X    = 60;
 const MARGIN_Y    = 110;
 const RAIL_WIDTH  = 136;
@@ -101,18 +102,30 @@ type EdgePath = {
 
 type NodeLayout = { node: FabricNode; box: Box };
 type TierLayout = { role: FabricRole; y: number; nodes: NodeLayout[] };
+type TierMeta = {
+  /** 0-based rank, top of pyramid first. */
+  rank: number;
+  /** Short label for the rail pill. */
+  label: string;
+  /** CSS tone suffix for the band and the node card class. */
+  tone: 'core' | 'dist' | 'access' | 'leaf';
+  /** Fallback FabricRole for CSS class injection. */
+  role: FabricRole;
+};
 type LayoutResult = {
   positioned:   NodeLayout[];
   totalWidth:   number;
   totalHeight:  number;
   tiers:        TierLayout[];
+  /** Rank metadata (label + tone) keyed by rank number, top first. */
+  tierMeta:     TierMeta[];
+  /** Map from device id to inferred 0-based rank. */
+  rankById:     Map<string, number>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Role ordering (top → bottom in the canvas)
 // ─────────────────────────────────────────────────────────────────────────────
-
-const TIER_ORDER: FabricRole[] = ['core', 'dist', 'access'];
 
 const ROLE_LABEL: Record<FabricRole, string> = {
   core:   'Core',
@@ -127,122 +140,258 @@ const TIER_RANK: Record<FabricRole, number> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout — 3 horizontal tiers with gravitational alignment
+// Layout — rank-inferred + dagre
+//
+// Topology can be more than 3 tiers: a typical bank has
+//   CORE  (rank 0)
+//   DIST  (rank 1)
+//   ACCESS first-hop  (rank 2 — uplinks to DIST)
+//   ACCESS second-hop (rank 3 — uplinks to ACCESS first-hop)
+//
+// We infer rank via BFS from cores so the layout stays correct when
+// devices are added/removed. Dagre handles the actual X/Y placement so
+// the result remains tidy for any N (e.g. 18 floors × 7 access each).
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildChildrenOf(nodes: FabricNode[], links: FabricLink[]): Record<string, FabricNode[]> {
+/**
+ * BFS-rank every node from any 'core' (rank 0). A node with multiple
+ * parents gets rank = max(parent.rank) + 1, so a second-hop access
+ * connected to a first-hop access lands at rank 3 (not 2). Orphan nodes
+ * (no path from any core) fall back to their role-based TIER_RANK so
+ * they still show up at a sensible vertical position.
+ */
+function inferTiers(
+  nodes: FabricNode[],
+  links: FabricLink[],
+): { rankById: Map<string, number>; tiers: TierMeta[] } {
   const byId = new Map<string, FabricNode>();
-  for (const n of nodes) byId.set(n.id, n);
-  const childrenOf: Record<string, FabricNode[]> = {};
+  nodes.forEach((n) => byId.set(n.id, n));
+
+  // Build adjacency (undirected) so BFS can travel either direction.
+  const adj = new Map<string, Set<string>>();
+  for (const n of nodes) adj.set(n.id, new Set());
   for (const link of links) {
-    const a = byId.get(link.fromDeviceId);
-    const b = byId.get(link.toDeviceId);
-    if (!a || !b) continue;
-    let parent: FabricNode, child: FabricNode;
-    if (TIER_RANK[a.role] < TIER_RANK[b.role]) { parent = a; child = b; }
-    else if (TIER_RANK[b.role] < TIER_RANK[a.role]) { parent = b; child = a; }
-    else continue;
-    (childrenOf[parent.id] ||= []).push(child);
+    if (!byId.has(link.fromDeviceId) || !byId.has(link.toDeviceId)) continue;
+    adj.get(link.fromDeviceId)!.add(link.toDeviceId);
+    adj.get(link.toDeviceId)!.add(link.fromDeviceId);
   }
-  return childrenOf;
+
+  // Seed BFS with every core. Rank grows outward from cores — a dist
+  // attached to a core gets rank 1; an access attached only to that
+  // dist gets rank 2; another access attached only to that first-hop
+  // access gets rank 3.
+  const rankById = new Map<string, number>();
+  const queue: string[] = [];
+  for (const n of nodes) {
+    if (n.role === 'core') {
+      rankById.set(n.id, 0);
+      queue.push(n.id);
+    }
+  }
+
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    const r = rankById.get(id) ?? 0;
+    for (const nb of adj.get(id) ?? []) {
+      const existing = rankById.get(nb);
+      const candidate = r + 1;
+      if (existing === undefined || candidate < existing) {
+        rankById.set(nb, candidate);
+        queue.push(nb);
+      }
+    }
+  }
+
+  // Orphans → fall back to role-based TIER_RANK so they still render.
+  for (const n of nodes) {
+    if (!rankById.has(n.id)) {
+      rankById.set(n.id, TIER_RANK[n.role]);
+    }
+  }
+
+  // Bucket nodes per rank so we know how many tier bands to draw.
+  const maxRank = nodes.length > 0 ? Math.max(...Array.from(rankById.values())) : 0;
+  const tiers: TierMeta[] = [];
+  for (let r = 0; r <= maxRank; r++) {
+    let label: string;
+    let tone: TierMeta['tone'];
+    let role: FabricRole;
+    switch (r) {
+      case 0: label = 'Core';          tone = 'core';   role = 'core';   break;
+      case 1: label = 'Distribution';  tone = 'dist';   role = 'dist';   break;
+      case 2: label = 'Access L1';    tone = 'access'; role = 'access'; break;
+      case 3: label = 'Access L2';    tone = 'leaf';   role = 'access'; break;
+      default: label = `Tier ${r}`;    tone = 'leaf';   role = 'access';
+    }
+    tiers.push({ rank: r, label, tone, role });
+  }
+  return { rankById, tiers };
 }
 
 function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
-  const buckets: Record<FabricRole, FabricNode[]> = { core: [], dist: [], access: [] };
-  for (const node of nodes) buckets[node.role].push(node);
-  for (const role of TIER_ORDER) {
-    buckets[role].sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }));
+  if (nodes.length === 0) {
+    return {
+      positioned: [],
+      totalWidth: 0,
+      totalHeight: 0,
+      tiers: [],
+      tierMeta: [],
+      rankById: new Map(),
+    };
   }
 
-  const childrenOf = buildChildrenOf(nodes, links);
+  // 1) BFS-rank every node.
+  const { rankById, tiers: tierMeta } = inferTiers(nodes, links);
 
-  // Canvas width is the WIDEST tier row plus margins. Each tier band,
-  // however, is drawn to its own bounding box (see tierBands below) so
-  // small tiers don't get a giant empty band around them.
-  const maxTierCount = Math.max(1, ...TIER_ORDER.map((r) => buckets[r].length));
-  const tierWidth = maxTierCount * NODE_W + Math.max(0, maxTierCount - 1) * NODE_GAP_X;
-  const totalWidth = MARGIN_X * 2 + tierWidth;
+  // 2) Build a dagre graph. Dagre assigns ranks (top-to-bottom) via
+  //    longest-path, which correctly puts cores at rank 0, dists at
+  //    rank 1, first-hop at rank 2, second-hop at rank 3.
+  const g = new dagre.graphlib.Graph({ multigraph: false, compound: false });
+  g.setGraph({
+    rankdir: 'TB',
+    ranksep: TIER_GAP,
+    nodesep: 28,
+    edgesep: 12,
+    marginx: MARGIN_X,
+    marginy: MARGIN_Y,
+  });
+  g.setDefaultEdgeLabel(() => ({}));
 
-  const tierY: Record<FabricRole, number> = {
-    core:   MARGIN_Y,
-    dist:   MARGIN_Y + NODE_H + TIER_GAP,
-    access: MARGIN_Y + 2 * (NODE_H + TIER_GAP),
-  };
-  const totalHeight = tierY.access + NODE_H + MARGIN_Y;
+  for (const node of nodes) {
+    g.setNode(node.id, { width: NODE_W, height: NODE_H });
+  }
+  for (const link of links) {
+    if (!g.hasNode(link.fromDeviceId) || !g.hasNode(link.toDeviceId)) continue;
+    g.setEdge(link.fromDeviceId, link.toDeviceId, { id: link.id });
+  }
 
+  dagre.layout(g);
+
+  // ── 3) Floor-based X grouping for access tiers ────────────────────────────
+  // Dagre spreads rank-2/3 nodes horizontally across the full canvas to
+  // avoid edge crossings, which makes a 90-node tier ~24 000 px wide.
+  // Instead, group by floor so all switches on the same floor are near
+  // each other. We infer a node's floor from its `floor` field.
+  //
+  // Strategy: for each unique floor, compute its centroid X from dagre's
+  // output, then re-centre every node on that floor's column. This keeps
+  // the horizontal ordering dagre chose but compresses each floor cluster
+  // to FLOOR_COL_WIDE px instead of letting it sprawl.
+  //
+  // For second-hop (rank 3): additionally stack vertically within the
+  // floor column so the 5 nodes fan out above each other.
+
+  // Collect nodes per rank for access tiers
+  const rank2Nodes: FabricNode[] = [];
+  const rank3Nodes: FabricNode[] = [];
+  for (const node of nodes) {
+    const r = rankById.get(node.id) ?? TIER_RANK[node.role];
+    if (r === 2) rank2Nodes.push(node);
+    if (r === 3) rank3Nodes.push(node);
+  }
+
+  // Build a floor→index map from rank-2 nodes (one per floor in the
+  // typical topology). Use `floor` field as the key; fall back to node id.
+  const rank2ByFloor = new Map<string, FabricNode>();
+  for (const n of rank2Nodes) rank2ByFloor.set(n.floor || n.id, n);
+  const floors = [...rank2ByFloor.keys()].sort();
+  const FLOOR_COL_WIDE = 320; // px per floor column (node 228 + gap 92)
+
+  // Centroid X per floor from dagre's rank-2 output
+  const floorX: Record<string, number> = {};
+  for (const [fl, n] of rank2ByFloor) {
+    const dn = g.node(n.id) as { x: number };
+    floorX[fl] = dn?.x ?? 0;
+  }
+
+  // Sort floors by their dagre centroid X so ordering is preserved
+  floors.sort((a, b) => (floorX[a] ?? 0) - (floorX[b] ?? 0));
+
+  // Assign a compact column index to each floor
+  const floorColIdx: Record<string, number> = {};
+  floors.forEach((fl, i) => { floorColIdx[fl] = i; });
+
+  // ── 4) Map dagre nodes to top-left boxMap with floor grouping ──────────
   const boxMap: Record<string, Box> = {};
+  const rank2Y = rank2Nodes[0] ? (g.node(rank2Nodes[0].id) as { y: number }).y : (MARGIN_Y + 2 * (NODE_H + TIER_GAP));
+  const rank3Y = rank3Nodes[0] ? (g.node(rank3Nodes[0].id) as { y: number }).y : (MARGIN_Y + 3 * (NODE_H + TIER_GAP));
+  const rank3NodeH = 68; // second-hop nodes are slightly shorter to save vertical space
 
-  // ACCESS row — evenly placed, anchored to its own width (left-aligned to MARGIN_X).
-  const accessNodes = buckets.access;
-  if (accessNodes.length > 0) {
-    const rowWidth = accessNodes.length * NODE_W + Math.max(0, accessNodes.length - 1) * NODE_GAP_X;
-    const startX = MARGIN_X + (tierWidth - rowWidth) / 2;
-    for (let i = 0; i < accessNodes.length; i++) {
-      const x = startX + i * (NODE_W + NODE_GAP_X);
-      boxMap[accessNodes[i].id] = { x, y: tierY.access, w: NODE_W, h: NODE_H };
+  for (const node of nodes) {
+    const r = rankById.get(node.id) ?? TIER_RANK[node.role];
+    const dn = g.node(node.id) as { x: number; y: number };
+    const dagreX = dn?.x ?? 0;
+    const dagreY = dn?.y ?? 0;
+
+    // Default: dagre's center coords → top-left
+    let x = dagreX - NODE_W / 2;
+    let y = dagreY - NODE_H / 2;
+    const fl = node.floor || node.id;
+
+    if (r === 2) {
+      // First-hop: compact to FLOOR_COL_WIDE column, stay on rank-2 Y
+      const col = floorColIdx[fl] ?? 0;
+      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2;
+      y = rank2Y - NODE_H / 2;
+    } else if (r === 3) {
+      // Second-hop: compact to same column, stack vertically.
+      // Group by floor: all second-hop nodes on the same floor share the
+      // same column X. Within a column, order by dagre's X relative
+      // position to preserve left-to-right order.
+      const col = floorColIdx[fl] ?? 0;
+      // Base X = column start + half column width (center of column)
+      const baseX = MARGIN_X + col * FLOOR_COL_WIDE + FLOOR_COL_WIDE / 2;
+      // Offset: use dagre's relative order within the floor to pick
+      // a fixed sub-column offset, so nodes don't all pile on the same X.
+      const shNodesInFloor = rank3Nodes.filter((n) => n.floor === node.floor);
+      const idx = shNodesInFloor.indexOf(node);
+      const SH_OFFSETS = [-60, 0, 60, -30, 30]; // 5 fixed sub-offsets for 2nd-hop nodes
+      x = baseX - NODE_W / 2 + (SH_OFFSETS[idx % SH_OFFSETS.length] ?? 0);
+      // Stack vertically within rank-3 band
+      y = rank3Y + (idx - (shNodesInFloor.length - 1) / 2) * (rank3NodeH + 8) - rank3NodeH / 2;
     }
+
+    boxMap[node.id] = { x, y: Math.max(MARGIN_Y, y), w: NODE_W, h: r === 3 ? rank3NodeH : NODE_H };
   }
 
-  // DIST and CORE — gravitational alignment
-  function placeTier(role: FabricRole, childRole: FabricRole) {
-    const tierNodes = buckets[role];
-    if (tierNodes.length === 0) return;
-
-    // Anchor the tier to the X-bbox of its children so a 2-node tier
-    // doesn't sprawl across the entire access row.
-    const childBoxes = tierNodes
-      .flatMap((n) => childrenOf[n.id] || [])
-      .map((c) => boxMap[c.id])
-      .filter(Boolean);
-    const childLeft  = childBoxes.length > 0 ? Math.min(...childBoxes.map((b) => b.x)) : MARGIN_X;
-    const childRight = childBoxes.length > 0 ? Math.max(...childBoxes.map((b) => b.x + b.w)) : MARGIN_X + tierWidth;
-    const tierLeft   = Math.max(MARGIN_X, childLeft - 80);
-    const tierRight  = Math.min(MARGIN_X + tierWidth - NODE_W, childRight - NODE_W + 80);
-
-    const items = tierNodes.map((node, idx) => {
-      const children = (childrenOf[node.id] || []).filter((c) => c.role === childRole);
-      let target: number;
-      if (children.length > 0) {
-        target = children.reduce((acc, c) => acc + (boxMap[c.id]?.x ?? 0), 0) / children.length;
-      } else {
-        target = (tierLeft + tierRight) / 2;
-      }
-      return { id: node.id, target, idx };
-    });
-
-    items.sort((a, b) => a.target - b.target || a.idx - b.idx);
-
-    // Wider same-tier gap so the link between two sibling nodes is
-    // clearly visible. Each card is 228 px wide; the gap-to-the-link is
-    // (spacing - NODE_W) / 2 either side of center, so spacing = 472 →
-    // ~122 px clear space between two same-tier cards before the line
-    // begins.
-    const spacing = NODE_W + NODE_GAP_X + 172;
-    const n = items.length;
-    for (let i = 0; i < n; i++) {
-      const offset = (i - (n - 1) / 2) * spacing;
-      let x = items[i].target + offset;
-      x = Math.max(MARGIN_X, Math.min(MARGIN_X + tierWidth - NODE_W, x));
-      boxMap[items[i].id] = { x, y: tierY[role], w: NODE_W, h: NODE_H };
-    }
+  // 4) Group positioned nodes by rank for the tier rail and bands.
+  const tierNodes: Record<number, NodeLayout[]> = {};
+  for (const node of nodes) {
+    const r = rankById.get(node.id) ?? 0;
+    (tierNodes[r] ||= []).push({ node, box: boxMap[node.id] });
+  }
+  // Sort each tier left-to-right so the rail pill label order is stable.
+  for (const r in tierNodes) {
+    tierNodes[r].sort((a, b) => a.box.x - b.box.x);
   }
 
-  placeTier('dist', 'access');
-  placeTier('core', 'dist');
+  const tierLayouts: TierLayout[] = tierMeta.map((t) => ({
+    role: ('access' as FabricRole), // legacy field — unused now that we use rank
+    y: tierNodes[t.rank]?.[0]?.box.y ?? (MARGIN_Y + t.rank * (NODE_H + TIER_GAP)),
+    nodes: tierNodes[t.rank] ?? [],
+  }));
 
   const positioned: NodeLayout[] = [];
-  const tiers: TierLayout[] = [];
-  for (const role of TIER_ORDER) {
-    const tierNodes = buckets[role];
-    const tierLayout: NodeLayout[] = tierNodes.map((node) => ({
-      node,
-      box: boxMap[node.id],
-    }));
-    tiers.push({ role, y: tierY[role], nodes: tierLayout });
-    positioned.push(...tierLayout);
-  }
+  for (const r in tierNodes) positioned.push(...tierNodes[r]);
 
-  return { positioned, totalWidth, totalHeight, tiers };
+  // Compute canvas bounding box from the actual boxMap extents so
+  // pan/zoom and tier bands are accurate.
+  const allBoxes = Object.values(boxMap);
+  const totalWidth  = allBoxes.length > 0
+    ? Math.max(...allBoxes.map((b) => b.x + b.w)) + MARGIN_X
+    : 0;
+  const totalHeight = allBoxes.length > 0
+    ? Math.max(...allBoxes.map((b) => b.y + b.h)) + MARGIN_Y
+    : 0;
+
+  return {
+    positioned,
+    totalWidth,
+    totalHeight,
+    tiers: tierLayouts,
+    tierMeta,
+    rankById,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -316,12 +465,8 @@ function buildPortEnd(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Side picker for cross-tier / same-tier links
-// ─────────────────────────────────────────────────────────────────────────────
-
-function crossTierSides(fromRole: FabricRole, toRole: FabricRole): { fromSide: Anchor; toSide: Anchor } | null {
-  const fr = TIER_RANK[fromRole];
-  const tr = TIER_RANK[toRole];
+// Side picker for cross-tier / same-tier links.
+function crossTierSides(fr: number, tr: number): { fromSide: Anchor; toSide: Anchor } | null {
   if (fr === tr) return null;
   if (fr < tr) return { fromSide: 'bottom', toSide: 'top' };
   return { fromSide: 'top', toSide: 'bottom' };
@@ -413,14 +558,19 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     const idx: Record<string, NodeLayout> = {};
     for (const item of layout.positioned) idx[item.node.id] = item;
 
-    // Step 1: side pick + stub classification for every link
+    // Step 1: side pick + stub classification for every link.
+    // Use the BFS-inferred rank (not the role-based rank) so a
+    // second-hop access uses top/bottom stubs relative to its first-hop
+    // parent, not relative to dist.
     type StubInfo = { fromSide: Anchor; toSide: Anchor; crossTier: boolean };
     const stubs: Record<string, StubInfo> = {};
     for (const link of links) {
       const a = idx[link.fromDeviceId];
       const b = idx[link.toDeviceId];
       if (!a || !b) continue;
-      const sides = crossTierSides(a.node.role, b.node.role);
+      const fr = layout.rankById.get(a.node.id) ?? TIER_RANK[a.node.role];
+      const tr = layout.rankById.get(b.node.id) ?? TIER_RANK[b.node.role];
+      const sides = crossTierSides(fr, tr);
       if (sides) {
         stubs[link.id] = { fromSide: sides.fromSide, toSide: sides.toSide, crossTier: true };
       } else {
@@ -561,31 +711,42 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     return <div className="nc-fabric-empty">No devices to plot.</div>;
   }
 
-  // Tier rail labels
-  const tierRail: { label: string; tone: FabricRole; y: number }[] = layout.tiers
-    .filter((t) => t.nodes.length > 0)
-    .map((t) => ({ label: ROLE_LABEL[t.role].toUpperCase(), tone: t.role, y: t.y + NODE_H / 2 }));
+  // Tier rail labels — driven by rank-based tierMeta now (5+ tiers
+  // possible: Core, Distribution, Access L1, Access L2, ...).
+  const tierRail: { label: string; tone: 'core' | 'dist' | 'access' | 'leaf'; y: number }[] =
+    layout.tierMeta
+      .filter((t) => (layout.tiers.find((tl) => tl.y === t.rank)?.nodes.length ?? 0) > 0)
+      .map((t) => {
+        const tier = layout.tiers[t.rank];
+        return {
+          label: t.label.toUpperCase(),
+          tone: t.tone,
+          y: (tier?.y ?? MARGIN_Y + t.rank * (NODE_H + TIER_GAP)) + NODE_H / 2,
+        };
+      });
 
   // Tier background bands — each band hugs its OWN nodes' X-bbox plus a
   // small padding. Empty space between tiers stays the canvas background,
-  // not part of any band.
-  const tierBands = layout.tiers
-    .filter((t) => t.nodes.length > 0)
+  // not part of any band. Uses tierMeta.tone for the CSS class.
+  const tierBands = layout.tierMeta
     .map((t) => {
-      const xs = t.nodes.map((n) => n.box.x);
-      const xe = t.nodes.map((n) => n.box.x + n.box.w);
+      const tier = layout.tiers[t.rank];
+      if (!tier || tier.nodes.length === 0) return null;
+      const xs = tier.nodes.map((n) => n.box.x);
+      const xe = tier.nodes.map((n) => n.box.x + n.box.w);
       const xLeft  = Math.min(...xs);
       const xRight = Math.max(...xe);
       const PAD_X = 24;
       const PAD_Y = 18;
       return {
-        role:  t.role,
+        tone: t.tone,
         left:  xLeft - PAD_X,
         right: xRight + PAD_X,
-        top:   t.y - PAD_Y,
-        bot:   t.y + NODE_H + PAD_Y,
+        top:   tier.y - PAD_Y,
+        bot:   tier.y + NODE_H + PAD_Y,
       };
-    });
+    })
+    .filter((b): b is NonNullable<typeof b> => b !== null);
 
   return (
     <div
@@ -641,12 +802,12 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
           <g className="nc-fabric-tier-bands">
             {tierBands.map((band) => (
               <rect
-                key={`tier-band-${band.role}`}
+                key={`tier-band-${band.tone}`}
                 x={band.left} y={band.top}
                 width={band.right - band.left}
                 height={band.bot - band.top}
                 rx={14}
-                className={`nc-fabric-tier-band is-${band.role}`}
+                className={`nc-fabric-tier-band is-${band.tone}`}
               />
             ))}
           </g>
