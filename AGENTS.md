@@ -385,7 +385,33 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
   `acc07d57…` (VPS deploy + login flow).
 - **Not yet committed** — file created locally, user will commit + push.
 
-### 2026-09-02 19:11 — FabricDiagram column layout + fix broken deploy pipeline
+### 2026-09-02 19:34 — FabricDiagram: 3-tier pyramid layout (Core/Dist/Access)
+- User said the column-by-floor layout was wrong: "F1/F2/F3 ngang hàng nhau"
+  was misinterpreted. The real ask is the classic 3-tier pyramid — Core on top,
+  Distribution in the middle, Access at the bottom (horizontally aligned).
+- Rewrote `frontend/src/features/fabric/FabricDiagram.tsx`:
+  - Replaced `groupByFloor` buckets with `role` buckets.
+  - Each role is one horizontal row (`TIER_ORDER = ['core','dist','access']`).
+  - Width is sized to the widest tier; smaller tiers center within that band.
+  - `crossTierSides()` picks `bottom→top` (or `top→bottom`) for cross-tier
+    links and falls back to side routing for same-tier links.
+  - `makeCrossTierPath` uses a mid-Y bus line so multiple parallel links from
+    different sources fan out cleanly before reaching their targets.
+  - Parallel links get `TRACK_STEP_X`/`TRACK_STEP_Y` offsets.
+- Added `.nc-fabric-tier-band` CSS variants (`is-core` blue, `is-dist` purple,
+  `is-access` green) so each tier has a faint coloured background band.
+- Build clean (`tsc -b` + `npm run build` both exit 0). Commit `99d431a`.
+- Pushed to main → CI green, Deploy green. Live at
+  http://42.119.165.109:8443/fabric. Verified in browser: 8 devices × 13 links
+  render as Core/Dist/Access pyramid with access switches horizontally aligned.
+- **Lesson:** the column-by-floor design treated each floor as a separate
+  physical column; what the user wanted was the logical 3-tier hierarchy
+  regardless of which floor each device happens to sit on. Layout language
+  should always start from "what role does this device play" not "where is it
+  located".
+- **Next time:** if user adds more access floors, consider auto-spacing the
+  access tier so the row gets wider naturally (already handled by
+  `maxTierCount`).
 - User: "F1/F2/F3 ngang hàng nhau, không phải kiểu vậy".
 - Rewrote `frontend/src/features/fabric/FabricDiagram.tsx` to use
   **columns-by-floor**: one column per floor (F1, F2, F3, F6…), nodes
@@ -409,3 +435,5 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
   `deploy.yml` rsync excludes. `tsc -b` (used by `npm run build`) is
   stricter than `tsc --noEmit`, so CI's advisory typecheck can let
   module-resolution breaks slip through.
+
+### 2026-09-02 19:34 — FabricDiagram: 3-tier pyramid layout (Core/Dist/Access)
