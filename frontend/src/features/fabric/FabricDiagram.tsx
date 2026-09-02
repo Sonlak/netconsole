@@ -514,23 +514,48 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     };
   }
 
-  // ── Centering pass: center the ENTIRE graph so all tiers share ONE ──
-  // common centre axis. Without this, dagre centers rank 0 (cores) at its
-  // own canvas centre and rank 1 (dists) at ITS own canvas centre, which
-  // pushes the dist tier to the outer edges of the core tier. By computing
-  // the overall graph bounding box and shifting every node by the same
-  // delta, every tier sits on the same vertical axis — a balanced pyramid.
-  const graphBoxes = Object.values(boxMap);
-  if (graphBoxes.length > 0) {
-    const graphLeft  = Math.min(...graphBoxes.map((b) => b.x));
-    const graphRight = Math.max(...graphBoxes.map((b) => b.x + b.w));
-    const graphCenterX = (graphLeft + graphRight) / 2;
-    // True canvas centre is the midpoint of the actual graph extent, not
-    // N * FLOOR_COL_WIDE (which can be wider or narrower than the graph).
-    const canvasCenterX = (graphLeft + graphRight) / 2;
-    const shift = canvasCenterX - graphCenterX;
-    for (const id of Object.keys(boxMap)) {
-      boxMap[id].x += shift;
+  // ── Centering pass: every tier shares ONE vertical axis = the centre ──
+  // of the widest tier (typically the access tier with the most nodes).
+  // Without this, dagre places each tier in its own local coordinate
+  // system and the tiers drift relative to each other — the DIST band
+  // sits left of the CORE band, the ACCESS band sits left of DIST, etc.
+  // By computing each tier's bounding box, finding the widest tier's
+  // centre, and shifting every node so its tier-centre matches, all
+  // tiers end up on the same vertical axis — a balanced pyramid.
+  const allBoxes = Object.entries(boxMap);
+  if (allBoxes.length > 0) {
+    // Compute per-tier bounding box + centre
+    const tierInfo = new Map<number, { left: number; right: number; centre: number; width: number }>();
+    for (const [id, box] of allBoxes) {
+      const r = rankById.get(id) ?? 0;
+      const cur = tierInfo.get(r);
+      const boxLeft  = box.x;
+      const boxRight = box.x + box.w;
+      if (!cur) {
+        tierInfo.set(r, { left: boxLeft, right: boxRight, centre: (boxLeft + boxRight) / 2, width: boxRight - boxLeft });
+      } else {
+        cur.left  = Math.min(cur.left, boxLeft);
+        cur.right = Math.max(cur.right, boxRight);
+        cur.centre = (cur.left + cur.right) / 2;
+        cur.width = cur.right - cur.left;
+      }
+    }
+    // Pick the widest tier as the axis reference.
+    let axisX = 0;
+    let maxWidth = 0;
+    for (const info of tierInfo.values()) {
+      if (info.width > maxWidth) {
+        maxWidth = info.width;
+        axisX = info.centre;
+      }
+    }
+    // Shift every tier so its centre = axisX.
+    for (const [id, box] of allBoxes) {
+      const r = rankById.get(id) ?? 0;
+      const tc = tierInfo.get(r);
+      if (!tc) continue;
+      const shift = axisX - tc.centre;
+      box.x += shift;
     }
   }
 
