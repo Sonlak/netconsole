@@ -1,30 +1,42 @@
 /**
  * FabricDiagram — Network topology visualization.
  *
- * Layout model: classic 3-tier pyramid.
+ * Layout model: classic 3-tier pyramid with **gravitational alignment**.
  *
  *   ┌──────────────────────────────────────────────────────────┐
- *   │   CORE  ───────────────────────────────────────────────  │  ← y = MARGIN_Y
- *   │                                                          │
+ *   │   CORE  ───────────────────────────────────────────────  │
  *   │       [CORE-01]                       [CORE-02]         │
- *   │            │                              │              │
- *   │            └────────┬─────────────────────┘              │  ← inter-tier bus A
- *   │                     │                                    │
- *   │            ┌────────┼────────┐                           │
- *   │            ▼        ▼        ▼                           │
- *   │   DIST  [DS-01]   [DS-02]   [DS-03]   [DS-04]            │  ← y = MARGIN_Y + NODE_H + GAP
- *   │            │        │        │                           │
- *   │            └────────┼────────┴──────────┐                │  ← inter-tier bus B
- *   │                     │                   │                │
- *   │            ┌────────┼────────┐          │                │
- *   │            ▼        ▼        ▼          ▼                │
- *   │   ACCESS [AS-01] [AS-02] [AS-03] [AS-04] [AS-05] [AS-06]│  ← y = MARGIN_Y + 2*(NODE_H + GAP)
+ *   │            │   ╲                    ╱   │              │  ← L3 uplinks (orange)
+ *   │            │    ╲──────────────────╱    │              │
+ *   │            └─────┼────────────────┼─────┘              │  ← inter-tier bus
+ *   │                  │                │                    │
+ *   │            ┌─────┼────────────────┼─────┐              │
+ *   │            ▼     ▼                ▼     ▼              │  ← trunk downlinks (blue)
+ *   │   DIST  [DS-01]    [DS-02]                             │
+ *   │            │  ╲       ╱  │                            │
+ *   │            │   ╲─────╱   │                            │  ← inter-tier bus
+ *   │            │    ╱───╲    │                            │
+ *   │            ▼   ╱     ╲   ▼                            │
+ *   │   ACCESS  [F1]  [F2]  [F3]  [F3-AS-02]                │
  *   └──────────────────────────────────────────────────────────┘
  *
- * Each role forms its own horizontal row, evenly distributed.
- * Cross-tier links use orthogonal paths with a mid-Y bus that
- *  aligns all the lines landing at the same row. Parallel links
- *  get a small x-track offset so they fan out cleanly.
+ * Each tier (access / dist / core) is laid out **gravitationally**:
+ *  - Access is evenly distributed across the bottom row.
+ *  - Each dist is centered above its access children (with symmetric
+ *    spread when several dists share the same centroid, which happens
+ *    in a full-mesh).
+ *  - Each core is centered above its dist children — same scheme — so
+ *    cores and dists end up in the same vertical columns and primary
+ *    uplinks read as straight vertical lines.
+ *
+ * Edge routing:
+ *  - Each source's outgoing cross-tier links share a **contiguous block
+ *    of busY slots**, and different sources get different blocks. So
+ *    links from different sources never overlap on the same bus line
+ *    even when the topology is full-mesh.
+ *  - Within a source, links are sorted by target X so the source's
+ *    ports fan out from left (closest target) to right (farthest target)
+ *    — matching the physical wiring intuition.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -39,14 +51,13 @@ import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types
 
 const NODE_W = 228;
 const NODE_H = 96;
-const PORT_STUB = 46;             // stub length from node edge into the bus
-const TIER_GAP = 188;             // vertical gap between two tiers (extra room for fan-out)
+const PORT_STUB = 42;             // stub length from node edge into the bus
+const TIER_GAP = 232;             // vertical gap between two tiers (extra room for per-source fan-out)
 const NODE_GAP_X = 72;            // horizontal gap between sibling nodes in same tier
 const MARGIN_X = 60;
 const MARGIN_Y = 110;
 const RAIL_WIDTH = 136;
-const TRACK_STEP_X = 18;          // x-offset for parallel links at stub level
-const TRACK_STEP_BUS = 26;        // y-offset per-link for cross-tier bus level (separates parallel links)
+const TRACK_STEP_BUS = 18;        // y-spacing between adjacent bus lanes — keeps lines from different sources on distinct busY rows
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk:   '#4f9cf9',
@@ -126,10 +137,31 @@ const TIER_RANK: Record<FabricRole, number> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout — 3 horizontal tiers
+// Layout — 3 horizontal tiers with gravitational alignment
 // ─────────────────────────────────────────────────────────────────────────────
 
-function layoutNodes(nodes: FabricNode[]): LayoutResult {
+/**
+ * Build a map: parentNodeId -> [childNode] where "parent" lives in a
+ * higher tier (smaller rank) than "child". Same-tier links are dropped.
+ */
+function buildChildrenOf(nodes: FabricNode[], links: FabricLink[]): Record<string, FabricNode[]> {
+  const byId = new Map<string, FabricNode>();
+  for (const n of nodes) byId.set(n.id, n);
+  const childrenOf: Record<string, FabricNode[]> = {};
+  for (const link of links) {
+    const a = byId.get(link.fromDeviceId);
+    const b = byId.get(link.toDeviceId);
+    if (!a || !b) continue;
+    let parent: FabricNode, child: FabricNode;
+    if (TIER_RANK[a.role] < TIER_RANK[b.role]) { parent = a; child = b; }
+    else if (TIER_RANK[b.role] < TIER_RANK[a.role]) { parent = b; child = a; }
+    else continue;
+    (childrenOf[parent.id] ||= []).push(child);
+  }
+  return childrenOf;
+}
+
+function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   // Bucket by role
   const buckets: Record<FabricRole, FabricNode[]> = { core: [], dist: [], access: [] };
   for (const node of nodes) buckets[node.role].push(node);
@@ -137,41 +169,95 @@ function layoutNodes(nodes: FabricNode[]): LayoutResult {
     buckets[role].sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }));
   }
 
+  const childrenOf = buildChildrenOf(nodes, links);
+
+  // Canvas width — based on the widest tier
   const maxTierCount = Math.max(1, ...TIER_ORDER.map((r) => buckets[r].length));
   const tierWidth = maxTierCount * NODE_W + Math.max(0, maxTierCount - 1) * NODE_GAP_X;
   const totalWidth = MARGIN_X * 2 + tierWidth;
 
-  const positioned: NodeLayout[] = [];
-  const tiers: TierLayout[] = [];
+  // Tier Y positions
+  const tierY: Record<FabricRole, number> = {
+    core:   MARGIN_Y,
+    dist:   MARGIN_Y + NODE_H + TIER_GAP,
+    access: MARGIN_Y + 2 * (NODE_H + TIER_GAP),
+  };
+  const totalHeight = tierY.access + NODE_H + MARGIN_Y;
 
-  let y = MARGIN_Y;
-  for (const role of TIER_ORDER) {
-    const tierNodes = buckets[role];
-    const count = tierNodes.length;
+  const boxMap: Record<string, Box> = {};
 
-    if (count === 0) {
-      tiers.push({ role, y, nodes: [] });
-      y += NODE_H + TIER_GAP;
-      continue;
-    }
-
-    const rowWidth = count * NODE_W + (count - 1) * NODE_GAP_X;
-    const startX = MARGIN_X + Math.max(0, (tierWidth - rowWidth) / 2);
-
-    const placed: NodeLayout[] = [];
-    for (let i = 0; i < count; i++) {
+  // ── Step 1: place ACCESS evenly across the canvas ────────────────────────────
+  const accessNodes = buckets.access;
+  if (accessNodes.length > 0) {
+    const rowWidth = accessNodes.length * NODE_W + Math.max(0, accessNodes.length - 1) * NODE_GAP_X;
+    const startX = MARGIN_X + (tierWidth - rowWidth) / 2;
+    for (let i = 0; i < accessNodes.length; i++) {
       const x = startX + i * (NODE_W + NODE_GAP_X);
-      const box: Box = { x, y, w: NODE_W, h: NODE_H };
-      const layout: NodeLayout = { node: tierNodes[i], box };
-      positioned.push(layout);
-      placed.push(layout);
+      boxMap[accessNodes[i].id] = { x, y: tierY.access, w: NODE_W, h: NODE_H };
     }
-
-    tiers.push({ role, y, nodes: placed });
-    y += NODE_H + TIER_GAP;
   }
 
-  const totalHeight = y - TIER_GAP + MARGIN_Y;
+  // ── Step 2: place DIST and CORE gravitationally ──────────────────────────────
+  //
+  // Each parent is positioned at the centroid of its children in the tier
+  // below. When several parents share the same centroid (full-mesh case),
+  // they are spread out symmetrically around that centroid. Because the
+  // core tier uses the dist tier's positions as its children, cores land
+  // in the same vertical columns as the dists — primary uplinks read as
+  // straight vertical lines, only the cross-uplinks cross.
+  function placeTier(role: FabricRole, childRole: FabricRole) {
+    const tierNodes = buckets[role];
+    if (tierNodes.length === 0) return;
+
+    // Compute target X = centroid of children. If a parent has no
+    // children in the target tier, fall back to even distribution
+    // across the canvas.
+    const items = tierNodes.map((node, idx) => {
+      const children = (childrenOf[node.id] || []).filter((c) => c.role === childRole);
+      let target: number;
+      if (children.length > 0) {
+        target = children.reduce((acc, c) => acc + (boxMap[c.id]?.x ?? 0), 0) / children.length;
+      } else {
+        const n = tierNodes.length;
+        target = n === 1
+          ? MARGIN_X + (tierWidth - NODE_W) / 2
+          : MARGIN_X + idx * (tierWidth - NODE_W) / (n - 1);
+      }
+      return { id: node.id, target, idx };
+    });
+
+    // Sort left-to-right by target. The secondary sort by `idx`
+    // preserves the bucket order when targets tie (full-mesh).
+    items.sort((a, b) => a.target - b.target || a.idx - b.idx);
+
+    // Symmetric spread around each node's target so the row reads as a
+    // regular sequence. Spacing is wider than a single NODE_W+NODE_GAP_X
+    // so primary uplinks don't bunch up over their target.
+    const spacing = NODE_W + NODE_GAP_X + 24;
+    const n = items.length;
+    for (let i = 0; i < n; i++) {
+      const offset = (i - (n - 1) / 2) * spacing;
+      let x = items[i].target + offset;
+      x = Math.max(MARGIN_X, Math.min(MARGIN_X + tierWidth - NODE_W, x));
+      boxMap[items[i].id] = { x, y: tierY[role], w: NODE_W, h: NODE_H };
+    }
+  }
+
+  placeTier('dist', 'access');
+  placeTier('core', 'dist');
+
+  // Build result
+  const positioned: NodeLayout[] = [];
+  const tiers: TierLayout[] = [];
+  for (const role of TIER_ORDER) {
+    const tierNodes = buckets[role];
+    const tierLayout: NodeLayout[] = tierNodes.map((node) => ({
+      node,
+      box: boxMap[node.id],
+    }));
+    tiers.push({ role, y: tierY[role], nodes: tierLayout });
+    positioned.push(...tierLayout);
+  }
 
   return { positioned, totalWidth, totalHeight, tiers };
 }
@@ -337,29 +423,95 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
   const [viewport,    setViewport]    = useState({ x: 0, y: 0, scale: 1 });
   const [hoverEdge,    setHoverEdge]  = useState<string | null>(null);
 
-  const layout = useMemo(() => layoutNodes(nodes), [nodes]);
+  const layout = useMemo(() => layoutNodes(nodes, links), [nodes, links]);
 
   // ── Build edges ────────────────────────────────────────────────────────────
   const edges = useMemo(() => {
     const idx: Record<string, NodeLayout> = {};
     for (const item of layout.positioned) idx[item.node.id] = item;
 
-    // Per-SOURCE indexing: a source's links fan out vertically so they don't
-    // share a horizontal bus segment. Per-PAIR indexing (the previous logic)
-    // collapsed every parallel link onto the same busY → looked bundled.
+    // Step 1: group links by source, then sort each source's outgoing
+    // links by target X (left → right). Sorting by target X makes the
+    // source's ports fan out naturally: port 0 (leftmost on the node) is
+    // the link that goes to the leftmost target, etc. Without this sort
+    // ports get filled in link-list order which can produce crossings on
+    // a full-mesh where DS-02 → F1 ends up using DS-02's middle port.
     const linksBySource: Record<string, FabricLink[]> = {};
     for (const link of links) {
       (linksBySource[link.fromDeviceId] ||= []).push(link);
     }
-    const sourceOrder: Record<string, number> = {};
-    const sourceCount: Record<string, number> = {};
-    Object.entries(linksBySource).forEach(([src, bucket]) => {
-      sourceCount[src] = bucket.length;
-      bucket.forEach((link, i) => { sourceOrder[link.id] = i; });
-    });
+    for (const srcId in linksBySource) {
+      linksBySource[srcId].sort((a, b) => {
+        const aBox = idx[a.toDeviceId]?.box;
+        const bBox = idx[b.toDeviceId]?.box;
+        if (!aBox || !bBox) return 0;
+        return aBox.x - bBox.x;
+      });
+    }
 
-    // Determine per-node, per-side port count. For cross-tier links we use
-    // top/bottom edges; for same-tier links, left/right.
+    // Step 2: classify each link by (source, direction). 'up' means the
+    // link crosses from a lower tier to a higher tier (e.g. dist→core);
+    // 'down' means the opposite (dist→access).
+    type Direction = 'up' | 'down';
+    type SourceDir = { srcId: string; direction: Direction; count: number };
+    function linkDirection(link: FabricLink): Direction | null {
+      const a = idx[link.fromDeviceId];
+      const b = idx[link.toDeviceId];
+      if (!a || !b) return null;
+      if (a.node.role === b.node.role) return null;
+      return TIER_RANK[b.node.role] > TIER_RANK[a.node.role] ? 'up' : 'down';
+    }
+
+    const sourceDirs: SourceDir[] = [];
+    const sourceDirCount: Record<string, number> = {};
+    for (const srcId in linksBySource) {
+      let upCount = 0, downCount = 0;
+      for (const link of linksBySource[srcId]) {
+        const dir = linkDirection(link);
+        if (dir === 'up') upCount++;
+        else if (dir === 'down') downCount++;
+      }
+      if (downCount > 0) {
+        const key = `${srcId}:down`;
+        sourceDirs.push({ srcId, direction: 'down', count: downCount });
+        sourceDirCount[key] = downCount;
+      }
+      if (upCount > 0) {
+        const key = `${srcId}:up`;
+        sourceDirs.push({ srcId, direction: 'up', count: upCount });
+        sourceDirCount[key] = upCount;
+      }
+    }
+
+    // Step 3: assign each (source, direction) a contiguous slice of bus
+    // indices. Different sources get different slices, so lines from
+    // different sources never share a busY row — that's how the diagram
+    // stays readable when the topology is full-mesh.
+    const totalCrossLinks = sourceDirs.reduce((acc, sd) => acc + sd.count, 0);
+    const halfTotal = (totalCrossLinks - 1) / 2;
+    const sourceDirBase: Record<string, number> = {};
+    {
+      let cursor = -halfTotal;
+      for (const sd of sourceDirs) {
+        const key = `${sd.srcId}:${sd.direction}`;
+        sourceDirBase[key] = cursor;
+        cursor += sd.count;
+      }
+    }
+
+    const linkBusOffset: Record<string, number> = {};
+    for (const sd of sourceDirs) {
+      const key = `${sd.srcId}:${sd.direction}`;
+      const filtered = linksBySource[sd.srcId].filter((l) => linkDirection(l) === sd.direction);
+      filtered.forEach((link, i) => {
+        linkBusOffset[link.id] = (sourceDirBase[key] + i) * TRACK_STEP_BUS;
+      });
+    }
+
+    // Step 4: count and assign port indices per (node, side). The
+    // source side uses the position of the link within the source's
+    // already-sorted outgoing list (filtered by side) so ports fan
+    // out by target X.
     type PortMap = Record<string, Record<Anchor, number>>;
     const portCount: PortMap = {};
     for (const item of layout.positioned) {
@@ -390,9 +542,21 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       portCount[link.toDeviceId][toSide]++;
     }
 
-    const portIdx: PortMap = {};
+    // For the source side, use the position in the source's sorted
+    // outgoing list so ports fan left-to-right by target X. The
+    // destination side keeps the natural order — it doesn't matter
+    // visually because both directions of a link converge on the
+    // target.
+    function sourcePortIdx(link: FabricLink, side: Anchor): number {
+      const srcLinks = linksBySource[link.fromDeviceId] || [];
+      const onSide = srcLinks.filter((l) => stubs[l.id]?.fromSide === side);
+      const idxOnSide = onSide.indexOf(link);
+      return idxOnSide < 0 ? 0 : idxOnSide;
+    }
+
+    const portIdxTarget: PortMap = {};
     for (const item of layout.positioned) {
-      portIdx[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
+      portIdxTarget[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
     }
 
     const edgeList: EdgePath[] = [];
@@ -404,14 +568,12 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       const info   = stubs[link.id]!;
       const sideA  = info.fromSide;
       const sideB  = info.toSide;
-      const order  = sourceOrder[link.id];
-      const total  = sourceCount[link.fromDeviceId];
-      // Centred fan-out around 0
-      const trackX = (order - (total - 1) / 2) * TRACK_STEP_X;
-      const busOffset = info.crossTier ? (order - (total - 1) / 2) * TRACK_STEP_BUS : 0;
 
-      const idxA = portIdx[link.fromDeviceId][sideA]++;
-      const idxB = portIdx[link.toDeviceId][sideB]++;
+      const idxA = sourcePortIdx(link, sideA);
+      const idxB = portIdxTarget[link.toDeviceId][sideB]++;
+
+      const trackX = 0;
+      const busOffset = info.crossTier ? (linkBusOffset[link.id] ?? 0) : 0;
 
       const fromEnd = buildPortEnd(a.box, sideA, idxA, portCount[link.fromDeviceId][sideA], link.fromPort, trackX, 0);
       const toEnd   = buildPortEnd(b.box, sideB, idxB, portCount[link.toDeviceId][sideB], link.toPort,   trackX, 0);
