@@ -269,6 +269,19 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
 7. **Worker auth token** is a long-lived JWT committed in
    `docker-compose.app.yml` for the `worker → backend` link. Treat as a
    secret; rotate via `scripts/rotate_secrets.sh`.
+8. **Dagre rank ignores the `rank` node field** — `frontend/src/features/fabric/FabricDiagram.tsx`
+   derives rank via BFS only as *labels/tone*; dagre always recomputes
+   ranks from edge direction. So **edge direction in DB must be
+   parent→child (higher-tier → lower-tier)**. If a link is stored as
+   `access → core`, the access will end up at rank 0 (top of the canvas)
+   and the rest of the layout collapses. Normalize direction in the
+   FabricTopology loader if this happens.
+9. **`FabricNode.floor` must be set on every access device** — the floor
+   grouping in `layoutNodes` keys columns by `node.floor`. A missing
+   `floor` falls back to `node.id`, which gets its own column and looks
+   like a layout bug. If you ever see a stray access node sitting alone
+   at the right edge of the canvas, the device record is missing a
+   `floor` value.
 
 ---
 
@@ -282,7 +295,7 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
 | Seed admin user | `backend/prisma/seed.ts` |
 | Job dispatcher | `worker/main.py` (or `worker/app.py`) |
 | Device status polling | `backend/src/services/pingScheduler.ts` |
-| Fabric topology UI | `frontend/src/features/fabric/FabricDiagram.tsx`, `frontend/src/pages/FabricPage.tsx` |
+| Fabric topology UI | `frontend/src/features/fabric/FabricDiagram.tsx` (dagre + BFS rank — see Session Log 2026-09-02 22:06), `frontend/src/pages/FabricPage.tsx`, layout sanity test: `frontend/sanity.mjs` |
 | Ant Design theme bridge | `frontend/src/components/antd-bridge/` + `frontend/src/styles/antd-bridge.css` |
 | Containerlab topology | `lab/*.clab.yml` |
 | Kea DHCP config | `lab/kea/kea-dhcp4.conf` (templated via env) |
@@ -463,3 +476,69 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
 - **Next:** if user wants a cleaner result for full-mesh, consider grouping
   dist→access links by "primary" child (heuristic: closest access by X) and
   showing the rest as dashed backup links. Or use dagre.js for a proper DAG layout.
+
+### 2026-09-02 22:06 — FabricDiagram: dagre + BFS rank-inference (scales to 18 floors × 7 access)
+- User reported the LAB's *real* topology is bigger than what the gravitational
+  layout was designed for: **2 cores + 4 dists + 18 floors × (2 first-hop +
+  5 second-hop) = 132 devices / ~260 links**. Each real floor has 2 first-hop
+  access switches that uplink to 2 dists, and 5 second-hop access switches
+  that daisy-chain (tail) up to those 2 first-hop. So the layout is now
+  **5 logical tiers, not 3**: Core → Distribution → Access L1 → Access L2.
+- The 3-tier heuristic could not handle this. Decision: replace the heuristic
+  with a real DAG layout using **dagre** + **BFS rank inference**.
+- `frontend/src/features/fabric/FabricDiagram.tsx` rewrite:
+  1. **`inferTiers(nodes, links)`** — BFS from every core (rank 0). For each
+     other node, rank = min(parent rank) + 1 (i.e. *shortest* path from a core).
+     Orphan nodes fall back to role-based `TIER_RANK`. Returns
+     `{ rankById: Map<id, number>, tiers: TierMeta[] }`.
+  2. **`layoutNodes(nodes, links)`** — builds a `dagre.graphlib.Graph`,
+     sets `rankdir: 'TB'`, `ranksep: TIER_GAP`, `nodesep: 28`. Dagre's
+     longest-path ranker assigns each node to the correct tier based on
+     edge direction (parent→child). The returned center coords are mapped
+     to top-left `boxMap`.
+  3. **Floor grouping** — dagre alone spreads rank-2/3 nodes across the
+     full canvas (90 second-hop → ~24 000 px wide). After dagre lays out
+     the graph, group access nodes by `device.floor`, sort floors by their
+     dagre centroid X, and assign each floor a compact column of
+     `FLOOR_COL_WIDE = 320` px. First-hop stays on a single X; second-hop
+     stacks vertically within the column with cascading sub-offsets
+     (`SH_OFFSETS = [-60, 0, 60, -30, 30]`) so 5 nodes fan out cleanly.
+  4. **Cross-tier side picking** now uses BFS-inferred rank (so an
+     Access L2 node uses `top` stub for uplink to its first-hop parent,
+     not relative to dist). Port placement code unchanged.
+  5. **`TierMeta`** replaced `TierLayout.role`. Tones: `core`, `dist`,
+     `access`, `leaf`. Labels: Core, Distribution, Access L1, Access L2.
+- `frontend/package.json` — added `dagre@^0.8.5` and `@types/dagre`.
+- `frontend/src/styles/antd-bridge.css` — added `.nc-fabric-tier-band.is-leaf`
+  (lighter green tone for Access L2 band).
+- New `frontend/sanity.mjs` (committed): offline simulator for the
+  18-floor topology, prints canvas dimensions and per-floor X positions.
+  Verified locally:
+  - 132 nodes / 260 links → **canvas 15 224 × 1 438 px** (vs ~24 000 ×
+    970 px with dagre alone; unbuildable with old heuristic).
+  - Rank Y separation clean: core=110, dist=438, fh=766, sh=956.
+  - 18 floor columns visible, second-hop stacked per floor.
+- **Critical lesson for next agent**: dagre's `rank` field on a node
+  is **ignored** when `multigraph: false` — dagre always re-computes
+  ranks from edge direction. So edges in DB MUST point parent→child.
+  If the API ever stores links in either direction, normalize them in
+  the FabricTopology loader (`bank.ts` or the page fetch) before
+  passing to `layoutNodes`, otherwise dist can end up at rank 0.
+- TypeScript clean + Vite build OK. Commit `e32b460`. Pushed → CI green →
+  Deploy green. Live at http://42.119.165.109:8443/fabric.
+- **What to verify next time you open a Fabric session**:
+  - The dagre dependency is in `package.json` (don't accidentally
+    remove it).
+  - `frontend/sanity.mjs` exists — run `node sanity.mjs` from the
+    frontend dir for a quick sanity check after layout changes.
+  - If the user complains "lines missing" or "nodes overlap", check
+    `boxMap` in the browser devtools — the 4th rank tier (Access L2)
+    uses `rank3NodeH = 68` instead of the default 96.
+  - If the user adds new tiers (e.g. a 5th hop), the only constants to
+    bump are inside `inferTiers` (the `switch (r)` block — add a new
+    `case 4`).
+  - Floor grouping assumes every access node has a non-empty
+    `node.floor`. If a node has no floor, the fallback column key is
+    the node id, which means it gets its own column → looks like a
+    bug. Ensure `FabricNode.floor` is always populated for access
+    devices.
