@@ -1,23 +1,30 @@
 /**
  * FabricDiagram — Network topology visualization.
  *
- * Layout model: columns-by-floor, top→bottom within column.
+ * Layout model: classic 3-tier pyramid.
  *
- *   ┌──────┐  ┌──────┐  ┌──────┐  ┌──────────────────────────┐
- *   │ F1   │  │ F2   │  │ F3   │  │ F6 (single column)       │
- *   │CORE  │  │CORE  │  │CORE  │  │ CORE-01                   │
- *   │DIST  │  │DIST  │  │DIST  │  │ CORE-02                   │
- *   │ACCESS│  │ACCESS│  │ACCESS│  │ DIST-01  DIST-02          │
- *   │      │  │      │  │AS-01 │  │ F1-AS…  F2-AS… F3-AS-01   │
- *   │AS-01 │  │AS-01 │  │AS-02 │  │ F3-AS-02                  │
- *   └──────┘  └──────┘  └──────┘  └──────────────────────────┘
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │   CORE  ───────────────────────────────────────────────  │  ← y = MARGIN_Y
+ *   │                                                          │
+ *   │       [CORE-01]                       [CORE-02]         │
+ *   │            │                              │              │
+ *   │            └────────┬─────────────────────┘              │  ← inter-tier bus A
+ *   │                     │                                    │
+ *   │            ┌────────┼────────┐                           │
+ *   │            ▼        ▼        ▼                           │
+ *   │   DIST  [DS-01]   [DS-02]   [DS-03]   [DS-04]            │  ← y = MARGIN_Y + NODE_H + GAP
+ *   │            │        │        │                           │
+ *   │            └────────┼────────┴──────────┐                │  ← inter-tier bus B
+ *   │                     │                   │                │
+ *   │            ┌────────┼────────┐          │                │
+ *   │            ▼        ▼        ▼          ▼                │
+ *   │   ACCESS [AS-01] [AS-02] [AS-03] [AS-04] [AS-05] [AS-06]│  ← y = MARGIN_Y + 2*(NODE_H + GAP)
+ *   └──────────────────────────────────────────────────────────┘
  *
- * Inside each column nodes are placed top→bottom by role (core, dist, access).
- * Each column has its own vertical "spine" bus that runs down the centre.
- * Cross-column links use a shared horizontal bus at the source/dest's stub y.
- *
- * Parallel links between the same device pair get unique track offsets so they
- * fan out without overlapping.
+ * Each role forms its own horizontal row, evenly distributed.
+ * Cross-tier links use orthogonal paths with a mid-Y bus that
+ *  aligns all the lines landing at the same row. Parallel links
+ *  get a small x-track offset so they fan out cleanly.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -32,14 +39,15 @@ import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types
 
 const NODE_W = 228;
 const NODE_H = 96;
-const PORT_STUB = 38;           // stub length from node edge to bus lane
-const PORT_LABEL_GAP = 7;
-const NODE_GAP_X = 64;          // gap between floor-columns
-const NODE_GAP_Y = 36;          // gap between stacked nodes inside one column
+const PORT_STUB = 34;             // stub length from node edge into the bus
+const PORT_LABEL_GAP = 6;
+const TIER_GAP = 168;             // vertical gap between two tiers (generous, for the bus)
+const NODE_GAP_X = 72;            // horizontal gap between sibling nodes in same tier
 const MARGIN_X = 60;
 const MARGIN_Y = 110;
 const RAIL_WIDTH = 136;
-const TRACK_STEP = 18;          // parallel track offset between parallel links
+const TRACK_STEP_X = 14;          // x-offset for parallel links (stub separation)
+const TRACK_STEP_Y = 12;          // y-offset for parallel links on side-routing
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk:   '#4f9cf9',
@@ -67,11 +75,12 @@ type PortEnd = {
   side: Anchor;
   portName: string;
   anchor:   Pt;   // point on the node edge
-  stubEnd:  Pt;   // end of the short stub
+  stubEnd:  Pt;   // end of the short stub into the bus lane
   labelPos: Pt;
   labelSize: { w: number; h: number };
   labelAnchor: 'start' | 'middle' | 'end';
-  trackOffset: number;  // perpendicular offset for parallel links
+  trackOffsetX: number;
+  trackOffsetY: number;
 };
 
 type EdgePath = {
@@ -86,21 +95,25 @@ type NodeLayout = {
   box:  Box;
 };
 
-type Column = {
-  /** Display key (F1, F2, F3, F6…) */
-  floor: string;
-  floorNumber: number | null;
-  /** Where this column's trunk spine x is. */
-  trunkX: number;
-  /** Stacked top→bottom by role. */
+type TierLayout = {
+  role: FabricRole;
+  y: number;
   nodes: NodeLayout[];
-  /** y of the bottom edge of the last node (= bottom of column). */
-  height: number;
+};
+
+type LayoutResult = {
+  positioned:   NodeLayout[];
+  totalWidth:   number;
+  totalHeight:  number;
+  tiers:        TierLayout[];
+  interBuses:   { y: number; left: number; right: number; kind: 'core-dist' | 'dist-access' }[];
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Role labels
+// Role ordering (top→bottom in the canvas)
 // ─────────────────────────────────────────────────────────────────────────────
+
+const TIER_ORDER: FabricRole[] = ['core', 'dist', 'access'];
 
 const ROLE_LABEL: Record<FabricRole, string> = {
   core:   'Core',
@@ -108,131 +121,105 @@ const ROLE_LABEL: Record<FabricRole, string> = {
   access: 'Access',
 };
 
-// Roles ordered top→bottom inside a column
-const ROLE_RANK: Record<FabricRole, number> = {
+const TIER_RANK: Record<FabricRole, number> = {
   core:   0,
   dist:   1,
   access: 2,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout — columns by floor
+// Layout — 3 horizontal tiers
 // ─────────────────────────────────────────────────────────────────────────────
-
-type LayoutResult = {
-  positioned: NodeLayout[];
-  totalWidth:  number;
-  totalHeight: number;
-  columns:     Column[];
-};
-
-function columnKey(node: FabricNode): string {
-  if (node.floorNumber != null) return `F${node.floorNumber}`;
-  return node.floor || 'Other';
-}
-
-function groupByFloor(nodes: FabricNode[]): { floor: string; floorNumber: number | null; nodes: FabricNode[] }[] {
-  const buckets: Record<string, { floorNumber: number | null; nodes: FabricNode[] }> = {};
-  for (const node of nodes) {
-    const key = columnKey(node);
-    if (!buckets[key]) buckets[key] = { floorNumber: node.floorNumber, nodes: [] };
-    buckets[key].nodes.push(node);
-  }
-  // sort within column: by role rank, then by shortName
-  for (const key of Object.keys(buckets)) {
-    buckets[key].nodes.sort((a, b) => {
-      const r = ROLE_RANK[a.role] - ROLE_RANK[b.role];
-      if (r !== 0) return r;
-      return a.shortName.localeCompare(b.shortName);
-    });
-  }
-  // sort columns by floorNumber asc, null/other last
-  const sorted = Object.entries(buckets)
-    .map(([floor, info]) => ({
-      floor,
-      floorNumber: info.floorNumber,
-      nodes: info.nodes,
-    }))
-    .sort((a, b) => {
-      const an = a.floorNumber ?? 9999;
-      const bn = b.floorNumber ?? 9999;
-      if (an !== bn) return an - bn;
-      return a.floor.localeCompare(b.floor);
-    });
-  return sorted;
-}
 
 function layoutNodes(nodes: FabricNode[]): LayoutResult {
-  const buckets = groupByFloor(nodes);
-
-  const colWidth = NODE_W;
-
-  // First pass — compute per-column heights (sum of node heights + gaps)
-  const columns: Column[] = buckets.map((bucket) => {
-    const list = bucket.nodes.map((node) => ({ node, h: NODE_H }));
-    const height = list.reduce((acc, cur, i) => acc + cur.h + (i > 0 ? NODE_GAP_Y : 0), 0);
-    return {
-      floor: bucket.floor,
-      floorNumber: bucket.floorNumber,
-      trunkX: 0, // will be filled in second pass
-      nodes: [], // will be filled in second pass
-      height,
-    };
-  });
-
-  // Find tallest column to size the canvas vertically
-  const maxColHeight = Math.max(1, ...columns.map((c) => c.height));
-
-  // Compute column X (left edges)
-  const totalWidth = MARGIN_X * 2 + columns.length * colWidth + Math.max(0, columns.length - 1) * NODE_GAP_X;
-  let cursorX = MARGIN_X;
-  for (const col of columns) {
-    col.trunkX = cursorX + colWidth / 2;
-    cursorX  += colWidth + NODE_GAP_X;
+  // Bucket by role
+  const buckets: Record<FabricRole, FabricNode[]> = { core: [], dist: [], access: [] };
+  for (const node of nodes) buckets[node.role].push(node);
+  for (const role of TIER_ORDER) {
+    buckets[role].sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }));
   }
 
-  // Place nodes inside each column, vertically centred against the tallest column
+  const maxTierCount = Math.max(1, ...TIER_ORDER.map((r) => buckets[r].length));
+  const tierWidth = maxTierCount * NODE_W + Math.max(0, maxTierCount - 1) * NODE_GAP_X;
+  const totalWidth = MARGIN_X * 2 + tierWidth;
+
   const positioned: NodeLayout[] = [];
-  for (const col of columns) {
-    const colNodes = nodes
-      .filter((n) => columnKey(n) === col.floor)
-      .sort((a, b) => {
-        const r = ROLE_RANK[a.role] - ROLE_RANK[b.role];
-        if (r !== 0) return r;
-        return a.shortName.localeCompare(b.shortName);
-      });
-    let y = MARGIN_Y + Math.max(0, (maxColHeight - col.height) / 2);
-    for (const node of colNodes) {
-      const box: Box = { x: col.trunkX - NODE_W / 2, y, w: NODE_W, h: NODE_H };
-      const layout: NodeLayout = { node, box };
-      positioned.push(layout);
-      col.nodes.push(layout);
-      y += NODE_H + NODE_GAP_Y;
+  const tiers: TierLayout[] = [];
+
+  let y = MARGIN_Y;
+  for (const role of TIER_ORDER) {
+    const tierNodes = buckets[role];
+    const count = tierNodes.length;
+
+    if (count === 0) {
+      tiers.push({ role, y, nodes: [] });
+      y += NODE_H + TIER_GAP;
+      continue;
     }
+
+    const rowWidth = count * NODE_W + (count - 1) * NODE_GAP_X;
+    const startX = MARGIN_X + Math.max(0, (tierWidth - rowWidth) / 2);
+
+    const placed: NodeLayout[] = [];
+    for (let i = 0; i < count; i++) {
+      const x = startX + i * (NODE_W + NODE_GAP_X);
+      const box: Box = { x, y, w: NODE_W, h: NODE_H };
+      const layout: NodeLayout = { node: tierNodes[i], box };
+      positioned.push(layout);
+      placed.push(layout);
+    }
+
+    tiers.push({ role, y, nodes: placed });
+    y += NODE_H + TIER_GAP;
   }
 
-  return {
-    positioned,
-    totalWidth,
-    totalHeight: MARGIN_Y * 2 + maxColHeight,
-    columns,
-  };
+  const totalHeight = y - TIER_GAP + MARGIN_Y;
+
+  // Inter-tier bus y positions — used to draw a faint horizontal bus line
+  // between core↔dist and dist↔access. Bus sits midway between the two tiers.
+  const interBuses: LayoutResult['interBuses'] = [];
+  const coreTier  = tiers.find((t) => t.role === 'core');
+  const distTier  = tiers.find((t) => t.role === 'dist');
+  const accessTier = tiers.find((t) => t.role === 'access');
+
+  if (coreTier && distTier) {
+    const a = coreTier.y  + NODE_H;
+    const b = distTier.y;
+    interBuses.push({
+      kind: 'core-dist',
+      y: (a + b) / 2,
+      left:  MARGIN_X - 24,
+      right: MARGIN_X + tierWidth + 24,
+    });
+  }
+  if (distTier && accessTier) {
+    const a = distTier.y  + NODE_H;
+    const b = accessTier.y;
+    interBuses.push({
+      kind: 'dist-access',
+      y: (a + b) / 2,
+      left:  MARGIN_X - 24,
+      right: MARGIN_X + tierWidth + 24,
+    });
+  }
+
+  return { positioned, totalWidth, totalHeight, tiers, interBuses };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Port placement
+// Port placement helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Offsets along a side (left/right = y, top/bottom = x).
- * Distributes ports evenly within the usable edge length.
- */
 function portOffset(portsOnSide: number, idx: number, side: Anchor): number {
   const totalLen = side === 'left' || side === 'right' ? NODE_H : NODE_W;
   if (portsOnSide <= 1) return totalLen / 2;
-  const inset = 22;
+  const inset = 28;
   const usable = totalLen - inset * 2;
   return inset + (usable / (portsOnSide - 1)) * idx;
+}
+
+function portLabelWidth(name: string): number {
+  return Math.max(64, (name?.length || 4) * 6.8 + 14);
 }
 
 function buildPortEnd(
@@ -241,11 +228,11 @@ function buildPortEnd(
   idx:        number,
   total:      number,
   portName:   string,
-  trackOffset: number,
+  trackOffsetX: number,
+  trackOffsetY: number,
 ): PortEnd {
   const off  = portOffset(total, idx, side);
-
-  const labelSize = { w: Math.max(64, (portName?.length || 4) * 6.8 + 14), h: 20 };
+  const labelSize = { w: portLabelWidth(portName || ''), h: 20 };
 
   let anchor: Pt, stubEnd: Pt, labelPos: Pt;
   let labelAnchor: 'start' | 'middle' | 'end' = 'middle';
@@ -253,61 +240,71 @@ function buildPortEnd(
   switch (side) {
     case 'right': {
       anchor   = { x: box.x + box.w, y: box.y + off };
-      stubEnd  = { x: box.x + box.w + PORT_STUB + trackOffset, y: box.y + off };
+      stubEnd  = { x: box.x + box.w + PORT_STUB + trackOffsetX, y: box.y + off + trackOffsetY };
       labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
       break;
     }
     case 'left': {
       anchor   = { x: box.x, y: box.y + off };
-      stubEnd  = { x: box.x - PORT_STUB - trackOffset, y: box.y + off };
+      stubEnd  = { x: box.x - PORT_STUB - trackOffsetX, y: box.y + off + trackOffsetY };
       labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
       labelAnchor = 'end';
       break;
     }
     case 'bottom': {
       anchor   = { x: box.x + off, y: box.y + box.h };
-      stubEnd  = { x: box.x + off + trackOffset, y: box.y + box.h + PORT_STUB };
+      stubEnd  = { x: box.x + off + trackOffsetX, y: box.y + box.h + PORT_STUB + trackOffsetY };
       labelPos = { x: stubEnd.x, y: stubEnd.y + PORT_LABEL_GAP };
       break;
     }
     case 'top': {
       anchor   = { x: box.x + off, y: box.y };
-      stubEnd  = { x: box.x + off + trackOffset, y: box.y - PORT_STUB };
+      stubEnd  = { x: box.x + off + trackOffsetX, y: box.y - PORT_STUB - trackOffsetY };
       labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
       labelAnchor = 'start';
       break;
     }
   }
 
-  return { side, portName, anchor, stubEnd, labelPos, labelSize, labelAnchor, trackOffset };
+  return { side, portName, anchor, stubEnd, labelPos, labelSize, labelAnchor, trackOffsetX, trackOffsetY };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Side picker — pick which edge of `from` faces `to`.
-//
-// When both devices are in the SAME column (same x), go top↔bottom.
-// When they are in DIFFERENT columns, prefer left/right (so the link runs
-// across the horizontal inter-column bus). If they're also on a similar row
-// the line stays horizontal; if they're on different rows it uses a small
-// mid-Y elbow.
+// Side picker for cross-tier links
 // ─────────────────────────────────────────────────────────────────────────────
+
+function crossTierSides(fromRole: FabricRole, toRole: FabricRole): { fromSide: Anchor; toSide: Anchor } | null {
+  const fr = TIER_RANK[fromRole];
+  const tr = TIER_RANK[toRole];
+  if (fr === tr) return null;        // same tier → use side routing
+  if (fr < tr) return { fromSide: 'bottom', toSide: 'top' };
+  return { fromSide: 'top', toSide: 'bottom' };
+}
 
 function pickSide(from: Box, to: Box): Anchor {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
-  if (Math.abs(dx) < 1) {
-    return dy > 0 ? 'bottom' : 'top';
-  }
+  if (Math.abs(dx) < 1) return dy > 0 ? 'bottom' : 'top';
   return dx > 0 ? 'right' : 'left';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Orthogonal path — from stub-end A → stub-end B with a single mid-Y elbow.
-// Both stub ends are on the SIDE edges of their respective nodes, so the
-// straight line connecting them is already horizontal-ish.
+// Path builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makePath(a: Pt, b: Pt): string {
+function makeCrossTierPath(a: Pt, b: Pt): string {
+  // Both ends are on top/bottom edges. We use the midpoint y as a horizontal
+  // bus line: stub → bus → bus → stub. If a and b share the same x, just a
+  // straight vertical line.
+  if (Math.abs(a.x - b.x) < 1) {
+    return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+  }
+  const busY = (a.y + b.y) / 2;
+  return `M ${a.x} ${a.y} L ${a.x} ${busY} L ${b.x} ${busY} L ${b.x} ${b.y}`;
+}
+
+function makeSidePath(a: Pt, b: Pt): string {
+  // Same-tier side routing — horizontal with a small mid-y elbow.
   if (Math.abs(a.y - b.y) < 0.5) {
     return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
   }
@@ -315,16 +312,8 @@ function makePath(a: Pt, b: Pt): string {
   return `M ${a.x} ${a.y} L ${a.x} ${midY} L ${b.x} ${midY} L ${b.x} ${b.y}`;
 }
 
-function makeVerticalPath(a: Pt, b: Pt): string {
-  if (Math.abs(a.x - b.x) < 0.5) {
-    return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
-  }
-  const midX = (a.x + b.x) / 2;
-  return `M ${a.x} ${a.y} L ${midX} ${a.y} L ${midX} ${b.y} L ${b.x} ${b.y}`;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Component
+// Components
 // ─────────────────────────────────────────────────────────────────────────────
 
 function FabricNodeCard({ node, box }: { node: FabricNode; box: Box }) {
@@ -375,64 +364,76 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     for (const item of layout.positioned) idx[item.node.id] = item;
 
     // Group links by device-pair so parallel links get unique track offsets
-    const pairKey  = (a: string, b: string) => (a < b ? `${a}||${b}` : `${b}||${a}`);
+    const pairKey = (a: string, b: string) => (a < b ? `${a}||${b}` : `${b}||${a}`);
     const pairBuckets: Record<string, FabricLink[]> = {};
     for (const link of links) {
       (pairBuckets[pairKey(link.fromDeviceId, link.toDeviceId)] ||= []).push(link);
     }
-    const linkTrackIdx: Record<string, number> = {};
+    const linkOrder: Record<string, number> = {};
     Object.entries(pairBuckets).forEach(([, bucket]) => {
-      bucket.forEach((link, i) => { linkTrackIdx[link.id] = i; });
+      bucket.forEach((link, i) => { linkOrder[link.id] = i; });
     });
-    const totalForPair = (a: string, b: string) => pairBuckets[pairKey(a, b)]?.length ?? 1;
 
-    // Per-node per-side port index counter (so we can distribute ports along an edge)
+    // Determine per-node, per-side port count. For cross-tier links we use
+    // top/bottom edges; for same-tier links, left/right.
     type PortMap = Record<string, Record<Anchor, number>>;
     const portCount: PortMap = {};
     for (const item of layout.positioned) {
       portCount[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
     }
-    // First pass: figure out which side each link uses, count per-side ports
-    type Stub = { side: Anchor };
-    const stubs: Record<string, { a?: Stub; b?: Stub }> = {};
+
+    type StubInfo = { fromSide: Anchor; toSide: Anchor; crossTier: boolean };
+    const stubs: Record<string, StubInfo> = {};
     for (const link of links) {
       const a = idx[link.fromDeviceId];
       const b = idx[link.toDeviceId];
       if (!a || !b) continue;
-      const sideA = pickSide(a.box, b.box);
-      const sideB = pickSide(b.box, a.box);
-      stubs[link.id] = { a: { side: sideA }, b: { side: sideB } };
-      portCount[link.fromDeviceId][sideA]++;
-      portCount[link.toDeviceId][sideB]++;
+      const sides = crossTierSides(a.node.role, b.node.role);
+      let fromSide: Anchor;
+      let toSide: Anchor;
+      let crossTier: boolean;
+      if (sides) {
+        fromSide = sides.fromSide;
+        toSide   = sides.toSide;
+        crossTier = true;
+      } else {
+        fromSide = pickSide(a.box, b.box);
+        toSide   = pickSide(b.box, a.box);
+        crossTier = false;
+      }
+      stubs[link.id] = { fromSide, toSide, crossTier };
+      portCount[link.fromDeviceId][fromSide]++;
+      portCount[link.toDeviceId][toSide]++;
     }
 
-    // Second pass: assign port indices & geometry
     const portIdx: PortMap = {};
     for (const item of layout.positioned) {
       portIdx[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
     }
+
     const edgeList: EdgePath[] = [];
     for (const link of links) {
       const a = idx[link.fromDeviceId];
       const b = idx[link.toDeviceId];
       if (!a || !b) continue;
 
-      const sideA  = stubs[link.id]!.a!.side;
-      const sideB  = stubs[link.id]!.b!.side;
-      const trackA = linkTrackIdx[link.id];        // 0,1,2…
-      const totalP = totalForPair(link.fromDeviceId, link.toDeviceId);
-      const trackOffset = (trackA - (totalP - 1) / 2) * TRACK_STEP;
+      const info   = stubs[link.id]!;
+      const sideA  = info.fromSide;
+      const sideB  = info.toSide;
+      const order  = linkOrder[link.id];
+      const totalP = pairBuckets[pairKey(link.fromDeviceId, link.toDeviceId)]?.length ?? 1;
+      // Centre parallel links around 0 — middle one stays straight, others fan out
+      const trackX = (order - (totalP - 1) / 2) * TRACK_STEP_X;
+      const trackY = order === 0 ? 0 : (order % 2 === 0 ? TRACK_STEP_Y : -TRACK_STEP_Y);
 
       const idxA = portIdx[link.fromDeviceId][sideA]++;
       const idxB = portIdx[link.toDeviceId][sideB]++;
 
-      const fromEnd = buildPortEnd(a.box, sideA, idxA, portCount[link.fromDeviceId][sideA], link.fromPort, trackOffset);
-      const toEnd   = buildPortEnd(b.box, sideB, idxB, portCount[link.toDeviceId][sideB], link.toPort, trackOffset);
+      const fromEnd = buildPortEnd(a.box, sideA, idxA, portCount[link.fromDeviceId][sideA], link.fromPort, trackX, trackY);
+      const toEnd   = buildPortEnd(b.box, sideB, idxB, portCount[link.toDeviceId][sideB], link.toPort,   trackX, trackY);
 
-      // Path uses mid-Y elbow (works for both same-row and different-row horizontal links).
-      // For purely top↔bottom links inside one column, use vertical mid-X elbow.
-      const isVertical = (sideA === 'top' || sideA === 'bottom') && (sideB === 'top' || sideB === 'bottom');
-      const d = isVertical ? makeVerticalPath(fromEnd.stubEnd, toEnd.stubEnd) : makePath(fromEnd.stubEnd, toEnd.stubEnd);
+      const d = info.crossTier ? makeCrossTierPath(fromEnd.stubEnd, toEnd.stubEnd)
+                               : makeSidePath(fromEnd.stubEnd, toEnd.stubEnd);
 
       edgeList.push({ link, d, fromEnd, toEnd });
     }
@@ -449,7 +450,7 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     const scale = Math.min(1, Math.min(w / layout.totalWidth, h / layout.totalHeight));
     setViewport({
       x: RAIL_WIDTH + Math.max(0, (w - layout.totalWidth * scale) / 2),
-      y: 28,
+      y: 36,
       scale,
     });
   };
@@ -488,34 +489,21 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     return <div className="nc-fabric-empty">No devices to plot.</div>;
   }
 
-  // Column backgrounds — one faint band per floor column
-  const columnBands = layout.columns.map((col) => {
-    const positions = col.nodes.map((n) => n.box);
-    if (!positions.length) return null;
-    const left  = Math.min(...positions.map((b) => b.x)) - 22;
-    const right = Math.max(...positions.map((b) => b.x + b.w)) + 22;
-    const top   = Math.min(...positions.map((b) => b.y)) - 22;
-    const bot   = Math.max(...positions.map((b) => b.y + b.h)) + 22;
-    return { floor: col.floor, left, right, top, bot };
-  }).filter(Boolean) as { floor: string; left: number; right: number; top: number; bot: number }[];
+  // Tier rail labels (CORE / DIST / ACCESS) — anchored to tier y
+  const tierRail: { label: string; tone: FabricRole; y: number }[] = layout.tiers
+    .filter((t) => t.nodes.length > 0)
+    .map((t) => ({ label: ROLE_LABEL[t.role].toUpperCase(), tone: t.role, y: t.y + NODE_H / 2 }));
 
-  // Tier rail labels — derived from columns (one entry per column)
-  const tierLabels: { label: string; tone: 'core' | 'dist' | 'access' | 'mixed'; y: number }[] = [];
-  for (const col of layout.columns) {
-    if (!col.nodes.length) continue;
-    const sample = col.nodes[0];
-    // Pick the dominant role in this column for the pill colour
-    const roles = col.nodes.map((n) => n.node.role);
-    let tone: 'core' | 'dist' | 'access' | 'mixed' = 'access';
-    if (roles.includes('core') && !roles.includes('dist') && !roles.includes('access')) tone = 'core';
-    else if (roles.includes('dist') && !roles.includes('access')) tone = 'dist';
-    else if (roles.includes('core') || roles.includes('dist')) tone = 'mixed';
-    tierLabels.push({
-      label: col.floor,
-      y: (sample.box.y + sample.box.y + sample.box.h) / 2,
-      tone,
-    });
-  }
+  // Tier background bands — full-width faint strips behind each tier
+  const tierBands = layout.tiers
+    .filter((t) => t.nodes.length > 0)
+    .map((t) => ({
+      role: t.role,
+      left:  MARGIN_X - 24,
+      right: layout.totalWidth - MARGIN_X + 24,
+      top:   t.y - 14,
+      bot:   t.y + NODE_H + 14,
+    }));
 
   return (
     <div
@@ -567,17 +555,29 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
             ))}
           </defs>
 
-          {/* Floor column bands */}
-          <g className="nc-fabric-floor-bands">
-            {columnBands.map((band) => (
-              <g key={`band-${band.floor}`}>
-                <rect x={band.left} y={band.top} width={band.right - band.left}
-                  height={band.bot - band.top} rx={14} className="nc-fabric-floor-band" />
-                <text x={band.left + 16} y={band.top + 18}
-                  className="nc-fabric-floor-label" dominantBaseline="middle">
-                  {band.floor}
-                </text>
-              </g>
+          {/* Tier background bands */}
+          <g className="nc-fabric-tier-bands">
+            {tierBands.map((band) => (
+              <rect
+                key={`tier-band-${band.role}`}
+                x={band.left} y={band.top}
+                width={band.right - band.left}
+                height={band.bot - band.top}
+                rx={14}
+                className={`nc-fabric-tier-band is-${band.role}`}
+              />
+            ))}
+          </g>
+
+          {/* Inter-tier bus lines */}
+          <g className="nc-fabric-bus-lanes">
+            {layout.interBuses.map((bus) => (
+              <line
+                key={`bus-${bus.kind}`}
+                x1={bus.left} y1={bus.y}
+                x2={bus.right} y2={bus.y}
+                className="nc-fabric-bus-lane"
+              />
             ))}
           </g>
 
@@ -643,9 +643,9 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
       {/* Tier rail */}
       <aside className="nc-fabric-tier-rail" aria-hidden="true">
-        {tierLabels.map((tier) => (
+        {tierRail.map((tier) => (
           <div
-            key={`rail-${tier.label}`}
+            key={`rail-${tier.tone}`}
             className={`nc-fabric-tier-pill is-${tier.tone}`}
             style={{ top: viewport.y + tier.y * viewport.scale }}
           >

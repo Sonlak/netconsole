@@ -509,19 +509,34 @@ textarea.nc-code-area {
   opacity: 0.92;
 }
 
-.nc-fabric-floor-band {
-  fill: color-mix(in srgb, var(--nc-raised) 40%, transparent);
+.nc-fabric-tier-band {
+  fill: color-mix(in srgb, var(--nc-raised) 36%, transparent);
   stroke: color-mix(in srgb, var(--nc-border) 60%, transparent);
   stroke-dasharray: 4 4;
   stroke-width: 1;
 }
 
+.nc-fabric-tier-band.is-core {
+  fill: color-mix(in srgb, #5b9dff 6%, transparent);
+  stroke: color-mix(in srgb, #5b9dff 32%, transparent);
+}
+
+.nc-fabric-tier-band.is-dist {
+  fill: color-mix(in srgb, #a78bfa 6%, transparent);
+  stroke: color-mix(in srgb, #a78bfa 32%, transparent);
+}
+
+.nc-fabric-tier-band.is-access {
+  fill: color-mix(in srgb, #34d399 6%, transparent);
+  stroke: color-mix(in srgb, #34d399 32%, transparent);
+}
+
 /* Bus lane — horizontal routing channel between tiers */
 .nc-fabric-bus-lane {
-  stroke: color-mix(in srgb, var(--nc-border) 30%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 36%, transparent);
   stroke-dasharray: 6 8;
   stroke-width: 1.5;
-  opacity: 0.6;
+  opacity: 0.55;
 }
 
 .nc-fabric-floor-label {
