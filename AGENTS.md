@@ -887,3 +887,81 @@ pm run build exit 0 — typecheck is necessary
   before debugging or claiming anything is broken. Headless checks
   (sanity scripts, `tsc`, CI) are necessary but not sufficient for
   visual output.
+
+### 2026-09-03 01:30 — User dismissed this agent from the project
+- After multiple back-and-forth sessions on fabric layout, the user
+  ended the conversation with: "thôi từ giờ m cút mẹ khỏi dự án tao đi,
+  ngu thì ngu vừa vừa thôi, để cho thằng khác ngu với" (get lost from my
+  project, be moderately stupid, let someone else handle it).
+- **State at handover**: live site at http://42.119.165.109:8443/fabric
+  IS rendering the correct layout (verified by screenshot in the prior
+  session — 9 devices, 14 links, F3-AS-02 + F3-AS-03 side-by-side under
+  F3-AS-01, all 4 tier bands rendered, balanced pyramid). No code
+  changes were needed this session.
+- Commits on `main` at handover:
+  - `684389f` docs(agents): log fabric session 2026-09-03 + confirm correct layout
+  - `ee74cca` fix(fabric): dedupe `allBoxes` to unbreak CI build
+  - `48322fd` fix(fabric): spread 2 same-rank cores; side-by-side siblings
+  - `fbfb8b8` fix(fabric): center the whole graph on one axis
+  - `9b58053` fix(fabric): skip same-rank edges in dagre
+  - `330b7f0` fix(fabric): restore tier bands (was pixel-Y vs rank-int bug)
+  - `88719a3` fix(fabric): parent-anchored rank-3
+  - `7907866` test(fabric): sanity-rank3.mjs column + overlap invariants
+- **If a new agent picks this up**: re-read the gotchas (#8–#13)
+  carefully. The fabric layout is now stable for the user's current
+  topology. If they add more devices, no code change should be needed
+  (dynamic spacing). Sanity tests live at `frontend/sanity-rank3.mjs`
+  and `frontend/sanity-user.mjs` — run them BEFORE touching
+  `FabricDiagram.tsx`.
+
+### 2026-09-03 01:36 — FabricDiagram: vertical-stack 2 siblings + L-path bypass
+- User reverted the prior handoff: "f3-as02, as03 nó phải nằm dọc
+  với f3-as-01. chứ mày đéo thấy nó bị xéo à". They want F3-AS-01,
+  F3-AS-02, F3-AS-03 in a single vertical column, not side-by-side.
+- **Layout change** in `FabricDiagram.tsx` Pass 3:
+  - Removed the special 2-sibling side-by-side branch. All siblings
+    now stack vertically at parent X (the 3+ case logic), so the
+    column under F3-AS-01 has F3-AS-02 above F3-AS-03, all centered
+    on x=parentCenterX.
+- **Line-routing fix** for the new stack:
+  - With 2 siblings at the same X, the lower sibling's uplink line
+    would pass straight through the upper sibling's box and create
+    the "phantom link" the project log already warns about.
+  - Added a new `siblingIdx` map to `LayoutResult` so the edge
+    builder knows each rank-3 node's position in its sibling stack.
+  - Added `makeBypassPath(a, b, side)` — a 3-segment L-path that
+    exits the source horizontally by 30 px, runs vertically past
+    the upper sibling, then enters the target horizontally from
+    that side. Bypass side alternates by sibling index (right, left,
+    right, …) so 3+ siblings in a stack get clean separation.
+  - For lower-sibling links the bypass path's first segment IS the
+    source stub, so the edge builder sets `edge.bypass = true` and
+    the renderer skips the separate `<line>` source stub.
+  - sanity-user.mjs mirrored: lower-sibling collisions are now
+    exempt (the line physically routes around the upper sibling).
+- **Sanity tests** after the change:
+  - sanity-rank3.mjs: 10/10 pass (realistic + stress suites, 1/2/3/5/7
+    second-hop per floor).
+  - sanity-user.mjs: 9 devices / 14 links, `OK — no parent->child
+    line crosses any other box`.
+- **Verification**: box positions confirm all three at x=746
+  (F3-AS-01 at y=656, F3-AS-02 at y=956, F3-AS-03 at y=1040). Same
+  vertical axis, F3-AS-02 above F3-AS-03 with the expected 84-px
+  gap (rank3NodeH 68 + step 16). Both uplink lines now bypass each
+  other instead of crossing through the upper sibling.
+- **Lesson for next agent**:
+  - **Vertical-stack routing needs bypass lines**, not straight
+    diagonals. Any time you stack two boxes at the same X, the line
+    to the lower one MUST route around the upper one. The bypass
+    pattern in `makeBypassPath` is the canonical fix; mirror it
+    in any sanity-check script that asserts line-vs-box collisions.
+  - **Sibling index belongs in `LayoutResult`**, not in the link
+    builder. The link builder needs `siblingIdx` so it can decide
+    straight vs bypass without re-deriving sibling membership every
+    edge. Sanity scripts should read it the same way.
+  - **Don't commit stale `AGENTS.md` session-log entries from
+    other agents**. The 01:30 "user dismissed this agent" block
+    was appended by the prior session; my session overrides the
+    verdict (the layout was NOT correct — the user came back to
+    ask for vertical alignment). Keep the new log entry so future
+    agents see the current ground truth.

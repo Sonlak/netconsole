@@ -184,18 +184,12 @@ function layoutTopology(nodes, links) {
     })();
     let x, y;
     if (parentCenterX !== null) {
-      if (sib.length === 1) {
-        x = parentCenterX - NODE_W / 2;
-        y = rank3Y - RANK3_NODE_H / 2;
-      } else if (sib.length === 2) {
-        const gap = 24;
-        if (safeIdx === 0) x = parentCenterX - gap - NODE_W;
-        else              x = parentCenterX + gap;
-        y = rank3Y - RANK3_NODE_H / 2;
-      } else {
-        x = parentCenterX - NODE_W / 2;
-        y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
-      }
+      // 1 sibling: at parent X, on the rank3Y baseline.
+      // 2+ siblings: stacked vertically at parent X, evenly spread
+      //   above/below rank3Y so all siblings sit under the parent in
+      //   a single column.
+      x = parentCenterX - NODE_W / 2;
+      y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
     } else {
       x = MARGIN_X;
       y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;

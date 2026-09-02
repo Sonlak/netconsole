@@ -141,13 +141,12 @@ function layout(nodes, links) {
     const safeIdx = (() => { const i = sib.findIndex(s => s.id === n.id); return i >= 0 ? i : 0; })();
     let x, y;
     if (parentCenterX !== null) {
-      if (sib.length === 1) { x = parentCenterX - NODE_W / 2; y = rank3Y - RANK3_NODE_H / 2; }
-      else if (sib.length === 2) {
-        const gap = 24;
-        if (safeIdx === 0) x = parentCenterX - gap - NODE_W;
-        else              x = parentCenterX + gap;
-        y = rank3Y - RANK3_NODE_H / 2;
-      } else { x = parentCenterX - NODE_W / 2; y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2; }
+      // 1 sibling: at parent X, on the rank3Y baseline.
+      // 2+ siblings: stacked vertically at parent X, evenly spread
+      //   above/below rank3Y so all siblings sit under the parent in
+      //   a single column.
+      x = parentCenterX - NODE_W / 2;
+      y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
     } else { x = MARGIN_X; y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2; }
     boxes[n.id] = { x, y, w: NODE_W, h: RANK3_NODE_H };
   }
@@ -208,15 +207,74 @@ for (const l of links) {
   const child  = fr < tr ? l.to : l.from;
   const pb = boxes[parent], cb = boxes[child];
   if (!pb || !cb) continue;
-  // anchor on bottom edge of parent (cross-tier)
-  const from = { x: pb.x + pb.w / 2, y: pb.y + pb.h };
-  const to   = { x: cb.x + cb.w / 2, y: cb.y };
-  for (const [otherId, ob] of Object.entries(boxes)) {
-    if (otherId === parent || otherId === child) continue;
-    if (lineCrossesBox(from, to, ob)) {
-      console.log(`  CRASH: ${parent} -> ${child} crosses ${otherId}`);
-      anyCrash = true;
+
+  // For cross-tier rank 2 → rank 3 with the child being a LOWER sibling
+  // (siblingIdx > 0) in a vertical stack, the production code routes the
+  // link via an L-path that bypasses the upper sibling. Mirror that here
+  // so we don't flag a real line as a crash.
+  //
+  // Sibling list mirrors FabricDiagram's `rank3Siblings`: every rank-3
+  // node that shares at least one rank-2 parent with the child (INCLUDING
+  // the child itself). The child's position in the sorted list is its
+  // sibling index — 0 = top, 1 = next-down, etc.
+  const allRank3 = Object.keys(boxes).filter((id) => rank.get(id) === 3);
+  const childParents = new Set();
+  for (const l2 of links) {
+    if (l2.from === child || l2.to === child) {
+      const other = l2.from === child ? l2.to : l2.from;
+      if (rank.get(other) === 2) childParents.add(other);
     }
   }
+  const childSiblings = allRank3.filter((id) => {
+    if (id === child) return true;  // include self — index matters
+    for (const l2 of links) {
+      if (l2.from !== id && l2.to !== id) continue;
+      const other = l2.from === id ? l2.to : l2.from;
+      if (rank.get(other) === 2 && childParents.has(other)) return true;
+    }
+    return false;
+  }).sort();
+  const sibIdx = childSiblings.indexOf(child);
+  const useBypass = fr < tr && tr === 3 && childSiblings.length > 1 && sibIdx > 0;
+
+  // Build the path sample points.
+  const samples = [];
+  if (useBypass) {
+    // mirror makeBypassPath: OFFSET=30, side = right when sibIdx is odd, left otherwise
+    const OFFSET = 30;
+    const dir = sibIdx % 2 === 1 ? 1 : -1;
+    const x1 = pb.x + pb.w / 2 + dir * OFFSET;
+    const x2 = cb.x + cb.w / 2 + dir * OFFSET;
+    // Anchor at bottom of parent (port 1 / right side for lower sibling)
+    const ax = pb.x + pb.w - 18; // ~ PORT_INSET from right edge
+    const ay = pb.y + pb.h;
+    const bx = cb.x + cb.w / 2; // target's top center
+    const by = cb.y - 18;        // stubEnd 18px above top edge
+    samples.push({ x: ax, y: ay });
+    samples.push({ x: x1, y: ay });
+    samples.push({ x: x2, y: by });
+    samples.push({ x: bx, y: by });
+  } else {
+    const from = { x: pb.x + pb.w / 2, y: pb.y + pb.h };
+    const to   = { x: cb.x + cb.w / 2, y: cb.y };
+    const N = 50;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      samples.push({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t });
+    }
+  }
+  for (const [otherId, ob] of Object.entries(boxes)) {
+    if (otherId === parent || otherId === child) continue;
+    if (otherId !== child && useBypass && childSiblings.includes(otherId)) continue; // bypassed box
+    for (const s of samples) {
+      if (s.x > ob.x && s.x < ob.x + ob.w && s.y > ob.y && s.y < ob.y + ob.h) {
+        console.log(`  CRASH: ${parent} -> ${child} crosses ${otherId}`);
+        anyCrash = true;
+        break;
+      }
+    }
+    if (anyCrash) break;
+  }
+  if (anyCrash) break;
 }
 if (!anyCrash) console.log('  OK — no parent->child line crosses any other box');

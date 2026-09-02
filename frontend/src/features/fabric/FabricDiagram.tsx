@@ -98,6 +98,12 @@ type EdgePath = {
   d:       string;
   fromEnd: PortEnd;
   toEnd:   PortEnd;
+  /**
+   * True for the L-path used by lower-sibling links. The path's first
+   * segment is the horizontal "source stub" (anchor → bypass point), so
+   * we skip rendering the separate `<line>` stub at the source.
+   */
+  bypass?: boolean;
 };
 
 type NodeLayout = { node: FabricNode; box: Box };
@@ -121,6 +127,17 @@ type LayoutResult = {
   tierMeta:     TierMeta[];
   /** Map from device id to inferred 0-based rank. */
   rankById:     Map<string, number>;
+  /**
+   * For each rank-3 node, its index among its siblings (nodes that share
+   * at least one rank-2 parent). Used by the link routing to detect
+   * "lower sibling in a vertical stack" — those need an L-path that
+   * bypasses the upper sibling's box instead of a straight diagonal
+   * that would visually cross the upper sibling.
+   *
+   * Index 0 = top sibling (closest to parent).
+   * Index N-1 = bottom sibling (furthest from parent).
+   */
+  siblingIdx:   Map<string, number>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +254,7 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
       tiers: [],
       tierMeta: [],
       rankById: new Map(),
+      siblingIdx: new Map(),
     };
   }
 
@@ -382,10 +400,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   // shared parent so they never overlap, regardless of how many there
   // are.
   const rank3Siblings = new Map<string, FabricNode[]>();
+  const rank3SafeIdx  = new Map<string, number>();
   for (const n of rank3Nodes) {
     const myParents = new Set(rank3Parents.get(n.id) ?? []);
     if (myParents.size === 0) {
       rank3Siblings.set(n.id, [n]);
+      rank3SafeIdx.set(n.id, 0);
       continue;
     }
     const set = new Set<FabricNode>([n]);
@@ -394,7 +414,9 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
       const mp = rank3Parents.get(m.id) ?? [];
       if (mp.some((p) => myParents.has(p))) set.add(m);
     }
-    rank3Siblings.set(n.id, [...set].sort((a, b) => a.id.localeCompare(b.id)));
+    const sibs = [...set].sort((a, b) => a.id.localeCompare(b.id));
+    rank3Siblings.set(n.id, sibs);
+    rank3SafeIdx.set(n.id, sibs.findIndex((s) => s.id === n.id));
   }
 
   const boxMap: Record<string, Box> = {};
@@ -438,14 +460,20 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     boxMap[node.id] = { x, y, w: NODE_W, h: NODE_H };
   }
 
-  // ── Pass 3: rank 3 (second-hop access) — siblings arranged so an uplink
-  // line from the rank-2 parent to one child NEVER crosses the box of
-  // another sibling. For 2 siblings, place them SIDE-BY-SIDE under the
-  // parent (one entirely to the left of parent's center, the other
-  // entirely to the right). For 3+ siblings, stack vertically with a
-  // horizontal offset that grows with each sibling so they stay
-  // visually separated. Either way, both uplink lines from the parent
-  // are clean diagonals without passing through any sibling box.
+  // ── Pass 3: rank 3 (second-hop access) — siblings stacked VERTICALLY
+  // under the rank-2 parent. All siblings share the parent's center X,
+  // forming a clean vertical column. This is the right reading for
+  // a tree-of-switches where each first-hop parent owns a column of
+  // second-hop children. Lines from parent's bottom-port(s) reach
+  // each child at its own Y; siblings do not block each other's
+  // uplink line because each child occupies a distinct Y band.
+  //
+  // For 1 sibling: place at parent X (no siblings to avoid).
+  // For 2+ siblings: stack with RANK3_STEP_Y = rank3NodeH + 16, so
+  // siblings are evenly spread above/below the rank3Y baseline. Each
+  // sibling has its own vertical band — the upper sibling sits closer
+  // to the parent, the lower sibling sits further down. No code
+  // change needed when adding more siblings (dynamic spacing).
   const RANK3_STEP_Y = rank3NodeH + 16;
   for (const node of nodes) {
     const r = rankById.get(node.id) ?? TIER_RANK[node.role];
@@ -474,30 +502,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     let y: number;
 
     if (parentCenterX !== null) {
-      if (siblings.length === 1) {
-        // Only one child — place directly under parent (same X).
-        x = parentCenterX - NODE_W / 2;
-        y = rank3Y - rank3NodeH / 2;
-      } else if (siblings.length === 2) {
-        // Two siblings — side-by-side. Each sits entirely outside the
-        // parent's X-range, so the uplink lines from parent to each
-        // are clean diagonals (left-down, right-down) without passing
-        // through the other sibling.
-        const gap = 24; // horizontal gap between parent edge and sibling edge
-        if (safeIdx === 0) {
-          // Left sibling: right edge = parentCenterX - gap.
-          x = parentCenterX - gap - NODE_W;
-        } else {
-          // Right sibling: left edge = parentCenterX + gap.
-          x = parentCenterX + gap;
-        }
-        y = rank3Y - rank3NodeH / 2;
-      } else {
-        // 3+ siblings — stack vertically at parent X (rare path;
-        // typical full-mesh has ≤2 siblings per first-hop parent).
-        x = parentCenterX - NODE_W / 2;
-        y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
-      }
+      // 1 sibling: at parent X, on the rank3Y baseline.
+      // 2+ siblings: stacked vertically at parent X, evenly spread
+      //   above/below rank3Y so all siblings sit under the parent in
+      //   a single column.
+      x = parentCenterX - NODE_W / 2;
+      y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
     } else {
       // No rank-2 parent known — fall back to the floor column centre.
       const fl = node.floor || node.id;
@@ -596,6 +606,7 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     tiers: tierLayouts,
     tierMeta,
     rankById,
+    siblingIdx: rank3SafeIdx,
   };
 }
 
@@ -690,6 +701,49 @@ function pickSide(from: Box, to: Box): Anchor {
 
 function makeStraightPath(a: Pt, b: Pt): string {
   return `M ${a.x.toFixed(2)} ${a.y.toFixed(2)} L ${b.x.toFixed(2)} ${b.y.toFixed(2)}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path — L-shape that bypasses an upper sibling.
+//
+// Used when a rank-3 node is the LOWER sibling in a vertically-stacked
+// sibling column under a rank-2 parent. The straight-diagonal path would
+// pass straight through the upper sibling's box, which looks like a
+// phantom link between siblings. Instead we route the line around the
+// upper sibling:
+//
+//   ┌─────────────┐
+//   │  rank-2     │
+//   │  parent     │──┐                        ← horizontal stub right
+//   └─────────────┘  │
+//                    │                        ← vertical, well clear of upper sibling
+//   ┌─────────────┐  │
+//   │  upper sib  │  │
+//   └─────────────┘  │
+//                    │
+//   ┌─────────────┐  │
+//   │  lower sib  │◄─┘                        ← horizontal entry from right
+//   └─────────────┘
+//
+// The bypass side (left/right) alternates by sibling index so 3+ siblings
+// in a stack get clear separation instead of all colliding on one side.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeBypassPath(a: Pt, b: Pt, side: 'left' | 'right'): string {
+  // Horizontal offset to clear the upper sibling and parent boxes.
+  // 30 px is enough: the parent's right edge is at most NODE_W/2 to the
+  // side of parent center, the upper sibling is at the same center, so
+  // 30 px right of any of their edges is in clear space.
+  const OFFSET = 30;
+  const dir = side === 'right' ? 1 : -1;
+  const x1 = a.x + dir * OFFSET;
+  const x2 = b.x + dir * OFFSET;
+  return [
+    `M ${a.x.toFixed(2)} ${a.y.toFixed(2)}`,
+    `L ${x1.toFixed(2)} ${a.y.toFixed(2)}`,
+    `L ${x2.toFixed(2)} ${b.y.toFixed(2)}`,
+    `L ${b.x.toFixed(2)} ${b.y.toFixed(2)}`,
+  ].join(' ');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -861,8 +915,37 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       const fromEnd = buildPortEnd(a.box, info.fromSide, fromIdx, fromTotal, link.fromPort);
       const toEnd   = buildPortEnd(b.box, info.toSide,   toIdx,   toTotal,   link.toPort);
 
-      const d = makeStraightPath(fromEnd.stubEnd, toEnd.stubEnd);
-      edgeList.push({ link, d, fromEnd, toEnd });
+      // Detect stacked-sibling situation: link is from rank 2 to rank 3
+      // and the target is the LOWER sibling in a vertical stack. Without
+      // bypass routing, the straight diagonal would cross the upper
+      // sibling's box — visually creating a phantom link between
+      // siblings. Use the L-path so the line routes around the upper
+      // sibling.
+      const fromRank = layout.rankById.get(a.node.id) ?? TIER_RANK[a.node.role];
+      const toRank   = layout.rankById.get(b.node.id) ?? TIER_RANK[b.node.role];
+      const targetSiblingIdx = layout.siblingIdx?.get(b.node.id) ?? 0;
+      const isLowerSibling =
+        info.crossTier &&
+        fromRank < toRank &&
+        toRank === 3 &&
+        targetSiblingIdx > 0;
+
+      let d: string;
+      let bypass = false;
+      if (isLowerSibling) {
+        // Alternate bypass side by sibling index so 3+ siblings in a
+        // stack spread their bypass routes (right, left, right, …)
+        // instead of all crashing into the same corridor.
+        const side: 'right' | 'left' = targetSiblingIdx % 2 === 1 ? 'right' : 'left';
+        // The bypass path's first segment IS the source stub (horizontal
+        // exit from the source port), so we inline it into the path
+        // and skip the separate `<line>` stub at the source.
+        d = makeBypassPath(fromEnd.anchor, toEnd.stubEnd, side);
+        bypass = true;
+      } else {
+        d = makeStraightPath(fromEnd.stubEnd, toEnd.stubEnd);
+      }
+      edgeList.push({ link, d, fromEnd, toEnd, bypass });
     }
 
     return edgeList;
@@ -1030,13 +1113,17 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                 onPointerEnter={() => setHoverEdge(edge.link.id)}
                 onPointerLeave={() => setHoverEdge((cur) => cur === edge.link.id ? null : cur)}
               >
-                {/* Stub at source — short perpendicular segment */}
-                <line
-                  x1={edge.fromEnd.anchor.x} y1={edge.fromEnd.anchor.y}
-                  x2={edge.fromEnd.stubEnd.x} y2={edge.fromEnd.stubEnd.y}
-                  className="nc-fabric-stub"
-                  stroke={KIND_COLOR[edge.link.kind]} strokeWidth={stroke}
-                />
+                {/* Stub at source — short perpendicular segment. Skipped for
+                    bypass paths because the L-path's first segment is the
+                    horizontal source stub, already drawn in `edge.d`. */}
+                {!edge.bypass && (
+                  <line
+                    x1={edge.fromEnd.anchor.x} y1={edge.fromEnd.anchor.y}
+                    x2={edge.fromEnd.stubEnd.x} y2={edge.fromEnd.stubEnd.y}
+                    className="nc-fabric-stub"
+                    stroke={KIND_COLOR[edge.link.kind]} strokeWidth={stroke}
+                  />
+                )}
                 {/* Stub at target */}
                 <line
                   x1={edge.toEnd.anchor.x} y1={edge.toEnd.anchor.y}
