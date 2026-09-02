@@ -151,6 +151,18 @@ function layout(nodes, links) {
     } else { x = MARGIN_X; y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2; }
     boxes[n.id] = { x, y, w: NODE_W, h: RANK3_NODE_H };
   }
+  // Centering: shift all nodes so the overall graph centre aligns with the
+  // canvas centre (MARGIN_X + N_floors * FLOOR_COL_WIDE / 2).
+  const allB = Object.values(boxes);
+  if (allB.length > 0) {
+    const gL = Math.min(...allB.map((b) => b.x));
+    const gR = Math.max(...allB.map((b) => b.x + b.w));
+    const gCx = (gL + gR) / 2;
+    const N = 3; // LAB topology has 3 floors
+    const cCx = MARGIN_X + (N * FLOOR_COL_WIDE) / 2;
+    const shift = cCx - gCx;
+    for (const id of Object.keys(boxes)) boxes[id].x += shift;
+  }
   return { boxes, rank };
 }
 

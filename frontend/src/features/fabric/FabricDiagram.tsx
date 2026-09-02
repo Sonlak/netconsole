@@ -514,6 +514,28 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     };
   }
 
+  // ── Centering pass: center the ENTIRE graph so all tiers share ONE ──
+  // common centre axis. Without this, dagre centers rank 0 (cores) at its
+  // own canvas centre and rank 1 (dists) at ITS own canvas centre, which
+  // pushes the dist tier to the outer edges of the core tier. By computing
+  // the overall graph bounding box and shifting every node by the same
+  // delta, every tier sits on the same vertical axis — a balanced pyramid.
+  const graphBoxes = Object.values(boxMap);
+  if (graphBoxes.length > 0) {
+    const graphLeft  = Math.min(...graphBoxes.map((b) => b.x));
+    const graphRight = Math.max(...graphBoxes.map((b) => b.x + b.w));
+    const graphCenterX = (graphLeft + graphRight) / 2;
+    // Canvas centre for a MARGIN_X-based layout is approximately:
+    //   MARGIN_X + (N_floors * FLOOR_COL_WIDE) / 2  (centred inside the
+    //   total space reserved for N_floors columns).
+    const N = floors.length;
+    const canvasCenterX = MARGIN_X + (N * FLOOR_COL_WIDE) / 2;
+    const shift = canvasCenterX - graphCenterX;
+    for (const id of Object.keys(boxMap)) {
+      boxMap[id].x += shift;
+    }
+  }
+
   // 4) Group positioned nodes by rank for the tier rail and bands.
   const tierNodes: Record<number, NodeLayout[]> = {};
   for (const node of nodes) {
