@@ -40,7 +40,6 @@ import type { FabricLink, FabricLinkKind, FabricNode, FabricRole } from '@/types
 const NODE_W = 228;
 const NODE_H = 96;
 const PORT_STUB = 46;             // stub length from node edge into the bus
-const PORT_LABEL_GAP = 6;
 const TIER_GAP = 188;             // vertical gap between two tiers (extra room for fan-out)
 const NODE_GAP_X = 72;            // horizontal gap between sibling nodes in same tier
 const MARGIN_X = 60;
@@ -212,27 +211,32 @@ function buildPortEnd(
     case 'right': {
       anchor   = { x: box.x + box.w, y: box.y + off };
       stubEnd  = { x: box.x + box.w + PORT_STUB + trackOffsetX, y: box.y + off + trackOffsetY };
-      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
+      // Label sits just to the right of the node, beside the port — out of the bus zone.
+      labelPos = { x: anchor.x + 6, y: anchor.y - labelSize.h / 2 };
+      labelAnchor = 'start';
       break;
     }
     case 'left': {
       anchor   = { x: box.x, y: box.y + off };
       stubEnd  = { x: box.x - PORT_STUB - trackOffsetX, y: box.y + off + trackOffsetY };
-      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
+      labelPos = { x: anchor.x - 6, y: anchor.y - labelSize.h / 2 };
       labelAnchor = 'end';
       break;
     }
     case 'bottom': {
       anchor   = { x: box.x + off, y: box.y + box.h };
       stubEnd  = { x: box.x + off + trackOffsetX, y: box.y + box.h + PORT_STUB + trackOffsetY };
-      labelPos = { x: stubEnd.x, y: stubEnd.y + PORT_LABEL_GAP };
+      // Label centred directly under the port — stays with the source node,
+      // keeps the inter-tier bus zone free of stacked labels.
+      labelPos = { x: anchor.x, y: anchor.y + 6 };
+      labelAnchor = 'middle';
       break;
     }
     case 'top': {
       anchor   = { x: box.x + off, y: box.y };
       stubEnd  = { x: box.x + off + trackOffsetX, y: box.y - PORT_STUB - trackOffsetY };
-      labelPos = { x: stubEnd.x, y: stubEnd.y - PORT_LABEL_GAP - labelSize.h };
-      labelAnchor = 'start';
+      labelPos = { x: anchor.x, y: anchor.y - 6 - labelSize.h };
+      labelAnchor = 'middle';
       break;
     }
   }
