@@ -591,13 +591,40 @@ textarea.nc-code-area {
   opacity: 0.85;
 }
 
+.nc-fabric-port .nc-fabric-port-bg {
+  fill: color-mix(in srgb, var(--nc-surface) 94%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 70%, transparent);
+  stroke-width: 1;
+}
+
+.nc-fabric-port .nc-fabric-port-text {
+  font-size: 10.5px;
+  font-weight: 650;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  fill: var(--nc-text-muted);
+  letter-spacing: -0.02em;
+  opacity: 0.85;
+  transition: opacity 0.12s ease, fill 0.12s ease;
+}
+
+.nc-fabric-link.is-hover .nc-fabric-port .nc-fabric-port-text {
+  fill: var(--nc-text);
+  opacity: 1;
+}
+
+.nc-fabric-link.is-hover .nc-fabric-port .nc-fabric-port-bg {
+  fill: color-mix(in srgb, var(--nc-surface) 99%, transparent);
+  stroke: color-mix(in srgb, var(--nc-border) 100%, transparent);
+}
+
+/* Legacy selectors kept for any residual markup. */
 .nc-fabric-port-label {
   font-size: 10.5px;
   font-weight: 650;
   font-family: var(--font-mono), ui-monospace, monospace;
   fill: var(--nc-text-muted);
   letter-spacing: -0.02em;
-  opacity: 0;
+  opacity: 0.85;
   pointer-events: none;
   transition: opacity 0.12s ease;
 }

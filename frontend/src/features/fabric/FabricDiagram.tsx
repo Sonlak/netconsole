@@ -81,6 +81,10 @@ type PortEnd = {
   portName: string;
   anchor:   Pt;       // point on the node edge
   stubEnd:  Pt;       // end of the short perpendicular stub
+  // Geometric position of the label, already offset away from the line so
+  // it never overlaps the diagonal itself.
+  labelPos: Pt;
+  labelAnchor: 'start' | 'middle' | 'end';
 };
 
 type EdgePath = {
@@ -256,7 +260,32 @@ function buildPortEnd(
 ): PortEnd {
   const anchor  = portAnchorOnEdge(box, side, idx, total);
   const stubEnd = stubFromAnchor(anchor, side, PORT_STUB);
-  return { side, portName, anchor, stubEnd };
+
+  // Label sits in a quiet zone beside the stub so it never sits on the
+  // diagonal line itself.
+  let labelPos: Pt;
+  let labelAnchor: 'start' | 'middle' | 'end' = 'middle';
+  const LABEL_OFFSET = 4;
+  switch (side) {
+    case 'top':
+      labelPos = { x: anchor.x, y: anchor.y - PORT_STUB - 14 };
+      labelAnchor = 'middle';
+      break;
+    case 'bottom':
+      labelPos = { x: anchor.x, y: anchor.y + PORT_STUB + 14 };
+      labelAnchor = 'middle';
+      break;
+    case 'left':
+      labelPos = { x: anchor.x - PORT_STUB - LABEL_OFFSET, y: anchor.y };
+      labelAnchor = 'end';
+      break;
+    case 'right':
+      labelPos = { x: anchor.x + PORT_STUB + LABEL_OFFSET, y: anchor.y };
+      labelAnchor = 'start';
+      break;
+  }
+
+  return { side, portName, anchor, stubEnd, labelPos, labelAnchor };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,46 +337,36 @@ function FabricNodeCard({ node, box }: { node: FabricNode; box: Box }) {
   );
 }
 
-function PortLabel({ end, visible }: { end: PortEnd; visible: boolean }) {
+function PortLabel({ end }: { end: PortEnd }) {
   const label = end.portName?.trim() || '—';
-  let x = end.stubEnd.x;
-  let y = end.stubEnd.y;
-  let anchor: 'start' | 'middle' | 'end' = 'middle';
-  let dy = 4;
+  const PAD_X = 5;
+  const CHAR_W = 6.2;
+  const H = 14;
+  const w = Math.max(22, label.length * CHAR_W + PAD_X * 2);
 
-  switch (end.side) {
-    case 'top':
-      y -= 6;
-      anchor = 'middle';
-      dy = -2;
-      break;
-    case 'bottom':
-      y += 14;
-      anchor = 'middle';
-      dy = 0;
-      break;
-    case 'left':
-      x -= 4;
-      anchor = 'end';
-      dy = 4;
-      break;
-    case 'right':
-      x += 4;
-      anchor = 'start';
-      dy = 4;
-      break;
-  }
+  let x = end.labelPos.x;
+  let y = end.labelPos.y;
+  if (end.labelAnchor === 'end')   x -= w;
+  else if (end.labelAnchor === 'start') x += 0;
+  else                              x -= w / 2;
+
+  const rectY = y - H / 2;
+  const textX = end.labelPos.x;
+  const textY = y + 0.5;
 
   return (
-    <text
-      x={x}
-      y={y + dy}
-      textAnchor={anchor}
-      dominantBaseline="middle"
-      className={`nc-fabric-port-label${visible ? ' is-visible' : ''}`}
-    >
-      {label}
-    </text>
+    <g className="nc-fabric-port">
+      <rect x={x} y={rectY} width={w} height={H} rx={4} className="nc-fabric-port-bg" />
+      <text
+        x={textX}
+        y={textY}
+        textAnchor={end.labelAnchor}
+        dominantBaseline="middle"
+        className="nc-fabric-port-text"
+      >
+        {label}
+      </text>
+    </g>
   );
 }
 
@@ -598,7 +617,6 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
             const isHover = hoverEdge === edge.link.id;
             const marker  = `nc-arrow-${edge.link.kind}`;
             const stroke  = KIND_STROKE[edge.link.kind];
-            const isVisible = isHover;       // labels only on hover — keeps canvas clean
             return (
               <g
                 key={edge.link.id}
@@ -644,8 +662,8 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
                   {edge.link.note ? `\n${edge.link.note}` : ''}
                   {isDown ? '\nLINK DOWN' : ''}
                 </title>
-                <PortLabel end={edge.fromEnd} visible={isVisible} />
-                <PortLabel end={edge.toEnd}   visible={isVisible} />
+                <PortLabel end={edge.fromEnd} />
+                <PortLabel end={edge.toEnd} />
               </g>
             );
           })}
