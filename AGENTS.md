@@ -296,6 +296,20 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
     pixel-y ≠ rank-number). If you ever see tier bands or tier rail
     labels disappear, that filter pattern is the first place to look.
     See commit `330b7f0`.
+12. **No fixed-offset arrays in layout code** — the old
+    `SH_OFFSETS = [-60, 0, 60, ...]` and `FH_OFFSETS = [-50, 0, 50, ...]`
+    patterns silently broke when the user added more nodes than the
+    array length, because the offsets were smaller than `NODE_W = 228`.
+    The dagre-based layout (`FabricDiagram.tsx`) now uses purely
+    dynamic spacing: rank-3 anchored under rank-2 parent + vertical
+    stack with `RANK3_STEP_Y = rank3NodeH + 16`, rank-2 spread =
+    `(FLOOR_COL_WIDE - NODE_W) / (fhCount - 1)` so every box stays
+    inside its column. When you add a new device, **no code change
+    should be needed**. If you find yourself writing
+    `const SOME_OFFSETS = [...]` for layout, refactor to dynamic
+    instead. See commits `88719a3` + `7907866` and the
+    `frontend/sanity-rank3.mjs` test that asserts "no rank-3 overlap"
+    + "no column overflow" for 1/2/3/5/7 second-hop per floor.
 
 ---
 
@@ -608,3 +622,79 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
     "label missing" — first check layout.tiers, 	ierMeta, and any
     filter that derives one from the other. The bug pattern is almost
     always a .find(...) with the wrong predicate.
+
+### 2026-09-02 23:55 — FabricDiagram: parent-anchored rank-3 + dynamic rank-2/first-hop
+- User added LAB-F3-AS-03 (the 10th device). F3-AS-02 and F3-AS-03
+  visually overlapped because the rank-3 layout used a fixed
+  SH_OFFSETS = [-60, 0, 60, -30, 30] array, and the offsets are
+  smaller than NODE_W (228), so adjacent siblings ended up only
+  60 px apart while being 228 px wide. Same trap existed for first-hop
+  switches with FH_OFFSETS = [-50, 0, 50, -25, 25, -12, 12].
+- **Fix**: rank-3 (second-hop access) is now anchored DIRECTLY under
+  the rank-2 (first-hop) parent by X, then stacked vertically. Siblings
+  (rank-3 nodes that share at least one rank-2 parent) are spread
+  evenly around 
+ank3Y with RANK3_STEP_Y = rank3NodeH + 16. Topology
+  reads as a tree: parent above, children below. Works for any number
+  of siblings automatically.
+- Multiple rank-2 parents (typical full-mesh: a second-hop connects to
+  BOTH first-hops on its floor) → average their X so the child lands
+  between its parents.
+- Orphan rank-3 (no rank-2 parent): falls back to the floor column
+  centre.
+- Rank-2 (first-hop) switch layout is now also dynamic — slot width is
+  (FLOOR_COL_WIDE - NODE_W) / (fhCount - 1), which keeps every
+  first-hop inside its column (no overflow into the next floor's column).
+  For 2 first-hops on a 320 px column with NODE_W=228: slotW = 92, so
+  the boxes overlap by 136 px, but their visible cards (narrower than
+  the bounding box) still read as separate, and they never cross the
+  column boundary.
+- **FabricDiagram.tsx rewrite**: the single-loop boxMap computation
+  became three explicit passes:
+  1. Pass 1 — rank 0/1 (cores, dists) use dagre's centre coords.
+  2. Pass 2 — rank 2 (first-hop) arranged by floor column.
+  3. Pass 3 — rank 3 (second-hop) anchored under rank-2 parent(s).
+  Pre-pass computes 
+ank3Parents and 
+ank3Siblings so pass 3 can
+  read parent X from oxMap and pick a sibling index for stacking.
+- **sanity-rank3.mjs (committed)**: offline test that builds the
+  same pass-2 + pass-3 math as the React code and asserts:
+  (a) no rank-3 vs rank-3 bounding-box collision, and
+  (b) no box overflows its floor column.
+  Runs topologies with 1, 2, 3, 5, 7 second-hop per floor. All five
+  pass. Run with 
+ode sanity-rank3.mjs from the frontend dir.
+- Commits 88719a3 (parent-anchored rank-3) + 7907866 (column
+  constraint + sanity test). CI green, deploy green. Verified live:
+  9 devices · 14 links, F3-AS-02 and F3-AS-03 stacked vertically
+  under F3-AS-01, no overlap with any other node, no overflow into
+  F4 column (well, F4 doesn't exist here, but the test covers 18
+  floors).
+- **Lessons for next agent:**
+  - **No fixed-offset arrays for layout**. Any layout rule that hard-
+    codes SH_OFFSETS = [-60, 0, 60, ...] will silently break when
+    the user adds more nodes than the array length. Use dynamic
+    spacing computed from the actual count ((spread) / (count - 1)
+    for sibling layout, (column_slack) / (count - 1) for column
+    layout). When adding a new node, no code change should be needed.
+  - **Bugs that "worked before" can still be layout bugs**. The
+    FH_OFFSETS = [-50, 0, 50, ...] was the source of an intra-floor
+    first-hop overlap that had been there since the original 3-tier
+    rewrite, but the visible cards were narrower than the bounding
+    boxes so nobody noticed. Always check that bounding boxes at
+    least respect column boundaries.
+  - **Sanity tests for layout must check bounding boxes, not just
+    node counts**. The previous check-fabric-layout.mjs only printed
+    canvas dimensions and dagre positions — it would have happily
+    reported "OK" while rank-3 nodes were overlapping. The new
+    sanity-rank3.mjs computes the same boxes the React code computes
+    and asserts overlap / overflow invariants.
+  - **When the user says "thông minh lên"** (be smarter / more
+    general), they want the layout to handle ANY future topology
+    change without code edits. Treat it as a robustness ask, not a
+    feature ask — refactor for generalisation, don't just patch the
+    one case in front of you.
+  - **CSS for tier bands** lives in rontend/src/styles/antd-bridge.css
+    under .nc-fabric-tier-band.is-<tone>. Tones are core, dist,
+    ccess, leaf. If you add a 5th tier, add a matching CSS class.
