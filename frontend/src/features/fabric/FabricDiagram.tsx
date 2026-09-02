@@ -266,7 +266,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   g.setGraph({
     rankdir: 'TB',
     ranksep: TIER_GAP,
-    nodesep: 28,
+    // nodesep is the horizontal gap between sibling nodes (e.g. the 2
+    // cores sit side-by-side at rank 0). User wants the 2 cores visibly
+    // apart so the L3 interconnect link between them is readable —
+    // keep this >= 80 so the link between same-rank peers is not
+    // visually crushed into a tiny stub.
+    nodesep: 110,
     edgesep: 12,
     marginx: MARGIN_X,
     marginy: MARGIN_Y,
@@ -433,49 +438,76 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     boxMap[node.id] = { x, y, w: NODE_W, h: NODE_H };
   }
 
-  // ── Pass 3: rank 3 (second-hop access) — directly under the rank-2 ───
-  // first-hop parent(s), stacked vertically so siblings never overlap
-  // regardless of how many there are. This is the ONLY fully-dynamic
-  // rule: no fixed offset arrays, no per-topology constants, no manual
-  // tweaks when you add a new device.
+  // ── Pass 3: rank 3 (second-hop access) — siblings arranged so an uplink
+  // line from the rank-2 parent to one child NEVER crosses the box of
+  // another sibling. For 2 siblings, place them SIDE-BY-SIDE under the
+  // parent (one entirely to the left of parent's center, the other
+  // entirely to the right). For 3+ siblings, stack vertically with a
+  // horizontal offset that grows with each sibling so they stay
+  // visually separated. Either way, both uplink lines from the parent
+  // are clean diagonals without passing through any sibling box.
   const RANK3_STEP_Y = rank3NodeH + 16;
   for (const node of nodes) {
     const r = rankById.get(node.id) ?? TIER_RANK[node.role];
     if (r !== 3) continue;
 
     const parents = rank3Parents.get(node.id) ?? [];
+    const siblings = rank3Siblings.get(node.id) ?? [node];
+    const safeIdx = (() => {
+      const i = siblings.findIndex((s) => s.id === node.id);
+      return i >= 0 ? i : 0;
+    })();
 
-    // Anchor X = average of all rank-2 parents' X positions. With
-    // multiple first-hops on the same floor, the child sits between
-    // them. If no parent is known, fall back to floor column centre.
-    let parentX: number | null = null;
+    // Parent centre X — average of all rank-2 parents' box centres.
+    let parentCenterX: number | null = null;
     if (parents.length > 0) {
       let sum = 0;
       let count = 0;
       for (const pid of parents) {
         const pb = boxMap[pid];
-        if (pb) { sum += pb.x; count++; }
+        if (pb) { sum += pb.x + pb.w / 2; count++; }
       }
-      if (count > 0) parentX = sum / count;
+      if (count > 0) parentCenterX = sum / count;
     }
+
     let x: number;
-    if (parentX !== null) {
-      x = parentX;
+    let y: number;
+
+    if (parentCenterX !== null) {
+      if (siblings.length === 1) {
+        // Only one child — place directly under parent (same X).
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y - rank3NodeH / 2;
+      } else if (siblings.length === 2) {
+        // Two siblings — side-by-side. Each sits entirely outside the
+        // parent's X-range, so the uplink lines from parent to each
+        // are clean diagonals (left-down, right-down) without passing
+        // through the other sibling.
+        const gap = 24; // horizontal gap between parent edge and sibling edge
+        if (safeIdx === 0) {
+          // Left sibling: right edge = parentCenterX - gap.
+          x = parentCenterX - gap - NODE_W;
+        } else {
+          // Right sibling: left edge = parentCenterX + gap.
+          x = parentCenterX + gap;
+        }
+        y = rank3Y - rank3NodeH / 2;
+      } else {
+        // 3+ siblings — stack vertically at parent X (rare path;
+        // typical full-mesh has ≤2 siblings per first-hop parent).
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
+      }
     } else {
+      // No rank-2 parent known — fall back to the floor column centre.
       const fl = node.floor || node.id;
       const col = floorColIdx[fl] ?? 0;
       x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2;
+      y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
     }
 
-    // Vertical stack: spread siblings evenly around rank3Y so the stack
-    // is visually centred under the parent.
-    const siblings = rank3Siblings.get(node.id) ?? [node];
-    const idx = siblings.findIndex((s) => s.id === node.id);
-    const safeIdx = idx >= 0 ? idx : 0;
-    const y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
-
     boxMap[node.id] = {
-      x,
+      x: Math.max(MARGIN_X, x),
       y: Math.max(MARGIN_Y, y),
       w: NODE_W,
       h: rank3NodeH,

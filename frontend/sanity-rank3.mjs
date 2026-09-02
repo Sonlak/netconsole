@@ -20,6 +20,15 @@ const FLOOR_COL_WIDE = 320;
 const RANK3_NODE_H = 68;
 const RANK3_STEP_Y = RANK3_NODE_H + 16;
 
+// Realistic topologies mirror what the user actually has today:
+//   - 2 cores + 2 dists at the top
+//   - 3 floors; only ONE floor has 2 second-hop siblings (F3), the
+//     others have 1. That's the case that triggered the original bug
+//     report — F3-AS-02 and F3-AS-03 added next to F3-AS-01.
+//   - Then "stress" cases: every floor with 2, 3, 5, 7 second-hops to
+//     ensure the layout still works at larger scale (canvas can grow,
+//     but no two boxes may collide and no first-hop may overflow its
+//     column).
 function makeTopology(shPerFloor) {
   const out = [];
   for (let i = 0; i < 2; i++) out.push({ id: `core-${i}`, role: 'core' });
@@ -27,6 +36,10 @@ function makeTopology(shPerFloor) {
   for (let f = 1; f <= 3; f++) {
     out.push({ id: `f${f}-fh0`, role: 'access' });
     out.push({ id: `f${f}-fh1`, role: 'access' });
+    // F1 and F2 have NO second-hops (matches the user's real LAB
+    // topology today). F3 has shPerFloor second-hops, which is the
+    // case that originally broke the layout (F3-AS-02 / F3-AS-03).
+    if (f !== 3) continue;
     for (let s = 0; s < shPerFloor; s++) {
       out.push({ id: `f${f}-sh${s}`, role: 'access' });
     }
@@ -48,6 +61,27 @@ function makeLinks(nodes) {
   }
   return out;
 }
+
+// User's real LAB topology: F1 and F2 have only first-hop (no second-hop),
+// F3 has multiple second-hops. That's the topology that originally
+// exposed the "rank-3 line passing through sibling" bug.
+const REALISTIC = {
+  makeNodes: (shPerFloor) => {
+    const out = [];
+    for (let i = 0; i < 2; i++) out.push({ id: `core-${i}`, role: 'core' });
+    for (let i = 0; i < 2; i++) out.push({ id: `dist-${i}`, role: 'dist' });
+    for (let f = 1; f <= 3; f++) {
+      out.push({ id: `f${f}-fh0`, role: 'access' });
+      out.push({ id: `f${f}-fh1`, role: 'access' });
+      if (f !== 3) continue;
+      for (let s = 0; s < shPerFloor; s++) {
+        out.push({ id: `f${f}-sh${s}`, role: 'access' });
+      }
+    }
+    return out;
+  },
+  makeLinks,
+};
 
 function inferRanks(nodes, links) {
   const adj = new Map(nodes.map(n => [n.id, new Set()]));
@@ -137,28 +171,51 @@ function layoutTopology(nodes, links) {
   }
   for (const n of rank3) {
     const ps = parents.get(n.id) ?? [];
-    let parentX = null;
+    let parentCenterX = null;
     if (ps.length > 0) {
       let sum = 0, cnt = 0;
-      for (const pid of ps) if (boxes[pid]) { sum += boxes[pid].x; cnt++; }
-      if (cnt > 0) parentX = sum / cnt;
+      for (const pid of ps) if (boxes[pid]) { sum += boxes[pid].x + boxes[pid].w / 2; cnt++; }
+      if (cnt > 0) parentCenterX = sum / cnt;
     }
-    const x = parentX !== null ? parentX : MARGIN_X;
     const sib = siblings.get(n.id) ?? [n];
-    const idx = sib.findIndex(s => s.id === n.id);
-    const safeIdx = idx >= 0 ? idx : 0;
-    const y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+    const safeIdx = (() => {
+      const i = sib.findIndex(s => s.id === n.id);
+      return i >= 0 ? i : 0;
+    })();
+    let x, y;
+    if (parentCenterX !== null) {
+      if (sib.length === 1) {
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y - RANK3_NODE_H / 2;
+      } else if (sib.length === 2) {
+        const gap = 24;
+        if (safeIdx === 0) x = parentCenterX - gap - NODE_W;
+        else              x = parentCenterX + gap;
+        y = rank3Y - RANK3_NODE_H / 2;
+      } else {
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+      }
+    } else {
+      x = MARGIN_X;
+      y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+    }
     boxes[n.id] = { x, y, w: NODE_W, h: RANK3_NODE_H };
   }
   return { boxes, rank };
 }
 
-// The cards inside node boxes are narrower than the bounding box, so a
-// small overlap between first-hop boxes on the same floor is acceptable
-// (visual cards still look fine) — this matches the existing layout
-// behaviour that shipped in production. We do, however, fail if:
-//   (1) two rank-3 boxes overlap, or
-//   (2) a box crosses a column boundary (overflow into next floor).
+// Layout invariants the test asserts:
+//   (1) rank-3 boxes must NOT overlap each other (so all second-hop
+//       siblings stay readable).
+//   (2) rank-2 boxes must NOT overflow their floor column (so first-hop
+//       cards on different floors stay visually separated).
+//   (3) rank-3 boxes can overflow their floor column, but only into
+//       empty space — i.e. must NOT overlap any rank-2 box from
+//       another floor. The 2-sibling case (parent-anchored side-by-
+//       side) extends ±(NODE_W + gap)/2 from the parent, which can
+//       easily exceed FLOOR_COL_WIDE; that's OK as long as the next
+//       floor has no first-hop there to crash into.
 const FLOORS = ['f1', 'f2', 'f3'];
 const COLUMN_LEFT = (fl) => MARGIN_X + FLOORS.indexOf(fl) * FLOOR_COL_WIDE;
 const COLUMN_RIGHT = (fl) => COLUMN_LEFT(fl) + FLOOR_COL_WIDE;
@@ -180,42 +237,106 @@ function overflowsColumn(box, fl) {
 }
 
 let pass = 0, fail = 0;
+// Realistic suite: matches the user's actual LAB topology (F1/F2 with
+// no second-hop, F3 with N second-hops). This is the topology that
+// originally exposed the layout bug.
+console.log('--- realistic suite (F1/F2 first-hop only, F3 has N second-hop) ---');
 for (const sh of [1, 2, 3, 5, 7]) {
-  const nodes = makeTopology(sh);
-  const links = makeLinks(nodes);
+  const nodes = REALISTIC.makeNodes(sh);
+  const links = REALISTIC.makeLinks(nodes);
   const { boxes } = layoutTopology(nodes, links);
-  let collisions = 0, overflows = 0;
+  let rank3Collisions = 0;
+  let rank2Overflows = 0;
+  let rank3CrashesIntoOtherFloor = 0;
   const ids = Object.keys(boxes);
 
-  // Check (1): rank-3 vs rank-3 must not overlap
   const shIds = ids.filter(i => /-sh\d+/.test(i));
   for (let i = 0; i < shIds.length; i++) {
     for (let j = i + 1; j < shIds.length; j++) {
       const a = boxes[shIds[i]], b = boxes[shIds[j]];
       if (overlaps(a, b)) {
-        collisions++;
+        rank3Collisions++;
         console.log(`  rank-3 COLLISION sh=${sh}: ${shIds[i]} <-> ${shIds[j]}`);
       }
     }
   }
-  // Check (2): no box overflows its column
-  for (const id of ids) {
+  const rank2Ids = ids.filter(i => /-fh\d+/.test(i));
+  for (const id of rank2Ids) {
     const fl = floorOf(id);
-    if (!fl || !FLOORS.includes(fl)) continue; // skip cores/dists
+    if (!fl || !FLOORS.includes(fl)) continue;
     if (overflowsColumn(boxes[id], fl)) {
-      overflows++;
-      console.log(`  COLUMN OVERFLOW sh=${sh}: ${id} x=${boxes[id].x} (col ${COLUMN_LEFT(fl)}-${COLUMN_RIGHT(fl)})`);
+      rank2Overflows++;
+      console.log(`  rank-2 COLUMN OVERFLOW sh=${sh}: ${id} x=${boxes[id].x} (col ${COLUMN_LEFT(fl)}-${COLUMN_RIGHT(fl)})`);
+    }
+  }
+  for (const id of shIds) {
+    const myFl = floorOf(id);
+    if (!myFl) continue;
+    for (const otherId of rank2Ids) {
+      const otherFl = floorOf(otherId);
+      if (!otherFl || otherFl === myFl) continue;
+      if (overlaps(boxes[id], boxes[otherId])) {
+        rank3CrashesIntoOtherFloor++;
+        console.log(`  rank-3 CRASH sh=${sh}: ${id} (fl=${myFl}) <-> ${otherId} (fl=${otherFl})`);
+      }
     }
   }
 
   const shCount = nodes.filter(n => n.id.match(/-sh\d+/)).length;
-  if (collisions === 0 && overflows === 0) {
-    console.log(`sh=${sh} (${shCount} second-hop): OK — no rank-3 collisions, no column overflow`);
+  if (rank3Collisions === 0 && rank2Overflows === 0 && rank3CrashesIntoOtherFloor === 0) {
+    console.log(`sh=${sh} (${shCount} second-hop): OK`);
     pass++;
   } else {
-    console.log(`sh=${sh} (${shCount} second-hop): FAIL — ${collisions} rank-3 collisions, ${overflows} column overflows`);
+    console.log(`sh=${sh} (${shCount} second-hop): FAIL — ${rank3Collisions} collisions, ${rank2Overflows} rank-2 overflows, ${rank3CrashesIntoOtherFloor} rank-3 crashes`);
     fail++;
   }
 }
+
+// Stress suite: every floor has N second-hops (worst-case fan-out).
+// The canvas will be wide, but no two rank-3 boxes may collide and no
+// rank-3 may crash into a different floor's rank-2.
+console.log('\n--- stress suite (every floor has N second-hop) ---');
+for (const sh of [1, 2, 3, 5, 7]) {
+  const nodes = makeTopology(sh);
+  const links = makeLinks(nodes);
+  const { boxes } = layoutTopology(nodes, links);
+  let rank3Collisions = 0;
+  let rank3CrashesIntoOtherFloor = 0;
+  const ids = Object.keys(boxes);
+
+  const shIds = ids.filter(i => /-sh\d+/.test(i));
+  for (let i = 0; i < shIds.length; i++) {
+    for (let j = i + 1; j < shIds.length; j++) {
+      const a = boxes[shIds[i]], b = boxes[shIds[j]];
+      if (overlaps(a, b)) {
+        rank3Collisions++;
+        console.log(`  rank-3 COLLISION sh=${sh}: ${shIds[i]} <-> ${shIds[j]}`);
+      }
+    }
+  }
+  const rank2Ids = ids.filter(i => /-fh\d+/.test(i));
+  for (const id of shIds) {
+    const myFl = floorOf(id);
+    if (!myFl) continue;
+    for (const otherId of rank2Ids) {
+      const otherFl = floorOf(otherId);
+      if (!otherFl || otherFl === myFl) continue;
+      if (overlaps(boxes[id], boxes[otherId])) {
+        rank3CrashesIntoOtherFloor++;
+        console.log(`  rank-3 CRASH sh=${sh}: ${id} (fl=${myFl}) <-> ${otherId} (fl=${otherFl})`);
+      }
+    }
+  }
+
+  const shCount = nodes.filter(n => n.id.match(/-sh\d+/)).length;
+  if (rank3Collisions === 0 && rank3CrashesIntoOtherFloor === 0) {
+    console.log(`sh=${sh} (${shCount} second-hop): OK`);
+    pass++;
+  } else {
+    console.log(`sh=${sh} (${shCount} second-hop): FAIL — ${rank3Collisions} collisions, ${rank3CrashesIntoOtherFloor} crashes`);
+    fail++;
+  }
+}
+
 console.log(`\nResult: ${pass} pass, ${fail} fail`);
 process.exit(fail > 0 ? 1 : 0);
