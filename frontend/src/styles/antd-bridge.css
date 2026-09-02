@@ -576,17 +576,34 @@ textarea.nc-code-area {
 }
 
 .nc-fabric-link.is-down .nc-fabric-line {
-  stroke-dasharray: 4 6;
-  animation: nc-fabric-dash 1.4s linear infinite;
-  opacity: 0.55;
+  /* Down link — subtle so it doesn't look like a rendering bug.
+     No animation: a moving dash reads as "broken" which is wrong here. */
+  stroke-dasharray: 6 5;
+  opacity: 0.45;
 }
 
-.nc-fabric-link.is-down.is-hover .nc-fabric-line {
-  opacity: 0.9;
+.nc-fabric-link.is-down .nc-fabric-stub {
+  opacity: 0.45;
 }
 
-@keyframes nc-fabric-dash {
-  to { stroke-dashoffset: -20; }
+.nc-fabric-link.is-down.is-hover .nc-fabric-line,
+.nc-fabric-link.is-down.is-hover .nc-fabric-stub {
+  opacity: 0.85;
+}
+
+.nc-fabric-port-label {
+  font-size: 10.5px;
+  font-weight: 650;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  fill: var(--nc-text-muted);
+  letter-spacing: -0.02em;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.nc-fabric-port-label.is-visible {
+  opacity: 1;
 }
 
 .nc-fabric-port rect {
