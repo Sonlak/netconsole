@@ -184,30 +184,67 @@ function layoutTopology(nodes, links) {
     })();
     let x, y;
     if (parentCenterX !== null) {
-      // 1 sibling: at parent X, on the rank3Y baseline.
-      // 2+ siblings: stacked vertically at parent X, evenly spread
-      //   above/below rank3Y so all siblings sit under the parent in
-      //   a single column.
-      x = parentCenterX - NODE_W / 2;
-      y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+      if (sib.length === 1) {
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y - RANK3_NODE_H / 2;
+      } else if (sib.length === 2) {
+        // Side-by-side, shifted right under parent. Left sibling
+        // starts at parent's left edge (under parent's left half),
+        // right sibling sits to the right of left sibling. Both at
+        // the same Y baseline. Mirror FabricDiagram.tsx Pass 3.
+        const gap = 20;
+        const parentLeftX = parentCenterX - NODE_W / 2;
+        if (safeIdx === 0) x = parentLeftX;
+        else              x = parentLeftX + NODE_W + gap;
+        y = rank3Y - RANK3_NODE_H / 2;
+      } else {
+        // 3+ siblings — stack vertically at parent X (bypass routing
+        // handled separately in FabricDiagram; this script only checks
+        // geometric overlap / column overflow, not lines).
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+      }
     } else {
       x = MARGIN_X;
       y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
     }
     boxes[n.id] = { x, y, w: NODE_W, h: RANK3_NODE_H };
   }
-  // Centering: shift all nodes so the overall graph centre aligns with the
-  // canvas centre (MARGIN_X + N_floors * FLOOR_COL_WIDE / 2). This keeps
-  // every tier on the same vertical axis — a balanced pyramid.
+  // Centering: per-tier shift to align rank-2 (access first-hop) axis.
+  // Rank-2 stays put; cores/dists/rank-3 all shift so their tier
+  // centres match rank-2 centre. Mirrors FabricDiagram.tsx centering.
   const allB = Object.values(boxes);
   if (allB.length > 0) {
-    const gL = Math.min(...allB.map((b) => b.x));
-    const gR = Math.max(...allB.map((b) => b.x + b.w));
-    const gCx = (gL + gR) / 2;
-    const N = 3; // realistic suite always has 3 floors (f1, f2, f3)
-    const cCx = MARGIN_X + (N * FLOOR_COL_WIDE) / 2;
-    const shift = cCx - gCx;
-    for (const id of Object.keys(boxes)) boxes[id].x += shift;
+    const tierInfo = new Map();
+    for (const id of Object.keys(boxes)) {
+      const r = rank.get(id);
+      const b = boxes[id];
+      const cur = tierInfo.get(r);
+      if (!cur) tierInfo.set(r, { left: b.x, right: b.x + b.w, centre: b.x + b.w / 2 });
+      else {
+        cur.left = Math.min(cur.left, b.x);
+        cur.right = Math.max(cur.right, b.x + b.w);
+        cur.centre = (cur.left + cur.right) / 2;
+      }
+    }
+    const axisInfo = tierInfo.get(2);
+    let axisX;
+    if (axisInfo) axisX = axisInfo.centre;
+    else {
+      let mw = -1;
+      for (const info of tierInfo.values()) {
+        const w = info.right - info.left;
+        if (w > mw) { mw = w; axisX = info.centre; }
+      }
+    }
+    for (const id of Object.keys(boxes)) {
+      const r = rank.get(id);
+      // rank-3 stays where Pass 3 placed it (relative to rank-2 parent).
+      if (r === 3) continue;
+      const tc = tierInfo.get(r);
+      if (!tc) continue;
+      boxes[id].x += axisX - tc.centre;
+    }
   }
   return { boxes, rank };
 }

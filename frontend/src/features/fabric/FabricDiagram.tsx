@@ -460,20 +460,25 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     boxMap[node.id] = { x, y, w: NODE_W, h: NODE_H };
   }
 
-  // ── Pass 3: rank 3 (second-hop access) — siblings stacked VERTICALLY
-  // under the rank-2 parent. All siblings share the parent's center X,
-  // forming a clean vertical column. This is the right reading for
-  // a tree-of-switches where each first-hop parent owns a column of
-  // second-hop children. Lines from parent's bottom-port(s) reach
-  // each child at its own Y; siblings do not block each other's
-  // uplink line because each child occupies a distinct Y band.
+  // ── Pass 3: rank 3 (second-hop access) — siblings placed in F3's column.
   //
-  // For 1 sibling: place at parent X (no siblings to avoid).
-  // For 2+ siblings: stack with RANK3_STEP_Y = rank3NodeH + 16, so
-  // siblings are evenly spread above/below the rank3Y baseline. Each
-  // sibling has its own vertical band — the upper sibling sits closer
-  // to the parent, the lower sibling sits further down. No code
-  // change needed when adding more siblings (dynamic spacing).
+  // Two cases based on sibling count:
+  //   (a) **1 sibling**: place directly under parent at parent X.
+  //   (b) **2 siblings**: side-by-side under parent, BOTH at the same Y
+  //       (rank3Y baseline). One sits left of parent X, the other right
+  //       of parent X. Both stay inside the floor column
+  //       (FLOOR_COL_WIDE = 320). Two clean diagonal uplinks — no line
+  //       crosses any sibling box.
+  //   (c) **3+ siblings**: stack vertically at parent X with
+  //       RANK3_STEP_Y = rank3NodeH + 16 spacing. Lower siblings need
+  //       L-path (bypass) routing so the uplink lines don't pass through
+  //       the upper siblings' boxes.
+  //
+  // User clarification (2026-09-03 01:51): "nằm dọc với F3-AS-01" means
+  // "in the same column as F3-AS-01" — NOT "stacked vertically on top
+  // of each other". For 2 siblings, the canonical reading is side-by-side
+  // in that column. Vertical stacking is only for 3+ siblings where
+  // side-by-side won't fit.
   const RANK3_STEP_Y = rank3NodeH + 16;
   for (const node of nodes) {
     const r = rankById.get(node.id) ?? TIER_RANK[node.role];
@@ -502,12 +507,39 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     let y: number;
 
     if (parentCenterX !== null) {
-      // 1 sibling: at parent X, on the rank3Y baseline.
-      // 2+ siblings: stacked vertically at parent X, evenly spread
-      //   above/below rank3Y so all siblings sit under the parent in
-      //   a single column.
-      x = parentCenterX - NODE_W / 2;
-      y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
+      if (siblings.length === 1) {
+        // Single child — under parent, parent X.
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y - rank3NodeH / 2;
+      } else if (siblings.length === 2) {
+        // Two siblings — side-by-side, paired SHIFTED RIGHT under the
+        // parent. Layout reads as: F3-AS-02 sits directly under
+        // F3-AS-01 (same X), F3-AS-03 sits to the right of F3-AS-02
+        // (same Y, side-by-side). The pair shares one horizontal
+        // baseline under the parent.
+        //
+        // User spec (2026-09-03 02:00): "F3-AS-02, F3-AS-03 nằm
+        // ngang hàng, dịch qua phải nằm dưới con F3-AS-01". The pair
+        // starts at parent's left edge and extends right.
+        const gap = 20;
+        const parentLeftX = parentCenterX - NODE_W / 2;
+        if (safeIdx === 0) {
+          // Left sibling — starts at parent's left edge (directly
+          // under parent's left half).
+          x = parentLeftX;
+        } else {
+          // Right sibling — starts after left sibling + gap.
+          x = parentLeftX + NODE_W + gap;
+        }
+        y = rank3Y - rank3NodeH / 2;
+      } else {
+        // 3+ siblings — stack vertically at parent X with dynamic
+        // RANK3_STEP_Y spacing. Lower siblings use bypass routing
+        // (see makeBypassPath) so their uplink lines don't pass
+        // through the upper siblings' boxes.
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
+      }
     } else {
       // No rank-2 parent known — fall back to the floor column centre.
       const fl = node.floor || node.id;
@@ -524,48 +556,53 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     };
   }
 
-  // ── Centering pass: every tier shares ONE vertical axis = the centre ──
-  // of the widest tier (typically the access tier with the most nodes).
-  // Without this, dagre places each tier in its own local coordinate
-  // system and the tiers drift relative to each other — the DIST band
-  // sits left of the CORE band, the ACCESS band sits left of DIST, etc.
-  // By computing each tier's bounding box, finding the widest tier's
-  // centre, and shifting every node so its tier-centre matches, all
-  // tiers end up on the same vertical axis — a balanced pyramid.
-  const allBoxes = Object.entries(boxMap);
-  if (allBoxes.length > 0) {
-    // Compute per-tier bounding box + centre
-    const tierInfo = new Map<number, { left: number; right: number; centre: number; width: number }>();
-    for (const [id, box] of allBoxes) {
+  // ── Centering pass: per-tier shift so every tier shares ONE vertical ──
+  // axis = the centre of the rank-2 (access first-hop) tier. Rank-2
+  // stays where its floor columns put it; cores, dists, and rank-3 all
+  // shift to align with rank-2's centre.
+  //
+  // Why per-tier and not uniform graph-bbox shift: with side-by-side
+  // rank-3 siblings under F3, the rank-3 tier is wider than rank-2
+  // (extends past F3 column). Using the graph bbox centre would drag
+  // rank-2 leftward and could push F1 first-hop off the canvas. Using
+  // rank-2 centre as the axis keeps every tier balanced on the
+  // floor-column axis (F1/F2/F3 first-hop column).
+  if (Object.keys(boxMap).length > 0) {
+    const tierInfo = new Map<number, { left: number; right: number; centre: number }>();
+    for (const id of Object.keys(boxMap)) {
       const r = rankById.get(id) ?? 0;
+      const b = boxMap[id];
       const cur = tierInfo.get(r);
-      const boxLeft  = box.x;
-      const boxRight = box.x + box.w;
       if (!cur) {
-        tierInfo.set(r, { left: boxLeft, right: boxRight, centre: (boxLeft + boxRight) / 2, width: boxRight - boxLeft });
+        tierInfo.set(r, { left: b.x, right: b.x + b.w, centre: b.x + b.w / 2 });
       } else {
-        cur.left  = Math.min(cur.left, boxLeft);
-        cur.right = Math.max(cur.right, boxRight);
+        cur.left  = Math.min(cur.left, b.x);
+        cur.right = Math.max(cur.right, b.x + b.w);
         cur.centre = (cur.left + cur.right) / 2;
-        cur.width = cur.right - cur.left;
       }
     }
-    // Pick the widest tier as the axis reference.
+    // Rank-2 (access first-hop) is the axis reference.
+    const axisInfo = tierInfo.get(2);
     let axisX = 0;
-    let maxWidth = 0;
-    for (const info of tierInfo.values()) {
-      if (info.width > maxWidth) {
-        maxWidth = info.width;
-        axisX = info.centre;
+    if (axisInfo) {
+      axisX = axisInfo.centre;
+    } else {
+      // No rank-2 nodes — fall back to the widest tier.
+      let mw = -1;
+      for (const info of tierInfo.values()) {
+        const w = info.right - info.left;
+        if (w > mw) { mw = w; axisX = info.centre; }
       }
     }
-    // Shift every tier so its centre = axisX.
-    for (const [id, box] of allBoxes) {
+    for (const id of Object.keys(boxMap)) {
       const r = rankById.get(id) ?? 0;
+      // rank-3 stays where Pass 3 placed it (relative to rank-2 parent).
+      // Don't shift it to the rank-2 axis — that drags rank-3 sideways
+      // away from its parent and out of the floor column.
+      if (r === 3) continue;
       const tc = tierInfo.get(r);
       if (!tc) continue;
-      const shift = axisX - tc.centre;
-      box.x += shift;
+      boxMap[id].x += axisX - tc.centre;
     }
   }
 
@@ -916,19 +953,29 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       const toEnd   = buildPortEnd(b.box, info.toSide,   toIdx,   toTotal,   link.toPort);
 
       // Detect stacked-sibling situation: link is from rank 2 to rank 3
-      // and the target is the LOWER sibling in a vertical stack. Without
-      // bypass routing, the straight diagonal would cross the upper
-      // sibling's box — visually creating a phantom link between
-      // siblings. Use the L-path so the line routes around the upper
-      // sibling.
+      // and the target is the LOWER sibling in a VERTICALLY-stacked
+      // column under the rank-2 parent. Without bypass routing, the
+      // straight diagonal would cross the upper sibling's box —
+      // visually creating a phantom link between siblings.
+      //
+      // Important: only fire when the target is actually at the same
+      // X as the parent (true vertical stack). For 2 siblings laid
+      // out side-by-side inside the floor column, both targets are at
+      // different X and the uplink lines are clean diagonals — no
+      // bypass is needed (and using bypass there would push the
+      // line OUTSIDE the floor column).
       const fromRank = layout.rankById.get(a.node.id) ?? TIER_RANK[a.node.role];
       const toRank   = layout.rankById.get(b.node.id) ?? TIER_RANK[b.node.role];
       const targetSiblingIdx = layout.siblingIdx?.get(b.node.id) ?? 0;
+      const targetAtParentX = Math.abs(
+        (b.box.x + b.box.w / 2) - (a.box.x + a.box.w / 2),
+      ) < 1;
       const isLowerSibling =
         info.crossTier &&
         fromRank < toRank &&
         toRank === 3 &&
-        targetSiblingIdx > 0;
+        targetSiblingIdx > 0 &&
+        targetAtParentX;
 
       let d: string;
       let bypass = false;

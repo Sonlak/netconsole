@@ -141,26 +141,59 @@ function layout(nodes, links) {
     const safeIdx = (() => { const i = sib.findIndex(s => s.id === n.id); return i >= 0 ? i : 0; })();
     let x, y;
     if (parentCenterX !== null) {
-      // 1 sibling: at parent X, on the rank3Y baseline.
-      // 2+ siblings: stacked vertically at parent X, evenly spread
-      //   above/below rank3Y so all siblings sit under the parent in
-      //   a single column.
-      x = parentCenterX - NODE_W / 2;
-      y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+      if (sib.length === 1) { x = parentCenterX - NODE_W / 2; y = rank3Y - RANK3_NODE_H / 2; }
+      else if (sib.length === 2) {
+        // Side-by-side, shifted right under parent. Left sibling
+        // starts at parent's left edge (under parent's left half),
+        // right sibling sits to the right of left sibling. Both at
+        // the same Y baseline. Mirror FabricDiagram.tsx Pass 3.
+        const gap = 20;
+        const parentLeftX = parentCenterX - NODE_W / 2;
+        if (safeIdx === 0) x = parentLeftX;
+        else              x = parentLeftX + NODE_W + gap;
+        y = rank3Y - RANK3_NODE_H / 2;
+      } else {
+        // 3+ siblings — stack vertically at parent X.
+        x = parentCenterX - NODE_W / 2;
+        y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2;
+      }
     } else { x = MARGIN_X; y = rank3Y + (safeIdx - (sib.length - 1) / 2) * RANK3_STEP_Y - RANK3_NODE_H / 2; }
     boxes[n.id] = { x, y, w: NODE_W, h: RANK3_NODE_H };
   }
-  // Centering: shift all nodes so the overall graph centre aligns with the
-  // canvas centre (MARGIN_X + N_floors * FLOOR_COL_WIDE / 2).
+  // Centering: per-tier shift to align rank-2 (access first-hop) axis.
+  // Mirrors FabricDiagram.tsx centering.
   const allB = Object.values(boxes);
   if (allB.length > 0) {
-    const gL = Math.min(...allB.map((b) => b.x));
-    const gR = Math.max(...allB.map((b) => b.x + b.w));
-    const gCx = (gL + gR) / 2;
-    const N = 3; // LAB topology has 3 floors
-    const cCx = MARGIN_X + (N * FLOOR_COL_WIDE) / 2;
-    const shift = cCx - gCx;
-    for (const id of Object.keys(boxes)) boxes[id].x += shift;
+    const tierInfo = new Map();
+    for (const id of Object.keys(boxes)) {
+      const r = rank.get(id);
+      const b = boxes[id];
+      const cur = tierInfo.get(r);
+      if (!cur) tierInfo.set(r, { left: b.x, right: b.x + b.w, centre: b.x + b.w / 2 });
+      else {
+        cur.left = Math.min(cur.left, b.x);
+        cur.right = Math.max(cur.right, b.x + b.w);
+        cur.centre = (cur.left + cur.right) / 2;
+      }
+    }
+    const axisInfo = tierInfo.get(2);
+    let axisX;
+    if (axisInfo) axisX = axisInfo.centre;
+    else {
+      let mw = -1;
+      for (const info of tierInfo.values()) {
+        const w = info.right - info.left;
+        if (w > mw) { mw = w; axisX = info.centre; }
+      }
+    }
+    for (const id of Object.keys(boxes)) {
+      const r = rank.get(id);
+      // rank-3 stays where Pass 3 placed it (relative to rank-2 parent).
+      if (r === 3) continue;
+      const tc = tierInfo.get(r);
+      if (!tc) continue;
+      boxes[id].x += axisX - tc.centre;
+    }
   }
   return { boxes, rank };
 }
@@ -208,73 +241,21 @@ for (const l of links) {
   const pb = boxes[parent], cb = boxes[child];
   if (!pb || !cb) continue;
 
-  // For cross-tier rank 2 → rank 3 with the child being a LOWER sibling
-  // (siblingIdx > 0) in a vertical stack, the production code routes the
-  // link via an L-path that bypasses the upper sibling. Mirror that here
-  // so we don't flag a real line as a crash.
-  //
-  // Sibling list mirrors FabricDiagram's `rank3Siblings`: every rank-3
-  // node that shares at least one rank-2 parent with the child (INCLUDING
-  // the child itself). The child's position in the sorted list is its
-  // sibling index — 0 = top, 1 = next-down, etc.
-  const allRank3 = Object.keys(boxes).filter((id) => rank.get(id) === 3);
-  const childParents = new Set();
-  for (const l2 of links) {
-    if (l2.from === child || l2.to === child) {
-      const other = l2.from === child ? l2.to : l2.from;
-      if (rank.get(other) === 2) childParents.add(other);
-    }
-  }
-  const childSiblings = allRank3.filter((id) => {
-    if (id === child) return true;  // include self — index matters
-    for (const l2 of links) {
-      if (l2.from !== id && l2.to !== id) continue;
-      const other = l2.from === id ? l2.to : l2.from;
-      if (rank.get(other) === 2 && childParents.has(other)) return true;
-    }
-    return false;
-  }).sort();
-  const sibIdx = childSiblings.indexOf(child);
-  const useBypass = fr < tr && tr === 3 && childSiblings.length > 1 && sibIdx > 0;
-
-  // Build the path sample points.
-  const samples = [];
-  if (useBypass) {
-    // mirror makeBypassPath: OFFSET=30, side = right when sibIdx is odd, left otherwise
-    const OFFSET = 30;
-    const dir = sibIdx % 2 === 1 ? 1 : -1;
-    const x1 = pb.x + pb.w / 2 + dir * OFFSET;
-    const x2 = cb.x + cb.w / 2 + dir * OFFSET;
-    // Anchor at bottom of parent (port 1 / right side for lower sibling)
-    const ax = pb.x + pb.w - 18; // ~ PORT_INSET from right edge
-    const ay = pb.y + pb.h;
-    const bx = cb.x + cb.w / 2; // target's top center
-    const by = cb.y - 18;        // stubEnd 18px above top edge
-    samples.push({ x: ax, y: ay });
-    samples.push({ x: x1, y: ay });
-    samples.push({ x: x2, y: by });
-    samples.push({ x: bx, y: by });
-  } else {
-    const from = { x: pb.x + pb.w / 2, y: pb.y + pb.h };
-    const to   = { x: cb.x + cb.w / 2, y: cb.y };
-    const N = 50;
-    for (let i = 0; i <= N; i++) {
-      const t = i / N;
-      samples.push({ x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t });
-    }
-  }
+  // Cross-tier rank 2 → rank 3 lines. The current topology has at most
+  // 2 second-hop siblings per first-hop, which the layout places
+  // SIDE-BY-SIDE inside the floor column. Both uplink lines are clean
+  // diagonals — no bypass path is needed and no collision should be
+  // reported. (For 3+ siblings the layout stacks vertically and
+  // FabricDiagram.tsx uses an L-path bypass around the upper sibling;
+  // that case isn't exercised in this test topology.)
+  const from = { x: pb.x + pb.w / 2, y: pb.y + pb.h };
+  const to   = { x: cb.x + cb.w / 2, y: cb.y };
   for (const [otherId, ob] of Object.entries(boxes)) {
     if (otherId === parent || otherId === child) continue;
-    if (otherId !== child && useBypass && childSiblings.includes(otherId)) continue; // bypassed box
-    for (const s of samples) {
-      if (s.x > ob.x && s.x < ob.x + ob.w && s.y > ob.y && s.y < ob.y + ob.h) {
-        console.log(`  CRASH: ${parent} -> ${child} crosses ${otherId}`);
-        anyCrash = true;
-        break;
-      }
+    if (lineCrossesBox(from, to, ob)) {
+      console.log(`  CRASH: ${parent} -> ${child} crosses ${otherId}`);
+      anyCrash = true;
     }
-    if (anyCrash) break;
   }
-  if (anyCrash) break;
 }
 if (!anyCrash) console.log('  OK — no parent->child line crosses any other box');
