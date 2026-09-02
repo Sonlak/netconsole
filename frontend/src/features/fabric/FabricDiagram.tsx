@@ -751,7 +751,7 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
   // possible: Core, Distribution, Access L1, Access L2, ...).
   const tierRail: { label: string; tone: 'core' | 'dist' | 'access' | 'leaf'; y: number }[] =
     layout.tierMeta
-      .filter((t) => (layout.tiers.find((tl) => tl.y === t.rank)?.nodes.length ?? 0) > 0)
+      .filter((t) => (layout.tiers[t.rank]?.nodes.length ?? 0) > 0)
       .map((t) => {
         const tier = layout.tiers[t.rank];
         return {
