@@ -82,17 +82,22 @@ jobs:
           # Preserve user-managed files & gitignored artefacts on the server.
           # --delete ensures removed files in repo are also removed from server,
           # but excludes below protect data we want to keep across deploys.
+          #
+          # IMPORTANT: all excludes are anchored with a leading slash so they
+          # only match repo-root paths. Without the anchor, patterns like
+          # `data/` would also wipe source-tree folders such as
+          # `frontend/src/data/`, which broke the frontend build for weeks.
           rsync -a --delete \
-            --exclude '.git/' \
-            --exclude '.git' \
-            --exclude 'data/' \
-            --exclude 'volumes/' \
-            --exclude 'netconsole-app.tar.gz' \
-            --exclude '.tmp-hello.txt' \
-            --exclude '.tmp-cfg/' \
-            --exclude 'scripts/ci-rsa-*.bak' \
+            --exclude '/.git/' \
+            --exclude '/.git' \
+            --exclude '/data/' \
+            --exclude '/volumes/' \
+            --exclude '/netconsole-app.tar.gz' \
+            --exclude '/.tmp-hello.txt' \
+            --exclude '/.tmp-cfg/' \
+            --exclude '/scripts/ci-rsa-*.bak' \
             --exclude '*.pid' \
-            --exclude 'logs/' \
+            --exclude '/logs/' \
             ./src/ "$DEPLOY_DIR/"
 
           echo "--- Synced. DEPLOY_DIR contents:"
