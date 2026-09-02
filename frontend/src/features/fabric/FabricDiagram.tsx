@@ -525,11 +525,9 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     const graphLeft  = Math.min(...graphBoxes.map((b) => b.x));
     const graphRight = Math.max(...graphBoxes.map((b) => b.x + b.w));
     const graphCenterX = (graphLeft + graphRight) / 2;
-    // Canvas centre for a MARGIN_X-based layout is approximately:
-    //   MARGIN_X + (N_floors * FLOOR_COL_WIDE) / 2  (centred inside the
-    //   total space reserved for N_floors columns).
-    const N = floors.length;
-    const canvasCenterX = MARGIN_X + (N * FLOOR_COL_WIDE) / 2;
+    // True canvas centre is the midpoint of the actual graph extent, not
+    // N * FLOOR_COL_WIDE (which can be wider or narrower than the graph).
+    const canvasCenterX = (graphLeft + graphRight) / 2;
     const shift = canvasCenterX - graphCenterX;
     for (const id of Object.keys(boxMap)) {
       boxMap[id].x += shift;
