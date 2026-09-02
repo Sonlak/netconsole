@@ -410,8 +410,11 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   }
 
   // ── Pass 2: rank 2 (first-hop access) — one column per floor, evenly ─
-  // spaced across the column width. Works for any number of first-hop
-  // switches per floor (1, 2, 3, ...).
+  // spaced across the column width. Constrained so all first-hops stay
+  // inside their own column (no overflow into the next floor). Boxes
+  // may overlap each other within a column (the card visuals are
+  // narrower than the bounding box), but they never cross column
+  // boundaries, so cards on different floors stay visually separated.
   for (const node of nodes) {
     const r = rankById.get(node.id) ?? TIER_RANK[node.role];
     if (r !== 2) continue;
@@ -420,8 +423,10 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     const fhNodesInFloor = rank2Nodes.filter((n) => n.floor === node.floor);
     const fhIdx = fhNodesInFloor.indexOf(node);
     const fhCount = Math.max(1, fhNodesInFloor.length);
-    // Divide the column into fhCount equal slots, leave 40 px total padding.
-    const slotW = (FLOOR_COL_WIDE - 40) / fhCount;
+    // Max total spread inside the column = FLOOR_COL_WIDE - NODE_W (the
+    // slack). Divide it evenly between the (fhCount - 1) gaps.
+    const maxSpread = FLOOR_COL_WIDE - NODE_W; // 92 px for 320/228
+    const slotW = fhCount > 1 ? maxSpread / (fhCount - 1) : 0;
     const fhOffset = (fhIdx - (fhCount - 1) / 2) * slotW;
     const x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2 + fhOffset;
     const y = rank2Y - NODE_H / 2;
