@@ -436,4 +436,30 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
   stricter than `tsc --noEmit`, so CI's advisory typecheck can let
   module-resolution breaks slip through.
 
-### 2026-09-02 19:34 — FabricDiagram: 3-tier pyramid layout (Core/Dist/Access)
+### 2026-09-02 20:45 — FabricDiagram: gravitational alignment + per-source busY
+- User complaint: "topo vẽ như vậy, đéo thể hiểu được" — lines between tiers cross
+  chaotically because the previous layout centered each tier independently while
+  the LAB topology is full-mesh (both dists connect to ALL 3 access switches,
+  both cores connect to both dists).
+- `frontend/src/features/fabric/FabricDiagram.tsx` fully rewritten:
+  1. **Gravitational tier placement**: Access placed evenly. Each dist centered at
+     the centroid of its access children; each core centered at the centroid of
+     its dist children. With symmetric spread (spacing = NODE_W+NODE_GAP_X+24)
+     around that centroid, cores and dists now land in the same vertical
+     columns — primary uplinks read as straight vertical lines, only the
+     cross-uplinks cross in the middle.
+  2. **Per-source port sorting**: each source's outgoing cross-tier links are
+     sorted by target X before port indices are assigned. The leftmost port goes
+     to the leftmost target, so the fan-out matches physical wiring intuition.
+  3. **Per-source busY lanes**: links from different sources get non-overlapping
+     busY ranges. Within a source, each link gets a unique busY index so
+     parallel links from the same source don't bundle into one thick cable.
+- Key constants: `TIER_GAP 188→232`, `PORT_STUB 46→42`, `TRACK_STEP_BUS 26→18→14`
+  (TRACK_STEP_BUS 14 chosen so max busOffset ≈ 63 stays within the stubEnd
+  vertical range, avoiding kinks in the path).
+- TypeScript clean + Vite build OK. Commits `c43bfda` (main fix) + `11b0328`
+  (TRACK_STEP_BUS tuning). Pushed → CI green → Deploy green. Live at
+  http://42.119.165.109:8443/fabric.
+- **Next:** if user wants a cleaner result for full-mesh, consider grouping
+  dist→access links by "primary" child (heuristic: closest access by X) and
+  showing the rest as dashed backup links. Or use dagre.js for a proper DAG layout.
