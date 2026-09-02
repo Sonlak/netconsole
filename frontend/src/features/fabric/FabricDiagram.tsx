@@ -280,10 +280,17 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     if (!g.hasNode(link.fromDeviceId) || !g.hasNode(link.toDeviceId)) continue;
     const fromRank = rankById.get(link.fromDeviceId) ?? 0;
     const toRank   = rankById.get(link.toDeviceId)   ?? 0;
-    // Always point parent (lower rank) → child (higher rank). If the
-    // DB stored the link child→parent, flip it for dagre only.
-    const parentId = fromRank <= toRank ? link.fromDeviceId : link.toDeviceId;
-    const childId  = fromRank <= toRank ? link.toDeviceId   : link.fromDeviceId;
+    // Only feed STRICTLY parent → child edges to dagre. Skip:
+    //   - same-rank peer links (CORE↔CORE, DIST↔DIST, etc.) — otherwise
+    //     one core would land at rank 0 and the other at rank 1 because
+    //     the edge makes the sink have an incoming dependency.
+    //   - child→parent links after BFS flip — we flip them but only
+    //     when there is an actual rank difference to avoid creating
+    //     a self-loop in dagre's longest-path.
+    if (fromRank === toRank) continue;
+    // Always point parent (lower rank) → child (higher rank).
+    const parentId = fromRank < toRank ? link.fromDeviceId : link.toDeviceId;
+    const childId  = fromRank < toRank ? link.toDeviceId   : link.fromDeviceId;
     g.setEdge(parentId, childId, { id: link.id });
   }
 
