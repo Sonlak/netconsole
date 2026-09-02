@@ -341,53 +341,140 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   floors.forEach((fl, i) => { floorColIdx[fl] = i; });
 
   // ── 4) Map dagre nodes to top-left boxMap with floor grouping ──────────
-  const boxMap: Record<string, Box> = {};
-  const rank2Y = rank2Nodes[0] ? (g.node(rank2Nodes[0].id) as { y: number }).y : (MARGIN_Y + 2 * (NODE_H + TIER_GAP));
-  const rank3Y = rank3Nodes[0] ? (g.node(rank3Nodes[0].id) as { y: number }).y : (MARGIN_Y + 3 * (NODE_H + TIER_GAP));
+  // Tier-Y baselines (centred Y from dagre for each rank tier). We
+  // need them because rank-2 nodes are arranged in a compact column
+  // (not spread by dagre), so we re-anchor them to a single Y line
+  // per tier rather than trusting dagre's per-node coords.
+  const rank2Y = rank2Nodes[0]
+    ? (g.node(rank2Nodes[0].id) as { y: number }).y
+    : (MARGIN_Y + 2 * (NODE_H + TIER_GAP));
+  const rank3Y = rank3Nodes[0]
+    ? (g.node(rank3Nodes[0].id) as { y: number }).y
+    : (MARGIN_Y + 3 * (NODE_H + TIER_GAP));
   const rank3NodeH = 68; // second-hop nodes are slightly shorter to save vertical space
 
+  // Pre-compute parent ID for every rank-3 node: each rank-3 switch has
+  // at least one rank-2 (first-hop) neighbour. We use those neighbours to
+  // anchor the rank-3 node vertically under its first-hop parent.
+  // A rank-3 node may have multiple rank-2 parents (full-mesh typical
+  // for second-hop wiring); in that case we average their X so the
+  // child lands between its parents.
+  const rank3Parents = new Map<string, string[]>();
+  for (const n of rank3Nodes) {
+    const parents: string[] = [];
+    for (const l of links) {
+      let otherId: string | null = null;
+      if (l.toDeviceId === n.id) otherId = l.fromDeviceId;
+      else if (l.fromDeviceId === n.id) otherId = l.toDeviceId;
+      if (!otherId) continue;
+      if ((rankById.get(otherId) ?? 0) === 2) parents.push(otherId);
+    }
+    rank3Parents.set(n.id, parents);
+  }
+
+  // Sibling groups: two rank-3 nodes are siblings if they share at least
+  // one rank-2 parent. All siblings are stacked vertically under their
+  // shared parent so they never overlap, regardless of how many there
+  // are.
+  const rank3Siblings = new Map<string, FabricNode[]>();
+  for (const n of rank3Nodes) {
+    const myParents = new Set(rank3Parents.get(n.id) ?? []);
+    if (myParents.size === 0) {
+      rank3Siblings.set(n.id, [n]);
+      continue;
+    }
+    const set = new Set<FabricNode>([n]);
+    for (const m of rank3Nodes) {
+      if (m.id === n.id) continue;
+      const mp = rank3Parents.get(m.id) ?? [];
+      if (mp.some((p) => myParents.has(p))) set.add(m);
+    }
+    rank3Siblings.set(n.id, [...set].sort((a, b) => a.id.localeCompare(b.id)));
+  }
+
+  const boxMap: Record<string, Box> = {};
+
+  // ── Pass 1: rank 0 + rank 1 (cores, dists) use dagre's centre coords. ──
   for (const node of nodes) {
     const r = rankById.get(node.id) ?? TIER_RANK[node.role];
+    if (r > 1) continue;
     const dn = g.node(node.id) as { x: number; y: number };
     const dagreX = dn?.x ?? 0;
     const dagreY = dn?.y ?? 0;
+    boxMap[node.id] = {
+      x: dagreX - NODE_W / 2,
+      y: Math.max(MARGIN_Y, dagreY - NODE_H / 2),
+      w: NODE_W,
+      h: NODE_H,
+    };
+  }
 
-    // Default: dagre's center coords → top-left
-    let x = dagreX - NODE_W / 2;
-    let y = dagreY - NODE_H / 2;
+  // ── Pass 2: rank 2 (first-hop access) — one column per floor, evenly ─
+  // spaced across the column width. Works for any number of first-hop
+  // switches per floor (1, 2, 3, ...).
+  for (const node of nodes) {
+    const r = rankById.get(node.id) ?? TIER_RANK[node.role];
+    if (r !== 2) continue;
     const fl = node.floor || node.id;
+    const col = floorColIdx[fl] ?? 0;
+    const fhNodesInFloor = rank2Nodes.filter((n) => n.floor === node.floor);
+    const fhIdx = fhNodesInFloor.indexOf(node);
+    const fhCount = Math.max(1, fhNodesInFloor.length);
+    // Divide the column into fhCount equal slots, leave 40 px total padding.
+    const slotW = (FLOOR_COL_WIDE - 40) / fhCount;
+    const fhOffset = (fhIdx - (fhCount - 1) / 2) * slotW;
+    const x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2 + fhOffset;
+    const y = rank2Y - NODE_H / 2;
+    boxMap[node.id] = { x, y, w: NODE_W, h: NODE_H };
+  }
 
-    if (r === 2) {
-      // First-hop: compact to FLOOR_COL_WIDE column, stay on rank-2 Y.
-      // If multiple first-hop nodes share the same floor (e.g. two access
-      // switches on one floor), spread them horizontally so they don't
-      // overlap at the same X coordinate.
+  // ── Pass 3: rank 3 (second-hop access) — directly under the rank-2 ───
+  // first-hop parent(s), stacked vertically so siblings never overlap
+  // regardless of how many there are. This is the ONLY fully-dynamic
+  // rule: no fixed offset arrays, no per-topology constants, no manual
+  // tweaks when you add a new device.
+  const RANK3_STEP_Y = rank3NodeH + 16;
+  for (const node of nodes) {
+    const r = rankById.get(node.id) ?? TIER_RANK[node.role];
+    if (r !== 3) continue;
+
+    const parents = rank3Parents.get(node.id) ?? [];
+
+    // Anchor X = average of all rank-2 parents' X positions. With
+    // multiple first-hops on the same floor, the child sits between
+    // them. If no parent is known, fall back to floor column centre.
+    let parentX: number | null = null;
+    if (parents.length > 0) {
+      let sum = 0;
+      let count = 0;
+      for (const pid of parents) {
+        const pb = boxMap[pid];
+        if (pb) { sum += pb.x; count++; }
+      }
+      if (count > 0) parentX = sum / count;
+    }
+    let x: number;
+    if (parentX !== null) {
+      x = parentX;
+    } else {
+      const fl = node.floor || node.id;
       const col = floorColIdx[fl] ?? 0;
-      const fhNodesInFloor = rank2Nodes.filter((n) => n.floor === node.floor);
-      const fhIdx = fhNodesInFloor.indexOf(node);
-      const FH_OFFSETS = [-50, 0, 50, -25, 25, -12, 12]; // up to 7 first-hop nodes
-      const fhOffset = FH_OFFSETS[fhIdx % FH_OFFSETS.length] ?? 0;
-      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2 + fhOffset;
-      y = rank2Y - NODE_H / 2;
-    } else if (r === 3) {
-      // Second-hop: compact to same column, stack vertically.
-      // Group by floor: all second-hop nodes on the same floor share the
-      // same column X. Within a column, order by dagre's X relative
-      // position to preserve left-to-right order.
-      const col = floorColIdx[fl] ?? 0;
-      // Base X = column start + half column width (center of column)
-      const baseX = MARGIN_X + col * FLOOR_COL_WIDE + FLOOR_COL_WIDE / 2;
-      // Offset: use dagre's relative order within the floor to pick
-      // a fixed sub-column offset, so nodes don't all pile on the same X.
-      const shNodesInFloor = rank3Nodes.filter((n) => n.floor === node.floor);
-      const idx = shNodesInFloor.indexOf(node);
-      const SH_OFFSETS = [-60, 0, 60, -30, 30]; // 5 fixed sub-offsets for 2nd-hop nodes
-      x = baseX - NODE_W / 2 + (SH_OFFSETS[idx % SH_OFFSETS.length] ?? 0);
-      // Stack vertically within rank-3 band
-      y = rank3Y + (idx - (shNodesInFloor.length - 1) / 2) * (rank3NodeH + 8) - rank3NodeH / 2;
+      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2;
     }
 
-    boxMap[node.id] = { x, y: Math.max(MARGIN_Y, y), w: NODE_W, h: r === 3 ? rank3NodeH : NODE_H };
+    // Vertical stack: spread siblings evenly around rank3Y so the stack
+    // is visually centred under the parent.
+    const siblings = rank3Siblings.get(node.id) ?? [node];
+    const idx = siblings.findIndex((s) => s.id === node.id);
+    const safeIdx = idx >= 0 ? idx : 0;
+    const y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
+
+    boxMap[node.id] = {
+      x,
+      y: Math.max(MARGIN_Y, y),
+      w: NODE_W,
+      h: rank3NodeH,
+    };
   }
 
   // 4) Group positioned nodes by rank for the tier rail and bands.
