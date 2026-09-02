@@ -57,7 +57,7 @@ const NODE_GAP_X = 72;            // horizontal gap between sibling nodes in sam
 const MARGIN_X = 60;
 const MARGIN_Y = 110;
 const RAIL_WIDTH = 136;
-const TRACK_STEP_BUS = 18;        // y-spacing between adjacent bus lanes — keeps lines from different sources on distinct busY rows
+const TRACK_STEP_BUS = 14;        // y-spacing between adjacent bus lanes — keeps lines from different sources on distinct busY rows
 
 const KIND_COLOR: Record<FabricLinkKind, string> = {
   trunk:   '#4f9cf9',
