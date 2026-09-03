@@ -12,9 +12,13 @@ import { scheduleArpCollection } from './services/arpAddress.js';
 import { scheduleMacCollection } from './services/macAddress.js';
 import { scheduleInterfacesCollection } from './services/interfaces.js';
 import { scheduleConfigCollection } from './services/deviceTabCollection.js';
+import { scheduleLogsCollection } from './services/logs.js';
 import { scheduleJobWatchdog } from './services/jobWatchdog.js';
+import { startLogRetentionCleanup } from './services/logRetention.js';
+import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { fabricRouter } from './routes/fabric.js';
+import { logsRouter } from './routes/logs.js';
 import { authRouter } from './routes/auth.js';
 import { authMiddleware } from './middleware/auth.js';
 import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
@@ -47,11 +51,31 @@ const arpCollectIntervalSeconds = Number(process.env.ARP_COLLECT_INTERVAL_SECOND
 const interfacesCollectIntervalSeconds =
   Number(process.env.INTERFACES_COLLECT_INTERVAL_SECONDS) || 120;
 const configCollectIntervalSeconds = Number(process.env.CONFIG_COLLECT_INTERVAL_SECONDS) || 300;
+const logsCollectIntervalSeconds = Number(process.env.LOGS_COLLECT_INTERVAL_SECONDS) || 0;
+const syslogUdpPort = Number(process.env.SYSLOG_UDP_PORT) || 1514;
+const logRetentionDays = Number(process.env.LOG_RETENTION_DAYS) || 30;
 
 // Graceful shutdown support
 let isShuttingDown = false;
 const httpServer = app.listen(port, () => {
   console.log(`NetConsole API running on http://localhost:${port}`);
+
+  // UDP syslog receiver (no-auth, trusted LAN — always starts if port > 0)
+  if (syslogUdpPort > 0) {
+    try {
+      const { port: boundPort } = startSyslogReceiver({ port: syslogUdpPort, address: '0.0.0.0' });
+      console.log(`Syslog UDP receiver bound to :${boundPort}`);
+    } catch (error) {
+      console.error('[syslog] failed to bind:', error);
+    }
+  }
+
+  // Log retention cleanup
+  if (logRetentionDays > 0) {
+    startLogRetentionCleanup(logRetentionDays);
+    console.log(`Log retention cleanup enabled (keep ${logRetentionDays} days)`);
+  }
+
   scheduleDevicePing(pingIntervalSeconds);
   console.log(`Ping monitor enabled (every ${pingIntervalSeconds}s)`);
   scheduleMacCollection(macCollectIntervalSeconds);
@@ -62,6 +86,12 @@ const httpServer = app.listen(port, () => {
   console.log(`Ports auto-collect enabled (every ${interfacesCollectIntervalSeconds}s)`);
   scheduleConfigCollection(configCollectIntervalSeconds);
   console.log(`Config auto-collect enabled (every ${configCollectIntervalSeconds}s)`);
+  if (logsCollectIntervalSeconds > 0) {
+    scheduleLogsCollection(logsCollectIntervalSeconds);
+    console.log(`Logs auto-collect enabled (every ${logsCollectIntervalSeconds}s)`);
+  } else {
+    console.log('Logs auto-collect disabled (set LOGS_COLLECT_INTERVAL_SECONDS to enable)');
+  }
   scheduleJobWatchdog(30);
   console.log('Job watchdog enabled (reclaim stale RUNNING every 30s)');
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
@@ -92,6 +122,7 @@ app.get('/api/health', (_req, res) => {
       'fabric',
       'dhcp',
       'generate-config',
+      'logs',
       'auth',
     ],
     pingIntervalSeconds,
@@ -99,6 +130,9 @@ app.get('/api/health', (_req, res) => {
     arpCollectIntervalSeconds,
     interfacesCollectIntervalSeconds,
     configCollectIntervalSeconds,
+    logsCollectIntervalSeconds,
+    logRetentionDays,
+    syslogUdpPort,
     keaApiUrl: process.env.KEA_API_URL || null,
   });
 });
@@ -115,28 +149,35 @@ app.use('/api/interfaces', authMiddleware, moderateRateLimit, interfacesRouter);
 app.use('/api/fabric', authMiddleware, moderateRateLimit, fabricRouter);
 app.use('/api/dhcp', authMiddleware, strictRateLimit, dhcpRouter);
 app.use('/api/config', authMiddleware, strictRateLimit, generateConfigRouter);
+app.use('/api/logs', authMiddleware, strictRateLimit, logsRouter);
 app.use('/api/jobs', authMiddleware, moderateRateLimit, jobsRouter);
 
 // Graceful shutdown
-function gracefulShutdown(signal: string) {
+async function gracefulShutdown(signal: string) {
   console.log(`\n${signal} received. Starting graceful shutdown...`);
   isShuttingDown = true;
 
   // Stop accepting new connections
-  httpServer.close(() => {
+  httpServer.close(async () => {
     console.log('HTTP server closed');
+
+    // Close UDP syslog receiver
+    try {
+      await stopSyslogReceiver();
+      console.log('Syslog UDP receiver closed');
+    } catch (error) {
+      console.error('[shutdown] syslog receiver error:', error);
+    }
+
     // Close database connection
-    import('./lib/prisma.js').then(({ prisma }) => {
-      prisma.$disconnect()
-        .then(() => {
-          console.log('Database connection closed');
-          process.exit(0);
-        })
-        .catch((err) => {
-          console.error('Error disconnecting from database:', err);
-          process.exit(1);
-        });
-    });
+    try {
+      const { prisma } = await import('./lib/prisma.js');
+      await prisma.$disconnect();
+      console.log('Database connection closed');
+    } catch (error) {
+      console.error('Error disconnecting from database:', error);
+    }
+    process.exit(0);
   });
 
   // Force shutdown after 30 seconds

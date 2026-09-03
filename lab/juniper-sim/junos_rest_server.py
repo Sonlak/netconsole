@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, "/usr/local/lib/netconsole")
 
 import interface_state
+import syslog_buffer
 
 
 def _load_device_env() -> dict[str, str]:
@@ -53,6 +54,14 @@ def mac_table_payload() -> dict:
 
 def arp_table_payload() -> dict:
     return interface_state.arp_rest_payload()
+
+
+def log_payload() -> dict:
+    return syslog_buffer.rest_payload()
+
+
+def show_log_text() -> str:
+    return syslog_buffer.format_show_log()
 
 
 class JunosRestHandler(BaseHTTPRequestHandler):
@@ -120,6 +129,23 @@ class JunosRestHandler(BaseHTTPRequestHandler):
             self._json(200, interface_state.rest_payload())
             return
 
+        if path in {
+            "/rpc/get-log-information",
+            "/rpc/get-log-information/",
+        }:
+            self._json(200, log_payload())
+            return
+
+        if path == "/cli/show-log":
+            body = show_log_text()
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+
         if path in {"/", "/rpc"}:
             self._json(
                 200,
@@ -130,6 +156,7 @@ class JunosRestHandler(BaseHTTPRequestHandler):
                         "get-ethernet-switching-table-information",
                         "get-arp-table-information",
                         "get-interface-information",
+                        "get-log-information",
                     ],
                 },
             )

@@ -7,6 +7,8 @@ import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
 import { applyInterfaceActionSnapshot, queueGetInterfaces } from '../services/interfaces.js';
 import { invalidateFabricCache } from '../services/fabricTopology.js';
+import { isAllowedLogFilename } from '../lib/junosLogFiles.js';
+import { persistLogsForJob } from '../services/logs.js';
 
 export const jobsRouter = Router();
 
@@ -180,7 +182,18 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
       return;
     }
 
-    res.json({ job, device });
+    let persistedLogs = 0;
+    if (job.type === JobType.GET_LOGS && job.status === JobStatus.SUCCESS && job.deviceId) {
+      try {
+        const result = (job.result ?? {}) as { entries?: unknown[]; hostname?: string };
+        const entries = Array.isArray(result.entries) ? (result.entries as Parameters<typeof persistLogsForJob>[1]) : [];
+        persistedLogs = await persistLogsForJob(job.id, entries, result.hostname ?? '');
+      } catch (logError) {
+        console.error('[logs] persist failed', logError);
+      }
+    }
+
+    res.json({ job, device, persistedLogs });
     if (job.type === JobType.GET_INTERFACES) invalidateFabricCache();
   } catch {
     res.status(409).json({ error: 'Job is not running' });
@@ -191,7 +204,7 @@ jobsRouter.post('/', async (req, res) => {
   const { deviceId, type, payload } = req.body as {
     deviceId?: string;
     type?: JobType;
-    payload?: unknown;
+    payload?: Record<string, unknown> | { filename?: unknown };
   };
 
   if (!deviceId || !type || !Object.values(JobType).includes(type)) {
@@ -205,12 +218,34 @@ jobsRouter.post('/', async (req, res) => {
     return;
   }
 
+  // Sanitize GET_LOGS payloads: validate the optional `filename` against
+  // our whitelist so users can't ask the worker for arbitrary paths.
+  let safePayload: Prisma.InputJsonValue | undefined;
+  if (payload !== undefined && payload !== null) {
+    if (type === JobType.GET_LOGS && 'filename' in payload) {
+      const filename = payload.filename;
+      if (typeof filename === 'string' && filename) {
+        if (!isAllowedLogFilename(filename)) {
+          res.status(400).json({ error: `Unknown log filename: ${filename}` });
+          return;
+        }
+        safePayload = { filename } as Prisma.InputJsonValue;
+      } else if (filename == null) {
+        safePayload = { filename: 'messages' } as Prisma.InputJsonValue;
+      }
+    } else {
+      safePayload = payload as Prisma.InputJsonValue;
+    }
+  } else if (type === JobType.GET_LOGS) {
+    safePayload = { filename: 'messages' } as Prisma.InputJsonValue;
+  }
+
   const job = await prisma.job.create({
     data: {
       deviceId,
       type,
       status: JobStatus.PENDING,
-      ...(payload !== undefined ? { payload: payload as Prisma.InputJsonValue } : {}),
+      ...(safePayload !== undefined ? { payload: safePayload } : {}),
     },
     include: { device: true },
   });

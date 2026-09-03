@@ -124,6 +124,10 @@ services:
       ARP_COLLECT_INTERVAL_SECONDS: 120
       INTERFACES_COLLECT_INTERVAL_SECONDS: 120
       CONFIG_COLLECT_INTERVAL_SECONDS: 300
+      LOGS_COLLECT_INTERVAL_SECONDS: 300
+      LOG_RETENTION_DAYS: 30
+      LOG_ALERT_INTERVAL_SECONDS: 30
+      SYSLOG_UDP_PORT: 1514
       LAB_SSH_ENABLED: "false"
       LAB_SSH_USER: netconsole
       LAB_SSH_PASSWORD: Admin@123
@@ -143,6 +147,7 @@ services:
         ipv4_address: 172.31.0.3
     expose:
       - "3000"
+      - "1514/udp"
 
   worker:
     build:

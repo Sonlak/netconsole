@@ -719,6 +719,92 @@ class InterfaceActionTask(BaseTask):
         }
 
 
+class GetLogsTask(BaseTask):
+    job_type = "GET_LOGS"
+
+    def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
+        from netconsole_worker.config import settings
+        from netconsole_worker.junos_rest import compact_raw, fetch_log_information
+        from netconsole_worker.parsers.syslog_rpc import parse_log_payload
+        from netconsole_worker.ssh_client import run_ssh_command
+
+        payload = job.payload or {}
+        filename = str(payload.get("filename") or "").strip() or None
+
+        rest_error: str | None = None
+        hostname_fallback = device.name
+
+        if settings.junos_rest_enabled:
+            username = settings.junos_rest_user or settings.lab_ssh_user
+            password = settings.junos_rest_password or settings.lab_ssh_password
+            rest_result = fetch_log_information(
+                device.ip,
+                username=username,
+                password=password,
+                scheme=settings.junos_rest_scheme,
+                port=settings.junos_rest_port,
+                verify_tls=settings.junos_rest_verify_tls,
+                filename=filename,
+            )
+
+            if rest_result["ok"]:
+                raw_payload = rest_result["payload"] or rest_result["raw"]
+                entries = parse_log_payload(raw_payload)
+                if not entries and rest_result.get("raw"):
+                    entries = parse_log_payload(rest_result["raw"])
+                if entries:
+                    hostname_fallback = (
+                        entries[0].get("hostname") or device.name
+                    )
+                    return {
+                        "implemented": True,
+                        "source": "junos-rest",
+                        "message": f"Junos REST log OK ({len(entries)} entries)",
+                        "command": "get-log-information"
+                        + (f"?filename={filename}" if filename else ""),
+                        "hostname": hostname_fallback,
+                        "entries": entries,
+                        "raw": compact_raw(rest_result["raw"]),
+                    }
+                rest_error = "Junos REST returned no log entries"
+            else:
+                rest_error = rest_result["error"] or "Junos REST request failed"
+
+        if settings.lab_ssh_enabled:
+            ssh_command = "show log messages" if not filename else f"show log {filename}"
+            ssh_result = run_ssh_command(
+                host=device.ip,
+                username=settings.lab_ssh_user,
+                password=settings.lab_ssh_password,
+                port=settings.lab_ssh_port,
+                command=ssh_command,
+            )
+            if ssh_result["sshOk"]:
+                entries = parse_log_payload(ssh_result["output"] or "")
+                if entries:
+                    hostname_fallback = entries[0].get("hostname") or device.name
+                    return {
+                        "implemented": True,
+                        "source": "ssh-cli",
+                        "message": f"SSH log OK ({len(entries)} entries)",
+                        "command": ssh_command,
+                        "hostname": hostname_fallback,
+                        "entries": entries,
+                        "raw": ssh_result["output"],
+                        "restError": rest_error,
+                    }
+                rest_error = "SSH returned no log entries"
+
+        return {
+            **self.stub_result(job, device),
+            "entries": [],
+            "hostname": hostname_fallback,
+            "source": None,
+            "message": rest_error or "Log collection disabled (enable JUNOS_REST or LAB_SSH)",
+            "restError": rest_error,
+        }
+
+
 from netconsole_worker.tasks.managed_check import ManagedCheckTask
 
 TASK_REGISTRY = {
@@ -731,6 +817,7 @@ TASK_REGISTRY = {
         GetArpTask(),
         GetMacTask(),
         GetInterfacesTask(),
+        GetLogsTask(),
         InterfaceActionTask(),
         ManagedCheckTask(),
     ]

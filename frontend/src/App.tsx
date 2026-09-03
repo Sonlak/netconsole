@@ -16,6 +16,8 @@ const ArpPage = lazy(() => import('./pages/ArpPage'));
 const DhcpPage = lazy(() => import('./pages/DhcpPage'));
 const InterfacesPage = lazy(() => import('./pages/InterfacesPage'));
 const MacAddressPage = lazy(() => import('./pages/MacAddressPage'));
+const LogsPage = lazy(() => import('./pages/LogsPage'));
+const AlertsPage = lazy(() => import('./features/logs/AlertsPage').then((m) => ({ default: m.AlertsPage })));
 const GenerateConfigPage = lazy(() => import('./pages/GenerateConfigPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const FabricPage = lazy(() => import('./pages/FabricPage'));
@@ -42,6 +44,8 @@ export default function App() {
               <Route path="fabric" element={<FabricPage />} />
               <Route path="mac-addresses" element={<MacAddressPage />} />
               <Route path="arp-addresses" element={<ArpPage />} />
+              <Route path="logs" element={<LogsPage />} />
+              <Route path="logs/alerts" element={<AlertsPage />} />
               <Route path="interfaces" element={<InterfacesPage />} />
               <Route path="generate-config" element={<GenerateConfigPage />} />
               <Route path="dhcp" element={<DhcpPage />} />

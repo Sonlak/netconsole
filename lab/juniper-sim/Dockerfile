@@ -18,12 +18,13 @@ RUN apt-get update \
   && chmod 440 /etc/sudoers.d/lab-ip
 
 COPY interface_state.py /usr/local/lib/netconsole/interface_state.py
+COPY syslog_buffer.py /usr/local/lib/netconsole/syslog_buffer.py
 COPY junos_cli.py /usr/local/bin/junos_cli.py
 COPY junos_rest_server.py /usr/local/bin/junos_rest_server.py
 COPY sshd_config /etc/ssh/sshd_config
 COPY entrypoint.sh /entrypoint.sh
 
-RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/junos_cli.py /usr/local/bin/junos_rest_server.py /usr/local/lib/netconsole/interface_state.py \
+RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/junos_cli.py /usr/local/bin/junos_rest_server.py /usr/local/lib/netconsole/interface_state.py /usr/local/lib/netconsole/syslog_buffer.py \
   && chmod +x /entrypoint.sh /usr/local/bin/junos_cli.py /usr/local/bin/junos_rest_server.py
 
 EXPOSE 22 8443

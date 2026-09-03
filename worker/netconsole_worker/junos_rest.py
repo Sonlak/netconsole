@@ -14,6 +14,7 @@ RPC_CHASSIS_INV = "get-chassis-inventory"
 RPC_SYSTEM_UPTIME = "get-system-uptime-information"
 RPC_CONFIGURATION = "get-configuration"
 RPC_VLAN_INFO = "get-vlan-information"
+RPC_LOG_INFORMATION = "get-log-information"
 
 
 def compact_raw(raw: str, limit: int = 4000) -> str:
@@ -508,6 +509,35 @@ def fetch_vlan_information(
         verify_tls=verify_tls,
         timeout=timeout,
         accept="application/xml",
+    )
+
+
+def fetch_log_information(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    scheme: str = "https",
+    port: int = 8443,
+    verify_tls: bool = False,
+    timeout: float = 30.0,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Fetch `show log messages` (or a specific log filename) via RESTCONF."""
+    params: dict[str, str] = {}
+    if filename:
+        params["filename"] = filename
+    return fetch_junos_rpc(
+        host,
+        RPC_LOG_INFORMATION,
+        username=username,
+        password=password,
+        scheme=scheme,
+        port=port,
+        verify_tls=verify_tls,
+        timeout=timeout,
+        accept="application/xml",
+        params=params or None,
     )
 
 

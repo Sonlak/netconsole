@@ -21,6 +21,7 @@ enum JobType {
   GET_ARP
   GET_MAC
   GET_INTERFACES
+  GET_LOGS
   INTERFACE_ACTION
   MANAGED_CHECK
   DISCOVERY_PROBE
@@ -73,6 +74,7 @@ model Device {
   uptimeAt           DateTime?
   jobs               Job[]
   savedConfig        DeviceSavedConfig?
+  logs               DeviceLog[]
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 }
@@ -91,6 +93,109 @@ model Job {
 
   @@index([deviceId])
   @@index([status])
+}
+
+enum LogSeverity {
+  EMERGENCY
+  ALERT
+  CRITICAL
+  ERROR
+  WARNING
+  NOTICE
+  INFORMATIONAL
+  DEBUG
+}
+
+enum LogFacility {
+  KERNEL
+  USER
+  MAIL
+  DAEMON
+  AUTHORIZATION
+  SYSLOG
+  NTP
+  SECURITY
+  CONSOLE
+  LOCAL0
+  LOCAL1
+  LOCAL2
+  LOCAL3
+  LOCAL4
+  LOCAL5
+  LOCAL6
+  LOCAL7
+  PFE
+  FIREWALL
+  CHANGE_LOG
+  INTERACTIVE_COMMANDS
+  CONFLICT_LOG
+  DFC
+  EXTERNAL
+  FTP
+  PRINTER
+  NEWS
+  UUCP
+  CLOCK
+  AUTH_PRIVATE
+  UNKNOWN
+}
+
+model DeviceLog {
+  id          String       @id @default(uuid())
+  deviceId    String?
+  device      Device?      @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  hostname    String
+  severity    LogSeverity
+  facility    LogFacility  @default(UNKNOWN)
+  timestamp   DateTime
+  message     String
+  program     String?
+  pid         Int?
+  tag         String?
+  jobId       String?      @unique
+  receivedAt  DateTime     @default(now())
+
+  @@index([deviceId, timestamp])
+  @@index([severity, timestamp])
+  @@index([timestamp])
+}
+
+model LogAlertRule {
+  id              String       @id @default(uuid())
+  name            String
+  description     String?
+  deviceId        String?      // null = applies to all devices
+  minSeverity     LogSeverity  // matches logs >= this severity (most-severe-first)
+  messagePattern  String?      // optional regex to match the message
+  facility        LogFacility? // null = any facility
+  enabled         Boolean      @default(true)
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  alerts          LogAlert[]
+
+  @@index([enabled])
+  @@index([deviceId, enabled])
+}
+
+model LogAlert {
+  id             String       @id @default(uuid())
+  ruleId         String
+  rule           LogAlertRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  deviceId       String?
+  deviceIp       String?
+  severity       LogSeverity
+  hostname       String
+  program        String?
+  message        String
+  deviceLogId    String?      // nullable: syslog-UDP logs have no deviceLog row
+  timestamp      DateTime
+  acknowledged   Boolean      @default(false)
+  acknowledgedAt DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([ruleId, acknowledged])
+  @@index([deviceId, acknowledged])
+  @@index([acknowledged, createdAt])
 }
 
 model DiscoveryScan {

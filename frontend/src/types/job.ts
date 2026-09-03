@@ -4,6 +4,7 @@ export type JobType =
   | 'GET_ARP'
   | 'GET_MAC'
   | 'GET_INTERFACES'
+  | 'GET_LOGS'
   | 'INTERFACE_ACTION'
   | 'MANAGED_CHECK'
   | 'DISCOVERY_PROBE'
@@ -44,6 +45,7 @@ export const JOB_TYPE_LABELS: Record<JobType, string> = {
   GET_ARP: 'Get ARP table',
   GET_MAC: 'Get MAC table',
   GET_INTERFACES: 'Get interfaces',
+  GET_LOGS: 'Get device logs',
   INTERFACE_ACTION: 'Interface action',
   MANAGED_CHECK: 'Managed check',
   DISCOVERY_PROBE: 'Discovery probe',
