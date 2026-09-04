@@ -119,7 +119,7 @@ function parseIdentity(payload: unknown, raw: string): JunosFields {
   return fields;
 }
 
-const IDENTITY_TIMEOUT_MS = 45000;
+const IDENTITY_TIMEOUT_MS = 60000;
 
 function probeIsDead(status?: number, error?: string): boolean {
   if (status != null && status !== 405 && status < 500) return true;
