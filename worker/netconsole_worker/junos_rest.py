@@ -584,7 +584,7 @@ def probe_device_identity(
     scheme: str = "https",
     port: int = 8443,
     verify_tls: bool = False,
-    timeout: float = 4.0,
+    timeout: float = 20.0,
 ) -> dict[str, Any]:
     """Read hostname/model/version/serial via Junos REST RPCs."""
     from netconsole_worker.parsers.device_identity_rpc import (
