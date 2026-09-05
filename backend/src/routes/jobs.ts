@@ -5,7 +5,7 @@ import { authMiddleware, verifyToken } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
-import { applyInterfaceActionSnapshot, queueGetInterfaces } from '../services/interfaces.js';
+import { applyInterfaceActionSnapshot } from '../services/interfaces.js';
 import { invalidateFabricCache } from '../services/fabricTopology.js';
 import { isAllowedLogFilename } from '../lib/junosLogFiles.js';
 import { persistLogsForJob } from '../services/logs.js';
@@ -168,9 +168,10 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
           await applyInterfaceActionSnapshot(job.deviceId, result).catch((error) => {
             console.error(`[interfaces] snapshot after ${result.action} failed`, error);
           });
-          void queueGetInterfaces(job.deviceId, { force: true }).catch((error) => {
-            console.error(`[interfaces] refresh after ${result.action} failed`, error);
-          });
+          // NOTE: queueGetInterfaces auto-refresh removed — snapshot already
+          // patches adminStatus/operStatus in the job result so the UI updates
+          // immediately.  A full interfaces re-fetch can still be triggered
+          // manually via POST /api/interfaces/:id/collect.
         }
       }
     } catch (applyError) {

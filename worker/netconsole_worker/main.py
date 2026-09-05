@@ -9,6 +9,7 @@ import httpx
 
 from netconsole_worker.config import settings
 from netconsole_worker.models import parse_job
+from netconsole_worker.junos_rest import get_rest_pool
 from netconsole_worker.ssh_client import get_pool
 from netconsole_worker.tasks.registry import TASK_REGISTRY
 
@@ -169,6 +170,18 @@ def main() -> None:
                         stats["closes"],
                         stats["evictions"],
                         reuse_pct,
+                    )
+                rest_stats = get_rest_pool().stats
+                if rest_stats["borrows"] > 0:
+                    rest_reuse_pct = 100.0 * rest_stats["reuses"] / rest_stats["borrows"]
+                    logger.info(
+                        "[rest-pool] borrows=%d opens=%d reuses=%d closes=%d evictions=%d reuse=%.1f%%",
+                        rest_stats["borrows"],
+                        rest_stats["opens"],
+                        rest_stats["reuses"],
+                        rest_stats["closes"],
+                        rest_stats["evictions"],
+                        rest_reuse_pct,
                     )
                 last_pool_stats_at = now
 
