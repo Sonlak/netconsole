@@ -77,7 +77,15 @@ export function LogsPage() {
   const navigate = useNavigate();
   const { value: searchText, setValue: setSearchText, committed: q } = useUrlSearch('q');
   const deviceFilter = get('device') || 'all';
-  const severityFilter = (get('severity')?.split(',').filter(Boolean) ?? []) as LogSeverity[];
+  // IMPORTANT: these filters are derived from URL params and must be memoized.
+  // A new array reference on every render would invalidate the `load` callback
+  // below, which triggers `useEffect(() => { setHasLoaded(false); ... }, [load])`
+  // every render — that effect sets state every render, which re-renders the
+  // component, which creates a new array, which loops forever → React error #185.
+  const severityFilter = useMemo(
+    () => (get('severity')?.split(',').filter(Boolean) ?? []) as LogSeverity[],
+    [get],
+  );
   const facilityFilter = (get('facility') || 'all') as LogFacility | 'all';
   const filenameFilter = (get('filename') || DEFAULT_LOG_FILENAME) as string;
 
