@@ -1131,3 +1131,82 @@ pm run build exit 0 — typecheck is necessary
     not login.** When debugging auth-spam complaints, also check the
     data-fetch endpoints -- the frontend may be polling state it doesn't
     actually need to refresh.
+
+### 2026-09-05 11:30 — Logs: SSH pool + cross-job dedup killed the auth-log flood
+- User reopened the page after the polling fix and said: "user netconsole
+  login vào liên tục vậy, vào liên tục từng giây luôn" — every row in the
+  logs table was `Accepted password for netconsole from 10.10.20.20 ... ssh2`.
+- Two distinct problems were stacked together:
+  1. Every collector job (MAC/ARP/Ports/Config/Logs) opened a **fresh
+     paramiko session** per device per cycle. 5 collectors × 6 devices
+     × every 60–300s = ~25 SSH handshakes/min across the lab. Each one
+     wrote 1–2 lines in the device's `auth.log`.
+  2. The Junos auth.log keeps the same N lines until rotated, so every
+     re-run of `GET_LOGS` reads them again and inserts them into
+     `DeviceLog`. With 2–3 runs per hour per device and no cross-job
+     dedup, the DB accumulated 3–5× copies of every line.
+- Verified via SQL: 639 SSH-login lines in 65 min (≈9.8/min across
+  4 devices) and 521,951 rows in `DeviceLog` after a few hours of
+  GET_LOGS polling.
+- **Fix A — SSH connection pool in worker**
+  (`worker/netconsole_worker/ssh_client.py`):
+  `SSHConnectionPool` keyed by `(host, port, username)`, with a
+  background reaper thread (every 60s) that drops connections idle > 600s.
+  `transport.set_keepalive(60)` for the lab firewall. All entry points
+  (`run_ssh_command`, `run_junos_commands`) route through `pool.borrow()`
+  / `pool.release()` / `pool.invalidate()`. The liveness probe runs a
+  cheap `show version | match /./` via `exec_command` so we don't
+  hand a half-dead TCP back to a job.
+- **Fix B — `DeviceLog` cross-job dedup in backend**
+  (`backend/src/services/logs.ts → persistLogsForJob`): before inserting,
+  query existing rows with the same `(deviceId, timestamp, hostname,
+  message)`. Filter the candidate batch to skip them, then `createMany`
+  only the new rows. The Junos auth.log line is "the same" forever; we
+  insert it exactly once.
+- **One-off cleanup**: `_dedupe_logs.sql` deleted **503,104 duplicate
+  rows** from `DeviceLog` (521k → 18.8k rows, 96% reduction). SSH-login
+  counts per device dropped 131–186 → 33–36 (matches the actual ~1 SSH
+  login per device per 5-min cycle).
+- **Pool reuse in practice** is smaller than I'd hoped: the SSH
+  keepalive beats the lab's NAT timeout for in-cycle borrows, but
+  connections still die between cycles (5 min). So the pool mostly
+  helps when one device needs back-to-back commands in a single job
+  (rare). The dedup is what really fixed the user-visible noise.
+- **Live verification** (screenshot attached as evidence):
+  http://42.119.165.109:8443/logs now shows distinct, non-duplicated
+  timestamps (12:42:25, 12:42:19, 12:42:11, ...), different devices
+  interleaved, and operational events (License notice, rest-api events)
+  visible instead of being buried under SSH spam.
+- Commits:
+  - `e8f84d2` fix(backend): dedup DeviceLog across jobs on
+    (deviceId,timestamp,hostname,message)
+  - `3954609` fix(worker): liveness probe with 'true' before reusing
+  - `bf9d67c` debug(worker): detailed alive-check logs
+  - `4b13eb0` fix(worker): bump SSH pool idle to 600s
+  - `162f0c2` debug(worker): trace release path
+  - `1896302` fix(worker): restore asctime format
+  - `804313b` debug(worker): trace pool reuse vs open per borrow
+  - `8b1523e` fix(worker): background-reaper pool
+  - `9d3c949` fix(worker): pool SSH connections to stop Junos auth.log
+    flood
+- **Lessons for next agent:**
+  - **Two bugs can stack into one ugly complaint.** The auth-log spam
+    had a "real" cause (every job opens a new SSH session) and a
+    "cosmetic" cause (no cross-job dedup). I burned 30 minutes on
+    the pool before realising dedup is what the user actually sees.
+    When the user says "UI is broken", take a screenshot FIRST and
+    measure WHICH rows dominate. SSH = 503k rows but only 130 unique
+    lines; dedup is the bigger lever.
+  - **`transport.is_active()` lies for half-open TCP.** It only checks
+    the paramiko layer; the underlying socket can be closed by NAT
+    and `is_active()` still returns True. Always do a tiny `exec_command`
+    with a timeout before reusing a pooled connection.
+  - **Junos EX sims don't honor paramiko keepalives.** SSH connections
+    still die after 1–2 min idle, even with `set_keepalive(30)`. So
+    pool reuse across 5-min cycles is unreliable. Lower the bar:
+    cache for the duration of a single job, then accept cold starts.
+  - **`seen`/`Set` dedup at the application layer beats DB constraints
+    when key shapes might evolve.** Cheaper to migrate later, and
+    doesn't break existing rows.
+  - **Bulk cleanups go in `_<name>.sql` files in the repo root** so
+    they're recoverable. Don't run raw `psql` and forget what happened.
