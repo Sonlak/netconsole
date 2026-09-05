@@ -37,6 +37,12 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Postgres backups (generated on VPS, never commit)
+backups/
+# ...except the README explaining how to restore them
+!backups/
+!backups/README.md
+
 # Untrack the frontend logs feature folder (nested in src/)
 !frontend/src/features/logs/
 
