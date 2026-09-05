@@ -135,9 +135,11 @@ jobs:
         run: |
           set -euo pipefail
           sleep 3
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8443/ || echo "000")
+          # Follow the 80 -> 443 redirect with -L. The self-signed cert
+          # would otherwise cause a TLS handshake error (-k ignores that).
+          code=$(curl -skL -o /dev/null -w "%{http_code}" --max-time 5 https://127.0.0.1:8443/ || echo "000")
           if [ "$code" = "200" ]; then
-            echo "✅ Frontend OK (HTTP $code)"
+            echo "✅ Frontend OK (HTTPS $code)"
           else
             echo "❌ Frontend returned HTTP $code"
             echo "--- Frontend log ---"
