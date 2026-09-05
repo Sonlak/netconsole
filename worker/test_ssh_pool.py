@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import sys
 import threading
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -88,7 +87,7 @@ def test_invalidate() -> None:
 
     with patch("paramiko.SSHClient") as MockSSH:
         MockSSH.return_value = fake_client
-        conn1 = pool.borrow("1.2.3.4", 22, "u", "p", timeout=1)
+        _ = pool.borrow("1.2.3.4", 22, "u", "p", timeout=1)
 
     pool.invalidate("1.2.3.4", 22, "u")
     assert pool.stats["closes"] == 1
@@ -97,7 +96,7 @@ def test_invalidate() -> None:
     # Next borrow should open a new connection
     with patch("paramiko.SSHClient") as MockSSH:
         MockSSH.return_value = fake_client
-        conn2 = pool.borrow("1.2.3.4", 22, "u", "p", timeout=1)
+        _ = pool.borrow("1.2.3.4", 22, "u", "p", timeout=1)
 
     assert pool.stats["opens"] == 2
     pool._stop_reaper.set()

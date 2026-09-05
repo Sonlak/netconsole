@@ -4,6 +4,7 @@ from typing import Any
 
 from netconsole_worker.models import DeviceInfo, JobInfo
 from netconsole_worker.tasks.base import BaseTask
+from netconsole_worker.tasks.managed_check import ManagedCheckTask
 
 
 class ConnectTestTask(BaseTask):
@@ -804,8 +805,6 @@ class GetLogsTask(BaseTask):
             "restError": rest_error,
         }
 
-
-from netconsole_worker.tasks.managed_check import ManagedCheckTask
 
 TASK_REGISTRY = {
     task.job_type: task
