@@ -99,7 +99,7 @@ const httpServer = app.listen(port, () => {
 
 // CORS - phải đặt trước routes
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 // Health check - không cần auth
 app.get('/api/health', (_req, res) => {

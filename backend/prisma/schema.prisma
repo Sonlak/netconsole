@@ -152,12 +152,13 @@ model DeviceLog {
   program     String?
   pid         Int?
   tag         String?
-  jobId       String?      @unique
+  jobId       String?
   receivedAt  DateTime     @default(now())
 
   @@index([deviceId, timestamp])
   @@index([severity, timestamp])
   @@index([timestamp])
+  @@index([jobId])
 }
 
 model LogAlertRule {
