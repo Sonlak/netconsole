@@ -184,11 +184,16 @@ class SSHConnectionPool:
 
     def release(self, host: str, port: int, username: str) -> None:
         """Mark the connection idle again. Closes only on eviction."""
+        import logging
+        log = logging.getLogger(__name__)
         key = self._key(host, port, username)
         with self._lock:
             entry = self._pool.get(key)
             if entry:
                 entry.last_used = time.monotonic()
+                log.debug("pool release %s use_count=%d", key, entry.use_count)
+            else:
+                log.debug("pool release MISS %s (not in pool)", key)
 
     def invalidate(self, host: str, port: int, username: str) -> None:
         """Force-close a poisoned connection (next borrow will reopen)."""
