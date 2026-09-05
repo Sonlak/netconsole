@@ -317,8 +317,8 @@ def fetch_junos_rpc(
     host: str,
     rpc: str,
     *,
-    username: str,
-    password: str,
+    username: str = "",
+    password: str = "",
     scheme: str = "https",
     port: int = 8443,
     verify_tls: bool = False,
@@ -328,7 +328,11 @@ def fetch_junos_rpc(
     body: str | None = None,
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
-    """Call a Junos REST RPC endpoint and return JSON/XML payload."""
+    """Call a Junos REST RPC endpoint and return JSON/XML payload.
+
+    `username`/`password` are only required when no pooled `client` is
+    supplied (in which case we open a one-shot authenticated client).
+    """
     base = f"{scheme}://{host}:{port}".rstrip("/")
     url = f"{base}/rpc/{rpc}"
     if params:
@@ -337,6 +341,14 @@ def fetch_junos_rpc(
 
     owns_client = client is None
     if client is None:
+        if not username or not password:
+            return {
+                "ok": False,
+                "statusCode": None,
+                "payload": None,
+                "raw": "",
+                "error": "fetch_junos_rpc: need username+password when no pooled client is provided",
+            }
         client = httpx.Client(
             auth=(username, password),
             verify=verify_tls,
@@ -402,14 +414,21 @@ def post_junos_rpc(
     host: str,
     body: str,
     *,
-    username: str,
-    password: str,
+    username: str = "",
+    password: str = "",
     scheme: str = "https",
     port: int = 8443,
     verify_tls: bool = False,
     timeout: float = 30.0,
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
+    """POST a Junos RPC body.
+
+    When a pooled `client` is supplied we reuse its existing TLS+Basic-auth
+    session (created via JunosRESTPool.borrow) and do NOT need the per-call
+    `username`/`password` parameters. Falls back to creating a one-shot
+    httpx.Client when no pooled client is provided.
+    """
     return fetch_junos_rpc(
         host,
         "",
