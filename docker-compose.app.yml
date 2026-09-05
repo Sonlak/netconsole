@@ -141,7 +141,8 @@ services:
       KEA_STANDBY_API_URL: http://172.31.0.11:8000/
       KEA_TIMEOUT_MS: "5000"
       SEED_DISABLED: "false"
-      CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443"
+      CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
+      JWT_SECRET: "d97aklKZ_BKmRrHtXH6fLSZs48AlwJpAU8_RdcuCKqBm_0Jufe8Rx-FkpGhQT-cu"
     networks:
       netconsole:
         ipv4_address: 172.31.0.3
@@ -162,7 +163,7 @@ services:
       POLL_INTERVAL_SECONDS: 1
       WORKER_NAME: netconsole-worker
       WORKER_CONCURRENCY: "4"
-      WORKER_AUTH_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3b3JrZXIiLCJ0eXBlIjoid29ya2VyIiwicm9sZSI6IndvcmtlciIsImlhdCI6MTc4ODE2OTg0MCwiZXhwIjoxODE5NzA1ODQwfQ._mcExiqUWIhQw0t53gxnpUelp6ByAsupDefvKrDLYO0"
+      WORKER_AUTH_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3b3JrZXIiLCJyb2xlIjoid29ya2VyIiwidHlwZSI6IndvcmtlciIsImlhdCI6MTc4ODYyMzI3OSwiZXhwIjoxODIwMTU5Mjc5fQ.bELHMgB561GkhTyo8jGiHUQKKa22O_DhnoUoSKsmJLU"
       LAB_SSH_ENABLED: "true"
       LAB_SSH_USER: netconsole
       LAB_SSH_PASSWORD: Admin@123
