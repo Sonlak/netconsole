@@ -307,25 +307,77 @@ export async function persistLogsForJob(jobId: string, entries: LogEntry[], host
   await prisma.deviceLog.deleteMany({ where: { jobId } });
   if (!entries.length) return 0;
 
-  const data: Prisma.DeviceLogCreateManyInput[] = [];
+  // Build the (deviceId, timestamp, hostname, message) tuples we'll insert.
+  // Then drop any that already exist in the DB so re-runs of GET_LOGS don't
+  // pile up identical auth.log lines. The Junos auth.log returns the same N
+  // entries every time `show log messages` runs, so without cross-job dedup
+  // a single SSH login ends up as 3-5 rows in the logs page.
+  const candidateRows: Prisma.DeviceLogCreateManyInput[] = [];
+  const candidateKeys = new Set<string>();
   for (const entry of entries) {
     const timestamp = parseTimestamp(entry.timestamp);
     if (!timestamp) continue;
     const severity = normalizeSeverity(entry.severity);
     const facility = normalizeFacility(entry.facility);
-    data.push({
+    const hostname = (entry.hostname || hostnameFallback || job.device?.name || 'unknown').slice(0, 128);
+    const message = (entry.message || '').slice(0, 4000);
+    const key = [
+      job.deviceId ?? 'unknown',
+      timestamp.toISOString(),
+      hostname,
+      message,
+    ].join('\u0000');
+    if (candidateKeys.has(key)) continue;
+    candidateKeys.add(key);
+    candidateRows.push({
       deviceId: job.deviceId ?? null,
-      hostname: (entry.hostname || hostnameFallback || job.device?.name || 'unknown').slice(0, 128),
+      hostname,
       severity,
       facility,
       timestamp,
-      message: (entry.message || '').slice(0, 4000),
+      message,
       program: entry.program ?? null,
       pid: entry.pid ?? null,
       tag: entry.tag ?? null,
       jobId,
     });
   }
+
+  if (!candidateRows.length) return 0;
+
+  // Filter out rows whose (deviceId, timestamp, hostname, message) already
+  // exists in the DB from a previous job. Use OR of equality predicates
+  // rather than `in` tuples because Prisma's findMany doesn't support
+  // composite-key `in`.
+  const existing = await prisma.deviceLog.findMany({
+    where: {
+      deviceId: job.deviceId ?? null,
+      OR: candidateRows.map((row) => ({
+        timestamp: row.timestamp as Date,
+        hostname: row.hostname as string,
+        message: row.message as string,
+      })),
+    },
+    select: { timestamp: true, hostname: true, message: true },
+  });
+  const existingKeys = new Set(
+    existing.map((row) =>
+      [
+        row.timestamp.toISOString(),
+        row.hostname,
+        row.message,
+      ].join('\u0000'),
+    ),
+  );
+
+  const data = candidateRows.filter((row) => {
+    const key = [
+      (row.timestamp as Date).toISOString(),
+      row.hostname as string,
+      row.message as string,
+    ].join('\u0000');
+    return !existingKeys.has(key);
+  });
 
   if (!data.length) return 0;
 
