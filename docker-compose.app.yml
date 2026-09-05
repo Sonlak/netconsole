@@ -186,7 +186,7 @@ services:
     restart: unless-stopped
     depends_on: [backend]
     ports:
-      - "0.0.0.0:8443:80"
+      - "0.0.0.0:8443:443"
     networks:
       netconsole:
         ipv4_address: 172.31.0.5
