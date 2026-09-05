@@ -1,4 +1,5 @@
 import cors from 'cors';
+import compression from 'compression';
 import express from 'express';
 import { devicesRouter } from './routes/devices.js';
 import { discoveryRouter } from './routes/discovery.js';
@@ -99,6 +100,8 @@ const httpServer = app.listen(port, () => {
 
 // CORS - phải đặt trước routes
 app.use(cors(corsOptions));
+// Compress all JSON/text responses (logs inventory is ~500KB without this).
+app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: '25mb' }));
 
 // Health check - không cần auth

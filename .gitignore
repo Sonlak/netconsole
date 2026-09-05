@@ -37,6 +37,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Untrack the frontend logs feature folder (nested in src/)
+!frontend/src/features/logs/
+
 # Coverage / Testing
 coverage/
 .nyc_output/

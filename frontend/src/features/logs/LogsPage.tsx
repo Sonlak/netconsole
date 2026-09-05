@@ -46,7 +46,7 @@ import {
   type LogsInventory,
 } from '@/types/log';
 
-const AUTO_REFRESH_MS = 10000;
+const AUTO_REFRESH_MS = 30000;
 
 const FACILITY_OPTIONS = Object.entries(LOG_FACILITY_LABEL)
   .filter(([key]) => key !== 'UNKNOWN')
