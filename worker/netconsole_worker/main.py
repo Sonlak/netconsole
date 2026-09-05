@@ -9,6 +9,7 @@ import httpx
 
 from netconsole_worker.config import settings
 from netconsole_worker.models import parse_job
+from netconsole_worker.ssh_client import get_pool
 from netconsole_worker.tasks.registry import TASK_REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ def main() -> None:
 
     inflight: dict[Future[None], str] = {}
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="nc-job") as pool:
+        last_pool_stats_at = 0.0
         while True:
             for fut in [item for item in list(inflight) if item.done()]:
                 job_id = inflight.pop(fut)
@@ -153,6 +155,22 @@ def main() -> None:
                     fut.result()
                 except Exception:
                     logger.exception("Job %s worker crash", job_id)
+
+            now = time.monotonic()
+            if now - last_pool_stats_at >= 300:
+                stats = get_pool().stats
+                if stats["borrows"] > 0:
+                    reuse_pct = 100.0 * stats["reuses"] / stats["borrows"]
+                    logger.info(
+                        "[ssh-pool] borrows=%d opens=%d reuses=%d closes=%d evictions=%d reuse=%.1f%%",
+                        stats["borrows"],
+                        stats["opens"],
+                        stats["reuses"],
+                        stats["closes"],
+                        stats["evictions"],
+                        reuse_pct,
+                    )
+                last_pool_stats_at = now
 
             free = concurrency - len(inflight)
             submitted = 0
