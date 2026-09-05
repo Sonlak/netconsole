@@ -134,7 +134,7 @@ def run_once(client: WorkerClient) -> int:
 def main() -> None:
     logging.basicConfig(
         level=logging.DEBUG,
-        format="%(asctime) [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     concurrency = max(1, int(settings.worker_concurrency))
     poller = WorkerClient()
