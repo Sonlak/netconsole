@@ -47,7 +47,7 @@ class SSHConnectionPool:
     is actually being hit.
     """
 
-    def __init__(self, idle_seconds: float = 240.0, reap_interval: float = 30.0) -> None:
+    def __init__(self, idle_seconds: float = 600.0, reap_interval: float = 60.0) -> None:
         self._lock = threading.Lock()
         self._pool: dict[tuple[str, int, str], _PooledConn] = {}
         self._idle_seconds = idle_seconds
