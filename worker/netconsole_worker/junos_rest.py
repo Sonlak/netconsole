@@ -319,7 +319,7 @@ def fetch_junos_rpc(
     *,
     username: str = "",
     password: str = "",
-    scheme: str = "https",
+    scheme: str = "http",
     port: int = 8443,
     verify_tls: bool = False,
     timeout: float = 20.0,
@@ -332,6 +332,7 @@ def fetch_junos_rpc(
 
     `username`/`password` are only required when no pooled `client` is
     supplied (in which case we open a one-shot authenticated client).
+    Default scheme is `http` to match the lab Junos RESTCONF servers.
     """
     base = f"{scheme}://{host}:{port}".rstrip("/")
     url = f"{base}/rpc/{rpc}"
@@ -416,7 +417,7 @@ def post_junos_rpc(
     *,
     username: str = "",
     password: str = "",
-    scheme: str = "https",
+    scheme: str = "http",
     port: int = 8443,
     verify_tls: bool = False,
     timeout: float = 30.0,
@@ -428,6 +429,11 @@ def post_junos_rpc(
     session (created via JunosRESTPool.borrow) and do NOT need the per-call
     `username`/`password` parameters. Falls back to creating a one-shot
     httpx.Client when no pooled client is provided.
+
+    The default `scheme='http'` matches the lab Junos RESTCONF servers in
+    this project (JUNOS_REST_SCHEME=http in docker-compose.app.yml). Callers
+    that pass a pooled client should also pass `scheme` so the host URL is
+    rebuilt correctly when the RPC helper builds the request URL.
     """
     return fetch_junos_rpc(
         host,
@@ -537,7 +543,7 @@ def apply_set_configuration(
 
     # load RPC
     load_started = _time.perf_counter()
-    loaded = post_junos_rpc(host, load_body.decode(), client=client)
+    loaded = post_junos_rpc(host, load_body.decode(), client=client, scheme=scheme, port=port)
     load_ms = int((_time.perf_counter() - load_started) * 1000)
     load_raw = loaded.get("raw") or ""
     if not loaded["ok"] or "<xnm:error" in load_raw.lower() or "<load-success" not in load_raw:
@@ -553,12 +559,12 @@ def apply_set_configuration(
 
     # commit RPC — reuse the same pooled client
     commit_started = _time.perf_counter()
-    commit = post_junos_rpc(host, "<commit-configuration/>", client=client)
+    commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
     commit_ms = int((_time.perf_counter() - commit_started) * 1000)
     commit_raw = commit.get("raw") or ""
     if not commit["ok"] or "<commit-success" not in commit_raw:
         # Rollback on failed commit
-        post_junos_rpc(host, "<discard-changes/>", client=client)
+        post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
         detail = format_junos_rpc_error(commit_raw) or commit.get("error") or "commit-configuration failed"
         return {
             "ok": False,
@@ -613,10 +619,10 @@ def rollback_configuration(
             "raw": load_raw,
         }
 
-    commit = post_junos_rpc(host, "<commit-configuration/>", client=client)
+    commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
     commit_raw = commit.get("raw") or ""
     if not commit["ok"] or "<commit-success" not in commit_raw:
-        post_junos_rpc(host, "<discard-changes/>", client=client)
+        post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
         detail = format_junos_rpc_error(commit_raw) or commit.get("error") or "rollback commit failed"
         return {
             "ok": False,
