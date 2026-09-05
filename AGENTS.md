@@ -181,7 +181,17 @@ GitHub → Actions → Rollback → Run workflow
 ### Emergency: SSH to VPS directly (if CI is down)
 
 ```powershell
-ssh -i C:\Users\XUANSON\.ssh\id_ed25519 sonnx@42.119.165.109
+# KHUYẾN NGHỊ — qua Tailscale (port 22 public đã bị khóa)
+ssh -i C:\Users\XUANSON\.ssh\id_ed25519 sonnx@netconsole-vps
+ssh -i C:\Users\XUANSON\.ssh\id_ed25519 sonnx@100.102.133.86
+
+# CHỈ khi Tailscale down — qua lab NIC ens34 (nếu VPN/range đó còn mở)
+ssh -i C:\Users\XUANSON\.ssh\id_ed25519 sonnx@10.10.20.20
+
+# Public IP 42.119.165.109 — port 22 ĐÃ BỊ KHÓA bởi
+# /etc/systemd/system/netconsole-lock-ssh.service (iptables DROP ens33).
+# Chỉ dùng cloud console/VNC nếu cần emergency direct access.
+```
 
 # On VPS:
 cd /opt/netconsole
@@ -253,9 +263,15 @@ picks up jobs, executes them via SSH/RESTCONF, writes result back via
    yet redirect to a forced change-password page**. So a fresh admin login
    hits the dashboard with a warning flag but no enforcement. TODO: build
    `ChangePasswordRequiredPage` and wire it into `ProtectedRoute`.
-2. **Firewall on VPS** — IP allow-listing blocks the agent's home IP
-   (`42.114.206.127`). The user had to whitelist `0.0.0.0/0` on port 22.
-   `firewalld` is **not** running on the VPS; use raw `iptables`.
+2. **Firewall on VPS** — netconsole-vps dùng firewalld config trên disk
+   nhưng **firewalld daemon không chạy** (inactive dead). Layer thực thi
+   là raw `iptables`/`ip6tables` (nftables backend). Port 22 public
+   (`ens33`, IP `42.119.165.109`) đã bị khóa bằng rule
+   `DROP tcp -- ens33 * 0.0.0.0/0 tcp dpt:22` via unit
+   `netconsole-lock-ssh.service` (persistent qua reboot, idempotent).
+   SSH chỉ còn hoạt động qua Tailscale (`100.102.133.86`) hoặc lab
+   NIC (`ens34`, `10.10.20.20`). Nếu cần sửa firewall: dùng
+   `iptables -I INPUT 1 ...` hoặc `ip6tables` trực tiếp.
 3. **Windows line endings** — any `.sh` written from PowerShell must use
    `newline="\n"` when written via `Path.write_text`; otherwise bash on
    Linux sees `set -eu\r` and errors.
@@ -965,3 +981,89 @@ pm run build exit 0 — typecheck is necessary
     verdict (the layout was NOT correct — the user came back to
     ask for vertical alignment). Keep the new log entry so future
     agents see the current ground truth.
+
+### 2026-09-04 22:33 — VPS: xóa SSH whitelist + khóa port 22 public
+- User asked vào VPS `netconsole-vps` (Tailscale `100.102.133.86`) và:
+  (1) tìm + xóa mọi whitelist IP từ lần trước, (2) khóa port 22
+  trên public NIC, (3) đảm bảo rule sống qua reboot.
+- **Tìm thấy whitelist** trong firewalld config (`firewalld` không
+  chạy lúc này, nên config không enforce, nhưng vẫn cần dọn):
+  - `/etc/firewalld/zones/public.xml`: 3 rule SSH whitelist đã xóa:
+    ~~`<source ipset="fpt">`~~ (ipset FPT chứa 25 CIDR VN ISP),
+    ~~`<source address="21.209.166.154/32">`~~,
+    ~~`<source address="21.228.41.245/32">`~~.
+  - `/etc/firewalld/ipsets/fpt.xml`: đã xóa (ipset chỉ dùng cho
+    whitelist SSH đã bỏ).
+  - Backup: `public.xml.bak.20260904-pre-tailscale-only` và
+    `fpt.xml.bak.20260904`.
+  - File `public.xml` còn lại chỉ còn `dhcpv6-client`, `port 8443`,
+    `forward` — không còn rule SSH nào.
+- **Khóa port 22 trên public NIC `ens33`** (IP `42.119.165.109`):
+  - Rule iptables: `DROP tcp -- ens33 * 0.0.0.0/0 tcp dpt:22`
+    ở INPUT chain line 1. Bot scan public đã bị drop (6 packets).
+  - Tailscale (`tailscale0`) và lab NIC (`ens34`) — port 22 vẫn mở.
+  - Tương tự IPv6 ip6tables rule.
+  - **Lưu ý**: `firewalld` inactive + không chạy; dùng raw
+    `iptables`/`ip6tables` trực tiếp để không conflict với Docker
+    network (`br-6927c41e8d41`, `tailscale0`).
+- **Persistence qua reboot**: tạo unit
+  `/etc/systemd/system/netconsole-lock-ssh.service`:
+  - `After=tailscaled.service Before=sshd.service`, `Type=oneshot`,
+    `RemainAfterExit=yes`.
+  - `ExecStart` idempotent: dùng `iptables -C` trước, chỉ insert
+    nếu rule chưa có.
+  - Đã enable → rule sẽ tự apply mỗi lần boot.
+- **Cách SSH vào VPS từ giờ**: qua Tailscale
+  (`ssh sonnx@netconsole-vps` hoặc `ssh sonnx@100.102.133.86`);
+  public IP `42.119.165.109` port 22 đã bị DROP.
+- **Lesson for next agent**:
+  - **firewalld inactive không có nghĩa config sạch** — config
+    trên disk vẫn tồn tại và sẽ được áp dụng nếu firewalld
+    được bật lại. Luôn dọn config trên disk, không chỉ `systemctl stop`.
+  - **RHEL/Rocky dùng `firewalld` làm frontend cho nftables/iptables** —
+    nhưng nftables không expose rule qua `iptables -L` theo cách
+    truyền thống. `iptables-save` + `nft list ruleset` đều cần check
+    để thấy toàn cảnh.
+  - **Khi khóa port 22, luôn dùng `-i <public-if>`** — nếu không
+    rule sẽ block SSH qua mọi interface (bao gồm tailscale0) và
+    mất quyền truy cập. Interface `ens33` là NIC public.
+  - **Test Tailscale SSH hoạt động SAU khi apply DROP rule** —
+    verify qua chính SSH session đang dùng (conntrack giữ existing
+    session), rồi mở session mới qua Tailscale để chắc chắn.
+
+
+### 2026-09-05 09:47 — Logs page: 3 bugs fixed, data flowing now
+- User reported logs page treo UI + empty even though 4 devices are online/managed.
+- Bug 1: SSH fallback disabled in worker env (LAB_SSH_ENABLED=false). Junos EX sims don't
+  support get-log-information RESTCONF RPC. Flipped to true + LAB_SSH_PORT=22. Worker now
+  uses "show log messages" and gets 3000-6000 entries/device.
+- Bug 2: persistLogsForJob cast lowercase parser strings ('info', 'warning', 'daemon') directly
+  to LogSeverity/LogFacility enums. Added SEVERITY_MAP + FACILITY_MAP normalisers covering
+  abbreviations (err->ERROR, warn->WARNING, crit->CRITICAL, emerg->EMERGENCY, lpr->PRINTER,
+  authpriv->AUTH_PRIVATE, ...).
+- Bug 3a: express.json default 2MB limit rejected ~2MB log job results with PayloadTooLargeError.
+  Bumped to 25mb.
+- Bug 3b: DeviceLog.jobId @unique blocked createMany of >1 rows per job. Dropped @unique,
+  replaced with @@index([jobId]) so the deleteMany({jobId}) idempotency check still works.
+- Verified live at http://42.119.165.109:8443/logs:
+  - "Managed 6 - Devices with data 4 - Rows loaded 1000"
+  - 4 devices: LAB-F6-CORE-01 (9417), LAB-F6-CORE-02 (9450), LAB-F6-DS-01 (6303),
+    LAB-F6-DS-02 (11797) -> 36967 total rows
+  - Page renders 1000 entries x 50 pages
+- Commits pushed:
+  - 8a5c3c8 fix(logs): raise express body limit + drop DeviceLog.jobId unique
+  - fb8309a fix(logs): normalize severity/facility to Prisma enum + enable SSH fallback
+  - 0aa8780 fix(logs): memoize severityFilter to break infinite loop (React #185)
+- Lessons for next agent:
+  - The logs page had THREE bugs piled on each other. Don't stop after the first fix
+    if symptoms persist -- DeviceLog was empty even after the React loop fix because
+    backend -> worker -> persist was broken in two more places.
+  - PrismaClientValidationError on enum fields usually means the data shape doesn't
+    match the enum exactly. Add a normaliser rather than a stringly-typed cast.
+  - express.json default limit is 100 KB. Anything returning large JSON arrays (logs,
+    MAC tables, configs) needs limit:'Xmb' set upfront.
+  - @unique on a FK-style column that has many rows will explode the first time
+    createMany tries to insert >1 row. Always use @@index unless you genuinely want 1:1.
+  - Junos RESTCONF RPC support varies by platform. get-log-information isn't on EX
+    switches -- only on MX/J. SSH "show log messages | last N" is the universal fallback.
+- Status: deployed and verified live. 4 devices showing logs. Next user ask: continue.
