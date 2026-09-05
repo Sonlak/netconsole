@@ -226,6 +226,80 @@ export function scheduleLogsCollection(intervalSeconds: number) {
  * Persist log entries from a finished GET_LOGS job. Idempotent on (jobId).
  * Drops existing rows for the same jobId before re-inserting so retries don't dup.
  */
+
+const SEVERITY_MAP: Record<string, LogSeverity> = {
+  emergency: 'EMERGENCY',
+  emerg: 'EMERGENCY',
+  alert: 'ALERT',
+  critical: 'CRITICAL',
+  crit: 'CRITICAL',
+  error: 'ERROR',
+  err: 'ERROR',
+  warning: 'WARNING',
+  warn: 'WARNING',
+  notice: 'NOTICE',
+  informational: 'INFORMATIONAL',
+  info: 'INFORMATIONAL',
+  debug: 'DEBUG',
+};
+
+const FACILITY_MAP: Record<string, LogFacility> = {
+  kern: 'KERNEL',
+  kernel: 'KERNEL',
+  user: 'USER',
+  mail: 'MAIL',
+  daemon: 'DAEMON',
+  auth: 'AUTHORIZATION',
+  authorization: 'AUTHORIZATION',
+  authpriv: 'AUTH_PRIVATE',
+  'auth-private': 'AUTH_PRIVATE',
+  syslog: 'SYSLOG',
+  ntp: 'NTP',
+  clock: 'CLOCK',
+  security: 'SECURITY',
+  console: 'CONSOLE',
+  local0: 'LOCAL0',
+  local1: 'LOCAL1',
+  local2: 'LOCAL2',
+  local3: 'LOCAL3',
+  local4: 'LOCAL4',
+  local5: 'LOCAL5',
+  local6: 'LOCAL6',
+  local7: 'LOCAL7',
+  pfe: 'PFE',
+  firewall: 'FIREWALL',
+  'change-log': 'CHANGE_LOG',
+  changelog: 'CHANGE_LOG',
+  'interactive-commands': 'INTERACTIVE_COMMANDS',
+  interactivecommands: 'INTERACTIVE_COMMANDS',
+  'conflict-log': 'CONFLICT_LOG',
+  conflictlog: 'CONFLICT_LOG',
+  dfc: 'DFC',
+  external: 'EXTERNAL',
+  ftp: 'FTP',
+  printer: 'PRINTER',
+  lpr: 'PRINTER',
+  news: 'NEWS',
+  uucp: 'UUCP',
+};
+
+function normalizeSeverity(value: unknown): LogSeverity {
+  if (typeof value !== 'string') return 'INFORMATIONAL';
+  const upper = value.toUpperCase() as LogSeverity;
+  if (Object.values(SEVERITY_MAP).includes(upper)) return upper;
+  const lower = value.toLowerCase();
+  return SEVERITY_MAP[lower] ?? 'INFORMATIONAL';
+}
+
+function normalizeFacility(value: unknown): LogFacility {
+  if (typeof value !== 'string') return 'UNKNOWN';
+  const upper = value.toUpperCase() as LogFacility;
+  if (upper === 'UNKNOWN') return 'UNKNOWN';
+  if (Object.values(FACILITY_MAP).includes(upper)) return upper;
+  const lower = value.toLowerCase();
+  return FACILITY_MAP[lower] ?? 'UNKNOWN';
+}
+
 export async function persistLogsForJob(jobId: string, entries: LogEntry[], hostnameFallback: string): Promise<number> {
   const job = await prisma.job.findUnique({ where: { id: jobId }, include: { device: true } });
   if (!job) return 0;
@@ -237,8 +311,8 @@ export async function persistLogsForJob(jobId: string, entries: LogEntry[], host
   for (const entry of entries) {
     const timestamp = parseTimestamp(entry.timestamp);
     if (!timestamp) continue;
-    const severity = (typeof entry.severity === 'string' ? entry.severity : 'INFORMATIONAL') as LogSeverity;
-    const facility = (typeof entry.facility === 'string' ? entry.facility : 'UNKNOWN') as LogFacility;
+    const severity = normalizeSeverity(entry.severity);
+    const facility = normalizeFacility(entry.facility);
     data.push({
       deviceId: job.deviceId ?? null,
       hostname: (entry.hostname || hostnameFallback || job.device?.name || 'unknown').slice(0, 128),
