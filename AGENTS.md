@@ -1067,3 +1067,67 @@ pm run build exit 0 — typecheck is necessary
   - Junos RESTCONF RPC support varies by platform. get-log-information isn't on EX
     switches -- only on MX/J. SSH "show log messages | last N" is the universal fallback.
 - Status: deployed and verified live. 4 devices showing logs. Next user ask: continue.
+
+### 2026-09-05 10:42 â€” Logs polling: tame 10s spam + 92% compression savings
+- User noticed 'login' calls every second on the logs page. Turned out
+  they were GET /api/logs polls, not logins. Two sources:
+  - chrome.exe (user's actual browser tab)
+  - Cursor/3.14.27 Electron (the IDE inside which the user is reading
+    the assistant transcript -- it makes its own curl-like calls to the
+    page's URL and triggers the same Vite assets/api requests).
+- Both fire the same polling logic.
+- Root causes (stacked, again):
+  1. **frontend/src/features/logs/LogsPage.tsx** had
+     `AUTO_REFRESH_MS = 10000` (every 10s). For a 500KB+ payload that's
+     6 calls/min per tab Ã— 2 tabs = ~3 MB/min on the wire just to keep
+     the logs table 'fresh'. 30s is a saner default; if real-time is
+     needed the right path is SSE/WebSocket, not faster polling.
+  2. **No response compression anywhere.** The /api/logs response is
+     ~520 KB raw JSON; nginx was spilling it to /var/cache/nginx/proxy_temp/
+     on every request (warning in nginx logs:
+     "an upstream response is buffered to a temporary file"). With
+     compression middleware enabled in backend/src/index.ts + proxy_buffers
+     + gzip_proxied in frontend/nginx.conf, response drops to ~37 KB.
+- **The big gotcha I almost missed**: .gitignore had a top-level
+  `logs/` rule that was hiding `frontend/src/features/logs/LogsPage.tsx`
+  (and probably the whole feature dir) from git. Without the file in
+  git, no one reading the repo would have known the logs page even
+  existed. Added explicit `!frontend/src/features/logs/` negation.
+- **Verification on live VPS**:
+  - nginx access logs show /api/logs = 200 37071 bytes (was 518770).
+    **92.7% reduction** (513596 -> 37243 bytes measured via curl).
+  - Polling cadence now 30s between /api/logs requests (04:04:38,
+    04:04:41 [Chrome tab still on 10s because it loaded BEFORE deploy],
+    04:05:08 [Cursor tab post-deploy shows 30s cadence]).
+  - Logs page screenshot at http://42.119.165.109:8443/logs renders
+    1000 rows Ã— 50 pages, "Updated 2ms ago", all 4 managed devices.
+- **Files touched**:
+  - frontend/src/features/logs/LogsPage.tsx (AUTO_REFRESH_MS 10000 -> 30000)
+  - frontend/nginx.conf (proxy_buffers + gzip_proxied)
+  - backend/src/index.ts (compression middleware + express.json 25mb)
+  - backend/package.json (added 'compression' + '@types/compression')
+  - .gitignore (unblock frontend/src/features/logs/)
+- **Commits**:
+  - 4049a48 fix(logs): ungate frontend logs feature from gitignore + tame polling
+- **Lessons for next agent**:
+  - **Always check the .gitignore pattern matching**. Any top-level
+    directory name that matches a real source folder (logs/, data/,
+    api/, src/, ...) is a trap. Use negation rules for source trees
+    that share common names with ignored runtime artifacts.
+  - **If a page feels slow, check the polling interval + payload
+    compression before blaming the API.** 30s Ã— 37 KB is sane;
+    10s Ã— 500 KB is wasteful.
+  - **When building images locally to test, use the SAME Dockerfile
+    that the compose file references.** I built ./frontend first
+    (which is the dev Vite image), but compose.app.yml uses
+    Dockerfile.prod (nginx). The first restart gave me Vite dev on
+    port 5173 instead of nginx on 80 -- confusing because the prod
+    compose file was supposedly untouched.
+  - **Compression alone often beats pagination** for read-heavy
+    list endpoints with lots of repetitive text fields. 500 KB JSON
+    typically gzips to 5-10% of original size if the data is mostly
+    repeated strings (syslog messages share a lot of common tokens).
+  - **The user complaining "login every second" was actually polling,
+    not login.** When debugging auth-spam complaints, also check the
+    data-fetch endpoints -- the frontend may be polling state it doesn't
+    actually need to refresh.
