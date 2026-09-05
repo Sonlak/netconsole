@@ -8,8 +8,8 @@ from typing import Any
 import httpx
 
 from netconsole_worker.config import settings
-from netconsole_worker.models import parse_job
 from netconsole_worker.junos_rest import get_rest_pool
+from netconsole_worker.models import parse_job
 from netconsole_worker.ssh_client import get_pool
 from netconsole_worker.tasks.registry import TASK_REGISTRY
 

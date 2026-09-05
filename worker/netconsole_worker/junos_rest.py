@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -7,6 +8,15 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+
+logger = logging.getLogger(__name__)
+
+
+def _quiet_close(client: httpx.Client) -> None:
+    try:
+        client.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("httpx.Client close failed: %s", exc)
 
 RPC_MAC_TABLE = "get-ethernet-switching-table-information"
 RPC_ARP_TABLE = "get-arp-table-information"
@@ -68,9 +78,9 @@ class JunosRESTPool:
                     entry = self._pool[key]
                     if now - entry.last_used > self._idle_seconds:
                         try:
-                            entry.client.close()
-                        except Exception:
-                            pass
+                            _quiet_close(entry.client)
+                        except Exception:  # noqa: BLE001
+                            logger.debug("reaper close failed")
                         del self._pool[key]
                         self.stats["evictions"] += 1
                         self.stats["closes"] += 1
@@ -106,12 +116,10 @@ class JunosRESTPool:
                     self.stats["borrows"] += 1
                     self.stats["reuses"] += 1
                     return entry.client
-                except Exception:
+                except Exception as exc:  # noqa: BLE001
                     # socket dead — fall through to open a fresh client
-                    try:
-                        entry.client.close()
-                    except Exception:
-                        pass
+                    logger.debug("rest-pool alive check failed: %s", exc)
+                    _quiet_close(entry.client)
                     self.stats["closes"] += 1
                     del self._pool[key]
 
@@ -135,10 +143,7 @@ class JunosRESTPool:
         with self._lock:
             entry = self._pool.pop(key, None)
             if entry is not None:
-                try:
-                    entry.client.close()
-                except Exception:
-                    pass
+                _quiet_close(entry.client)
                 self.stats["closes"] += 1
                 self.stats["evictions"] += 1
 
@@ -146,10 +151,7 @@ class JunosRESTPool:
         self._stop_reaper.set()
         with self._lock:
             for entry in self._pool.values():
-                try:
-                    entry.client.close()
-                except Exception:
-                    pass
+                _quiet_close(entry.client)
             self._pool.clear()
 
 
