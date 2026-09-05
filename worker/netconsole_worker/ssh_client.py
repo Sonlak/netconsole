@@ -15,9 +15,8 @@ the actual operational events.
 
 This module now exposes a tiny **connection pool** keyed by
 `(host, port, username)`. Tasks borrow a connection, run any number of
-commands, return it. Idle connections are reaped after
-`pool_idle_seconds` (default 90s) so we still honour
-`MaxStartups`/firewall idle timers.
+commands, return it. A background thread reaps idle connections every
+`reap_interval` seconds so the pool never grows unbounded.
 """
 
 from __future__ import annotations
@@ -33,35 +32,61 @@ import paramiko
 @dataclass
 class _PooledConn:
     client: paramiko.SSHClient
-    last_used: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.monotonic)
     use_count: int = 0
-    keepalive: bool = True
+    last_used: float = field(default_factory=time.monotonic)
 
 
 class SSHConnectionPool:
     """Thread-safe single-connection-per-key cache.
 
     One connection per (host, port, username) is kept open between
-    borrows. Idle connections older than `idle_seconds` are reaped on
-    the next borrow. A monotonic counter (`stats`) exposes call counts
-    so we can verify the cache is actually being hit.
+    borrows. A background daemon thread reaps connections idle for
+    more than `idle_seconds` to keep the pool bounded. A monotonic
+    counter (`stats`) exposes call counts so we can verify the cache
+    is actually being hit.
     """
 
-    def __init__(self, idle_seconds: float = 90.0) -> None:
+    def __init__(self, idle_seconds: float = 240.0, reap_interval: float = 30.0) -> None:
         self._lock = threading.Lock()
         self._pool: dict[tuple[str, int, str], _PooledConn] = {}
         self._idle_seconds = idle_seconds
+        self._reap_interval = reap_interval
+        self._stop_reaper = threading.Event()
+        self._reaper = threading.Thread(target=self._reap_loop, daemon=True, name="ssh-pool-reaper")
+        self._reaper.start()
         self.stats = {"borrows": 0, "opens": 0, "reuses": 0, "closes": 0, "evictions": 0}
 
+    # ------------------------------------------------------------------
+    # Background reaper
+    # ------------------------------------------------------------------
+    def _reap_loop(self) -> None:
+        while not self._stop_reaper.wait(self._reap_interval):
+            now = time.monotonic()
+            with self._lock:
+                for key in list(self._pool):
+                    entry = self._pool[key]
+                    if now - entry.last_used > self._idle_seconds:
+                        try:
+                            entry.client.close()
+                        except Exception:
+                            pass
+                        del self._pool[key]
+                        self.stats["evictions"] += 1
+                        self.stats["closes"] += 1
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def _key(self, host: str, port: int, username: str) -> tuple[str, int, str]:
         return (host, int(port), username)
 
     def _is_alive(self, conn: _PooledConn) -> bool:
         """Return False if the cached connection has been torn down.
 
-        Cheap check: a previously-open transport whose channel is closed
-        means the device closed the session (idle-timeout, reboot, etc.)
-        and any further `exec_command` would raise EOFError.
+        A previously-open transport whose channel is closed means the
+        device closed the session (idle-timeout, reboot, etc.) and any
+        further `exec_command` would raise EOFError.
         """
         client = conn.client
         transport = client.get_transport() if hasattr(client, "get_transport") else None
@@ -70,18 +95,6 @@ class SSHConnectionPool:
         if not transport.is_active():
             return False
         return True
-
-    def _evict_idle(self, now: float) -> None:
-        for key in list(self._pool):
-            entry = self._pool[key]
-            if now - entry.last_used > self._idle_seconds:
-                try:
-                    entry.client.close()
-                except Exception:
-                    pass
-                del self._pool[key]
-                self.stats["evictions"] += 1
-                self.stats["closes"] += 1
 
     def borrow(
         self,
@@ -92,12 +105,10 @@ class SSHConnectionPool:
         timeout: int = 15,
     ) -> _PooledConn:
         key = self._key(host, port, username)
-        now = time.monotonic()
         with self._lock:
-            self._evict_idle(now)
             entry = self._pool.get(key)
             if entry and self._is_alive(entry):
-                entry.last_used = now
+                entry.last_used = time.monotonic()
                 entry.use_count += 1
                 self.stats["reuses"] += 1
                 self.stats["borrows"] += 1
@@ -123,12 +134,12 @@ class SSHConnectionPool:
                 look_for_keys=False,
                 allow_agent=False,
             )
-            # Send keepalive every 30s so lab firewalls / idle-timers
+            # Send keepalive every 60s so lab firewalls / idle-timers
             # don't drop the connection mid-job.
             transport = client.get_transport()
             if transport is not None:
-                transport.set_keepalive(30)
-            entry = _PooledConn(client=client, last_used=now, use_count=1)
+                transport.set_keepalive(60)
+            entry = _PooledConn(client=client, last_used=time.monotonic(), use_count=1)
             self._pool[key] = entry
             self.stats["opens"] += 1
             self.stats["borrows"] += 1
@@ -155,6 +166,7 @@ class SSHConnectionPool:
                 self.stats["closes"] += 1
 
     def close_all(self) -> None:
+        self._stop_reaper.set()
         with self._lock:
             for entry in list(self._pool.values()):
                 try:
@@ -166,10 +178,16 @@ class SSHConnectionPool:
 
 
 # Module-level singleton — one worker process, one pool.
-_POOL = SSHConnectionPool()
+_POOL: SSHConnectionPool | None = None
+_POOL_INIT_LOCK = threading.Lock()
 
 
 def get_pool() -> SSHConnectionPool:
+    global _POOL
+    if _POOL is None:
+        with _POOL_INIT_LOCK:
+            if _POOL is None:
+                _POOL = SSHConnectionPool()
     return _POOL
 
 
