@@ -21,7 +21,9 @@ import { generateConfigRouter } from './routes/generateConfig.js';
 import { fabricRouter } from './routes/fabric.js';
 import { logsRouter } from './routes/logs.js';
 import { authRouter } from './routes/auth.js';
+import { auditLogRouter } from './routes/auditLog.js';
 import { authMiddleware } from './middleware/auth.js';
+import { auditLogMiddleware } from './middleware/auditLog.js';
 import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
 
 // CORS whitelist - chỉ cho phép domain được cấp phép
@@ -103,6 +105,9 @@ app.use(cors(corsOptions));
 // Compress all JSON/text responses (logs inventory is ~500KB without this).
 app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: '25mb' }));
+// Audit middleware: capture every mutating request, registered EARLY so it
+// sees the original method/path even when auth rejects the request.
+app.use(auditLogMiddleware);
 
 // Health check - không cần auth
 app.get('/api/health', (_req, res) => {
@@ -127,6 +132,7 @@ app.get('/api/health', (_req, res) => {
       'generate-config',
       'logs',
       'auth',
+      'audit-log',
     ],
     pingIntervalSeconds,
     macCollectIntervalSeconds,
@@ -154,6 +160,7 @@ app.use('/api/dhcp', authMiddleware, strictRateLimit, dhcpRouter);
 app.use('/api/config', authMiddleware, strictRateLimit, generateConfigRouter);
 app.use('/api/logs', authMiddleware, strictRateLimit, logsRouter);
 app.use('/api/jobs', authMiddleware, moderateRateLimit, jobsRouter);
+app.use('/api/audit-log', authMiddleware, strictRateLimit, auditLogRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {

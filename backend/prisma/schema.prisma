@@ -272,3 +272,26 @@ model User {
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 }
+
+// Append-only audit trail. Every mutating API request is logged here by the
+// auditLog middleware in backend/src/middleware/auditLog.ts. Never delete
+// rows from this table — bank auditors will ask for the full history.
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  username   String?  // denormalised so audit stays readable after user deletion
+  role       String?
+  method     String
+  path       String   // original URL including query string
+  action     String   // route shape, e.g. "/api/jobs" or "/api/auth/users/:id"
+  ip         String?
+  userAgent  String?
+  statusCode Int
+  metadata   Json?    // bodyKeys + params + summary, never raw secrets
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([path, createdAt])
+  @@index([statusCode, createdAt])
+  @@index([createdAt])
+}
