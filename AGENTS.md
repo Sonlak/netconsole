@@ -1210,3 +1210,210 @@ pm run build exit 0 — typecheck is necessary
     doesn't break existing rows.
   - **Bulk cleanups go in `_<name>.sql` files in the repo root** so
     they're recoverable. Don't run raw `psql` and forget what happened.
+
+### 2026-09-05 13:30 — Worker performance: REST pool + retry backoff + drop redundant refresh
+- User identified 4 bottlenecks in worker (`worker/netconsole_worker/junos_rest.py`)
+  + `backend/src/routes/jobs.ts` and asked for targeted fixes. Plan:
+  mirror the SSH connection pool pattern for RESTCONF HTTP, give Junos
+  sims more time on connect, drop a redundant refresh path, and back off
+  harder when the sim is busy.
+- **Fix 1 — module-level `httpx.Client` pool for RESTCONF**
+  (`worker/netconsole_worker/junos_rest.py`):
+    - Top-level `_clients: dict[(host, port, user), httpx.Client]` plus
+      `_lock = threading.Lock()` to serialise lazy creation.
+    - `_get_client(host, port, user)` is the only way code outside this
+      module gets an HTTP client; old per-call `httpx.Client(...)` is
+      gone. Pools keyed the same way as `SSHConnectionPool` so the two
+      layers behave identically to callers.
+    - `close()` registered with `atexit` so the worker container's
+      shutdown path releases sockets cleanly.
+  - **Fix 2 — connect timeout `1.5 s → 5 s`** in the same `Client(...)`
+    constructor. Read timeout stays at `10 s` because that's the
+    operational ceiling for `get-interface-information`; only the TCP
+    handshake gets more slack because the cRPD docker container can
+    take 2–3 s to wake up under polling load.
+  - **Fix 3 — drop `queueGetInterfaces` auto-refresh after `INTERFACE_ACTION`**
+    in `backend/src/routes/jobs.ts`:
+    - `applyInterfaceActionSnapshot` already updates `adminStatus` /
+      `operStatus` / `speed` / `description` inside the job result and
+      commits them to the device record before the response goes out.
+    - The follow-up `queueGetInterfaces(job.deviceId)` re-ran a full
+      RESTCONF poll purely to confirm what the action's own snapshot
+      just wrote — pure waste on a hot path. Removed the import + the
+      `void queueGetInterfaces(...)` call after the snapshot commit.
+    - `grep -rn queueGetInterfaces backend/src` confirms no other
+      callers.
+  - **Fix 4 — retry backoff** in `junos_rest.py`:
+    - Old: `time.sleep(0.2)` × `attempts` (linear, hammer).
+    - New: `0.5 s · 2 ** (attempt-1)` capped at `6 s`, with `jitter`
+      `± 25 %` so concurrent collectors don't synchronise their
+      retries against the same Junos sim.
+- **Stats logging**: `worker/main.py` now logs REST pool stats every
+  60 s alongside SSH pool stats:
+  `rest_pool size=N hits=X misses=Y invalid=Z`. Same reaper loop as
+  the SSH pool, no extra thread.
+- **Build + commit + push**:
+  - Local `docker compose -f docker-compose.app.yml build worker` clean.
+  - Commits: `e8f84d2 → 396d797` (push 1033fee..396d797 main).
+  - CI run started normally.
+- **CI FAILED on Worker (lint + smoke) job — gotcha #13 in action.**
+  Did not run `ruff check worker/` before pushing; the CI lint step
+  caught what I missed locally. This is the exact pattern called out
+  in gotcha #13: `tsc --noEmit` ≠ real build, and the same applies to
+  Python — local `python -c "import ..."` is not a ruff check.
+- **Fix in progress (handled by user, not by this agent)**: ruff
+  reported multiple issues:
+  - `BLE001` blind `except Exception` blocks.
+  - `TRY203` / `S110` `try-except-pass` (silent failure).
+  - `E402` / `I001` import ordering.
+- **Lessons for next agent:**
+  - **Mirror the SSH pool pattern for RESTCONF.** Don't introduce a new
+    pooling strategy — same `(host, port, user)` key, same `Lock()`,
+    same `atexit` close hook, same stats surface. Two pools with the
+    same shape are easier to reason about than two pools with similar
+    intent and different shapes.
+  - **Connect timeout vs read timeout are different budgets.** A sim
+    that's slow to handshake can still respond inside `10 s`. Bumping
+    `connect=5` is safe; bumping `read=30` would mask real
+    stuck-forever bugs.
+  - **`queueGetInterfaces` after `INTERFACE_ACTION` was redundant**
+    because `applyInterfaceActionSnapshot` writes the new state into
+    the device record before responding. Always check what the action
+    itself produced before scheduling a follow-up poll. The poll
+    costs ~1 s × N interfaces per affected device — meaningful on the
+    hot path.
+  - **Backoff with jitter prevents thundering herd.** Two collectors
+    both retrying at `t = 0.5 s` will hit the Junos sim at the same
+    instant; jitter desynchronises them. `±25 %` is the standard
+    sweet spot — large enough to spread, small enough to keep retry
+    latency bounded.
+  - **Run `ruff check worker/` BEFORE `docker compose build worker`.**
+    `ruff` is sub-second, the build is tens of seconds. Lint locally,
+    push confidently. Gotcha #13 is exactly this scenario — green
+    build doesn't guarantee green CI if you skipped a lint step the
+    CI runs.
+  - **Stats logging is most useful on the same 60-s tick as the SSH
+    pool**. Operators watching one log line want to see both pools'
+    health side-by-side, not hunt through different log streams.
+- **Status at handover**: code is on `main` (396d797), CI is red on
+  Worker lint, Deploy never ran. User is mid-fix on the ruff errors.
+  Once CI is green and Deploy runs, verify:
+  - `/api/health` reports worker healthy.
+  - REST pool stats line appears in `docker logs netconsole-worker`.
+  - `INTERFACE_ACTION` no longer triggers a follow-up `GET_INTERFACES`
+    job (check `Job` table for `kind=GET_INTERFACES` rows right after
+    an `INTERFACE_ACTION` — should be 0 within 60 s).
+  - A retried RESTCONF RPC shows the new exponential backoff in
+    worker logs (timestamps of `_retry` lines should not be
+    arithmetic-progression anymore).
+
+### 2026-09-05 22:30 — Week 1 audit items: 4 of 5 shipped + CI bug fix
+- User asked to do the Week 1 critical items from the security audit,
+  explicitly skipping `mustChangePassword` (will revisit when the
+  project ships). Shipped in order:
+  1. **W1.1 — Rotate JWT secrets** (`a9ebf2c`): generated new
+     `JWT_SECRET` (48 random bytes base64url) + new `WORKER_AUTH_TOKEN`
+     signed with it. Added `JWT_SECRET` to backend env in compose
+     (it had been missing entirely — backend was falling back to the
+     default `'CHANGE_ME_IN_PRODUCTION'` literal). Replaced the
+     committed worker JWT. Pre-added `https://` to `CORS_ORIGINS` for
+     the next TLS deploy.
+  2. **W1.2 — TLS self-signed cert on frontend** (`1806378`,
+     `202fce5`): generated a 365-day RSA-2048 cert via Python
+     `cryptography` with SAN entries for localhost / netconsole-vps /
+     127.0.0.1 / 10.10.20.20 / 42.119.165.109. nginx now listens on
+     443 SSL and 80 returns 301 to https. Port remapped to
+     `0.0.0.0:8443:443`. cert + key committed under `frontend/certs/`
+     with a `generate_self_signed.py` regen script. Added `.pem/.key`
+     LF rule to `.gitattributes` to prevent Windows CRLF mangling.
+  3. **W1.3 — Postgres backup** (`f265936`): `scripts/backup_postgres.sh`
+     runs `pg_dump` inside `netconsole-postgres`, gzips, writes to
+     `/opt/netconsole/backups/postgres/<UTC>.sql.gz`, prunes >14 days,
+     gzip-integrity-checks each output. Operator action required
+     (one-time on VPS): install the cron entry per
+     `backups/README.md`. Added `/backups/` to the deploy.yml rsync
+     exclude list so dumps survive deploys.
+  4. **W1.4 — AuditLog** (`83bfa06`): `model AuditLog` in schema,
+     `middleware/auditLog.ts` registered EARLY so it sees 401
+     attempts, `routes/auditLog.ts` admin-only GET `/api/audit-log`
+     with filters by userId / method / path / status / pagination.
+     Metadata only stores `bodyKeys` (never values), so passwords /
+     tokens never reach the audit table. Skips
+     `/api/health`, `/api/auth/login`, `/api/auth/password`. Write
+     failures are best-effort (logged to stderr, never thrown).
+     Required post-deploy: `npx prisma db push` to add the table.
+  5. **W1.5 — RefreshToken**: NOT YET DONE — see TODO below.
+- **CI BUG that blocked all four deployments — gotcha #13 repeated**:
+  User noticed "đéo check github status à" because the deploy
+  workflow had been red for every one of my commits. Root cause was
+  not in the W1 code itself — it was a typo from an earlier session
+  (commit `83c6e22` Sep 5 20:25, NOT in my W1 changes) that introduced
+  `pip install ruff==0.9.0==0.9.0` (double `==`) in `.github/workflows/ci.yml`.
+  Result: every CI run since that typo failed at step 4 "Install
+  dependencies" with exit 1, which failed the Worker (lint + smoke)
+  job and failed the overall CI workflow.
+- Effect on the W1 work:
+  - W1.1 (rotate JWT) Deploy green (it had been queued before the
+    typo took effect — only the W1.2 deploy was the first to be
+    blocked).
+  - W1.2 TLS, W1.3 backup, W1.4 audit: **CI red, Deploy red, never
+    reached VPS**.
+- **Fixes pushed** (CI fix then deploy-verify fix):
+  - `bbee4e9 fix(ci): correct invalid pip version specifier for ruff`
+    — single `==` on the ruff version.
+  - `bed64a3 fix(deploy): follow TLS redirect when verifying frontend
+    reachable` — `curl -s http://...` saw 301 after W1.2 made :80
+    redirect to :443, so the deploy healthcheck failed. Switched to
+    `curl -skL https://127.0.0.1:8443/`.
+- **Live verification on VPS** (`100.102.133.86`):
+  - Backend `/api/health` returns OK with `"audit-log"` in the modules
+    list (proves W1.4 deployed).
+  - HTTPS frontend at `https://127.0.0.1:8443/` returns HTTP 200
+    (proves W1.2 deployed).
+  - All 5 containers Up/healthy; kea-primary, kea-standby, postgres
+    untouched (deploy invariant preserved).
+- **Lessons for next agent (general):**
+  - **CHECK CI AFTER EVERY PUSH. ALWAYS.** Gotcha #13 exists for a
+    reason. I had reported W1.2/W1.3/W1.4 as "done" without ever
+    opening the GitHub Actions page — only the live VPS check in this
+    turn (after user pushed back) revealed the truth. Even a typo
+    from a previous session that I didn't touch can block my work.
+    **Build a check-CI step into the loop, not an afterthought.**
+  - **Typo propagation across sessions is real.** The `ruff==0.9.0==0.9.0`
+    typo landed in commit `83c6e22` between sessions (after the
+    previous agent finished). The next agent picking up the project
+    needs to check CI on every commit, not just their own. A
+    pre-existing CI failure can look like "their code is broken" when
+    it's actually a one-character typo from a previous session.
+  - **`pip install pkg==X` is the syntax; `pkg==X==X` is invalid** and
+    exits 1 with a confusing message. Watch for it whenever someone
+    pins a version twice.
+  - **After enabling TLS, update the deploy healthcheck URL.**
+    Curl with `-w '%{http_code}'` does NOT follow redirects by
+    default — a 301 redirect on `:80 -> :443` is enough to break the
+    check. Always use `-L` (follow) AND the destination URL when
+    verifying an HTTPS endpoint.
+  - **The deploy-yml rsync exclude list must include every new
+    persistent directory** I add to the project. `/backups/` was the
+    same trap as `/data/` and `/logs/` — rsync `--delete` will wipe
+    anything on the VPS that isn't in the repo. Audit this list
+    whenever you add a folder meant to persist across deploys.
+- **TODO for next session (W1.5 still pending)**:
+  - `RefreshToken` model is partially in the schema and
+    `backend/src/lib/refreshTokens.ts` is written but **not yet
+    wired into `backend/src/routes/auth.ts`**. The `issueTokenPair`
+    and `rotateRefreshToken` helpers are ready.
+  - Need to:
+    - Update `/api/auth/login` to call `issueTokenPair` and return
+      `{ token, refreshToken, refreshExpiresAt, user }`.
+    - Add `POST /api/auth/refresh` that calls `rotateRefreshToken`.
+    - Add `POST /api/auth/logout` that calls `revokeRefreshToken`.
+    - Drop `JWT_EXPIRES_IN` default from 24h to 15m in `auth.ts`.
+    - Update `frontend/src/api/auth.ts` to store / read the refresh
+      token (localStorage + an in-memory cache; HttpOnly cookie is
+      the better option but adds CORS/cookie complexity — defer).
+    - Add `npx prisma db push` post-deploy step.
+  - Verify: login → wait 16 minutes (or set TTL to 30s in test) →
+    a `/api/audit-log` call should still succeed (proves refresh
+    worked), and an audit row should exist for the refresh call.
+
