@@ -521,10 +521,10 @@ def apply_set_configuration(
 
     _ = log
 
-    set_text = "\n".join(commands) + "\n"
+    set_text = "\n".join(commands).rstrip("\n")
     load_body = (
         '<load-configuration action="set" format="text">'
-        f"<configuration-set>\n{escape(set_text)}</configuration-set>"
+        f"<configuration-set>{escape(set_text)}</configuration-set>"
         "</load-configuration>"
     ).encode()
 
