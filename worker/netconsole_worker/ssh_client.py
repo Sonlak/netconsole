@@ -81,12 +81,18 @@ class SSHConnectionPool:
     def _key(self, host: str, port: int, username: str) -> tuple[str, int, str]:
         return (host, int(port), username)
 
-    def _is_alive(self, conn: _PooledConn) -> bool:
+    def _is_alive(self, conn: _PooledConn, host: str, port: int, username: str) -> bool:
         """Return False if the cached connection has been torn down.
 
-        A previously-open transport whose channel is closed means the
-        device closed the session (idle-timeout, reboot, etc.) and any
-        further `exec_command` would raise EOFError.
+        Cheap check: a previously-open transport whose channel is closed
+        means the device closed the session (idle-timeout, reboot, etc.)
+        and any further `exec_command` would raise EOFError.
+
+        `transport.is_active()` only checks the paramiko-level socket —
+        it can return True while the underlying TCP is half-open. We do
+        one cheap exec ("true") to make sure end-to-end is alive before
+        reusing the connection. That round-trip is negligible compared
+        to a fresh TCP+SSH handshake.
         """
         client = conn.client
         transport = client.get_transport() if hasattr(client, "get_transport") else None
@@ -94,7 +100,13 @@ class SSHConnectionPool:
             return False
         if not transport.is_active():
             return False
-        return True
+        try:
+            stdin, stdout, stderr = client.exec_command("true", timeout=5)
+            stdin.close() if hasattr(stdin, "close") else None
+            exit_status = stdout.channel.recv_exit_status()
+            return exit_status == 0
+        except Exception:
+            return False
 
     def borrow(
         self,
@@ -109,7 +121,7 @@ class SSHConnectionPool:
         key = self._key(host, port, username)
         with self._lock:
             entry = self._pool.get(key)
-            if entry and self._is_alive(entry):
+            if entry and self._is_alive(entry, host, port, username):
                 entry.last_used = time.monotonic()
                 entry.use_count += 1
                 self.stats["reuses"] += 1
