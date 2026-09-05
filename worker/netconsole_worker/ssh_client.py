@@ -104,6 +104,8 @@ class SSHConnectionPool:
         password: str,
         timeout: int = 15,
     ) -> _PooledConn:
+        import logging
+        log = logging.getLogger(__name__)
         key = self._key(host, port, username)
         with self._lock:
             entry = self._pool.get(key)
@@ -112,10 +114,12 @@ class SSHConnectionPool:
                 entry.use_count += 1
                 self.stats["reuses"] += 1
                 self.stats["borrows"] += 1
+                log.debug("pool reuse %s use_count=%d", key, entry.use_count)
                 return entry
 
             if entry:
                 # Stale entry; close it before opening a new one.
+                log.info("pool evict stale %s (transport dead)", key)
                 try:
                     entry.client.close()
                 except Exception:
@@ -125,15 +129,19 @@ class SSHConnectionPool:
 
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                hostname=host,
-                port=port,
-                username=username,
-                password=password,
-                timeout=timeout,
-                look_for_keys=False,
-                allow_agent=False,
-            )
+            try:
+                client.connect(
+                    hostname=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    timeout=timeout,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+            except Exception:
+                # Don't cache a connection we never opened.
+                raise
             # Send keepalive every 60s so lab firewalls / idle-timers
             # don't drop the connection mid-job.
             transport = client.get_transport()
@@ -143,6 +151,7 @@ class SSHConnectionPool:
             self._pool[key] = entry
             self.stats["opens"] += 1
             self.stats["borrows"] += 1
+            log.debug("pool open %s", key)
             return entry
 
     def release(self, host: str, port: int, username: str) -> None:
