@@ -146,9 +146,15 @@ services:
     networks:
       netconsole:
         ipv4_address: 172.31.0.3
-    expose:
-      - "3000"
-      - "1514/udp"
+    ports:
+      # API (host curl only, not exposed externally)
+      - "127.0.0.1:3000:3000"
+      # Syslog UDP receiver — MUST be published (not just `expose`) so that
+      # the host kernel forwards incoming UDP packets from real devices on
+      # the lab NIC (`10.10.20.20`) into the container. Without this,
+      # Docker doesn't install a DNAT rule for UDP and the host kernel
+      # silently drops the packet after the socket bind check.
+      - "1514:1514/udp"
 
   worker:
     build:
