@@ -1,17 +1,43 @@
 ﻿import { Link } from 'react-router-dom';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CloudDownloadOutlined, RollbackOutlined, SaveOutlined, ThunderboltOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, Input, Modal, Select, Space, Typography, message } from 'antd';
+import {
+  CheckSquareOutlined,
+  CloudDownloadOutlined,
+  FilterOutlined,
+  RocketOutlined,
+  RollbackOutlined,
+  SaveOutlined,
+  ThunderboltOutlined,
+} from '@ant-design/icons';
+import {
+  Alert,
+  Button,
+  Card,
+  Checkbox,
+  Empty,
+  Input,
+  Modal,
+  Segmented,
+  Select,
+  Space,
+  Tabs,
+  Tag,
+  Typography,
+  message,
+} from 'antd';
 import { triggerDeviceConfig } from '@/api/deviceOperations';
 import {
   ackCommitJob,
   ackRollbackJob,
+  bulkCommitGenerateConfig,
   commitGenerateConfig,
   fetchConfigTemplates,
   fetchGenerateConfig,
+  previewBulkConfig,
   renderConfigTemplate,
   rollbackGenerateConfig,
   saveGenerateConfig,
+  type BulkCommitResult,
   type ConfigRole,
   type ConfigTemplateMeta,
   type DeviceSavedConfig,
@@ -24,12 +50,45 @@ import { StatusDot } from '@/components/common/StatusDot';
 import { StaleDataBanner } from '@/components/common/StaleDataBanner';
 import { Timestamp } from '@/components/display/Timestamp';
 import ManagedChecksTags from '@/components/ManagedChecksTags';
-import { SITES, deviceFloor, deviceSite, floorLabel, floorNumbers, floorsMatch, isKnownSite } from '@/data/bank';
+import { SITES, deviceFloor, deviceRole, deviceSite, floorLabel, floorNumbers, floorsMatch, isKnownSite } from '@/data/bank';
 import { useDevices } from '@/hooks/useDevices';
 import { useSiteFilter } from '@/hooks/useSiteFilter';
 import { toError } from '@/lib/errors';
+import type { Device } from '@/types/device';
+
+const BULK_ROLE_OPTIONS: Exclude<ConfigRole, 'custom'>[] = ['core', 'dist', 'access'];
+const BULK_ROLE_LABEL: Record<Exclude<ConfigRole, 'custom'>, string> = {
+  core: 'Core (L3)',
+  dist: 'Distribution (L2/L3)',
+  access: 'Access switch',
+};
 
 export default function GenerateConfigPage() {
+  return (
+    <div className="nc-page">
+      <Typography.Title level={4} style={{ marginTop: 0 }}>
+        Config Studio
+      </Typography.Title>
+      <Tabs
+        defaultActiveKey="single"
+        items={[
+          {
+            key: 'single',
+            label: 'Single device',
+            children: <SingleDevicePanel />,
+          },
+          {
+            key: 'bulk',
+            label: 'Bulk deploy',
+            children: <BulkDeployPanel />,
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+function SingleDevicePanel() {
   const { site, setSite, get, patch } = useSiteFilter();
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
   const [templates, setTemplates] = useState<ConfigTemplateMeta[]>([]);
@@ -342,15 +401,11 @@ export default function GenerateConfigPage() {
   }
 
   return (
-    <div className="nc-page">
+    <>
       <StaleDataBanner error={templates.length ? templatesError : null} onRetry={() => void loadTemplates()} />
       {devicesError && devices.length === 0 ? (
         <ErrorState title="Could not load devices" error={devicesError} onRetry={() => void refetchDevices()} />
       ) : null}
-
-      <Typography.Title level={4} style={{ marginTop: 0 }}>
-        Config Studio
-      </Typography.Title>
 
       <Card bordered={false} style={{ marginBottom: 12 }}>
         <Space wrap>
@@ -530,6 +585,370 @@ export default function GenerateConfigPage() {
           </Card>
         </>
       )}
-    </div>
+    </>
+  );
+}
+
+function BulkDeployPanel() {
+  const { site, setSite } = useSiteFilter();
+  const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
+
+  const [role, setRole] = useState<Exclude<ConfigRole, 'custom'>>('access');
+  const [floorFilter, setFloorFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [managedOnly, setManagedOnly] = useState(true);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [previewDeviceId, setPreviewDeviceId] = useState<string | null>(null);
+  const [previewContent, setPreviewContent] = useState('');
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [deploying, setDeploying] = useState(false);
+  const [lastResult, setLastResult] = useState<BulkCommitResult | null>(null);
+
+  // Devices in scope for the chosen role (+ site + floor + search + managed-only).
+  const candidates = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return devices
+      .filter((d) => deviceRole(d) === role)
+      .filter((d) => site === 'all' || deviceSite(d) === site)
+      .filter((d) => !floorFilter || floorsMatch(d, floorFilter))
+      .filter((d) => !needle || `${d.name} ${d.ip}`.toLowerCase().includes(needle))
+      .filter((d) => !managedOnly || d.status === 'MANAGED');
+  }, [devices, role, site, floorFilter, search, managedOnly]);
+
+  // Floor options scoped to the chosen role so the dropdown doesn't offer
+  // empty buckets ("ACCESS at F12" when no access switch lives on F12).
+  const floorOptions = useMemo(() => {
+    const inScope = devices.filter((d) => deviceRole(d) === role && (site === 'all' || deviceSite(d) === site));
+    const set = new Set(inScope.map((d) => deviceFloor(d)).filter(Boolean));
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [devices, role, site]);
+
+  // Stats per role for the segmented header.
+  const roleCounts = useMemo(() => {
+    const out: Record<Exclude<ConfigRole, 'custom'>, { total: number; managed: number }> = {
+      core: { total: 0, managed: 0 },
+      dist: { total: 0, managed: 0 },
+      access: { total: 0, managed: 0 },
+    };
+    for (const d of devices) {
+      const r = deviceRole(d);
+      out[r].total += 1;
+      if (d.status === 'MANAGED') out[r].managed += 1;
+    }
+    return out;
+  }, [devices]);
+
+  // Drop selections that fell out of the candidate set (e.g. floor changed).
+  useEffect(() => {
+    const candidateIds = new Set(candidates.map((d) => d.id));
+    setSelected((current) => current.filter((id) => candidateIds.has(id)));
+    if (previewDeviceId && !candidateIds.has(previewDeviceId)) {
+      setPreviewDeviceId(null);
+      setPreviewContent('');
+    }
+  }, [candidates, previewDeviceId]);
+
+  const previewDevice = useMemo(
+    () => (previewDeviceId ? candidates.find((d) => d.id === previewDeviceId) ?? null : null),
+    [candidates, previewDeviceId],
+  );
+
+  const loadPreview = useCallback(async (deviceId: string) => {
+    setPreviewDeviceId(deviceId);
+    setPreviewContent('');
+    setPreviewLoading(true);
+    try {
+      const out = await previewBulkConfig(role, deviceId);
+      setPreviewContent(out.content);
+    } catch (cause) {
+      setPreviewContent('');
+      message.error(cause instanceof Error ? cause.message : 'Could not render template for preview');
+    } finally {
+      setPreviewLoading(false);
+    }
+  }, [role]);
+
+  const toggleDevice = (id: string, checked: boolean) => {
+    setSelected((current) => {
+      const set = new Set(current);
+      if (checked) set.add(id);
+      else set.delete(id);
+      return Array.from(set);
+    });
+  };
+
+  const toggleAll = (checked: boolean) => {
+    setSelected(checked ? candidates.map((d) => d.id) : []);
+  };
+
+  const allChecked = candidates.length > 0 && candidates.every((d) => selected.includes(d.id));
+  const someChecked = !allChecked && candidates.some((d) => selected.includes(d.id));
+
+  const selectedDevices = useMemo(
+    () => candidates.filter((d) => selected.includes(d.id)),
+    [candidates, selected],
+  );
+
+  const managedSelected = selectedDevices.filter((d) => d.status === 'MANAGED').length;
+  const unmanagedSelected = selectedDevices.length - managedSelected;
+
+  const canDeploy = selectedDevices.length > 0 && managedSelected > 0;
+
+  const confirmDeploy = () => {
+    if (!canDeploy) return;
+    Modal.confirm({
+      width: 720,
+      title: `Deploy ${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)?`,
+      content: (
+        <div>
+          <Typography.Paragraph style={{ marginBottom: 6 }}>
+            Renders the <strong>{BULK_ROLE_LABEL[role]}</strong> template per device and queues one
+            <code> APPLY_CONFIG </code>job each. Worker runs them in parallel.
+          </Typography.Paragraph>
+          {unmanagedSelected > 0 ? (
+            <Alert
+              showIcon
+              type="warning"
+              style={{ marginBottom: 8 }}
+              message={`${unmanagedSelected} selected device(s) are not MANAGED — they will be skipped.`}
+            />
+          ) : null}
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 6 }}>
+            First 10 selected:
+          </Typography.Paragraph>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {selectedDevices.slice(0, 10).map((d) => (
+              <li key={d.id}>
+                <code>{d.name}</code> · {d.ip} · {deviceSite(d)} / {deviceFloor(d)} · {d.status}
+              </li>
+            ))}
+            {selectedDevices.length > 10 ? <li>… and {selectedDevices.length - 10} more</li> : null}
+          </ul>
+          <Typography.Paragraph type="warning" style={{ marginTop: 8, marginBottom: 0 }}>
+            This pushes configuration onto the live devices.
+          </Typography.Paragraph>
+        </div>
+      ),
+      okText: `Deploy to ${managedSelected}`,
+      onOk: async () => {
+        setDeploying(true);
+        try {
+          const result = await bulkCommitGenerateConfig(
+            selectedDevices.filter((d) => d.status === 'MANAGED').map((d) => d.id),
+            role,
+          );
+          setLastResult(result);
+          if (result.jobs.length > 0) {
+            message.success(
+              <span>
+                Queued {result.jobs.length} job(s) —{' '}
+                <Link to={`/jobs?type=APPLY_CONFIG`}>open Jobs</Link>
+              </span>,
+            );
+          }
+          if (result.skipped.length > 0) {
+            message.warning(`Skipped ${result.skipped.length} device(s): ${result.skipped[0].reason}`);
+          }
+          // Deselect everything that just got a job; keep selection visible
+          // for unmanaged devices so the user can fix their status first.
+          setSelected((current) =>
+            current.filter((id) => !result.jobs.some((j) => j.deviceId === id)),
+          );
+        } catch (cause) {
+          message.error(cause instanceof Error ? cause.message : 'Bulk deploy failed');
+        } finally {
+          setDeploying(false);
+        }
+      },
+    });
+  };
+
+  if (loadingDevices && devices.length === 0) return <PageSkeleton />;
+  if (devicesError && devices.length === 0) {
+    return <ErrorState title="Could not load devices" error={devicesError} onRetry={() => void refetchDevices()} />;
+  }
+
+  return (
+    <>
+      <Card bordered={false} style={{ marginBottom: 12 }} title="Bulk deploy template to many devices">
+        <Space wrap size={12} align="center">
+          <Segmented
+            value={role}
+            onChange={(value) => setRole(value as Exclude<ConfigRole, 'custom'>)}
+            options={BULK_ROLE_OPTIONS.map((r) => ({
+              value: r,
+              label: `${BULK_ROLE_LABEL[r]} (${roleCounts[r].managed}/${roleCounts[r].total})`,
+            }))}
+          />
+          <Select
+            value={site}
+            style={{ width: 140 }}
+            onChange={setSite}
+            options={[{ value: 'all', label: 'All sites' }, ...SITES.map((item) => ({ value: item.code, label: item.code }))]}
+          />
+          <Select
+            value={floorFilter}
+            style={{ width: 140 }}
+            onChange={setFloorFilter}
+            options={[{ value: '', label: 'All floors' }, ...floorOptions.map((value) => ({ value, label: value }))]}
+          />
+          <Input
+            prefix={<FilterOutlined />}
+            placeholder="Search name or IP"
+            style={{ width: 220 }}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            allowClear
+          />
+          <Checkbox checked={managedOnly} onChange={(e) => setManagedOnly(e.target.checked)}>
+            Managed only
+          </Checkbox>
+        </Space>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+          {candidates.length} candidate(s) for the <strong>{BULK_ROLE_LABEL[role]}</strong> template
+          {managedOnly ? ' (managed only)' : ''}. Selected {selected.length}.
+        </Typography.Paragraph>
+      </Card>
+
+      <div className="nc-config-grid">
+        <Card
+          bordered={false}
+          title={
+            <Space>
+              <Checkbox
+                indeterminate={someChecked}
+                checked={allChecked}
+                disabled={candidates.length === 0}
+                onChange={(e) => toggleAll(e.target.checked)}
+              >
+                Devices
+              </Checkbox>
+              <Tag color="blue">{candidates.length}</Tag>
+            </Space>
+          }
+          extra={
+            <Button
+              size="small"
+              type="link"
+              disabled={selected.length === 0}
+              onClick={() => setSelected([])}
+            >
+              Clear
+            </Button>
+          }
+          bodyStyle={{ padding: 0 }}
+        >
+          {candidates.length === 0 ? (
+            <div style={{ padding: 24 }}>
+              <Empty description="No devices match the current filter" />
+            </div>
+          ) : (
+            <ul className="nc-bulk-device-list">
+              {candidates.map((d) => (
+                <BulkDeviceRow
+                  key={d.id}
+                  device={d}
+                  checked={selected.includes(d.id)}
+                  previewing={previewDeviceId === d.id}
+                  onToggle={(checked) => toggleDevice(d.id, checked)}
+                  onPreview={() => void loadPreview(d.id)}
+                />
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card bordered={false} title="Preview (per device)">
+          {previewDevice ? (
+            <>
+              <Typography.Paragraph style={{ marginBottom: 8 }}>
+                <strong>{previewDevice.name}</strong> · {previewDevice.ip} · {deviceSite(previewDevice)} /{' '}
+                {deviceFloor(previewDevice)} · <Tag>{BULK_ROLE_LABEL[role]}</Tag>
+              </Typography.Paragraph>
+              <Input.TextArea
+                className="nc-code-area"
+                value={previewLoading ? '' : previewContent}
+                readOnly
+                autoSize={{ minRows: 22, maxRows: 28 }}
+                placeholder={previewLoading ? 'Rendering template…' : 'Click a device to preview the rendered config'}
+              />
+              <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+                Each device gets the same template rendered with its own hostname + IP. Selecting more devices
+                does NOT change this preview — only the chosen device drives the rendering.
+              </Typography.Paragraph>
+            </>
+          ) : (
+            <Empty description="Pick a device on the left to preview what will be applied." />
+          )}
+        </Card>
+      </div>
+
+      <Card bordered={false} style={{ marginTop: 12 }} title="Deploy">
+        <Space wrap align="center">
+          <Button
+            type="primary"
+            icon={<RocketOutlined />}
+            disabled={!canDeploy}
+            loading={deploying}
+            onClick={confirmDeploy}
+          >
+            Deploy {BULK_ROLE_LABEL[role]} template to {managedSelected} device(s)
+          </Button>
+          <Button
+            icon={<CheckSquareOutlined />}
+            disabled={selected.length === 0}
+            onClick={() => setSelected([])}
+          >
+            Clear selection
+          </Button>
+          <Typography.Text type="secondary">
+            {selected.length} selected · {managedSelected} managed · {unmanagedSelected} skipped
+          </Typography.Text>
+        </Space>
+        {lastResult ? (
+          <Alert
+            showIcon
+            type={lastResult.skipped.length === 0 ? 'success' : 'warning'}
+            style={{ marginTop: 12 }}
+            message={
+              <span>
+                Last deploy: <strong>{lastResult.jobs.length}</strong> job(s) queued,{' '}
+                <strong>{lastResult.skipped.length}</strong> skipped.{' '}
+                <Link to="/jobs?type=APPLY_CONFIG">Track on Jobs page</Link>
+              </span>
+            }
+          />
+        ) : null}
+      </Card>
+    </>
+  );
+}
+
+function BulkDeviceRow({
+  device,
+  checked,
+  previewing,
+  onToggle,
+  onPreview,
+}: {
+  device: Device;
+  checked: boolean;
+  previewing: boolean;
+  onToggle: (checked: boolean) => void;
+  onPreview: () => void;
+}) {
+  const managed = device.status === 'MANAGED';
+  return (
+    <li className={`nc-bulk-device-row${previewing ? ' is-previewing' : ''}`}>
+      <Checkbox checked={checked} disabled={!managed} onChange={(e) => onToggle(e.target.checked)}>
+        <span className="nc-bulk-device-row-name">{device.name}</span>
+        <span className="nc-bulk-device-row-meta">{device.ip} · {deviceSite(device)} / {deviceFloor(device)}</span>
+        <StatusDot status={device.status} />
+        {!managed ? <Tag color="orange">skip — not MANAGED</Tag> : null}
+      </Checkbox>
+      <Button size="small" type="link" onClick={onPreview}>
+        {previewing ? 'Re-render' : 'Preview'}
+      </Button>
+    </li>
   );
 }

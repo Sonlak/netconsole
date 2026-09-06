@@ -131,7 +131,7 @@ export default function AppLayout() {
       key: 'grp-network',
       type: 'group',
       label: 'Network',
-      children: NAV.slice(4, 10).map((item) => ({
+      children: NAV.slice(4, 9).map((item) => ({
         key: item.key,
         icon: item.icon,
         label: item.label,

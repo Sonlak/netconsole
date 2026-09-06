@@ -95,3 +95,36 @@ export async function ackRollbackJob(jobId: string): Promise<DeviceSavedConfig> 
   const response = await authFetch(`${API_BASE}/jobs/${jobId}/ack-rollback`, { method: 'POST' });
   return handleResponse(response);
 }
+
+export type BulkCommitResult = {
+  jobs: { id: string; deviceId: string; deviceName: string; deviceIp: string }[];
+  skipped: { deviceId: string; reason: string }[];
+};
+
+/**
+ * Render the same template (role) for every selected device and queue one
+ * APPLY_CONFIG job per device. Returns the list of created jobs and any
+ * devices that were skipped (e.g. not MANAGED). Backend caps at 64 devices
+ * per request; frontend should disable the button beyond that.
+ */
+export async function bulkCommitGenerateConfig(
+  deviceIds: string[],
+  role: Exclude<ConfigRole, 'custom'>,
+): Promise<BulkCommitResult> {
+  return authJsonFetch(`${API_BASE}/bulk-commit`, {
+    method: 'POST',
+    body: JSON.stringify({ deviceIds, role }),
+  });
+}
+
+/**
+ * Render the template for a single device without saving or queueing.
+ * Used by the bulk-deploy UI to show the user what *this* device will
+ * receive (each device has its own hostname/IP so the output differs).
+ */
+export async function previewBulkConfig(
+  role: Exclude<ConfigRole, 'custom'>,
+  deviceId: string,
+): Promise<{ content: string; role: string; deviceName: string }> {
+  return renderConfigTemplate(role, deviceId);
+}

@@ -887,3 +887,55 @@ textarea.nc-code-area {
   background-size: 6px 100%;
   background-repeat: repeat-x;
 }
+
+/* Bulk deploy device picker (Config Studio → Bulk deploy tab) */
+.nc-bulk-device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 540px;
+  overflow: auto;
+}
+
+.nc-bulk-device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--nc-border-subtle);
+  transition: background 0.12s ease;
+}
+
+.nc-bulk-device-row:last-child {
+  border-bottom: 0;
+}
+
+.nc-bulk-device-row:hover {
+  background: var(--nc-hover, color-mix(in srgb, var(--nc-accent) 6%, transparent));
+}
+
+.nc-bulk-device-row.is-previewing {
+  background: color-mix(in srgb, var(--nc-accent) 10%, transparent);
+}
+
+.nc-bulk-device-row .ant-checkbox-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  white-space: nowrap;
+}
+
+.nc-bulk-device-row-name {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.nc-bulk-device-row-meta {
+  color: var(--nc-text-muted);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 12px;
+  margin-right: 6px;
+}

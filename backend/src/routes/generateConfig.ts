@@ -214,6 +214,109 @@ generateConfigRouter.post('/devices/:id/rollback', async (req, res) => {
   );
 });
 
+/**
+ * Bulk-deploy a rendered config template to many devices at once.
+ * Renders the template per device (each device has its own hostname/IP),
+ * upserts the saved config (so a rollback is possible later), then enqueues
+ * one APPLY_CONFIG job per device. Worker runs them in parallel via the
+ * normal job queue.
+ *
+ * Body: { deviceIds: string[], role: 'core' | 'dist' | 'access' }
+ * Response 202: { jobs: [...], skipped: [{ deviceId, reason }] }
+ *
+ * Caps at 64 devices per request to keep the response bounded.
+ */
+generateConfigRouter.post('/bulk-commit', async (req, res) => {
+  const rawIds = req.body?.deviceIds;
+  if (!Array.isArray(rawIds) || rawIds.length === 0) {
+    res.status(400).json({ error: 'deviceIds must be a non-empty array' });
+    return;
+  }
+  if (rawIds.length > 64) {
+    res.status(400).json({ error: 'deviceIds cap is 64 per request' });
+    return;
+  }
+  const role = asRole(req.body?.role);
+  if (!role) {
+    res.status(400).json({ error: 'role must be core, dist, or access' });
+    return;
+  }
+
+  // Drop non-string ids and dedupe (caller may double-tap a checkbox).
+  const deviceIds = Array.from(
+    new Set(rawIds.filter((v): v is string => typeof v === 'string' && v.length > 0)),
+  );
+
+  const devices = await prisma.device.findMany({
+    where: { id: { in: deviceIds } },
+    select: {
+      id: true,
+      name: true,
+      ip: true,
+      status: true,
+      savedConfig: { select: { committedContent: true } },
+    },
+  });
+
+  const found = new Map(devices.map((d) => [d.id, d]));
+  const jobs: Array<{ id: string; deviceId: string; deviceName: string; deviceIp: string }> = [];
+  const skipped: Array<{ deviceId: string; reason: string }> = [];
+
+  for (const deviceId of deviceIds) {
+    const device = found.get(deviceId);
+    if (!device) {
+      skipped.push({ deviceId, reason: 'Device not found' });
+      continue;
+    }
+    if (device.status !== DeviceStatus.MANAGED) {
+      skipped.push({ deviceId, reason: 'Thiết bị phải MANAGED trước khi commit' });
+      continue;
+    }
+
+    const content = renderConfigTemplate(role, device);
+    const previous = device.savedConfig?.committedContent ?? '';
+
+    await prisma.deviceSavedConfig.upsert({
+      where: { deviceId: device.id },
+      create: { deviceId: device.id, role, content },
+      update: { role, content },
+    });
+
+    const job = await prisma.job.create({
+      data: {
+        deviceId: device.id,
+        type: JobType.APPLY_CONFIG,
+        status: JobStatus.PENDING,
+        payload: {
+          config: content,
+          role,
+          previous,
+          bulk: true,
+          bulkRole: role,
+          bulkTotal: deviceIds.length,
+        },
+      },
+      include: {
+        device: { select: { id: true, name: true, ip: true } },
+      },
+    });
+
+    if (!job.device) {
+      skipped.push({ deviceId: device.id, reason: 'Device disappeared after job create' });
+      continue;
+    }
+
+    jobs.push({
+      id: job.id,
+      deviceId: device.id,
+      deviceName: job.device.name,
+      deviceIp: job.device.ip,
+    });
+  }
+
+  res.status(202).json({ jobs, skipped });
+});
+
 generateConfigRouter.post('/jobs/:jobId/ack-commit', async (req, res) => {
   const job = await prisma.job.findUnique({ where: { id: req.params.jobId } });
   if (!job?.deviceId || job.type !== JobType.APPLY_CONFIG || job.status !== JobStatus.SUCCESS) {
