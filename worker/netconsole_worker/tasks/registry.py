@@ -48,22 +48,27 @@ class GetConfigTask(BaseTask):
                 config = parse_configuration_set(rest_result["payload"] or rest_result["raw"])
                 if not config and rest_result.get("raw"):
                     config = parse_configuration_set(rest_result["raw"])
-                if config:
-                    identity = parse_identity_from_set_config(config)
-                    return {
-                        "implemented": True,
-                        "source": "junos-rest",
-                        "config": config,
-                        "hostname": identity.get("hostname") or "",
-                        "version": identity.get("version") or "",
-                        "command": "get-configuration format=set",
-                        "message": f"Collected running config from {device.name}",
-                    }
-                rest_error = "Junos REST returned empty configuration"
-            else:
-                rest_error = rest_result["error"] or "Junos REST get-configuration failed"
+                # Treat REST success as authoritative. Empty config is unusual
+                # but valid (a Junos sim running with no overrides) — do NOT
+                # fall back to SSH in that case. SSH only runs when REST itself
+                # returns ok=False.
+                identity = parse_identity_from_set_config(config)
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "config": config,
+                    "hostname": identity.get("hostname") or "",
+                    "version": identity.get("version") or "",
+                    "command": "get-configuration format=set",
+                    "message": (
+                        f"Collected running config from {device.name}"
+                        if config
+                        else f"Collected running config from {device.name} (empty)"
+                    ),
+                }
+            rest_error = rest_result["error"] or "Junos REST get-configuration failed"
 
-        if settings.lab_ssh_enabled:
+        if settings.lab_ssh_enabled and rest_error:
             ssh_result = run_ssh_command(
                 host=device.ip,
                 username=settings.lab_ssh_user,
@@ -285,20 +290,26 @@ class GetArpTask(BaseTask):
                 entries = parse_arp_table_rpc(rest_result["payload"] or rest_result["raw"])
                 if not entries and rest_result.get("raw"):
                     entries = parse_arp_table_rpc(rest_result["raw"])
-                if entries:
-                    return {
-                        "implemented": True,
-                        "source": "junos-rest",
-                        "message": "Junos REST ARP table OK",
-                        "command": "get-arp-table-information",
-                        "entries": entries,
-                        "raw": compact_raw(rest_result["raw"]),
-                    }
-                rest_error = "Junos REST returned no ARP entries"
-            else:
-                rest_error = rest_result["error"] or "Junos REST request failed"
+                # Treat REST success as authoritative — even an empty table is
+                # a valid answer ("no ARP entries on this device yet"). Skip the
+                # SSH fallback unless REST actually failed; this stops the
+                # auth.log flood from REST-able devices whose tables are
+                # momentarily empty.
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "message": (
+                        "Junos REST ARP table OK"
+                        if entries
+                        else "Junos REST ARP table OK (empty)"
+                    ),
+                    "command": "get-arp-table-information",
+                    "entries": entries,
+                    "raw": compact_raw(rest_result["raw"]),
+                }
+            rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if settings.lab_ssh_enabled:
+        if settings.lab_ssh_enabled and rest_error:
             command = "show arp"
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -373,20 +384,26 @@ class GetMacTask(BaseTask):
                 entries = parse_mac_table_rpc(rest_result["payload"] or rest_result["raw"])
                 if not entries and rest_result.get("raw"):
                     entries = parse_mac_table_rpc(rest_result["raw"])
-                if entries:
-                    return {
-                        "implemented": True,
-                        "source": "junos-rest",
-                        "message": "Junos REST MAC table OK",
-                        "command": "get-ethernet-switching-table-information",
-                        "entries": entries,
-                        "raw": compact_raw(rest_result["raw"]),
-                    }
-                rest_error = "Junos REST returned no MAC entries"
-            else:
-                rest_error = rest_result["error"] or "Junos REST request failed"
+                # Treat REST success as authoritative — empty MAC table is a
+                # valid response when no clients have connected yet, so we do
+                # NOT fall back to SSH. The auth.log flood from REST-able
+                # devices with empty tables was the dominant source of SSH
+                # noise; this kills it.
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "message": (
+                        "Junos REST MAC table OK"
+                        if entries
+                        else "Junos REST MAC table OK (empty)"
+                    ),
+                    "command": "get-ethernet-switching-table-information",
+                    "entries": entries,
+                    "raw": compact_raw(rest_result["raw"]),
+                }
+            rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if settings.lab_ssh_enabled:
+        if settings.lab_ssh_enabled and rest_error:
             command = "show ethernet-switching table"
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -514,11 +531,15 @@ class GetInterfacesTask(BaseTask):
                         "interfaces": interfaces,
                         "raw": compact_raw(rest_result["raw"]),
                     }
-                rest_error = "Junos REST returned no interfaces"
+                # REST returned ok=True but parser got no interfaces. This is
+                # rare — usually means the device is mid-reboot or has no L2/L3
+                # interfaces at all. Fall back to SSH so we don't silently drop
+                # the report, but log the REST attempt for diagnostics.
+                rest_error = "Junos REST returned no interfaces (parser empty)"
             else:
                 rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if settings.lab_ssh_enabled:
+        if settings.lab_ssh_enabled and rest_error:
             command = "show interfaces terse"
             ssh_result = run_ssh_command(
                 host=device.ip,
