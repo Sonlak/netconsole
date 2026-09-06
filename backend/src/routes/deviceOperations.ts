@@ -7,6 +7,8 @@ import {
   getLatestJobResult,
   stubPayload,
 } from '../services/deviceOperations.js';
+import { authMiddleware } from '../middleware/auth.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 async function readOperation(deviceId: string, type: JobType, res: Response) {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
@@ -33,8 +35,8 @@ async function readOperation(deviceId: string, type: JobType, res: Response) {
   });
 }
 
-async function triggerOperation(deviceId: string, type: JobType, res: Response) {
-  const job = await createDeviceJob(deviceId, type, res);
+async function triggerOperation(deviceId: string, type: JobType, res: Response, createdById: string | null) {
+  const job = await createDeviceJob(deviceId, type, res, createdById ?? undefined);
   if (!job) {
     return;
   }
@@ -47,17 +49,27 @@ async function triggerOperation(deviceId: string, type: JobType, res: Response) 
 
 export function registerDeviceOperationRoutes(router: import('express').Router) {
   const idParam = (req: Request) => String(req.params.id);
+  const userId = (req: AuthenticatedRequest) => req.user?.userId ?? null;
 
   router.get('/:id/config', (req, res) =>
     void readOperation(idParam(req), JobType.GET_CONFIG, res),
   );
-  router.post('/:id/config', (req, res) =>
+  router.post('/:id/config', authMiddleware, (req, res) =>
     void (async () => {
       try {
-        const result = await collectDeviceConfig(idParam(req));
+        const result = await collectDeviceConfig(idParam(req), userId(req));
         res.status(result.queued ? 202 : 200).json(result);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Config collection failed';
+        const lockedBy = (error as { lockedBy?: unknown }).lockedBy;
+        if (message === 'Device busy' && lockedBy) {
+          res.status(409).json({
+            error: 'Device busy',
+            code: 'device_locked',
+            lockedBy,
+          });
+          return;
+        }
         const status = message === 'Device not found' ? 404 : 502;
         res.status(status).json({ error: message });
       }
@@ -66,17 +78,17 @@ export function registerDeviceOperationRoutes(router: import('express').Router) 
   router.get('/:id/arp', (req, res) =>
     void readOperation(idParam(req), JobType.GET_ARP, res),
   );
-  router.post('/:id/arp', (req, res) =>
-    void triggerOperation(idParam(req), JobType.GET_ARP, res),
+  router.post('/:id/arp', authMiddleware, (req, res) =>
+    void triggerOperation(idParam(req), JobType.GET_ARP, res, userId(req)),
   );
   router.get('/:id/mac', (req, res) =>
     void readOperation(idParam(req), JobType.GET_MAC, res),
   );
-  router.post('/:id/mac', (req, res) =>
-    void triggerOperation(idParam(req), JobType.GET_MAC, res),
+  router.post('/:id/mac', authMiddleware, (req, res) =>
+    void triggerOperation(idParam(req), JobType.GET_MAC, res, userId(req)),
   );
-  router.post('/:id/connect', (req, res) =>
-    void triggerOperation(idParam(req), JobType.CONNECT_TEST, res),
+  router.post('/:id/connect', authMiddleware, (req, res) =>
+    void triggerOperation(idParam(req), JobType.CONNECT_TEST, res, userId(req)),
   );
 }
 

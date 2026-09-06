@@ -88,11 +88,19 @@ model Job {
   payload   Json?
   result    Json?
   error     String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  // User who POSTed this job via /api/jobs. Workers (which also call POST
+  // for DISCOVERY_PROBE/queueGen) must carry a userId in their JWT; we
+  // attribute scheduler-driven jobs to the worker system user instead.
+  // Nullable so the existing rows (pre-migration) keep loading.
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   @@index([deviceId])
   @@index([status])
+  @@index([createdById])
+  @@index([deviceId, status])
 }
 
 enum LogSeverity {
@@ -275,6 +283,11 @@ model User {
   // Back-relation for RefreshToken. `onDelete: Cascade` because a deleted
   // user's refresh rows have no business meaning.
   refreshTokens RefreshToken[]
+
+  // Back-relation for jobs the user created via POST /api/jobs.
+  // `onDelete: SetNull` so historical jobs survive user deletion (audit
+  // trail is more important than referential tidiness here).
+  jobs Job[]
 }
 
 // Append-only audit trail. Every mutating API request is logged here by the

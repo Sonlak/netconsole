@@ -20,6 +20,8 @@ export type Job = {
   payload?: unknown;
   result: unknown;
   error: string | null;
+  createdById?: string | null;
+  createdBy?: { id: string; username: string } | null;
   createdAt: string;
   updatedAt: string;
   device?: {
@@ -29,6 +31,23 @@ export type Job = {
     site: string;
     vendor?: string;
     model?: string;
+  };
+};
+
+/**
+ * Body returned by POST /api/jobs when the device already has an
+ * in-flight job. UI surfaces this as "Device busy, locked by ...".
+ */
+export type DeviceLockedResponse = {
+  error: 'Device busy';
+  code: 'device_locked';
+  lockedBy: {
+    jobId: string;
+    jobType: JobType;
+    jobStatus: JobStatus;
+    jobCreatedAt: string;
+    userId: string | null;
+    username: string | null;
   };
 };
 

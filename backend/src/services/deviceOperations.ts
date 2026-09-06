@@ -1,6 +1,89 @@
-import { JobStatus, JobType } from '@prisma/client';
+import { JobStatus, JobType, Prisma } from '@prisma/client';
 import type { Response } from 'express';
 import { prisma } from '../lib/prisma.js';
+import type { PrismaClient } from '@prisma/client';
+
+export type DeviceBusyError = {
+  code: 'device_locked';
+  blockingJob: {
+    id: string;
+    type: JobType;
+    status: JobStatus;
+    createdAt: Date;
+    createdByUsername: string | null;
+  };
+};
+
+/**
+ * Try to create a job for a device, serialised by Postgres advisory lock.
+ * Returns either { kind: 'created', job } or { kind: 'busy', error }.
+ * Caller decides how to map the busy case to HTTP (POST /api/jobs uses 409,
+ * POST /api/devices/:id/xxx uses 409 too but with a slightly different shape).
+ *
+ * IMPORTANT: `tx` must be a transaction handle — advisory locks are
+ * scoped to the transaction and released automatically on commit/rollback.
+ */
+export async function tryCreateDeviceJob(
+  tx: Prisma.TransactionClient | PrismaClient,
+  deviceId: string,
+  type: JobType,
+  createdById: string | null,
+  payload?: Prisma.InputJsonValue,
+): Promise<
+  | { kind: 'created'; job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null } }
+  | { kind: 'busy'; error: DeviceBusyError }
+> {
+  // Serialize every concurrent POST that targets this device. hashtext
+  // maps UUID -> int4 -> bigint so identical deviceIds always collide on
+  // the same lock; different devices never block each other.
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceId})::bigint)`;
+
+  const blocking = await tx.job.findFirst({
+    where: {
+      deviceId,
+      status: { in: [JobStatus.PENDING, JobStatus.RUNNING] },
+    },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      createdBy: { select: { username: true } },
+    },
+  });
+
+  if (blocking) {
+    return {
+      kind: 'busy',
+      error: {
+        code: 'device_locked',
+        blockingJob: {
+          id: blocking.id,
+          type: blocking.type,
+          status: blocking.status,
+          createdAt: blocking.createdAt,
+          createdByUsername: blocking.createdBy?.username ?? null,
+        },
+      },
+    };
+  }
+
+  const job = await tx.job.create({
+    data: {
+      deviceId,
+      type,
+      status: JobStatus.PENDING,
+      ...(createdById ? { createdById } : {}),
+      ...(payload !== undefined ? { payload } : {}),
+    },
+    select: {
+      id: true,
+      type: true,
+      status: true,
+      createdAt: true,
+      deviceId: true,
+    },
+  });
+
+  return { kind: 'created', job };
+}
 
 export async function getLatestJobResult(
   deviceId: string,
@@ -16,6 +99,7 @@ export async function createDeviceJob(
   deviceId: string,
   type: JobType,
   res: Response,
+  createdById?: string,
 ) {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
   if (!device) {
@@ -23,15 +107,30 @@ export async function createDeviceJob(
     return null;
   }
 
-  const job = await prisma.job.create({
-    data: {
-      deviceId,
-      type,
-      status: JobStatus.PENDING,
-    },
+  const outcome = await prisma.$transaction(async (tx) =>
+    tryCreateDeviceJob(tx, deviceId, type, createdById ?? null),
+  );
+
+  if (outcome.kind === 'busy') {
+    res.status(409).json({
+      error: 'Device busy',
+      code: 'device_locked',
+      lockedBy: {
+        jobId: outcome.error.blockingJob.id,
+        jobType: outcome.error.blockingJob.type,
+        jobStatus: outcome.error.blockingJob.status,
+        jobCreatedAt: outcome.error.blockingJob.createdAt,
+        username: outcome.error.blockingJob.createdByUsername,
+      },
+    });
+    return null;
+  }
+
+  // Re-fetch with device relation for the existing 202 response shape.
+  const job = await prisma.job.findUnique({
+    where: { id: outcome.job.id },
     include: { device: true },
   });
-
   return job;
 }
 

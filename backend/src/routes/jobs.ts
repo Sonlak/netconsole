@@ -9,6 +9,7 @@ import { applyInterfaceActionSnapshot } from '../services/interfaces.js';
 import { invalidateFabricCache } from '../services/fabricTopology.js';
 import { isAllowedLogFilename } from '../lib/junosLogFiles.js';
 import { persistLogsForJob } from '../services/logs.js';
+import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 
 export const jobsRouter = Router();
 
@@ -201,7 +202,17 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
   }
 });
 
-jobsRouter.post('/', async (req, res) => {
+jobsRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
+  if (!req.user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const userId = req.user.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized: missing user id in token' });
+    return;
+  }
+
   const { deviceId, type, payload } = req.body as {
     deviceId?: string;
     type?: JobType;
@@ -241,13 +252,35 @@ jobsRouter.post('/', async (req, res) => {
     safePayload = { filename: 'messages' } as Prisma.InputJsonValue;
   }
 
-  const job = await prisma.job.create({
-    data: {
-      deviceId,
-      type,
-      status: JobStatus.PENDING,
-      ...(safePayload !== undefined ? { payload: safePayload } : {}),
-    },
+  // Device lock + cross-user attribution via the shared helper. See
+  // services/deviceOperations.ts → tryCreateDeviceJob for the advisory
+  // lock semantics. POST /api/jobs and POST /api/devices/:id/xxx share
+  // this code path so the lock is enforced uniformly across all entry
+  // points.
+  const outcome = await prisma.$transaction(async (tx) =>
+    tryCreateDeviceJob(tx, deviceId, type, userId, safePayload),
+  );
+
+  if (outcome.kind === 'busy') {
+    const b = outcome.error.blockingJob;
+    res.status(409).json({
+      error: 'Device busy',
+      code: 'device_locked',
+      lockedBy: {
+        jobId: b.id,
+        jobType: b.type,
+        jobStatus: b.status,
+        jobCreatedAt: b.createdAt,
+        username: b.createdByUsername,
+      },
+    });
+    return;
+  }
+
+  // Re-fetch with device relation so the response shape is unchanged
+  // for existing clients (they expect job.device).
+  const job = await prisma.job.findUnique({
+    where: { id: outcome.job.id },
     include: { device: true },
   });
 
