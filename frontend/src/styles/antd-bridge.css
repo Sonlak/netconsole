@@ -87,6 +87,7 @@ textarea.nc-code-area {
   height: 100%;
   width: 100%;
   overflow: hidden;
+  position: relative;
 }
 
 .nc-app-shell > .ant-layout {
@@ -113,17 +114,54 @@ textarea.nc-code-area {
   padding: 0 16px;
   color: #e6edf3;
   border-bottom: 1px solid #1d2631;
+  flex: none;
+}
+
+.nc-app-logo-img {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  flex: none;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.45));
+  user-select: none;
 }
 
 .nc-app-logo-title {
   font-size: 14px;
   font-weight: 600;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
-.nc-app-logo-sub {
+.nc-app-footer {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 6;
+  padding: 10px 16px 12px;
+  font-family: var(--font-mono), ui-monospace, monospace;
   font-size: 11px;
+  line-height: 1.5;
   color: #657384;
+  pointer-events: none;
+  user-select: none;
+  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, #0e141b 70%, transparent) 100%);
+}
+
+.nc-app-footer-version {
+  color: #8a96a8;
+  letter-spacing: 0.02em;
+}
+
+.nc-app-footer-copy {
+  color: #657384;
+  margin-top: 2px;
+}
+
+.ant-layout-sider-collapsed ~ * .nc-app-footer,
+.ant-layout-sider-collapsed + .nc-app-footer {
+  /* keep bottom-left anchored even when sider is collapsed (80px wide) */
+  padding-left: 16px;
 }
 
 .nc-app-header {

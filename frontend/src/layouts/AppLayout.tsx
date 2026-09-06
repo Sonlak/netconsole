@@ -3,7 +3,6 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   ApiOutlined,
   ApartmentOutlined,
-  AppstoreOutlined,
   AlertOutlined,
   CloudServerOutlined,
   ClusterOutlined,
@@ -161,13 +160,19 @@ export default function AppLayout() {
         className="nc-app-sider"
       >
         <div className="nc-app-logo">
-          <AppstoreOutlined />
-          {!collapsed ? (
-            <div>
-              <div className="nc-app-logo-title">NetConsole</div>
-              <div className="nc-app-logo-sub">NKKN · NTMK</div>
-            </div>
-          ) : null}
+          <img
+            src="/logo.png"
+            alt="NetConsole"
+            className="nc-app-logo-img"
+            draggable={false}
+            onError={(event) => {
+              // Hide the broken-image glyph until the operator drops a real
+              // logo at frontend/public/logo.png. Without this the default
+              // browser placeholder icon clutters the sidebar.
+              (event.currentTarget as HTMLImageElement).style.visibility = 'hidden';
+            }}
+          />
+          {!collapsed ? <div className="nc-app-logo-title">NetConsole</div> : null}
         </div>
         <Menu
           theme="dark"
@@ -262,6 +267,10 @@ export default function AppLayout() {
           </ErrorBoundary>
         </Content>
       </Layout>
+      <footer className="nc-app-footer" aria-label="Application version and copyright">
+        <div className="nc-app-footer-version">Version: 1.2.0 (Build 20260906)</div>
+        <div className="nc-app-footer-copy">© 2026 SonLak.</div>
+      </footer>
       <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} items={NAV} />
     </Layout>
   );
