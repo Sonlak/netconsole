@@ -2099,3 +2099,76 @@ pm run build exit 0 â€” typecheck is necessary
     `styles={{ body: {...} }}` instead. Skipped for now (still works,
     only emits a console warning) to avoid scope creep. Follow-up
     cleanup when touching the file next time.
+
+
+### 2026-09-06 23:20 — Bulk deploy: live progress tracker + completion notification
+- User asked "sao không có thông báo ch?y push config xong v?y" — current
+  flow enqueues jobs and returns 202, but UI only showed "Queued N jobs"
+  toast, no completion signal.
+- **Backend unchanged** — the worker still polls jobs and the existing
+  `/api/jobs/:id` endpoint already returns the live job with status.
+  No new backend work needed.
+- **Frontend — new component** `frontend/src/features/generateConfig/BulkDeployProgressModal.tsx` (255 lines):
+  - `useEffect` polls `fetchJobsByIds(jobs.map(j => j.id))` every 2s
+    until every job reaches terminal status (SUCCESS / FAILED).
+  - Modal shows per-device row with icon (`CheckCircleTwoTone` /
+    `CloseCircleTwoTone` / `LoadingOutlined`) + name + IP + status
+    tag + error message if any.
+  - Header has running / complete / "N failed" tagged state.
+  - Footer shows "X/Y finished" while polling, "Done. M/N succeeded"
+    when complete. Close button disabled while polling so the user
+    can't accidentally dismiss mid-flight.
+  - Single ref guard (`notifiedRef`, `summaryShownRef`) prevents
+    duplicate toasts / browser notifications if the polling effect
+    re-fires.
+  - Auto-close 6s after completion (cleanup via timer ref).
+- **Browser Notification API**: on first bulk-deploy of the session,
+  request permission; if granted, fire a system notification when ANY
+  job failed (counts in title + body). Falls back gracefully on
+  browsers without the API or when permission is denied — still shows
+  the in-app toast.
+- **API helper** `fetchJobsByIds` added to `frontend/src/api/jobs.ts`
+  — `Promise.all` over existing `fetchJob` so no backend change.
+- **Integration** in `BulkDeployPanel` (`frontend/src/pages/GenerateConfigPage.tsx`):
+  - New state `trackedJobs` + `trackerOpen`.
+  - After `bulkCommitGenerateConfig` returns, open the tracker with
+    `setTrackedJobs(result.jobs); setTrackerOpen(true);`.
+  - Existing "Open Jobs page" toast kept; new behavior is the modal
+    itself.
+- **TypeScript fix**: `TERMINAL.includes(r.status)` initially failed
+  with `TS2345: JobStatus | 'UNKNOWN' not assignable to JobStatus`
+  on the derived-row `allTerminal` check. Fixed by narrowing:
+  `r.status !== 'UNKNOWN' && TERMINAL.includes(r.status)`.
+- Build clean (`tsc -b && vite build`). Commits:
+  - `11a658d feat(bulk-deploy): live progress tracker + completion notification`
+- Pushed ? CI green ? Deploy green. Frontend container restarted on
+  VPS (Up 2 min). Bundle verification: `Bulk deploy progress` string
+  present in `GenerateConfigPage-*.js` inside the container.
+- **Browser screenshot**: blocked — Cursor's embedded browser tool
+  cannot render the live HTTPS page (self-signed cert returns
+  `chrome-error://chromewebdata/` in the tool, even on a fresh tab).
+  The user should verify in their normal browser instead. Bundle +
+  curl + GitHub Actions conclusion are the only signals I have.
+- **Lessons for next agent**:
+  - **Notification permission request belongs at modal-open, not on
+    page mount**. Asking too early feels intrusive. Asking the first
+    time a deploy runs is contextual — the user just triggered the
+    feature and will understand why.
+  - **Tracker state should be a ref of job IDs, not Job objects**.
+    Jobs change status; the tracker needs to know "which jobs am I
+    following" without re-mounting when the polling effect updates
+    `live`. The current code stores the queued-list snapshot
+    (`trackedJobs`) separately from the polled status (`live`),
+    then derives the per-row view in a `useMemo` — this is the
+    pattern to reuse.
+  - **Disabled footer button while polling is a UX win**. Users will
+    try to close the modal mid-flight to "go do something else" and
+    lose the result; a disabled button + clear "Hide (keep tracking)"
+    copy keeps them oriented.
+  - **Browser Notification API needs feature-detect, not just
+    permission check**. `window.Notification` is undefined in some
+    sandboxed contexts; always guard with `'Notification' in window`
+    before calling anything on it.
+- **Status at handover**: code is on `main` (11a658d), CI + Deploy
+  green, frontend container restarted on VPS, bundle verified.
+  Awaiting user verification in their own browser.
