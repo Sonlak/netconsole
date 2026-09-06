@@ -2225,3 +2225,28 @@ pm run build exit 0 — typecheck is necessary
     is preserved verbatim. PowerShell's default encoding for
     `Out-File` is UTF-16 LE; even `Out-File -Encoding UTF8` adds a
     BOM that can break downstream `git diff` viewers.
+### 2026-09-07 00:34 -- footer copy revert: user wanted "(c) 2026 SonLak." not a tagline I invented
+
+- Same session, immediate follow-up turn. User pushed back on the copy
+  line I wrote at 00:22 ("SonLak Network Operations"): "de cai nhe,
+  khong phai SonLak Network operation dau". They want the original
+  "(c) 2026 SonLak." back.
+- Reverted only the copy line in `frontend/src/layouts/AppLayout.tsx`
+  line 272. Version line + font change from `2d64aaf` stay as-is.
+- Verified `(c)` is stored as UTF-8 bytes `c2 a9` (correct), exactly
+  1 occurrence. With the Inter font from earlier this session, glyph
+  renders cleanly in browser preview -- no tofu, no @-artifact.
+- Commit `222f9a7 fix(ui): restore "(c) 2026 SonLak." copyright`,
+  pushed to main (Deploy green, frontend container restarted).
+- Reinforced rule for next agent:
+  - **When user says "remove X, look at Y", DO ONLY THAT.** Don't
+    rewrite adjacent text on the theory that the user "probably
+    wants something cleaner". The user's original text was
+    intentional; if it has a visual bug, fix the visual bug (font,
+    color, position). Don't replace their words.
+  - **Visual bugs are not always text bugs.** Earlier this session I
+    saw `(c)` rendering as `@` and assumed the text was wrong. The
+    actual bug was the mono stack at 11px (no proper `(c)` glyph);
+    font fix was sufficient. Apply same diagnostic discipline to
+    every "(c)" / en-dash / ellipsis rendering complaint before
+    rewriting text.
