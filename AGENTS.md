@@ -1579,3 +1579,84 @@ pm run build exit 0 — typecheck is necessary
     `_*.{sh,sql,js,py,mjs,html}` rules to `.gitignore` to keep them
     out of git forever. Not done in this session.
 
+### 2026-09-06 14:50 — CI/CD: auto-rollback + GHCR image push (audit gap closed)
+- User asked to review the existing CI/CD against a banking-context
+  checklist. Audit found 2 real gaps; both shipped this session.
+- **Gap 1 — no auto-rollback.** Old `deploy.yml` would leave prod
+  broken on healthcheck fail; user had to manually run `rollback.yml`.
+- **Gap 2 — no image registry.** Images were built locally on the VPS
+  and discarded; no audit trail of "what exact code was running on
+  date X" (mandatory for bank compliance).
+- **Fix 1 — auto-rollback job in `deploy.yml`:**
+  - New `Save deploy marker` step in the success path writes
+    `/opt/netconsole/.last-deploy-{sha,ref,event}` so future runs can
+    see what was running before the failure.
+  - New `auto-rollback` job runs `if: failure()`, `needs: deploy`.
+    Reads the marker, `actions/checkout@v4` at that sha, rsyncs,
+    `docker compose up --build --no-deps`, re-runs backend healthcheck
+    + frontend HTTPS, posts Step Summary with before/after.
+  - If marker is missing (first deploy ever), the job errors out
+    with guidance to use `rollback.yml` manually.
+  - **First deploy verification**: marker was written successfully
+    on the live VPS (visible in the run summary of `Deploy to production`).
+- **Fix 2 — `push-images` job in `deploy.yml`** (parallel, no `needs`):
+  - `runs-on: ubuntu-latest` (GitHub-hosted, NOT self-hosted — VPS
+    can't reach ghcr.io outbound as cleanly as hosted runners).
+  - `if: github.event_name == 'push' && (ref == main || startsWith(ref, 'refs/tags/v'))`.
+  - Pushes `backend` / `worker` / `frontend` to `ghcr.io/sonlak/netconsole-*`
+    with tag scheme `sha-<7>` + branch + tag + `latest` (on main).
+  - Uses GHA build cache (`type=gha,mode=max`) for fast incremental
+    rebuilds. `permissions: packages: write` granted to the workflow
+    via `GITHUB_TOKEN` — no extra PAT needed.
+  - Registry is AUDIT TRAIL only — `deploy` still builds locally on VPS
+    (faster, no pull required). If you ever want registry-served
+    deploys, change the `Build & restart` step in `deploy` to
+    `docker compose pull backend worker frontend && docker compose
+    up -d --no-deps`.
+- **First run caught a real bug**: `context: .` (repo root) failed
+  with `failed to compute cache key: "/src": not found` because
+  `backend/Dockerfile` does `COPY src ./src` which only resolves
+  when context is `./backend`. Same trap for worker/Dockerfile and
+  frontend/Dockerfile.prod. `docker-compose.app.yml` uses
+  `context: ./backend` etc., so the GHCR job had to mirror that.
+  Fix commit `5c469f0 ci(ghcr): fix build context - Dockerfile
+  assumes per-service context`. Both deploys green after.
+- **Live verification**:
+  - CI #34022432752: success.
+  - Deploy #34022432747: success — backend/worker/frontend all Up,
+    HTTPS frontend 200 OK.
+  - GHCR: 3 packages published on Sonlak's profile
+    (`netconsole-backend`, `-worker`, `-frontend`).
+- **Lessons for next agent**:
+  - **Dockerfile context matters.** Any `COPY`/`ADD` in a Dockerfile
+    is resolved RELATIVE to the build context, not the repo root.
+    When adding a new build path (CI job, registry, Bake), copy the
+    `context:` value from `docker-compose.app.yml` — don't assume
+    repo root.
+  - **`docker/metadata-action@v5` + `type=sha,prefix=sha-`** gives
+    short, sortable, unique tags. Combined with `type=raw,value=latest,
+    enable={{is_default_branch}}`, you get a moving `latest` tag on
+    main + per-commit immutable tags + per-release `vX.Y.Z` tags.
+    No manual tag list maintenance.
+  - **Self-hosted runners + outbound to GHCR is flaky.** The
+    self-hosted VPS runner CAN reach ghcr.io (Docker Hub proxies),
+    but BuildKit's layer transfer over Tailscale vs. GitHub-hosted
+    bandwidth differs by an order of magnitude. Use GitHub-hosted
+    `ubuntu-latest` for registry push jobs even if your deploy job
+    runs on self-hosted — the bandwidth cost is paid by GitHub.
+  - **`if: failure() && needs: deploy`** is the canonical pattern
+    for "only run cleanup if main failed". The `needs:` makes the
+    dependent job skip when `deploy` was canceled (not failed),
+    so a manually-canceled Deploy does NOT trigger a rollback.
+  - **Marker-based rollback vs. tag-based rollback.** The auto-rollback
+    in this session uses `sha` from a marker file (last successful
+    deploy). `rollback.yml` uses user-provided tag. Together they
+    cover: (a) "the deploy I just ran broke things" → auto-rollback,
+    (b) "I want to roll back to a known release" → rollback.yml.
+    Don't replace one with the other; both are useful.
+  - **`GITHUB_TOKEN` + `packages: write` is sufficient for GHCR.**
+    No need for a separate `CR_PAT` unless you want to push to a
+    different org or to docker.io. The default token is auto-issued
+    by Actions for the lifetime of the run.
+
+
