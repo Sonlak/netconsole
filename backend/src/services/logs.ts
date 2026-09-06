@@ -60,6 +60,22 @@ type GetLogsJobResult = {
 const DEFAULT_LOOKBACK_HOURS = 24;
 const MAX_ROWS = 5000;
 
+// Substrings that mark a row as "noise" — Junos housekeeping that
+// pollutes the table without carrying operational signal. Each entry is
+// a case-insensitive `contains` predicate applied to `message`. The list
+// stays small and obvious so operators can disable the filter via
+// `?noise=true` and still find what they want.
+const NOISE_FILTERS: string[] = [
+  'RetrySubscription',          // jinsightd 1Hz retry loop on lab sims
+  'xml-mode version',           // mgd per-RPC marker
+  'JUNOScript client',          // NETCONF-over-SSH marker
+  'User .netconsole. login',    // RESTCONF RPC login (worker's own RPC)
+  'User .netconsole. logout',   // RESTCONF RPC logout
+  'User .netconsole., command',// RESTCONF RPC first command echo
+  'Authenticated user .netconsole. assigned to class', // cRPD session class
+  'Authentication succeeded for user .netconsole.',    // jade: worker auth
+];
+
 export async function listLogs(params: {
   deviceId?: string;
   severities?: LogSeverity[];
@@ -68,6 +84,7 @@ export async function listLogs(params: {
   since?: Date;
   until?: Date;
   limit?: number;
+  hideNoise?: boolean;
 }): Promise<LogsInventory> {
   const devices = await listCollectableDevices();
   const limit = Math.min(Math.max(params.limit ?? 1000, 1), MAX_ROWS);
@@ -98,6 +115,15 @@ export async function listLogs(params: {
       { program: { contains: needle, mode: 'insensitive' } },
       { tag: { contains: needle, mode: 'insensitive' } },
     ];
+  }
+  if (params.hideNoise) {
+    // Hide Junos housekeeping noise that floods the page from lab sims.
+    // The set is a string fragment match — operators can still find these
+    // lines by typing the text into the search box (which uses an
+    // unrestricted path).
+    where.NOT = NOISE_FILTERS.map((fragment) => ({
+      message: { contains: fragment, mode: 'insensitive' as const },
+    }));
   }
 
   const [entries, totalRows] = await Promise.all([

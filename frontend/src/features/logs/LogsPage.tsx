@@ -77,6 +77,8 @@ export function LogsPage() {
   const navigate = useNavigate();
   const { value: searchText, setValue: setSearchText, committed: q } = useUrlSearch('q');
   const deviceFilter = get('device') || 'all';
+  const noiseParam = get('noise');
+  const noiseVisible = noiseParam === 'true' || noiseParam === '1';
   // IMPORTANT: these filters are derived from URL params and must be memoized.
   // A new array reference on every render would invalidate the `load` callback
   // below, which triggers `useEffect(() => { setHasLoaded(false); ... }, [load])`
@@ -112,6 +114,7 @@ export function LogsPage() {
           severity: severityFilter.length > 0 ? severityFilter : undefined,
           facility: facilityFilter !== 'all' ? facilityFilter : undefined,
           q: q || undefined,
+          noise: noiseVisible,
         });
         setInventory({
           rows: Array.isArray(next?.rows) ? next.rows : [],
@@ -129,7 +132,7 @@ export function LogsPage() {
         setRefreshing(false);
       }
     },
-    [severityFilter, facilityFilter, q],
+    [severityFilter, facilityFilter, q, noiseVisible],
   );
 
   useEffect(() => {
@@ -159,12 +162,13 @@ export function LogsPage() {
     site !== 'all' ||
     deviceFilter !== 'all' ||
     severityFilter.length > 0 ||
-    facilityFilter !== 'all';
+    facilityFilter !== 'all' ||
+    noiseVisible;
 
   const clearFilters = () => {
     setSearchText('');
     setSite('all');
-    patch({ device: null, severity: null, facility: null, q: null });
+    patch({ device: null, severity: null, facility: null, q: null, noise: null });
   };
 
   const filteredRows = useMemo(() => {
@@ -412,6 +416,7 @@ export function LogsPage() {
       ? { key: 'severity', label: `Severity: ${severityFilter.map((s) => LOG_SEVERITY_LABEL[s]).join(', ')}` }
       : null,
     facilityFilter !== 'all' ? { key: 'facility', label: `Facility: ${LOG_FACILITY_LABEL[facilityFilter]}` } : null,
+    noiseVisible ? { key: 'noise', label: 'Including Junos noise' } : null,
   ].filter(Boolean) as { key: string; label: string }[];
 
   if (loading && !hasLoaded) return <PageSkeleton />;
@@ -473,6 +478,21 @@ export function LogsPage() {
                 >
                   Severity {severityFilter.length > 0 ? `(${severityFilter.length})` : ''}
                 </Button>
+                <Tooltip
+                  title={
+                    noiseVisible
+                      ? 'Showing Junos housekeeping lines (RPC logins, RetrySubscription). Click to hide.'
+                      : 'Hidden: RetrySubscription, mgd RPC login/logout/xml-mode, jade auth OK. Click to show.'
+                  }
+                >
+                  <Button
+                    size="small"
+                    type={noiseVisible ? 'primary' : 'default'}
+                    onClick={() => patch({ noise: noiseVisible ? null : 'true' })}
+                  >
+                    {noiseVisible ? 'Noise: shown' : 'Hide noise'}
+                  </Button>
+                </Tooltip>
                 <Input
                   allowClear
                   size="small"

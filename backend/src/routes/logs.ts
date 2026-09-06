@@ -59,6 +59,15 @@ async function getInventory(req: Request, res: Response<LogsInventory | { error:
   const q = typeof req.query.q === 'string' ? req.query.q : undefined;
   const limit = parseLimit(typeof req.query.limit === 'string' ? req.query.limit : undefined);
   const filename = typeof req.query.filename === 'string' ? req.query.filename : undefined;
+  // When true (default), suppress noisy Junos housekeeping lines that
+  // dominate the table on lab sims. Operators can opt-in to see them
+  // via ?noise=true or a UI toggle. Default off because:
+  //  - RetrySubscription 1Hz from containerlab chassisd (no operational value)
+  //  - mgd "User 'X' login/logout" + xml-mode for every RESTCONF RPC on cRPD
+  //    (RESTCONF server logs the RPC over the SSH subsystem even though
+  //    transport is HTTPS — quirk of the vjunos-style RESTCONF adapter)
+  //  - "Authentication succeeded" already covered by auth-monitor alerts
+  const hideNoise = req.query.noise !== 'true';
 
   // The UI passes `filename` as a UX hint (which log file to show). Backend
   // log rows are not currently partitioned by filename, but we record the
@@ -74,7 +83,7 @@ async function getInventory(req: Request, res: Response<LogsInventory | { error:
   }
 
   try {
-    const inventory = await listLogs({ severities, facility, since, until, deviceId, q, limit });
+    const inventory = await listLogs({ severities, facility, since, until, deviceId, q, limit, hideNoise });
     if (logFile) {
       (inventory as LogsInventory & { filename?: string }).filename = logFile;
     }

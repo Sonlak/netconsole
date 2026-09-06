@@ -54,6 +54,7 @@ export type LogsInventoryQuery = {
   until?: string;
   limit?: number;
   filename?: string;
+  noise?: boolean;
 };
 
 function buildQuery(params: LogsInventoryQuery = {}): string {
@@ -67,6 +68,7 @@ function buildQuery(params: LogsInventoryQuery = {}): string {
   if (params.until) search.append('until', params.until);
   if (params.limit) search.append('limit', String(params.limit));
   if (params.filename) search.append('filename', params.filename);
+  if (params.noise) search.append('noise', 'true');
   const text = search.toString();
   return text ? `?${text}` : '';
 }
