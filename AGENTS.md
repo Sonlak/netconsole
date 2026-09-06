@@ -1805,3 +1805,94 @@ pm run build exit 0 — typecheck is necessary
     interval, so I knew the safety net wasn't the only source.
     Don't disable SSH fallback without proof UDP is delivering.
 
+### 2026-09-06 21:00 — Logs: syslog UDP push working end-to-end + SSH fallback removed
+- User asked to **kill SSH fallback for logs entirely** after configuring
+  `set system syslog host 10.10.20.20 port 1514 any any` on real
+  Junos devices. Before touching code, I re-verified UDP push on the
+  VPS — and that's when the **port-mapping bug** surfaced.
+- **THE BUG (commit `85b3086`)** — `docker-compose.app.yml` had
+  `expose: 1514/udp` on `netconsole-backend`. This is the trap:
+  `expose` only **documents** the port to other containers in the
+  same compose network. It does **NOT** install a host-kernel
+  iptables DNAT rule. So:
+  - Backend container correctly bind on `0.0.0.0:1514` (visible in
+    `/proc/net/udp`).
+  - Real Junos devices on `10.10.20.0/24` sent syslog UDP to
+    `10.10.20.20:1514` (verified via `sudo tcpdump -i ens34` —
+    dozens of `SYSLOG` packets per minute).
+  - Host kernel accepted the packet on socket table but had no
+    destination rule, so packets were silently DROPPED before
+    reaching the container.
+  - Symptom: DeviceLog growth over 1h was 738 rows, **all
+    source=`ssh-cli`**, **zero `syslog-udp`**. The user's `any any`
+    syslog config on real devices was correct from day one — but
+    the receiving end never heard a packet.
+- **Fix**: replace `expose:` with `ports:` so Docker installs the
+  DNAT rule.
+  ```yaml
+  ports:
+    - "127.0.0.1:3000:3000"      # API, host curl only
+    - "1514:1514/udp"            # syslog UDP, host-wide bind
+  ```
+- **Verification after the fix**:
+  - 879 rows syslog-udp in first 5 min (~176 rows/min across 4 devices).
+  - 780 rows in second 5 min (steady state, ~2.6 rows/s).
+  - 1410 rows in 10 min long-term probe.
+  - 0 rows ssh-cli, **0 `Accepted password` lines in DeviceLog**.
+  - Sample messages confirmed real Junos syslog:
+    `RetrySubscription: Triggering Re-subscription`,
+    `trace_rotate: rotating /var/log/license`,
+    `Registered PID 52746(rest-api): new process`.
+  - Severity mix: INFORMATIONAL 78%, DEBUG 16%, NOTICE 6%.
+- **The actual SSH-off (commit `2587ce9`)** came after verification.
+  Two changes:
+  1. `worker/netconsole_worker/tasks/registry.py → GetLogsTask.run`
+     no longer imports `run_ssh_command`. The SSH `show log messages`
+     block is removed entirely. The task now does RESTCONF
+     `get-log-information` only when the platform supports it; for
+     EX-class sims it returns a stub with a message telling the
+     operator to use the Logs page (which is fed by UDP push).
+  2. `docker-compose.app.yml`: `LOGS_COLLECT_INTERVAL_SECONDS: 1800 → 0`.
+     Backend's `index.ts` skips `scheduleLogsCollection` when the
+     value is 0 — periodic SSH pull is dead.
+- **Verified live (post-deploy)**:
+  - Worker rebuild succeeded, container Up.
+  - Logs page continues to populate from syslog-udp.
+  - SSH-login lines: 0 (was 130+/10min before).
+  - Worker SSH pool stats show 0 borrows for GET_LOGS jobs.
+- **Lessons for next agent**:
+  - **`expose` ≠ `ports` for UDP.** TCP-only services like the API
+    (3000) can stay on `expose` because Docker DNS resolves
+    container-to-container. UDP syslog from the LAN needs
+    host-kernel DNAT → `ports:` with host IP and `/udp` suffix.
+    This is the canonical "container listens but packets vanish"
+    trap. Verify with `sudo iptables -t nat -L PREROUTING | grep
+    <port>` — if no DNAT rule appears after `docker compose up`,
+    you forgot `ports:`.
+  - **Verify receiver ingestion BEFORE blaming the device config.**
+    The user said "đã cấu hình log any any" but the rows never
+    appeared. I assumed it was a Junos config issue; turned out
+    to be a Docker port mapping. Always check `tcpdump -i any
+    'udp dst port <port>'` and `docker exec <ctr> cat
+    /proc/net/udp` before deeper investigation.
+  - **SSH pool `borrows` counter is your friend.** When SSH fallback
+    is suspect, watch `docker logs netconsole-worker` for the
+    60s `ssh_pool size=N borrows=X` line. If borrows keeps ticking
+    for GET_LOGS while UDP rows are flowing, SSH fallback is still
+    firing. Should be 0 after this commit.
+  - **Empty REST table ≠ REST failure.** This entire class of bug
+    comes from "0 entries, must mean RPC broken, fall back to
+    SSH". For ARP/MAC/Config/Interfaces the fix was commit
+    `c066f11`. For LOGS the right answer is "trust the empty
+    answer + use syslog UDP push", because the data already arrived
+    a different way.
+  - **The backend scheduler only runs when interval > 0** (see
+    `backend/src/index.ts:57-97`). Setting `LOGS_COLLECT_INTERVAL_SECONDS=0`
+    is the canonical way to disable a periodic collector without
+    removing the route or task definition. Don't comment out the
+    schedule call — just set the env var.
+  - **Auth.log floods stay gone as long as the SSH pool sits idle.**
+    If you ever add a new collector that opens a fresh SSH session
+    per call, expect 1-2 auth lines per device per call. Use the
+    pool or accept that auth.log noise is part of doing business.
+
