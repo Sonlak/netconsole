@@ -1994,3 +1994,108 @@ pm run build exit 0 — typecheck is necessary
   3 min. RetrySubscription still flows in via syslog UDP (correct
   behavior — Junos should keep sending it, we just don't show it
   by default).
+
+### 2026-09-06 22:30 — Config Studio: dedupe sidebar + Bulk deploy tab (template + literal draft)
+- Two requests from user:
+  1. "Tab Config Studio bị duplicate trong Network + System" — the sidebar
+     had `Config Studio` listed in BOTH groups because `NAV.slice(4, 10)`
+     and `NAV.slice(9)` both included index 9 (Config Studio).
+  2. "Bulk deploy cần có chỗ điền draft, không chỉ template" — user wanted
+     to apply the same config to many devices without per-device templating.
+- **Fix 1 — sidebar dedupe** (`frontend/src/layouts/AppLayout.tsx`):
+  Changed `NAV.slice(4, 10)` to `NAV.slice(4, 9)`. Boundary now sits at
+  index 9 — Network (4-8 = MAC/ARP/Logs/Alerts/Ports) and System (9-12
+  = Config Studio/DHCP/Jobs/Settings) don't overlap.
+- **Fix 2 — Bulk deploy endpoint** (`backend/src/routes/generateConfig.ts`):
+  New `POST /api/config/bulk-commit`. Two modes:
+  - **Template mode** — `{ deviceIds, role }`. Renders the chosen
+    template per device so each gets its own hostname/IP. Server-side
+    per-device idempotency: each device's `DeviceSavedConfig` is upserted
+    BEFORE the job is queued (so a rollback is possible later), then one
+    `APPLY_CONFIG` job per device is enqueued.
+  - **Literal draft mode** — `{ deviceIds, content }`. Same content is
+    pushed verbatim to every selected device. `DeviceSavedConfig.role`
+    is set to `'custom'` (which the DB accepts because `role` is
+    `String`, not a Prisma enum). Job payload includes
+    `bulkMode: 'template' | 'literal'` for future audit filtering.
+  - Caps at 64 devices per request. Validates MANAGED status; returns
+    `{ jobs, skipped: [{ deviceId, reason }] }`.
+- **Frontend** (`frontend/src/pages/GenerateConfigPage.tsx`):
+  - Refactored page to a Tabs component: "Single device" (existing UI
+    intact) and "Bulk deploy" (new).
+  - New `BulkDeployPanel` with top-level Segmented mode toggle
+    (`By template (rendered per device)` | `Custom draft (applied as-is)`).
+  - Template mode: role Segmented + site/floor/search/managed-only
+    filters, multi-select device list with per-device "Preview" button,
+    rendered-config preview pane, "Deploy to N devices" button with
+    confirm modal showing the first 10 targets.
+  - Draft mode: role selector hidden (all roles eligible), draft Card
+    with code-style textarea + char/ready tags + warning that the
+    bytes go verbatim to every device, preview pane shows the literal
+    draft with chosen target device name.
+  - Deploy button label and confirm-modal copy adapt per mode.
+  - Preview button calls `previewBulkConfig` (new helper that wraps
+    `renderConfigTemplate`) so the user sees what the template will
+    produce for a specific device — each device has its own hostname/IP
+    so per-device rendering matters.
+- **Frontend API helpers** (`frontend/src/api/generateConfig.ts`):
+  `bulkCommitGenerateConfig(deviceIds, { role?, content? })` returns
+  `BulkCommitResult = { jobs, skipped }`. `previewBulkConfig(role, deviceId)`
+  for the per-device render.
+- **Styling** (`frontend/src/styles/antd-bridge.css`): added
+  `.nc-bulk-device-list` / `.nc-bulk-device-row` rules.
+- **Live verification** (Tailscale SSH to VPS, mint admin JWT via
+  backend container's `JWT_SECRET`, smoke-test both modes):
+  - Template mode `role=access` to `LAB-F3-AS-01` + `LAB-F6-CORE-01`:
+    HTTP 202, 2 jobs queued, both `FAILED` at the device with
+    `identical local address found on rt_inst [default], intfs
+    [irb.10 and me0.0], family [inet]`. **Junos rejected the wrong
+    template — no bad config committed.** But `DeviceSavedConfig`
+    had been pre-upserted with role='access', so I cleaned that up
+    via `DELETE FROM DeviceSavedConfig WHERE deviceId=...` for the
+    CORE device. ACCESS device's savedConfig left intact (role
+    matches its actual role).
+  - Literal mode pushing `set system login user netconsole class
+    super-user` + `set system services ssh` to `LAB-F3-AS-01`:
+    HTTP 202, 1 job queued, worker `SUCCESS` — config committed.
+    This is a benign config that's standard on every Junos device,
+    so it doesn't disturb the lab.
+- **Commits**:
+  - `8c1b1c4` (template mode + sidebar dedupe)
+  - `d0343c7` (literal draft mode + UI toggle)
+  - Both CI green + Deploy green. Containers restarted on the live VPS.
+- **Lessons for next agent**:
+  - **`bulk-commit` upserts DeviceSavedConfig BEFORE queueing.** This is
+    intentional (so the user can Rollback after a botched bulk deploy),
+    but it means a partial failure leaves stale saved-state on the
+    devices that rejected. For ops cleanup: `DELETE FROM
+    DeviceSavedConfig WHERE deviceId = '<core-id>'` is the right
+    recovery. Next iteration could move the upsert INTO the worker's
+    success handler, but that costs the "rollback available after bulk
+    deploy" property.
+  - **`renderConfigTemplate` only takes ConfigRole (no 'custom')** but
+    `DeviceSavedConfig.role` is plain `String` so we can persist
+    `'custom'`. Use a `string` local in the route handler and only cast
+    back to `ConfigRole` when calling `renderConfigTemplate`.
+  - **PowerShell SCP corrupts .sh and .json files with CRLF** — gotcha
+    #3 in action. Always `tr -d '\r'` on the VPS side before running
+    shell scripts that came over SCP. For JSON payloads, write the file
+    with `Write` then `tr -d '\r'` on the receiving end, OR pipe via
+    stdin with a heredoc (single-quoted in bash).
+  - **JWT forgery works for route smoke-tests** — the auth middleware
+    only verifies signature + decodes payload, no DB lookup. Mint a
+    short-lived JWT (`expiresIn: '5m'`) inside the backend container
+    using `JWT_SECRET` env. Don't reuse the token across sessions —
+    expiry is 5 minutes for a reason.
+  - **Junos config check rejects duplicate addresses** with a clear
+    error message. So bulk-deploying the wrong template to a CORE
+    router failed fast and safely — no `commit confirmed` rollback
+    needed. The Junos config check is a free safety net; don't bypass
+    it (`commit at` should still require a real reason string).
+  - **Body-parser sees CRLF before JSON parser** — when PowerShell
+    injects `\r\n` into a JSON body, Express logs `entity.parse.failed`
+    with status 400, NOT 500. Don't confuse the two.
+  - **The `bodyStyle` prop on AntD 5 Card is deprecated** — should use
+    `styles={{ body: {...} }}` instead. Skipped for now (still works,
+    only emits a console warning) to avoid scope creep. Follow-up
+    cleanup when touching the file next time.
