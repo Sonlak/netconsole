@@ -1417,6 +1417,54 @@ pm run build exit 0 — typecheck is necessary
     a `/api/audit-log` call should still succeed (proves refresh
     worked), and an audit row should exist for the refresh call.
 
+### 2026-09-06 14:00 — Device-lock via Postgres advisory lock + cross-user attribution
+- User asked for "device-lock + idempotency-key" (W1.5 concurrency, drift
+  detection deferred). Did not check existing code first — ran full audit
+  and found 0 implementation. Added in 1 session.
+- **Schema change** (`backend/prisma/schema.prisma`):
+  - `Job.createdById String?` → FK to `User(id, onDelete: SetNull)` so
+    historical jobs survive user deletion.
+  - Added `@@index([createdById])` + `@@index([deviceId, status])`.
+- **Core logic** (`backend/src/services/deviceOperations.ts`):
+  - New `tryCreateDeviceJob(tx, deviceId, type, createdById, payload?)`
+    returns `{kind:'created', job}` or `{kind:'busy', error}`.
+  - Uses `pg_advisory_xact_lock(hashtext(deviceId)::bigint)` inside a
+    `$transaction` — serialized at DB level, auto-releases on
+    commit/rollback. `$executeRaw` (not `$queryRaw`) because
+    `pg_advisory_xact_lock` returns void and Prisma P2010 on deserialize.
+  - Checks `PENDING | RUNNING` jobs before insert → returns 409 with
+    `lockedBy.username` so UI can say "Device busy, locked by admin".
+  - Strict: same user clicking twice also gets 409 (double-click protection).
+- **Updated routes** to use shared helper:
+  - `POST /api/jobs` — `authMiddleware` added, calls `tryCreateDeviceJob`
+    with userId from JWT.
+  - `POST /api/devices/:id/{arp,mac,connect}` — same pattern via
+    `createDeviceJob` service (which itself wraps the helper).
+  - `POST /api/devices/:id/config` → `collectDeviceConfig` service: RESTCONF
+    path wraps lock → check → REST → insert SUCCESS; non-RESTCONF path
+    wraps lock → check → insert PENDING → worker picks up.
+- **Verified live on VPS** (2026-09-06 14:25 UTC):
+  - Login → POST GET_ARP on LAB-F3-AS-03 → HTTP 202, `createdById` set.
+  - Immediate second POST → HTTP 409 `{"error":"Device busy","code":"device_locked",
+    "lockedBy":{"jobType":"GET_ARP","jobStatus":"RUNNING","username":"admin"}}`.
+  - Commits: `7a58115` (feature) + `55c599c` (void-fix).
+- **TODO (W1.5 refresh token still pending)** — see above.
+- **Lesson for next agent**:
+  - **`$queryRaw` vs `$executeRaw` matters.** Any raw SQL that returns
+    void (LOCK, NOTIFY, INSERT without RETURNING, etc.) must use
+    `$executeRaw`. `$queryRaw` always tries to deserialize a rowset and
+    crashes with P2010 on void columns.
+  - **Shared helper for cross-route reuse.** Three entry points
+    (POST /jobs, POST /devices/:id/arp|mac|connect, POST
+    /devices/:id/config) all call `tryCreateDeviceJob` — any future
+    entry point (e.g. discovery probe) should too, so the lock
+    behaviour is uniform.
+  - **User attribution is only set on user-facing POSTs.** Scheduler
+    services (collectConfig, macAddress, etc.) create jobs without
+    `createdById` — those rows will show `username: null` in 409
+    responses. Acceptable for now; if scheduler attribution is needed,
+    create a `system` user in seed and pass its ID in the worker JWT.
+
 ### 2026-09-06 02:50 — W1.5 shipped + rollback test + cron backup
 - User asked to (a) finish W1.5 (refresh tokens), explicitly skipping
   the `mustChangePassword` flow; (b) test the rollback workflow;
