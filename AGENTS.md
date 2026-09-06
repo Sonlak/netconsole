@@ -1735,3 +1735,73 @@ pm run build exit 0 — typecheck is necessary
     `error` column to confirm — `"connect: ..."` is fine, `"sshOk=False"`
     would be a regression.
 
+
+
+### 2026-09-06 17:00 — Logs: syslog UDP push verified live + SSH collector back-off to 30min
+- User asked whether logs still need SSH. Investigated and confirmed:
+  **Junos EX-class RESTCONF does NOT support `get-log-information`** —
+  it returns `<xnm:error><message>syntax error</message></xnm:error>`
+  for every shape we tried (GET, POST with empty body, POST with
+  `<messages/>` child, POST with `<messages>50</messages>` count).
+  That's a Junos limitation, not a code bug. Junos RESTCONF supports
+  `get-software-information` / `get-interface-information` /
+  `get-arp-table-information` / `get-chassis-inventory` but NOT log
+  retrieval. Real Junos users get logs via:
+  - **NETCONF `<get-log-information>` over SSH port 830**, or
+  - **CLI `show log messages` over SSH port 22** (current code path).
+- User configured `set system syslog host 10.10.20.20 port 1514 any
+  notice` on the real Junos devices themselves. The backend
+  `syslogReceiver.ts` was already listening on UDP 1514 (started at
+  every backend boot since commit `d2aefa3`).
+- **Verification on VPS**: 101 rows landed in `DeviceLog` over a
+  3-minute probe window across 4 `LAB-F6-*` devices. Sample messages
+  confirmed as real Junos syslog:
+  - `JADE_AUTH_SUCCESS: Authentication succeeded for user 'netconsole'
+    from host '10.10.20.20'` (RESTCONF auth from worker)
+  - `UI_COMMIT: User 'netconsole' requested 'commit' operation`
+  - `LIBJNX_SEND_NOTIFY_ROTATE: trace_rotate: rotating /var/log/license`
+  - `dynamic-profiles: No change to profiles`
+- **One-off action** (this session, no code change): user manually
+  configured syslog host on the lab switches. No new code needed
+  because backend was already wired.
+- **Code change** (`docker-compose.app.yml`):
+  - `LOGS_COLLECT_INTERVAL_SECONDS: 300 -> 1800` (5min -> 30min).
+  - SSH pull is now a safety-net only; healthy UDP push = 0 SSH
+    handshakes for logs. Commit `673f9cb chore(logs): bump ...`.
+  - Pushed → CI green → Deploy green → VPS Up.
+- **Files touched**: 1 line in compose file. Commit `673f9cb`.
+- **Live verification**:
+  - Backend logs: `[syslog] UDP syslog receiver listening on all
+    interfaces:1514` (still active after deploy).
+  - Backend scheduler: `[logs] managed=6 queued=6` lines now appear
+    every 30 min instead of every 5 min (verified via
+    `docker logs --since 2m`).
+  - DB rows: 101 rows / 3 min, monotonically increasing.
+- **Lessons for next agent**:
+  - **Junos RESTCONF cannot do logs.** Don't waste time trying more
+    POST body shapes — it's just not in the schema. Use SSH
+    (NETCONF or CLI) or syslog UDP push.
+  - **`syslogReceiver.ts` was already in the codebase** but had
+    never been validated end-to-end against real Junos because the
+    simulator (Python mock in `lab/juniper-sim/`) holds canned
+    buffers instead of actually sending UDP packets. Future work
+    item: update the simulator to actually emit UDP packets so the
+    syslog path is testable without real hardware.
+  - **The `[logs] managed=6 queued=6` line is a backend scheduler
+    log, not a worker log.** If you see it disappearing from
+    `docker logs netconsole-backend`, the interval is now long, not
+    the scheduler being broken.
+  - **Logs collector at 1800s is the new normal**. If real-time
+    alerting becomes a hard requirement, lower it temporarily;
+    otherwise leave it — UDP push covers freshness.
+  - **The `JADE_AUTH_SUCCESS` lines will keep showing up** even at
+    30 min interval because the worker's RESTCONF calls generate
+    auth events every commit. The dedup index `(deviceId,
+    timestamp, hostname, message)` from `e8f84d2` keeps them from
+    stacking up. If they DO start stacking, check the dedup query
+    in `backend/src/services/logs.ts → persistLogsForJob`.
+  - **Verify UDP push works BEFORE reducing interval.** I checked
+    DeviceLog growth (87 → 101 rows in 3 min) before bumping the
+    interval, so I knew the safety net wasn't the only source.
+    Don't disable SSH fallback without proof UDP is delivering.
+
