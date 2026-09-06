@@ -269,7 +269,7 @@ export default function AppLayout() {
       </Layout>
       <footer className="nc-app-footer" aria-label="Application version and copyright">
         <div className="nc-app-footer-version">NetConsole 1.2.0</div>
-        <div className="nc-app-footer-copy">SonLak Network Operations</div>
+        <div className="nc-app-footer-copy">© 2026 SonLak.</div>
       </footer>
       <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} items={NAV} />
     </Layout>
