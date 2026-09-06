@@ -158,6 +158,19 @@ jobs:
             --filter "name=netconsole-postgres" \
             --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
 
+      - name: Save deploy marker (for future auto-rollback)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPLOY_DIR"
+          SHA="${{ github.sha }}"
+          REF="${{ github.ref_name }}"
+          EVENT="${{ github.event_name }}"
+          # Persist current deploy so a future failed deploy can roll back to it.
+          printf '%s\n' "$SHA" > "$DEPLOY_DIR/.last-deploy-sha"
+          printf '%s\n' "$REF" > "$DEPLOY_DIR/.last-deploy-ref"
+          printf '%s\n' "$EVENT" > "$DEPLOY_DIR/.last-deploy-event"
+          echo "💾 Saved deploy marker: sha=$SHA ref=$REF event=$EVENT"
+
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
@@ -171,3 +184,220 @@ jobs:
 
           echo "----- Final docker compose ps -----"
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps
+
+  # Auto-rollback on failure. Runs ONLY if any previous step in `deploy` failed.
+  # Uses the .last-deploy-sha marker saved by the success path to restore the
+  # last known-good commit. If the marker is missing (first deploy ever, or
+  # a previous deploy never wrote it), we fall back to no-op and rely on
+  # manual rollback via .github/workflows/rollback.yml.
+  auto-rollback:
+    name: Auto-rollback to last known-good
+    runs-on: self-hosted
+    needs: deploy
+    if: failure()
+    timeout-minutes: 20
+    env:
+      DEPLOY_DIR: /opt/netconsole
+      COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
+      COMPOSE_PROJECT: netconsole
+      DEPLOY_SERVICES: "backend worker frontend"
+
+    steps:
+      - name: Notify deploy failure
+        run: |
+          echo "## ❌ Deploy failed — attempting auto-rollback" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Failed ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Read last known-good marker
+        id: marker
+        run: |
+          set -euo pipefail
+          SHA_FILE="$DEPLOY_DIR/.last-deploy-sha"
+          if [ ! -f "$SHA_FILE" ]; then
+            echo "::error::No .last-deploy-sha marker found at $DEPLOY_DIR."
+            echo "::error::This usually means the previous deploy never wrote it"
+            echo "::error::(the success path was added recently) OR the VPS was"
+            echo "::error::reprovisioned. Manual rollback via"
+            echo "::error::.github/workflows/rollback.yml is required."
+            exit 1
+          fi
+          PREV_SHA=$(cat "$SHA_FILE")
+          PREV_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
+          echo "PREV_SHA=$PREV_SHA" >> "$GITHUB_OUTPUT"
+          echo "PREV_REF=$PREV_REF" >> "$GITHUB_OUTPUT"
+          echo "Last known-good: sha=$PREV_SHA ref=$PREV_REF"
+
+      - name: Checkout previous commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.marker.outputs.PREV_SHA }}
+          fetch-depth: 1
+          path: src
+
+      - name: Sync previous commit to ${{ env.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          rsync -a --delete \
+            --exclude '/.git/' \
+            --exclude '/.git' \
+            --exclude '/data/' \
+            --exclude '/volumes/' \
+            --exclude '/netconsole-app.tar.gz' \
+            --exclude '/.tmp-hello.txt' \
+            --exclude '/.tmp-cfg/' \
+            --exclude '/scripts/ci-rsa-*.bak' \
+            --exclude '*.pid' \
+            --exclude '/logs/' \
+            --exclude '/backups/' \
+            --exclude '/.last-deploy-*' \
+            ./src/ "$DEPLOY_DIR/"
+
+      - name: Rebuild and restart app services
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
+
+      - name: Health-check restored deploy
+        run: |
+          set -euo pipefail
+          echo "Waiting for backend after rollback..."
+          for i in $(seq 1 40); do
+            if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
+              echo "✅ Backend healthy after rollback (attempt $i)"
+              break
+            fi
+            sleep 2
+          done
+          sleep 3
+          code=$(curl -skL -o /dev/null -w "%{http_code}" --max-time 5 https://127.0.0.1:8443/ || echo "000")
+          if [ "$code" != "200" ]; then
+            echo "::error::Frontend still unreachable after rollback (HTTP $code)"
+            docker logs --tail 30 netconsole-frontend || true
+            exit 1
+          fi
+          echo "✅ Frontend OK after rollback (HTTP $code)"
+
+      - name: Final state after rollback
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          echo "## ⏪ Auto-rollback complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Now running: \`${{ steps.marker.outputs.PREV_SHA }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "(was \`${{ steps.marker.outputs.PREV_REF }}\`, failed at \`${{ github.sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Container status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # Push immutable image tags to GitHub Container Registry.
+  # Runs in PARALLEL with `deploy` (no `needs:`). Does NOT replace the
+  # local-build-on-VPS path used by `deploy` — the registry is an audit
+  # trail / rollback artifact, not the production image source.
+  #
+  # Tags produced:
+  #   - ghcr.io/sonlak/netconsole-backend:sha-<7>
+  #   - ghcr.io/sonlak/netconsole-backend:v0.4.0    (only on tag push)
+  #   - ghcr.io/sonlak/netconsole-backend:latest    (only on main push)
+  # Same for worker + frontend.
+  push-images:
+    name: Push images to GHCR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/sonlak/netconsole-backend
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build + push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for worker
+        id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/sonlak/netconsole-worker
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build + push worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          push: true
+          tags: ${{ steps.meta-worker.outputs.tags }}
+          labels: ${{ steps.meta-worker.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata for frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/sonlak/netconsole-frontend
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build + push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile.prod
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "## 📦 Images pushed to GHCR" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-backend" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-worker" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-frontend" >> $GITHUB_STEP_SUMMARY
