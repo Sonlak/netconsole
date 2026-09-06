@@ -27,12 +27,23 @@ cd /opt/netconsole
 
 BACKUP_ROOT=/opt/netconsole/backups/postgres
 KEEP_DAYS=14
+MIN_FREE_GB=5   # refuse to start if the FS has less than this many GB free
 TS_UTC=$(date -u +%Y%m%dT%H%M%SZ)
 DEST="${BACKUP_ROOT}/${TS_UTC}.sql.gz"
 
 mkdir -p "${BACKUP_ROOT}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting postgres backup -> ${DEST}"
+
+# Pre-flight disk check. pg_dump emits plain SQL — uncompressed size is
+# roughly the on-disk DB size. Refuse to run if free space is below
+# MIN_FREE_GB so we never fill the root volume by accident.
+FREE_KB=$(df -Pk "${BACKUP_ROOT}" | awk 'NR==2 {print $4}')
+FREE_GB=$((FREE_KB / 1024 / 1024))
+if [ "${FREE_GB}" -lt "${MIN_FREE_GB}" ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] REFUSED: only ${FREE_GB}GB free at ${BACKUP_ROOT}, need >=${MIN_FREE_GB}GB" >&2
+    exit 3
+fi
 
 # pg_dump from inside the postgres container. --no-owner / --no-privileges
 # make the dump portable across postgres major versions.
