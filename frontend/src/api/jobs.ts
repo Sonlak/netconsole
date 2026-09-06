@@ -72,3 +72,13 @@ export async function waitForJobIfNeeded(
 async function fetchJob(jobId: string): Promise<Job> {
   return authJsonFetch<Job>(`${API_BASE}/${jobId}`);
 }
+
+/**
+ * Fetch many jobs in parallel. Used by the bulk-deploy progress tracker to
+ * poll all queued jobs in a single round of microtasks. With ≤64 jobs and
+ * ~50ms per request, a Promise.all round-trip finishes well under 200ms.
+ */
+export async function fetchJobsByIds(jobIds: string[]): Promise<Job[]> {
+  if (jobIds.length === 0) return [];
+  return Promise.all(jobIds.map(fetchJob));
+}

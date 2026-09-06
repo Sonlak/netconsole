@@ -25,6 +25,10 @@ import {
   Typography,
   message,
 } from 'antd';
+import {
+  BulkDeployProgressModal,
+  type BulkDeployQueuedJob,
+} from '@/features/generateConfig/BulkDeployProgressModal';
 import { triggerDeviceConfig } from '@/api/deviceOperations';
 import {
   ackCommitJob,
@@ -607,6 +611,8 @@ function BulkDeployPanel() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [deploying, setDeploying] = useState(false);
   const [lastResult, setLastResult] = useState<BulkCommitResult | null>(null);
+  const [trackedJobs, setTrackedJobs] = useState<BulkDeployQueuedJob[] | null>(null);
+  const [trackerOpen, setTrackerOpen] = useState(false);
 
   // Devices in scope for the chosen role (+ site + floor + search + managed-only).
   // In draft mode every role is in scope — the user is writing their own
@@ -788,10 +794,13 @@ function BulkDeployPanel() {
               : await bulkCommitGenerateConfig(managedIds, { content: draft });
           setLastResult(result);
           if (result.jobs.length > 0) {
+            // Open the progress tracker so the user sees per-device updates
+            // (success / failed) without having to navigate to the Jobs page.
+            setTrackedJobs(result.jobs);
+            setTrackerOpen(true);
             message.success(
               <span>
-                Queued {result.jobs.length} job(s) —{' '}
-                <Link to={`/jobs?type=APPLY_CONFIG`}>open Jobs</Link>
+                Queued {result.jobs.length} job(s) — tracking started.
               </span>,
             );
           }
@@ -1058,6 +1067,11 @@ set system services netconf ssh`}
           />
         ) : null}
       </Card>
+      <BulkDeployProgressModal
+        open={trackerOpen}
+        jobs={trackedJobs ?? []}
+        onClose={() => setTrackerOpen(false)}
+      />
     </>
   );
 }
