@@ -593,7 +593,11 @@ function BulkDeployPanel() {
   const { site, setSite } = useSiteFilter();
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
 
+  type BulkMode = 'template' | 'draft';
+
+  const [mode, setMode] = useState<BulkMode>('template');
   const [role, setRole] = useState<Exclude<ConfigRole, 'custom'>>('access');
+  const [draft, setDraft] = useState('');
   const [floorFilter, setFloorFilter] = useState('');
   const [search, setSearch] = useState('');
   const [managedOnly, setManagedOnly] = useState(true);
@@ -605,23 +609,28 @@ function BulkDeployPanel() {
   const [lastResult, setLastResult] = useState<BulkCommitResult | null>(null);
 
   // Devices in scope for the chosen role (+ site + floor + search + managed-only).
+  // In draft mode every role is in scope — the user is writing their own
+  // config, so role-based filtering doesn't apply.
   const candidates = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return devices
-      .filter((d) => deviceRole(d) === role)
+      .filter((d) => mode === 'draft' || deviceRole(d) === role)
       .filter((d) => site === 'all' || deviceSite(d) === site)
       .filter((d) => !floorFilter || floorsMatch(d, floorFilter))
       .filter((d) => !needle || `${d.name} ${d.ip}`.toLowerCase().includes(needle))
       .filter((d) => !managedOnly || d.status === 'MANAGED');
-  }, [devices, role, site, floorFilter, search, managedOnly]);
+  }, [devices, role, site, floorFilter, search, managedOnly, mode]);
 
   // Floor options scoped to the chosen role so the dropdown doesn't offer
   // empty buckets ("ACCESS at F12" when no access switch lives on F12).
   const floorOptions = useMemo(() => {
-    const inScope = devices.filter((d) => deviceRole(d) === role && (site === 'all' || deviceSite(d) === site));
+    const inScope =
+      mode === 'draft'
+        ? devices.filter((d) => site === 'all' || deviceSite(d) === site)
+        : devices.filter((d) => deviceRole(d) === role && (site === 'all' || deviceSite(d) === site));
     const set = new Set(inScope.map((d) => deviceFloor(d)).filter(Boolean));
     return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  }, [devices, role, site]);
+  }, [devices, role, site, mode]);
 
   // Stats per role for the segmented header.
   const roleCounts = useMemo(() => {
@@ -653,20 +662,37 @@ function BulkDeployPanel() {
     [candidates, previewDeviceId],
   );
 
-  const loadPreview = useCallback(async (deviceId: string) => {
-    setPreviewDeviceId(deviceId);
-    setPreviewContent('');
-    setPreviewLoading(true);
-    try {
-      const out = await previewBulkConfig(role, deviceId);
-      setPreviewContent(out.content);
-    } catch (cause) {
+  const loadPreview = useCallback(
+    async (deviceId: string) => {
+      setPreviewDeviceId(deviceId);
       setPreviewContent('');
-      message.error(cause instanceof Error ? cause.message : 'Could not render template for preview');
-    } finally {
+      setPreviewLoading(true);
+      try {
+        if (mode === 'template') {
+          const out = await previewBulkConfig(role, deviceId);
+          setPreviewContent(out.content);
+        } else {
+          // Draft mode: every device receives the same literal string.
+          setPreviewContent(draft);
+        }
+      } catch (cause) {
+        setPreviewContent('');
+        message.error(cause instanceof Error ? cause.message : 'Could not render template for preview');
+      } finally {
+        setPreviewLoading(false);
+      }
+    },
+    [role, mode, draft],
+  );
+
+  // When switching into draft mode, refresh the preview pane so the user
+  // sees the literal draft (not a stale template render).
+  useEffect(() => {
+    if (mode === 'draft' && previewDeviceId) {
+      setPreviewContent(draft);
       setPreviewLoading(false);
     }
-  }, [role]);
+  }, [mode, previewDeviceId, draft]);
 
   const toggleDevice = (id: string, checked: boolean) => {
     setSelected((current) => {
@@ -692,19 +718,41 @@ function BulkDeployPanel() {
   const managedSelected = selectedDevices.filter((d) => d.status === 'MANAGED').length;
   const unmanagedSelected = selectedDevices.length - managedSelected;
 
-  const canDeploy = selectedDevices.length > 0 && managedSelected > 0;
+  const draftValid = mode === 'draft' ? draft.trim().length > 0 : true;
+  const canDeploy = selectedDevices.length > 0 && managedSelected > 0 && draftValid;
+
+  const deployDescription = () => {
+    if (mode === 'template') {
+      return (
+        <Typography.Paragraph style={{ marginBottom: 6 }}>
+          Renders the <strong>{BULK_ROLE_LABEL[role]}</strong> template per device and queues one
+          <code> APPLY_CONFIG </code>job each. Worker runs them in parallel.
+        </Typography.Paragraph>
+      );
+    }
+    return (
+      <Typography.Paragraph style={{ marginBottom: 6 }}>
+        Pushes the literal draft below verbatim to every selected device and queues one
+        <code> APPLY_CONFIG </code>job each. The same {draft.trim().length} characters of config
+        land on every device — no per-device rendering.
+      </Typography.Paragraph>
+    );
+  };
 
   const confirmDeploy = () => {
     if (!canDeploy) return;
+    const okLabel = mode === 'template'
+      ? `Deploy to ${managedSelected}`
+      : `Push draft to ${managedSelected}`;
+    const titleSuffix = mode === 'template'
+      ? `${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)?`
+      : `this literal draft to ${managedSelected} device(s)?`;
     Modal.confirm({
       width: 720,
-      title: `Deploy ${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)?`,
+      title: mode === 'template' ? `Deploy ${titleSuffix}` : `Push ${titleSuffix}`,
       content: (
         <div>
-          <Typography.Paragraph style={{ marginBottom: 6 }}>
-            Renders the <strong>{BULK_ROLE_LABEL[role]}</strong> template per device and queues one
-            <code> APPLY_CONFIG </code>job each. Worker runs them in parallel.
-          </Typography.Paragraph>
+          {deployDescription()}
           {unmanagedSelected > 0 ? (
             <Alert
               showIcon
@@ -729,14 +777,15 @@ function BulkDeployPanel() {
           </Typography.Paragraph>
         </div>
       ),
-      okText: `Deploy to ${managedSelected}`,
+      okText: okLabel,
       onOk: async () => {
         setDeploying(true);
         try {
-          const result = await bulkCommitGenerateConfig(
-            selectedDevices.filter((d) => d.status === 'MANAGED').map((d) => d.id),
-            role,
-          );
+          const managedIds = selectedDevices.filter((d) => d.status === 'MANAGED').map((d) => d.id);
+          const result =
+            mode === 'template'
+              ? await bulkCommitGenerateConfig(managedIds, { role })
+              : await bulkCommitGenerateConfig(managedIds, { content: draft });
           setLastResult(result);
           if (result.jobs.length > 0) {
             message.success(
@@ -770,16 +819,32 @@ function BulkDeployPanel() {
 
   return (
     <>
-      <Card bordered={false} style={{ marginBottom: 12 }} title="Bulk deploy template to many devices">
+      <Card bordered={false} style={{ marginBottom: 12 }} title="Bulk deploy config to many devices">
         <Space wrap size={12} align="center">
           <Segmented
-            value={role}
-            onChange={(value) => setRole(value as Exclude<ConfigRole, 'custom'>)}
-            options={BULK_ROLE_OPTIONS.map((r) => ({
-              value: r,
-              label: `${BULK_ROLE_LABEL[r]} (${roleCounts[r].managed}/${roleCounts[r].total})`,
-            }))}
+            value={mode}
+            onChange={(value) => setMode(value as BulkMode)}
+            options={[
+              { value: 'template', label: 'By template (rendered per device)' },
+              { value: 'draft', label: 'Custom draft (applied as-is)' },
+            ]}
           />
+        </Space>
+        <Space wrap size={12} align="center" style={{ marginTop: 12 }}>
+          {mode === 'template' ? (
+            <Segmented
+              value={role}
+              onChange={(value) => setRole(value as Exclude<ConfigRole, 'custom'>)}
+              options={BULK_ROLE_OPTIONS.map((r) => ({
+                value: r,
+                label: `${BULK_ROLE_LABEL[r]} (${roleCounts[r].managed}/${roleCounts[r].total})`,
+              }))}
+            />
+          ) : (
+            <Typography.Text type="secondary">
+              Draft mode — all roles are eligible. Pick any device below.
+            </Typography.Text>
+          )}
           <Select
             value={site}
             style={{ width: 140 }}
@@ -805,10 +870,50 @@ function BulkDeployPanel() {
           </Checkbox>
         </Space>
         <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-          {candidates.length} candidate(s) for the <strong>{BULK_ROLE_LABEL[role]}</strong> template
+          {candidates.length} candidate(s){' '}
+          {mode === 'template' ? (
+            <>
+              for the <strong>{BULK_ROLE_LABEL[role]}</strong> template
+            </>
+          ) : (
+            <>across all roles</>
+          )}
           {managedOnly ? ' (managed only)' : ''}. Selected {selected.length}.
         </Typography.Paragraph>
       </Card>
+
+      {mode === 'draft' ? (
+        <Card
+          bordered={false}
+          style={{ marginBottom: 12 }}
+          title="Draft config (applied verbatim to every selected device)"
+          extra={
+            <Space size={4}>
+              <Tag>{draft.length} chars</Tag>
+              <Tag color={draft.trim() ? 'green' : 'orange'}>
+                {draft.trim() ? 'ready' : 'empty'}
+              </Tag>
+            </Space>
+          }
+        >
+          <Input.TextArea
+            className="nc-code-area"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            autoSize={{ minRows: 14, maxRows: 28 }}
+            placeholder={`# Same content sent to every selected device.
+# Use plain Junos set ... lines — no per-device templating.
+set system host-name PLACEHOLDER
+set system services ssh
+set system services netconf ssh`}
+          />
+          <Typography.Paragraph type="warning" style={{ marginTop: 8, marginBottom: 0 }}>
+            The exact bytes you write here are pushed to every selected device. There is no
+            per-device hostname/IP substitution. Use the template mode if each device needs its
+            own identity.
+          </Typography.Paragraph>
+        </Card>
+      ) : null}
 
       <div className="nc-config-grid">
         <Card
@@ -858,27 +963,57 @@ function BulkDeployPanel() {
           )}
         </Card>
 
-        <Card bordered={false} title="Preview (per device)">
-          {previewDevice ? (
+        <Card
+          bordered={false}
+          title={mode === 'template' ? 'Preview (per device)' : 'Preview (literal draft)'}
+        >
+          {mode === 'template' ? (
+            previewDevice ? (
+              <>
+                <Typography.Paragraph style={{ marginBottom: 8 }}>
+                  <strong>{previewDevice.name}</strong> · {previewDevice.ip} · {deviceSite(previewDevice)} /{' '}
+                  {deviceFloor(previewDevice)} · <Tag>{BULK_ROLE_LABEL[role]}</Tag>
+                </Typography.Paragraph>
+                <Input.TextArea
+                  className="nc-code-area"
+                  value={previewLoading ? '' : previewContent}
+                  readOnly
+                  autoSize={{ minRows: 22, maxRows: 28 }}
+                  placeholder={previewLoading ? 'Rendering template…' : 'Click a device to preview the rendered config'}
+                />
+                <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+                  Each device gets the same template rendered with its own hostname + IP. Selecting more devices
+                  does NOT change this preview — only the chosen device drives the rendering.
+                </Typography.Paragraph>
+              </>
+            ) : (
+              <Empty description="Pick a device on the left to preview what will be applied." />
+            )
+          ) : (
             <>
               <Typography.Paragraph style={{ marginBottom: 8 }}>
-                <strong>{previewDevice.name}</strong> · {previewDevice.ip} · {deviceSite(previewDevice)} /{' '}
-                {deviceFloor(previewDevice)} · <Tag>{BULK_ROLE_LABEL[role]}</Tag>
+                <Tag color="purple">Draft mode</Tag>
+                <Typography.Text type="secondary">
+                  Below is the verbatim draft that will be pushed to every selected device.
+                </Typography.Text>
               </Typography.Paragraph>
               <Input.TextArea
                 className="nc-code-area"
                 value={previewLoading ? '' : previewContent}
                 readOnly
                 autoSize={{ minRows: 22, maxRows: 28 }}
-                placeholder={previewLoading ? 'Rendering template…' : 'Click a device to preview the rendered config'}
+                placeholder={
+                  draft.trim()
+                    ? 'Waiting for click — click any device to view the draft in this pane.'
+                    : 'Type your draft in the card above. It will appear here once you pick a device.'
+                }
               />
-              <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-                Each device gets the same template rendered with its own hostname + IP. Selecting more devices
-                does NOT change this preview — only the chosen device drives the rendering.
-              </Typography.Paragraph>
+              {previewDevice ? (
+                <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+                  Target: <strong>{previewDevice.name}</strong> · {previewDevice.ip}
+                </Typography.Paragraph>
+              ) : null}
             </>
-          ) : (
-            <Empty description="Pick a device on the left to preview what will be applied." />
           )}
         </Card>
       </div>
@@ -892,7 +1027,9 @@ function BulkDeployPanel() {
             loading={deploying}
             onClick={confirmDeploy}
           >
-            Deploy {BULK_ROLE_LABEL[role]} template to {managedSelected} device(s)
+            {mode === 'template'
+              ? `Deploy ${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)`
+              : `Push draft to ${managedSelected} device(s)`}
           </Button>
           <Button
             icon={<CheckSquareOutlined />}
@@ -903,6 +1040,7 @@ function BulkDeployPanel() {
           </Button>
           <Typography.Text type="secondary">
             {selected.length} selected · {managedSelected} managed · {unmanagedSelected} skipped
+            {mode === 'draft' && !draftValid ? ' · draft empty' : ''}
           </Typography.Text>
         </Space>
         {lastResult ? (

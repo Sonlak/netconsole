@@ -215,13 +215,19 @@ generateConfigRouter.post('/devices/:id/rollback', async (req, res) => {
 });
 
 /**
- * Bulk-deploy a rendered config template to many devices at once.
- * Renders the template per device (each device has its own hostname/IP),
- * upserts the saved config (so a rollback is possible later), then enqueues
- * one APPLY_CONFIG job per device. Worker runs them in parallel via the
- * normal job queue.
+ * Bulk-deploy a config (either a rendered template or a literal draft) to
+ * many devices at once.
  *
- * Body: { deviceIds: string[], role: 'core' | 'dist' | 'access' }
+ * Body shape (one of):
+ *   { deviceIds: string[], role: 'core' | 'dist' | 'access' }
+ *     → render the template per device (each gets its own hostname/IP)
+ *   { deviceIds: string[], content: string, role?: 'custom' }
+ *     → apply the SAME literal `content` to every selected device
+ *
+ * In both cases we upsert DeviceSavedConfig (so a rollback is possible
+ * later) and enqueue one APPLY_CONFIG job per device. Worker runs them
+ * in parallel via the normal job queue.
+ *
  * Response 202: { jobs: [...], skipped: [{ deviceId, reason }] }
  *
  * Caps at 64 devices per request to keep the response bounded.
@@ -236,11 +242,19 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
     res.status(400).json({ error: 'deviceIds cap is 64 per request' });
     return;
   }
-  const role = asRole(req.body?.role);
-  if (!role) {
-    res.status(400).json({ error: 'role must be core, dist, or access' });
+
+  const literalContent = typeof req.body?.content === 'string' ? req.body.content : '';
+  const templateRole = asRole(req.body?.role);
+
+  if (!literalContent.trim() && !templateRole) {
+    res.status(400).json({ error: 'Either content (literal draft) or role (template) is required' });
     return;
   }
+  // Literal-draft mode stores role as 'custom' on DeviceSavedConfig.
+  // The DB column is plain String, so 'custom' is fine even though it's
+  // outside the ConfigRole union used by template rendering.
+  const useLiteral = literalContent.trim().length > 0;
+  const effectiveRole: string = useLiteral && !templateRole ? 'custom' : templateRole!;
 
   // Drop non-string ids and dedupe (caller may double-tap a checkbox).
   const deviceIds = Array.from(
@@ -273,13 +287,18 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
       continue;
     }
 
-    const content = renderConfigTemplate(role, device);
+    // Either use the literal draft verbatim (same for every device) or
+    // render the chosen template per-device so hostname/IP stay correct.
+    // In literal mode there's no template role to render with.
+    const content = useLiteral
+      ? literalContent
+      : renderConfigTemplate(effectiveRole as ConfigRole, device);
     const previous = device.savedConfig?.committedContent ?? '';
 
     await prisma.deviceSavedConfig.upsert({
       where: { deviceId: device.id },
-      create: { deviceId: device.id, role, content },
-      update: { role, content },
+      create: { deviceId: device.id, role: effectiveRole, content },
+      update: { role: effectiveRole, content },
     });
 
     const job = await prisma.job.create({
@@ -289,11 +308,12 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
         status: JobStatus.PENDING,
         payload: {
           config: content,
-          role,
+          role: effectiveRole,
           previous,
           bulk: true,
-          bulkRole: role,
+          bulkRole: effectiveRole,
           bulkTotal: deviceIds.length,
+          bulkMode: useLiteral ? 'literal' : 'template',
         },
       },
       include: {

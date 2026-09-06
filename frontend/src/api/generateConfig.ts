@@ -102,18 +102,27 @@ export type BulkCommitResult = {
 };
 
 /**
- * Render the same template (role) for every selected device and queue one
- * APPLY_CONFIG job per device. Returns the list of created jobs and any
- * devices that were skipped (e.g. not MANAGED). Backend caps at 64 devices
- * per request; frontend should disable the button beyond that.
+ * Bulk-deploy a config to many devices. Two modes:
+ *
+ * 1. **Template mode** — pass `role` (core/dist/access). Backend renders
+ *    the template per device so each one gets its own hostname/IP.
+ * 2. **Literal-draft mode** — pass `content` (verbatim config string).
+ *    Backend applies the same content to every selected device.
+ *
+ * Returns the list of created jobs and any devices that were skipped
+ * (e.g. not MANAGED). Backend caps at 64 devices per request.
  */
 export async function bulkCommitGenerateConfig(
   deviceIds: string[],
-  role: Exclude<ConfigRole, 'custom'>,
+  options: { role?: Exclude<ConfigRole, 'custom'>; content?: string },
 ): Promise<BulkCommitResult> {
   return authJsonFetch(`${API_BASE}/bulk-commit`, {
     method: 'POST',
-    body: JSON.stringify({ deviceIds, role }),
+    body: JSON.stringify({
+      deviceIds,
+      ...(options.role ? { role: options.role } : {}),
+      ...(options.content ? { content: options.content } : {}),
+    }),
   });
 }
 
