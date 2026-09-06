@@ -36,7 +36,9 @@ export async function tryCreateDeviceJob(
   // Serialize every concurrent POST that targets this device. hashtext
   // maps UUID -> int4 -> bigint so identical deviceIds always collide on
   // the same lock; different devices never block each other.
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceId})::bigint)`;
+  // `$executeRaw` (not `$queryRaw`) because pg_advisory_xact_lock returns
+  // void — Prisma cannot deserialize a void column on $queryRaw.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${deviceId})::bigint)`;
 
   const blocking = await tx.job.findFirst({
     where: {
