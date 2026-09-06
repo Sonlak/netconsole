@@ -745,10 +745,28 @@ class GetLogsTask(BaseTask):
     job_type = "GET_LOGS"
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
+        """
+        Logs are now ingested **passively via syslog UDP push** on the
+        backend (`backend/src/services/syslogReceiver.ts` listening on
+        UDP 1514). Real devices send their syslog stream to that
+        endpoint and rows land directly in `DeviceLog`.
+
+        This collector exists only as a fallback / on-demand pull for
+        a single device at a time (e.g. when an operator wants the
+        full historical buffer). We use Junos RESTCONF
+        `get-log-information` when available; if the device doesn't
+        support it (EX-class), we return a stub result and the operator
+        is expected to view logs via the streaming syslog source.
+
+        The SSH `show log messages` fallback was removed on
+        2026-09-06 because (a) it never ran on EX sims anyway — REST
+        was always failing — and (b) every SSH handshake floods the
+        device's `auth.log` which then pollutes the syslog stream the
+        page shows.
+        """
         from netconsole_worker.config import settings
         from netconsole_worker.junos_rest import compact_raw, fetch_log_information
         from netconsole_worker.parsers.syslog_rpc import parse_log_payload
-        from netconsole_worker.ssh_client import run_ssh_command
 
         payload = job.payload or {}
         filename = str(payload.get("filename") or "").strip() or None
@@ -756,73 +774,68 @@ class GetLogsTask(BaseTask):
         rest_error: str | None = None
         hostname_fallback = device.name
 
-        if settings.junos_rest_enabled:
-            username = settings.junos_rest_user or settings.lab_ssh_user
-            password = settings.junos_rest_password or settings.lab_ssh_password
-            rest_result = fetch_log_information(
-                device.ip,
-                username=username,
-                password=password,
-                scheme=settings.junos_rest_scheme,
-                port=settings.junos_rest_port,
-                verify_tls=settings.junos_rest_verify_tls,
-                filename=filename,
-            )
+        if not settings.junos_rest_enabled:
+            return {
+                **self.stub_result(job, device),
+                "entries": [],
+                "hostname": hostname_fallback,
+                "source": None,
+                "message": (
+                    "Log collection disabled: JUNOS_REST=false. "
+                    "Logs are streamed via syslog UDP on the backend; "
+                    "this on-demand collector requires RESTCONF."
+                ),
+            }
 
-            if rest_result["ok"]:
-                raw_payload = rest_result["payload"] or rest_result["raw"]
-                entries = parse_log_payload(raw_payload)
-                if not entries and rest_result.get("raw"):
-                    entries = parse_log_payload(rest_result["raw"])
-                if entries:
-                    hostname_fallback = (
-                        entries[0].get("hostname") or device.name
-                    )
-                    return {
-                        "implemented": True,
-                        "source": "junos-rest",
-                        "message": f"Junos REST log OK ({len(entries)} entries)",
-                        "command": "get-log-information"
-                        + (f"?filename={filename}" if filename else ""),
-                        "hostname": hostname_fallback,
-                        "entries": entries,
-                        "raw": compact_raw(rest_result["raw"]),
-                    }
-                rest_error = "Junos REST returned no log entries"
-            else:
-                rest_error = rest_result["error"] or "Junos REST request failed"
+        username = settings.junos_rest_user or settings.lab_ssh_user
+        password = settings.junos_rest_password or settings.lab_ssh_password
+        rest_result = fetch_log_information(
+            device.ip,
+            username=username,
+            password=password,
+            scheme=settings.junos_rest_scheme,
+            port=settings.junos_rest_port,
+            verify_tls=settings.junos_rest_verify_tls,
+            filename=filename,
+        )
 
-        if settings.lab_ssh_enabled:
-            ssh_command = "show log messages" if not filename else f"show log {filename}"
-            ssh_result = run_ssh_command(
-                host=device.ip,
-                username=settings.lab_ssh_user,
-                password=settings.lab_ssh_password,
-                port=settings.lab_ssh_port,
-                command=ssh_command,
-            )
-            if ssh_result["sshOk"]:
-                entries = parse_log_payload(ssh_result["output"] or "")
-                if entries:
-                    hostname_fallback = entries[0].get("hostname") or device.name
-                    return {
-                        "implemented": True,
-                        "source": "ssh-cli",
-                        "message": f"SSH log OK ({len(entries)} entries)",
-                        "command": ssh_command,
-                        "hostname": hostname_fallback,
-                        "entries": entries,
-                        "raw": ssh_result["output"],
-                        "restError": rest_error,
-                    }
-                rest_error = "SSH returned no log entries"
+        if rest_result["ok"]:
+            raw_payload = rest_result["payload"] or rest_result["raw"]
+            entries = parse_log_payload(raw_payload)
+            if not entries and rest_result.get("raw"):
+                entries = parse_log_payload(rest_result["raw"])
+            if entries:
+                hostname_fallback = (
+                    entries[0].get("hostname") or device.name
+                )
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "message": f"Junos REST log OK ({len(entries)} entries)",
+                    "command": "get-log-information"
+                    + (f"?filename={filename}" if filename else ""),
+                    "hostname": hostname_fallback,
+                    "entries": entries,
+                    "raw": compact_raw(rest_result["raw"]),
+                }
+            rest_error = "Junos REST returned no log entries"
+        else:
+            rest_error = rest_result["error"] or "Junos REST request failed"
 
+        # No SSH fallback. The Junos EX-class sims don't support
+        # `get-log-information` over RESTCONF and the SSH `show log
+        # messages` path floods auth.log. View the device's logs in
+        # the Live Logs page; rows arrive via syslog UDP push.
         return {
             **self.stub_result(job, device),
             "entries": [],
             "hostname": hostname_fallback,
             "source": None,
-            "message": rest_error or "Log collection disabled (enable JUNOS_REST or LAB_SSH)",
+            "message": (
+                f"Junos REST get-log-information not supported by this "
+                f"device ({rest_error}). View live logs on the Logs page; "
+                f"rows are streamed via syslog UDP."
+            ),
             "restError": rest_error,
         }
 
