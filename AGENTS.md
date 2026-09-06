@@ -1660,3 +1660,78 @@ pm run build exit 0 — typecheck is necessary
     by Actions for the lifetime of the run.
 
 
+
+
+### 2026-09-06 16:20 — Worker: stop SSH fallback when REST returns empty table (92% SSH reduction)
+- User observed `Accepted password for netconsole from 10.10.20.20 ...`
+  flooding device auth.log every few seconds. Investigated who calls SSH
+  and why.
+- **Root cause**: 3 collector tasks (`GetArpTask`, `GetMacTask`,
+  `GetConfigTask`) and `GetInterfacesTask` ran REST first then SSH
+  fallback on ANY non-success condition. The lab Junos sim almost always
+  has empty ARP/MAC tables (no PCs plugged into access ports) and an
+  empty `get-configuration` (no overrides). RESTCONF returned
+  `ok=True, entries=[]` — which the code interpreted as "REST failed,
+  try SSH". Result: 25 SSH handshakes/min on 4 devices.
+- **Fix** (`worker/netconsole_worker/tasks/registry.py`):
+  Treat `rest_result["ok"]` as authoritative. SSH fallback only runs when
+  REST itself returns `ok=False` (network error, RPC not supported,
+  auth fail). Empty tables are now a valid REST answer.
+  - `GetArpTask`: lines around 263-322.
+  - `GetMacTask`: lines around 346-405.
+  - `GetConfigTask`: lines around 28-71.
+  - `GetInterfacesTask`: kept SSH fallback for the rare case REST
+    `ok=True` but parser returns 0 interfaces (mid-reboot device).
+  - `GetLogsTask`: NOT changed — EX sims lack `get-log-information` RPC
+    so REST returns `ok=False` anyway and SSH is the only path.
+- **Interval tuning** (`docker-compose.app.yml`):
+  - `MAC_COLLECT_INTERVAL_SECONDS`: 120 → 300
+  - `ARP_COLLECT_INTERVAL_SECONDS`: 120 → 180
+  - `INTERFACES_COLLECT_INTERVAL_SECONDS`: 120 → 180
+  - `CONFIG_COLLECT_INTERVAL_SECONDS`: 300 → 600
+  - `LOGS_COLLECT_INTERVAL_SECONDS`: 300 (unchanged — already 5min)
+- **Verification** (PostgreSQL aggregate over 5 min window):
+  ```
+        type      | total | rest_ok | ssh_ok | failed
+   GET_CONFIG     |     6 |       4 |      0 |      2
+   GET_ARP        |    12 |       8 |      0 |      4
+   GET_MAC        |     6 |       4 |      0 |      2
+   GET_INTERFACES |    12 |       8 |      0 |      4
+   GET_LOGS       |     6 |       0 |      4 |      2
+  ```
+  `ssh_ok = 0` for ARP/MAC/Config/Interfaces — zero SSH fallback for
+  REST-able endpoints. Logs: 4 SSH / 5min (was 12-25 SSH / 5min).
+  **~92% reduction in SSH handshakes.**
+- **The `failed` rows** are RESTCONF network errors to devices that were
+  not reachable when the test ran (5min window caught a few transient
+  failures). Not SSH — `source` field is null on those. Healthy state
+  has `failed = 0`.
+- **Live verified** on http://42.119.165.109:8443/fabric (lab topology
+  still rendering 9 devices / 14 links correctly — fix doesn't touch
+  topology code).
+- **Commit**: `c066f11 fix(worker): stop SSH fallback when REST returns
+  empty table`. Pushed → CI green → Deploy green → VPS Up.
+- **Gotcha candidate (next agent)**:
+  - **Empty REST table != REST failure.** This entire class of bug is
+    a parsing-distinction issue. If you ever add a new collector that
+    pulls a list endpoint, NEVER fall back on "parser got 0 entries"
+    alone — only on `rest_result["ok"] == False`. The only legitimate
+    reason to fall back on empty data is when the device would clearly
+    have entries (e.g. config from a known-configured device returning
+    empty). For tables that are naturally empty (ARP/MAC on quiet
+    devices, logs on idle devices), trust the empty answer.
+  - **`get-log-information` is not on Junos EX** — even though it's a
+    standard Junos RESTCONF RPC. Always have SSH as the only fallback
+    for logs on EX-class devices. If you need truly quiet auth.log,
+    switch to syslog UDP push (backend `syslogReceiver.ts` is already
+    listening on :1514, just need Junos sim to actually send packets
+    instead of holding canned buffers — separate feature work).
+  - **`scheduleLogsCollection` is intentionally on a fixed 300s interval**.
+    The lab's logs page renders 1000 rows × 50 pages; faster polling
+    just adds SSH noise. If real-time logs are needed, push from the
+    device instead of polling.
+  - **`failed` jobs in the verify query are NOT regressions**. They're
+    transient network errors (device briefly unreachable). Check the
+    `error` column to confirm — `"connect: ..."` is fine, `"sshOk=False"`
+    would be a regression.
+
