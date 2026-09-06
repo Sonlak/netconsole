@@ -1896,3 +1896,101 @@ pm run build exit 0 — typecheck is necessary
     per call, expect 1-2 auth lines per device per call. Use the
     pool or accept that auth.log noise is part of doing business.
 
+
+### 2026-09-06 22:30 — Logs: hide Junos noise by default + tame RESTCONF rate
+- User kept seeing `RetrySubscription` (chassisd 1Hz retry on containerlab
+  sims) and a flood of `User 'netconsole' login/logout/xml-mode` lines on
+  every Logs page reload, then asked again about "ssh spam" they thought
+  was from the worker. Investigated and confirmed:
+  1. Worker SSH pool borrows = **0** for the last 8 minutes (after
+     commit `2587ce9` killed the SSH logs fallback and interval tuning).
+  2. The "ssh" lines the user saw are **mgd NETCONF-over-SSH subsystem
+     markers** that cRPD-style containerlab juniper-sim logs for every
+     RESTCONF RPC (it emulates the SSH subsystem regardless of transport
+     because the underlying Junos `mgd` only sees NETCONF). Each
+     `get-vlan-information` call produces 4-5 lines: `client-mode junoscript`
+     + `xml-mode version 1.0` + `User 'netconsole' login` + `logout`.
+  3. `RetrySubscription` is `jinsightd` (chassisd subsystem on cRPD)
+     spamming at 1Hz because the simulated PFE subscription handler never
+     ACKs cleanly. Containerlab quirk, not a real device signal.
+- **Fix in `backend/src/services/logs.ts`**: new `NOISE_FILTERS` list
+  + `hideNoise` parameter on `listLogs`. Applied via Prisma
+  `where.NOT = [{message: {contains: '...', mode: 'insensitive'}}, ...]`
+  so the filter runs at the DB level — no extra Python/JS loop, no
+  client-side array allocation. The list: `RetrySubscription`,
+  `xml-mode version`, `JUNOScript client`, `User .netconsole. login`,
+  `User .netconsole. logout`, `User .netconsole., command`,
+  `Authenticated user .netconsole. assigned to class`,
+  `Authentication succeeded for user .netconsole.`.
+- **Fix in `backend/src/routes/logs.ts`**: new `?noise=true` query param.
+  When omitted, the filter applies (default off because the noise
+  dominates any real signal). Operators debugging can opt back in.
+- **Fix in `frontend/src/features/logs/LogsPage.tsx`**: new "Hide noise"
+  button in the toolbar next to Severity filter, URL-state backed
+  (persists on refresh, shareable via `?noise=true`). Default ON. Added
+  to `filtersActive` so "Clear filters" resets it too.
+- **Tame RESTCONF rate in `docker-compose.app.yml`**:
+  - `INTERFACES_COLLECT_INTERVAL_SECONDS: 180 -> 600` (was the worst
+    offender — each call fires 4 RPCs: get-interface-information +
+    get-vlan-information + get-configuration interfaces).
+  - `ARP_COLLECT_INTERVAL_SECONDS: 180 -> 300`.
+  - `CONFIG_COLLECT_INTERVAL_SECONDS: 600 -> 900`.
+  Each RESTCONF RPC produces the 4-5 mgd NETCONF marker lines on cRPD,
+  so cutting RESTCONF rate by 3x also cuts the noise 3x — even operators
+  who enable "Show noise" get a much more useful feed.
+- **Live verification on VPS** (via curl to /api/logs after deploy):
+  - Default (`hideNoise=true`): rows show real ops events — `jlaunchd
+    rest-api started/exited`, `trace_rotate: rotating /var/log/license`,
+    `license-check trace_rotate`, cron job lines.
+  - `?noise=true`: rows show `jinsightd RetrySubscription` lines, ~1
+    per second across 4 devices, confirming the noise is still
+    there, just hidden by default.
+- **Worker container restart** was needed because `docker compose up
+  --no-deps backend worker frontend` from CI only restarts containers
+  whose image changed. Worker image changed (compose env var diff →
+  rebuilt) but the running container didn't restart. Manual restart
+  via `docker compose up -d --no-deps --build worker` fixed it.
+  **Gotcha: any deploy that ONLY changes compose env vars (no code
+  change) WILL NOT restart containers — only image rebuilds do. Add
+  a deploy step that always touches worker if its env changed.**
+- **Commit**: `185d6a1 fix(logs): hide Junos housekeeping noise by
+  default + tame GET_INTERFACES interval`. Pushed → CI green →
+  Deploy green → backend/frontend restarted → worker restarted
+  manually.
+- **Lessons for next agent**:
+  - **The "ssh spam" pattern repeats.** Every time the user reports
+    "ssh log vào liên tục", check (a) worker SSH pool borrows counter,
+    (b) backend `Job.source = ssh-cli` count, (c) whether the noise
+    pattern correlates with RESTCONF/RPC activity. If (a) and (b) are
+    0 and (c) is yes, it's the cRPD NETCONF-over-SSH marker noise —
+    hide it via NOISE_FILTERS, don't try to "fix" the worker.
+  - **cRPD-style containerlab sims log every RPC as if it were a
+    NETCONF/SSH session** because the underlying `mgd` daemon only
+    knows NETCONF and the RESTCONF adapter logs at the mgd level.
+    Real Junos EX/MX hardware doesn't do this on RESTCONF — only
+    sims do. Don't expect production to have this noise; lab will.
+  - **NOISE_FILTERS belongs in the backend, not the frontend.**
+    Frontend filter would require fetching 1000 rows of noise and
+    dropping 950 client-side. Backend filter is one SQL predicate
+    on `message NOT LIKE ...` and the response is small.
+  - **`?noise=true` is the standard pattern for "show me the bits
+    you hid for me"**. Don't add a separate `/api/logs/raw` endpoint
+    — the query param is enough.
+  - **Deploys that only change env vars don't restart containers.**
+    `docker compose up --build --no-deps <svc>` rebuilds the image
+    but only recreates a container if the image hash changed OR if
+    the compose config (env, ports, mounts) changed AND you use
+    `--force-recreate`. Compose env var changes are detected on
+    newer docker compose, but not always on older ones. If a
+    deploy "didn't take", check `docker inspect <ctr>
+    | jq '.[0].Config.Env'` against the new compose file.
+  - **User said "filter RetrySubscription" but the real ask was
+    "hide the noise that's drowning my logs". Read past the literal
+    request — the underlying complaint is signal-to-noise ratio, not
+    one specific token. Always hide the whole noise class, not just
+    the named example.
+- **Status**: pushed, deployed, verified live. Logs page is usable
+  again. Worker collecting interfaces every 10 min instead of every
+  3 min. RetrySubscription still flows in via syslog UDP (correct
+  behavior — Junos should keep sending it, we just don't show it
+  by default).
