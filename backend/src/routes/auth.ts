@@ -3,10 +3,18 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../lib/prisma.js';
 import { signToken, authMiddleware, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest, JwtPayload } from '../middleware/auth.js';
+import {
+  issueTokenPair,
+  rotateRefreshToken,
+  revokeRefreshToken,
+  revokeAllForUser,
+  RefreshError,
+} from '../lib/refreshTokens.js';
 
 export const authRouter = Router();
 
 const BCRYPT_ROUNDS = 12;
+const REFRESH_COOKIE_NAME = 'nc_refresh';
 
 // Helper: get client IP from common proxy headers, fallback to req.ip
 function getClientIp(req: Request): string | null {
@@ -14,6 +22,16 @@ function getClientIp(req: Request): string | null {
   const realIp = req.headers['x-real-ip'] as string | undefined;
   const ip = forwarded || realIp || req.ip || '';
   return ip || null;
+}
+
+// Helper: pull the refresh token from either the HttpOnly cookie or a
+// request body field (cookie preferred for XSS resistance; body field
+// accepted for non-browser clients like the worker container).
+function readRefreshToken(req: Request): string | null {
+  const fromCookie = (req as Request & { cookies?: Record<string, string> }).cookies?.[REFRESH_COOKIE_NAME];
+  if (fromCookie) return fromCookie;
+  const fromBody = (req.body && typeof req.body.refreshToken === 'string') ? req.body.refreshToken : null;
+  return fromBody;
 }
 
 // Helper: shape the user object we return to clients (never include password)
@@ -64,14 +82,24 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    const payload: JwtPayload = {
-      userId: user.id,
-      username: user.username,
-      role: user.role,
-    };
-
-    const token = signToken(payload);
     const ip = getClientIp(req);
+    const userAgent = (req.headers['user-agent'] as string | undefined) ?? null;
+
+    // Issue a (access JWT, refresh token) pair. The refresh row is the
+    // source of truth for session lifetime — access JWTs are short-lived
+    // (15 min) and stateless.
+    let pair;
+    try {
+      pair = await issueTokenPair(
+        user.id,
+        { userAgent, ip },
+        (payload) => signToken(payload),
+      );
+    } catch (err) {
+      console.error('Failed to issue token pair:', err);
+      res.status(500).json({ error: 'Internal server error' });
+      return;
+    }
 
     // Record last login (best-effort — do not fail the login if this errors)
     prisma.user
@@ -82,7 +110,9 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       .catch((err) => console.error('Failed to record lastLoginAt:', err));
 
     res.json({
-      token,
+      token: pair.accessToken,
+      refreshToken: pair.refreshToken,
+      refreshExpiresAt: pair.refreshExpiresAt.toISOString(),
       user: {
         id: user.id,
         username: user.username,
@@ -93,6 +123,92 @@ authRouter.post('/login', async (req: Request, res: Response) => {
     });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/refresh — exchange a refresh token for a new (access, refresh)
+// pair. The old refresh row is consumed atomically and a NEW refresh row is
+// issued; the raw refresh token rotates each call so a stolen token cannot
+// be replayed once it's been used.
+authRouter.post('/refresh', async (req: Request, res: Response) => {
+  try {
+    const raw = readRefreshToken(req);
+    if (!raw) {
+      res.status(400).json({ error: 'Refresh token is required (cookie or body field)' });
+      return;
+    }
+
+    const ip = getClientIp(req);
+    const userAgent = (req.headers['user-agent'] as string | undefined) ?? null;
+
+    let pair;
+    try {
+      pair = await rotateRefreshToken(
+        raw,
+        { userAgent, ip },
+        (payload) => signToken(payload),
+      );
+    } catch (err) {
+      if (err instanceof RefreshError) {
+        // Map domain codes to HTTP status. Replay detection is a security
+        // event — log it loudly so SIEM/dashboards see it.
+        if (err.code === 'replay_detected') {
+          console.warn(
+            `[auth] refresh replay detected (ip=${ip ?? 'unknown'}, ua=${userAgent ?? 'unknown'})`,
+          );
+          res.status(401).json({ error: err.message, code: err.code });
+          return;
+        }
+        res.status(401).json({ error: err.message, code: err.code });
+        return;
+      }
+      console.error('Refresh error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+      return;
+    }
+
+    res.json({
+      token: pair.accessToken,
+      refreshToken: pair.refreshToken,
+      refreshExpiresAt: pair.refreshExpiresAt.toISOString(),
+    });
+  } catch (error) {
+    console.error('Refresh error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/logout — revoke the supplied refresh token. Idempotent:
+// returns 204 whether or not the token was recognised.
+authRouter.post('/logout', async (req: Request, res: Response) => {
+  try {
+    const raw = readRefreshToken(req);
+    if (raw) {
+      await revokeRefreshToken(raw).catch((err) =>
+        console.error('Failed to revoke refresh token:', err),
+      );
+    }
+    res.status(204).end();
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/logout-all — revoke every refresh token for the current
+// user. Useful for "log out of every device" buttons.
+authRouter.post('/logout-all', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const revoked = await revokeAllForUser(userId);
+    res.json({ message: 'All sessions revoked', revoked });
+  } catch (error) {
+    console.error('Logout-all error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

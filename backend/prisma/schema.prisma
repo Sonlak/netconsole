@@ -271,6 +271,10 @@ model User {
   lastLoginIp        String?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
+
+  // Back-relation for RefreshToken. `onDelete: Cascade` because a deleted
+  // user's refresh rows have no business meaning.
+  refreshTokens RefreshToken[]
 }
 
 // Append-only audit trail. Every mutating API request is logged here by the
@@ -294,4 +298,31 @@ model AuditLog {
   @@index([path, createdAt])
   @@index([statusCode, createdAt])
   @@index([createdAt])
+}
+
+// Long-lived refresh token. Access tokens (15 min) are issued alongside a
+// refresh token (30 d); the frontend calls POST /api/auth/refresh to mint
+// a new access token without asking the user for their password.
+//
+// Token shape: a 256-bit random secret hashed with SHA-256, stored as
+// `tokenHash`. Only the hash is persisted — the raw token leaves the
+// backend once, in the original login response.
+//
+// Rotation: each successful /refresh returns a NEW refresh token AND
+// invalidates the previous one. Reusing a consumed token revokes the
+// whole chain (a stolen old token cannot be replayed).
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  consumedAt DateTime? // set when /refresh replaces this row; null = still valid
+  revokedAt  DateTime? // explicit logout or admin revoke
+  userAgent  String?
+  ip         String?
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
 }

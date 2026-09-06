@@ -23,11 +23,16 @@ export interface AuthenticatedRequest extends Request {
 }
 
 const JWT_SECRET: string = process.env.JWT_SECRET || process.env.SESSION_SECRET || 'CHANGE_ME_IN_PRODUCTION';
-const JWT_EXPIRES_IN: string = process.env.JWT_EXPIRES_IN || '24h';
+// Access tokens are intentionally short-lived (15 min). The /api/auth/refresh
+// endpoint mints a new pair using the long-lived refresh token.
+const JWT_EXPIRES_IN: string = process.env.JWT_EXPIRES_IN || '15m';
 
-export function signToken(payload: JwtPayload): string {
+export function signToken(
+  payload: JwtPayload,
+  expiresIn: string = JWT_EXPIRES_IN,
+): string {
   return jwt.sign(payload, JWT_SECRET, {
-    expiresIn: JWT_EXPIRES_IN as `${number}${'s' | 'm' | 'h' | 'd'}` | `${number}d`,
+    expiresIn: expiresIn as `${number}${'s' | 'm' | 'h' | 'd'}` | `${number}d`,
   });
 }
 

@@ -4,10 +4,11 @@ import {
   getCurrentUser,
   getToken,
   setToken as saveToken,
-  removeToken,
+  setRefreshToken as saveRefreshToken,
   getStoredUser,
   setStoredUser,
-  removeStoredUser,
+  clearAllAuth,
+  logout as apiLogout,
   type User,
 } from '../api/auth';
 
@@ -76,8 +77,7 @@ export function useAuth() {
       .catch(() => {
         if (cancelled) return;
         // Token invalid or expired → clear and drop back to login screen.
-        removeToken();
-        removeStoredUser();
+        clearAllAuth();
         setState({
           user: null,
           token: null,
@@ -97,6 +97,7 @@ export function useAuth() {
     try {
       const response = await apiLogin(credentials);
       saveToken(response.token);
+      saveRefreshToken(response.refreshToken, response.refreshExpiresAt);
       const user = buildUser(response);
       setStoredUser(user);
       setState({
@@ -118,9 +119,10 @@ export function useAuth() {
     }
   }, []);
 
-  const logout = useCallback(() => {
-    removeToken();
-    removeStoredUser();
+  const logout = useCallback(async () => {
+    // Fire-and-forget: the local state update should not block on the
+    // /logout HTTP call finishing.
+    void apiLogout();
     setState({
       user: null,
       token: null,

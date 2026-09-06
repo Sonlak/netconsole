@@ -1,19 +1,7 @@
-import { authHeaders } from './auth';
+import { authJsonFetch } from './http';
 import type { Job } from '../types/job';
 
 const API_BASE = '/api/jobs';
-
-async function handleResponse<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    if (response.status === 401) {
-      window.location.href = '/login';
-      throw new Error('Unauthorized');
-    }
-    const payload = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(payload.error ?? 'Request failed');
-  }
-  return response.json() as Promise<T>;
-}
 
 export async function fetchJobs(params: { status?: string; forWorker?: string; limit?: number } = {}): Promise<Job[]> {
   const searchParams = new URLSearchParams();
@@ -21,27 +9,18 @@ export async function fetchJobs(params: { status?: string; forWorker?: string; l
   if (params.forWorker) searchParams.append('forWorker', params.forWorker);
   if (params.limit) searchParams.append('limit', params.limit.toString());
 
-  const response = await fetch(`${API_BASE}?${searchParams.toString()}`, {
-    headers: authHeaders(),
-  });
-  return handleResponse<Job[]>(response);
+  return authJsonFetch<Job[]>(`${API_BASE}?${searchParams.toString()}`);
 }
 
 export async function claimJob(id: string): Promise<Job> {
-  const response = await fetch(`${API_BASE}/${id}/claim`, {
-    method: 'PATCH',
-    headers: authHeaders(),
-  });
-  return handleResponse<Job>(response);
+  return authJsonFetch<Job>(`${API_BASE}/${id}/claim`, { method: 'PATCH' });
 }
 
 export async function completeJob(id: string, result?: unknown, error?: string): Promise<Job> {
-  const response = await fetch(`${API_BASE}/${id}/complete`, {
+  return authJsonFetch<Job>(`${API_BASE}/${id}/complete`, {
     method: 'PATCH',
-    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({ result, error }),
   });
-  return handleResponse<Job>(response);
 }
 
 export class JobWaitTimeoutError extends Error {
@@ -91,8 +70,5 @@ export async function waitForJobIfNeeded(
 }
 
 async function fetchJob(jobId: string): Promise<Job> {
-  const response = await fetch(`${API_BASE}/${jobId}`, {
-    headers: authHeaders(),
-  });
-  return handleResponse<Job>(response);
+  return authJsonFetch<Job>(`${API_BASE}/${jobId}`);
 }
