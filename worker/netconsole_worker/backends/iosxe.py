@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import re
+from ipaddress import ip_address
 from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
+from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for SSH fallback
 from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse  # reused for SSH fallback
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table  # reused
@@ -518,14 +520,34 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _parse_iosxe_arp(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """`Cisco-IOS-XE-arp-oper:arp-data` → list of {address, mac, interface}."""
+    """`Cisco-IOS-XE-arp-oper:arp-data` → list of {ip, mac, interface, ...}.
+
+    Field names normalized to match `ArpAddressRow`. IOS-XE YANG
+    `arp-entry` uses `address`/`hardware` (no `hostname`, no `flags`).
+    """
     entries = payload.get("Cisco-IOS-XE-arp-oper:arp-data", {}).get("arp-entry", [])
     out: list[dict[str, Any]] = []
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         address = entry.get("address")
-        mac = entry.get("hardware") or entry.get("mac")
-        interface = entry.get("interface")
         if not address:
             continue
-        out.append({"address": address, "macAddress": mac, "interface": interface})
+        mac = normalize_mac(entry.get("hardware") or entry.get("mac") or "")
+        if not mac:
+            continue
+        # Skip loopback / link-local.
+        try:
+            parsed = ip_address(address)
+            if parsed.is_loopback or parsed.is_link_local:
+                continue
+        except ValueError:
+            continue
+        out.append({
+            "ip": address,
+            "mac": mac,
+            "hostname": entry.get("hostname") or address,
+            "interface": entry.get("interface") or "-",
+            "flags": "none",
+        })
     return out

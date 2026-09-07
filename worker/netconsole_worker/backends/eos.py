@@ -14,11 +14,13 @@ basic.
 from __future__ import annotations
 
 import logging
+from ipaddress import ip_address
 from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
+from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for text fallback
 from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse  # reused for text fallback
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table  # reused
@@ -51,6 +53,62 @@ def _text_to_cmds(config: str) -> list[str]:
             continue
         commands.append(stripped)
     return commands
+
+
+def _slice_eos_interface_block(section_output: str, iface: str) -> str:
+    """Return just the config block for `iface` from a full interface section.
+
+    EOS `show running-config section interface` returns something like:
+
+        interface Ethernet1
+           description uplink
+           no switchport
+        !
+        interface Ethernet2
+           switchport access vlan 10
+        !
+
+    Top-level `interface <name>` lines mark a new block; the block ends at
+    the next top-level line or `!`. Subcommands are indented (single space
+    in our parsed output, sometimes a tab).
+
+    If no block matches, return a comment so the frontend modal isn't empty.
+    """
+    if not section_output:
+        return f"! No running-config section returned for {iface}"
+
+    header = f"interface {iface}".lower()
+    out_lines: list[str] = []
+    capturing = False
+    seen_any_header = False
+    for raw_line in section_output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.lstrip()
+        is_header = stripped.lower().startswith("interface ") and (
+            len(stripped) == len("interface ") or stripped[len("interface ")] != " "
+        )
+        if is_header:
+            if capturing:
+                break
+            seen_any_header = True
+            if stripped.lower() == header:
+                capturing = True
+                out_lines.append(line)
+            continue
+        if capturing:
+            if line.strip() == "!":
+                break
+            out_lines.append(line)
+
+    if not out_lines:
+        if not seen_any_header:
+            return f"! No interface section found in running-config (looked for {iface})"
+        return f"! No explicit configuration for {iface} (using defaults)"
+
+    # Add a `!` terminator so the slice is syntactically complete.
+    if not out_lines[-1].strip() == "!":
+        out_lines.append("!")
+    return "\n".join(out_lines)
 
 
 class EOSBackend(DeviceBackend):
@@ -438,7 +496,12 @@ class EOSBackend(DeviceBackend):
                 "end",
             ]
         elif action == "show-run":
-            commands = [f"show running-config interface {iface}"]
+            # EOS does not accept `show running-config interface <name>`
+            # the way Junos / IOS-XE do. We pull the whole `interface`
+            # section and slice out the requested block. This works for
+            # both physical and logical interfaces (e.g. `Ethernet1`,
+            # `Port-Channel1`, `Vlan10`).
+            commands = ["show running-config section interface"]
         else:
             raise RuntimeError(f"Unsupported interface action for EOS: {action}")
 
@@ -449,6 +512,8 @@ class EOSBackend(DeviceBackend):
                 if r["result"]:
                     first = r["result"][0]
                     output = first.get("output") if isinstance(first, dict) else str(first)
+                if action == "show-run":
+                    output = _slice_eos_interface_block(output, iface)
                 return {
                     "implemented": True,
                     "source": "eos-api",
@@ -466,17 +531,32 @@ class EOSBackend(DeviceBackend):
 
         if self.config.ssh_enabled:
             outputs: list[dict[str, str]] = []
-            for cmd in commands:
+            if action == "show-run":
                 ssh_result = run_ssh_command(
                     host=device.ip,
                     username=self.config.ssh_user,
                     password=self.config.ssh_password,
                     port=self.config.ssh_port,
-                    command=cmd,
+                    command="show running-config section interface",
                 )
                 if not ssh_result["sshOk"]:
-                    raise RuntimeError(ssh_result["error"] or f"SSH failed on: {cmd}")
-                outputs.append({"command": cmd, "output": ssh_result["output"]})
+                    raise RuntimeError(ssh_result["error"] or "SSH failed on show running-config section interface")
+                outputs.append({"command": "show running-config section interface", "output": ssh_result["output"] or ""})
+            else:
+                for cmd in commands:
+                    ssh_result = run_ssh_command(
+                        host=device.ip,
+                        username=self.config.ssh_user,
+                        password=self.config.ssh_password,
+                        port=self.config.ssh_port,
+                        command=cmd,
+                    )
+                    if not ssh_result["sshOk"]:
+                        raise RuntimeError(ssh_result["error"] or f"SSH failed on: {cmd}")
+                    outputs.append({"command": cmd, "output": ssh_result["output"]})
+            config_text = ""
+            if action == "show-run" and outputs:
+                config_text = _slice_eos_interface_block(outputs[-1]["output"], iface)
             return {
                 "implemented": True,
                 "source": "ssh-cli",
@@ -488,7 +568,7 @@ class EOSBackend(DeviceBackend):
                 "message": f"Interface action {action} OK on {iface}",
                 "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
                 "accessVlan": vlan if action == "set-access-vlan" else None,
-                "config": outputs[-1]["output"] if action == "show-run" and outputs else None,
+                "config": config_text if action == "show-run" else None,
             }
 
         raise RuntimeError("Interface actions require EOS_API or LAB_SSH")
@@ -579,7 +659,14 @@ def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _parse_eos_arp(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """`show ip arp` JSON → list of {address, mac, interface, age}."""
+    """`show ip arp` JSON → list of {ip, mac, hostname, interface, flags}.
+
+    Field names are normalized to match the frontend + backend
+    `ArpAddressRow` contract (see `backend/src/types/arpAddress.ts`).
+    EOS eAPI returns `address`/`hwAddress`/no `hostname`/no `flags` —
+    we map them here so the global ARP table and per-device ARP tab
+    render the same way regardless of vendor.
+    """
     if not result:
         return []
     first = result[0]
@@ -588,17 +675,39 @@ def _parse_eos_arp(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for entry in arp_entries:
         if not isinstance(entry, dict):
             continue
+        ip = entry.get("address")
+        mac = entry.get("hwAddress") or entry.get("macAddress") or ""
+        if not ip:
+            continue
+        normalized_mac = normalize_mac(mac)
+        if not normalized_mac:
+            continue
+        # Skip link-local / loopback addresses (matches Juniper behavior).
+        try:
+            parsed = ip_address(ip)
+            if parsed.is_loopback or parsed.is_link_local:
+                continue
+        except ValueError:
+            continue
         out.append({
-            "address": entry.get("address"),
-            "macAddress": entry.get("hwAddress") or entry.get("macAddress"),
-            "interface": entry.get("interface"),
+            "ip": ip,
+            "mac": normalized_mac,
+            "hostname": entry.get("hostname") or ip,
+            "interface": entry.get("interface") or "-",
+            "flags": entry.get("flags") or "none",
             "age": entry.get("age"),
         })
     return out
 
 
 def _parse_eos_mac(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """`show mac address-table` JSON → list of {macAddress, interface, vlan, type}."""
+    """`show mac address-table` JSON → list of {mac, vlan, interface, ...}.
+
+    Field names normalized to match the frontend + backend
+    `MacAddressRow` contract. EOS `entryType` is the long form
+    (`dynamic`/`static`); we mirror it to `type` and derive a single
+    `flags` char so the existing Juniper `D`/`S` Tag renderers work.
+    """
     if not result:
         return []
     first = result[0]
@@ -607,11 +716,19 @@ def _parse_eos_mac(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for entry in tables.get("tableEntries", []) or []:
         if not isinstance(entry, dict):
             continue
+        mac = normalize_mac(entry.get("macAddress") or "")
+        if not mac:
+            continue
+        entry_type = (entry.get("entryType") or "dynamic").lower()
+        flag = "S" if entry_type == "static" else "D"
         out.append({
-            "macAddress": entry.get("macAddress"),
-            "interface": entry.get("interface"),
-            "vlan": entry.get("vlanId"),
-            "type": entry.get("entryType"),
+            "mac": mac,
+            "vlan": str(entry.get("vlanId") or "-"),
+            "tag": "-",
+            "interface": entry.get("interface") or "-",
+            "flags": flag,
+            "type": entry_type,
+            "sessId": "0",
         })
     return out
 

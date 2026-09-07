@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import logging
 import re
+from ipaddress import ip_address
 from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
+from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for SSH fallback
 from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
@@ -599,6 +601,11 @@ def _parse_nxos_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _parse_nxos_arp(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """DME `show-ip-arp-1` → list of {ip, mac, interface, ...}.
+
+    Field names normalized to match `ArpAddressRow`. NX-OS DME uses
+    `addr`/`mac`/`ifId` (no `hostname`, no `flags`).
+    """
     items = payload.get("imdata") or []
     out: list[dict[str, Any]] = []
     for item in items:
@@ -607,29 +614,51 @@ def _parse_nxos_arp(payload: dict[str, Any]) -> list[dict[str, Any]]:
         address = attributes.get("addr")
         if not address:
             continue
+        mac = normalize_mac(attributes.get("mac") or "")
+        if not mac:
+            continue
+        try:
+            parsed = ip_address(address)
+            if parsed.is_loopback or parsed.is_link_local:
+                continue
+        except ValueError:
+            continue
         out.append({
-            "address": address,
-            "macAddress": attributes.get("mac"),
-            "interface": attributes.get("ifId"),
+            "ip": address,
+            "mac": mac,
+            "hostname": address,
+            "interface": attributes.get("ifId") or "-",
+            "flags": "none",
             "age": attributes.get("age"),
         })
     return out
 
 
 def _parse_nxos_mac(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """DME `show-mac-address-table-1` → list of {mac, vlan, interface, ...}.
+
+    Field names normalized to match `MacAddressRow`. NX-OS `type` is
+    `"static"`/`"dynamic"` (long form) — we mirror it to `type` and
+    derive a single `flags` char.
+    """
     items = payload.get("imdata") or []
     out: list[dict[str, Any]] = []
     for item in items:
         body = next(iter(item.values())) if isinstance(item, dict) else {}
         attributes = body.get("attributes", {}) if isinstance(body, dict) else {}
-        mac = attributes.get("macAddr")
+        mac = normalize_mac(attributes.get("macAddr") or "")
         if not mac:
             continue
+        entry_type = (attributes.get("type") or "dynamic").lower()
+        flag = "S" if entry_type == "static" else "D"
         out.append({
-            "macAddress": mac,
-            "interface": attributes.get("intf"),
-            "vlan": attributes.get("vlanId"),
-            "type": attributes.get("type"),
+            "mac": mac,
+            "vlan": str(attributes.get("vlanId") or "-"),
+            "tag": "-",
+            "interface": attributes.get("intf") or "-",
+            "flags": flag,
+            "type": entry_type,
+            "sessId": "0",
         })
     return out
 
