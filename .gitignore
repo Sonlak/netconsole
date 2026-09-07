@@ -124,3 +124,28 @@ agent-tools/*.py
 agent-tools/*.sh
 agent-tools/*.json
 
+# Root-level scratch probe / debug files (kept locally, not for the repo)
+# These start with an underscore so they're easy to spot in `git status`.
+/_[a-z_]*.[a-z]
+/_[a-z_]*.[a-z].sql
+/_*.bat
+/_*.sh
+/_*.js
+/_*.sql
+/_*.json
+/_*.html
+/_*.zip
+/AGENTS.md.from-prev-commit
+/fabric-check.html
+/fp-check.js
+/index-check.js
+/jobs_success.json
+/_ssh_password.txt
+
+# Worker scratch probe / debug files (same convention)
+worker/_*.py
+
+# Cache directories
+.ruff_cache/
+worker/.ruff_cache/
+

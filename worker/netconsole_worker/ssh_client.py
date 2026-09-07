@@ -275,10 +275,10 @@ def run_ssh_command(
     try:
         output, err_text, exit_status = _exec_on(entry.client, command, timeout, input_text)
     except Exception as exc:  # noqa: BLE001 - lab boundary
+        # ALWAYS drop the poisoned pooled entry, then decide whether to retry
+        # on a brand-new connection. Without this, a half-dead transport
+        # would block every subsequent job on the same (host, port, user).
         pool.invalidate(host, port, username)
-        # Cisco IOS-XE and some other servers close the transport after an
-        # exec completes.  Retry ONCE with a brand-new connection so that
-        # callers (e.g. interface_action with multiple commands) still work.
         import paramiko
         if isinstance(exc, paramiko.ssh_exception.SSHException) and (
             "not active" in str(exc) or "Channel closed" in str(exc)
@@ -286,23 +286,28 @@ def run_ssh_command(
             import logging
             log = logging.getLogger(__name__)
             log.debug("transport died on %s, retrying with fresh connection", host)
-            fresh = pool._create_conn(host, int(port), username, password, timeout)
+            # pool.borrow opens a new connection if needed; wrap in try so a
+            # second connect failure returns a clear error instead of leaking
+            # the AttributeError we used to get from a missing _create_conn.
             try:
-                output, err_text, exit_status = _exec_on(fresh, command, timeout, input_text)
-                pool.release(host, port, username)  # put fresh conn back into pool
-                if exit_status != 0:
-                    return {
-                        "sshOk": False,
-                        "output": output,
-                        "error": err_text.strip() or f"SSH command exited with status {exit_status}",
-                    }
-                return {"sshOk": True, "output": output if output else err_text}
+                fresh_entry = pool.borrow(host, port, username, password, timeout=timeout)
+            except Exception as conn_exc:  # noqa: BLE001
+                return {"sshOk": False, "output": "", "error": f"retry connect failed: {conn_exc}"}
+            try:
+                output, err_text, exit_status = _exec_on(
+                    fresh_entry.client, command, timeout, input_text
+                )
             except Exception as exc2:  # noqa: BLE001
-                try:
-                    fresh.close()
-                except Exception:
-                    pass
+                pool.invalidate(host, port, username)
                 return {"sshOk": False, "output": "", "error": str(exc2)}
+            pool.release(host, port, username)
+            if exit_status != 0:
+                return {
+                    "sshOk": False,
+                    "output": output,
+                    "error": err_text.strip() or f"SSH command exited with status {exit_status}",
+                }
+            return {"sshOk": True, "output": output if output else err_text}
         return {"sshOk": False, "output": "", "error": str(exc)}
 
     pool.release(host, port, username)

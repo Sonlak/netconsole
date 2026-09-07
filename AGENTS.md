@@ -42,6 +42,8 @@ visualize fabric topology.
 | 11 | `TierLayout.y` = pixel Y | Not a rank integer. Any `find(tl.y === t.rank)` filter silently returns 0 |
 | 12 | No fixed-offset arrays | SH_OFFSETS/FH_OFFSETS patterns break when count exceeds array length. Use dynamic spacing |
 | 13 | `tsc --noEmit` misses TS2451 | Run `npm run build` (= `tsc -b && vite build`) before committing TSX. Check Frontend (build) job in GitHub Actions |
+| 14 | IOS-XE NETCONF for config ops | Device must have `netconf-yang` + `netconf ssh`. Use SSH port **830**, not 22. Supports `:writable-running:1.0` but NOT `:candidate:1.0` -- target `<running/>` directly, no `<commit>` needed. `<shutdown/>` is a **presence container**, not a boolean: `shut` = `nc:operation="merge"`, `no-shut` = `nc:operation="delete"` (treat `data-missing` on delete as success). Code in `worker/netconsole_worker/ssh_client.py::netconf_interface_action`, called from `backends/iosxe.py::interface_action` (NETCONF first, SSH fallback). RESTCONF (port 443) on 17.x is unreliable — banner times out, ignore it. |
+| 15 | Junos commit reliability | (a) `Junos cRPD` first commit after pool open spikes 20-30s; watchdog cap must be ≥ 300s for Juniper (worker=90s RESTCONF timeout, backend base 240s + Juniper extra 60s in `services/jobWatchdog.ts`). (b) If watchdog kills a mid-commit job, Junos keeps the half-loaded candidate. `worker/netconsole_worker/junos_rest.py::apply_set_configuration` auto-recovers on `configuration database modified` by `<discard-changes/>` + re-load+commit. (c) C-style `/* … */` in `DeviceSavedConfig.content` makes Junos emit `unknown command: /*` and leave a "modified" database — `backends/juniper.py::_set_commands` strips them and the backend `validateConfigPayload()` rejects the request with HTTP 400 before enqueue. (d) `SSHConnectionPool` has no `_create_conn` — `run_ssh_command` retry path must call `pool.borrow(...)` (fixed 2026-09-07, was a silent `AttributeError` that surfaced as "No existing session" in user logs). |
 
 Full detail: `docs/agents/05-gotchas.md`
 
@@ -53,6 +55,11 @@ Full detail: `docs/agents/05-gotchas.md`
 - **Rollback schema-drift**: `rollback.yml` fails if `prisma db push` must drop tables with data. Need `--accept-data-loss` flag or schema-drift detection
 - **Off-host backup copy**: `backup_postgres.sh` dumps locally; no rsync to Tailscale NAS or B2 yet
 - **Per-device vendor credentials (Phase 2)** -- shared `ENABLE_*_API` env vars are fine for v1, but prod users will want per-device override (e.g. a single Arista in a fleet of Junipers). Plan: add `Device.connectorJson` JSON column; `select_backend` reads per-device creds first, env fallback second. Schema migration is a one-line `prisma db push`, but the worker needs new env-var resolution paths. Backlog only -- not started.
+- **Bulk-config safety net (pre-apply snapshot)** -- current `apply_config` commits each line immediately; if SSH drops mid-batch or a typo crashes the device, the box is half-configured with no undo. Plan (deferred, not started):
+  - IOS-XE: prepend `file prompt quiet` + `archive config` to `apply_config` (writes `flash:pre.config`). Rollback stays manual via console `configure replace flash:pre.config force` -- per user: "không cần auto-reload, vẫn để chờ console vào kiểm tra".
+  - EOS: prepend `copy running-config startup-config` (optionally `copy running-config rescue-config`) to `apply_config`. Rollback stays manual via console `configure replace flash:startup-config` or `rollback rescue-config`.
+  - Overhead: ~1-2s per device (one-time per apply, not per line). Trade-off accepted; not implemented yet -- log here so the next agent picks it up after Phase 2 per-device creds.
+  - Open design Q deferred with it: (a) post-apply verify ping? (b) keep snapshot until admin confirms OK via UI, or auto-delete on success? Decide when implementing.
 
 ---
 
@@ -87,9 +94,10 @@ Full detail: `docs/agents/05-gotchas.md`
 - `04-architecture.md` -- branching, commit style, REST API, job queue, deploy invariants
 - `05-gotchas.md` -- all 13 gotchas with full detail + commit references
 - `06-file-map.md` -- "where is X" quick lookup
-- `07-vendor-api-survey.md` -- Cisco + Arista + Juniper API comparison (added 2026-09-07)
-- `08-vendor-extension-plan.md` -- implementation plan to add EOS/IOS-XE/NX-OS (added 2026-09-07)
+- `07-vendor-api-survey.md` -- Cisco + Arista + Juniper API comparison (added 2026-09-07; updated 2026-09-07 16:40 to mark RESTCONF as ⚠️ unreliable and NETCONF as ✅ working path for IOS-XE)
+- `08-vendor-extension-plan.md` -- implementation plan to add EOS/IOS-XE/NX-OS (added 2026-09-07; updated 2026-09-07 16:40 to mark NETCONF as primary config/interface path on IOS-XE)
 - `09-vendor-device-configs.md` -- copy/paste device-side config blocks for EOS/IOS-XE/NX-OS (added 2026-09-07)
+- `10-bulk-config-safety-net.md` -- design notes for pre-apply snapshot (IOS-XE `archive config`, EOS `copy run start` + optional `rescue-config`). Manual rollback via console; +1-2s/device overhead. Backlog, not started.
 
 ---
 

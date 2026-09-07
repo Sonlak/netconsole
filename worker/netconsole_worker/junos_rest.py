@@ -521,6 +521,13 @@ def apply_set_configuration(
     connection is reused across the load and commit RPCs, and across
     consecutive interface actions to the same device.  Connect timeout
     is 5 s (was 1.5 s) to avoid premature retries when Junos is slow.
+
+    Recovery: if the commit RPC fails with "configuration database
+    modified" (typically because a previous worker run was killed by
+    the watchdog and left pending changes on the device), we
+    `<discard-changes/>` once and re-run load+commit on the same pooled
+    socket. This unblocks a long tail of "lúc được lúc không" failures
+    that the user has been seeing on the lab Junos cRPD sims.
     """
     import time as _time
     from xml.sax.saxutils import escape
@@ -541,13 +548,27 @@ def apply_set_configuration(
         host, port, username, password, scheme, verify_tls, timeout=timeout
     )
 
-    # load RPC
-    load_started = _time.perf_counter()
-    loaded = post_junos_rpc(host, load_body.decode(), client=client, scheme=scheme, port=port)
-    load_ms = int((_time.perf_counter() - load_started) * 1000)
-    load_raw = loaded.get("raw") or ""
-    if not loaded["ok"] or "<xnm:error" in load_raw.lower() or "<load-success" not in load_raw:
-        detail = format_junos_rpc_error(load_raw) or loaded.get("error") or "load-configuration failed"
+    def _load() -> tuple[bool, str, int]:
+        load_started = _time.perf_counter()
+        loaded = post_junos_rpc(host, load_body.decode(), client=client, scheme=scheme, port=port)
+        load_ms = int((_time.perf_counter() - load_started) * 1000)
+        load_raw = loaded.get("raw") or ""
+        if not loaded["ok"] or "<xnm:error" in load_raw.lower() or "<load-success" not in load_raw:
+            return False, load_raw, load_ms
+        return True, load_raw, load_ms
+
+    def _commit() -> tuple[bool, str, int]:
+        commit_started = _time.perf_counter()
+        commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
+        commit_ms = int((_time.perf_counter() - commit_started) * 1000)
+        commit_raw = commit.get("raw") or ""
+        ok = commit["ok"] and "<commit-success" in commit_raw
+        return ok, commit_raw, commit_ms
+
+    # First attempt
+    load_ok, load_raw, load_ms = _load()
+    if not load_ok:
+        detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
         return {
             "ok": False,
             "stage": "load",
@@ -557,15 +578,57 @@ def apply_set_configuration(
             "commitMs": 0,
         }
 
-    # commit RPC — reuse the same pooled client
-    commit_started = _time.perf_counter()
-    commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
-    commit_ms = int((_time.perf_counter() - commit_started) * 1000)
-    commit_raw = commit.get("raw") or ""
-    if not commit["ok"] or "<commit-success" not in commit_raw:
-        # Rollback on failed commit
+    commit_ok, commit_raw, commit_ms = _commit()
+    if not commit_ok:
+        # Recover from "configuration database modified" by discarding any
+        # stale pending changes and re-trying the whole load+commit cycle.
+        # Anything else (syntax error, permission denied, ...) we surface
+        # to the caller so the operator sees the real reason.
+        err_text = (format_junos_rpc_error(commit_raw) or commit_raw or "").lower()
+        if "configuration database modified" in err_text:
+            logger.warning(
+                "junos %s: commit failed with 'configuration database modified', "
+                "running <discard-changes/> and retrying load+commit",
+                host,
+            )
+            post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+            load_ok2, load_raw2, load_ms2 = _load()
+            if not load_ok2:
+                detail = format_junos_rpc_error(load_raw2) or "load failed on retry"
+                return {
+                    "ok": False,
+                    "stage": "load-retry",
+                    "error": f"load failed (after discard): {detail}",
+                    "raw": load_raw2,
+                    "loadMs": load_ms2,
+                    "commitMs": commit_ms,
+                }
+            commit_ok2, commit_raw2, commit_ms2 = _commit()
+            if not commit_ok2:
+                # Best-effort discard so we don't leave pending changes for
+                # the next caller even on a permanent failure.
+                post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+                detail = format_junos_rpc_error(commit_raw2) or "commit failed on retry"
+                return {
+                    "ok": False,
+                    "stage": "commit-retry",
+                    "error": f"commit failed (after discard): {detail}",
+                    "raw": commit_raw2,
+                    "loadMs": load_ms2,
+                    "commitMs": commit_ms2,
+                }
+            return {
+                "ok": True,
+                "stage": "commit",
+                "error": None,
+                "raw": f"{load_raw2}\n{commit_raw2}\n(recovered after discard-changes)",
+                "loadMs": load_ms2,
+                "commitMs": commit_ms2,
+            }
+        # Non-recoverable commit error: discard the bad change so the next
+        # job starts from a clean database, then report the real failure.
         post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
-        detail = format_junos_rpc_error(commit_raw) or commit.get("error") or "commit-configuration failed"
+        detail = format_junos_rpc_error(commit_raw) or "commit-configuration failed"
         return {
             "ok": False,
             "stage": "commit",

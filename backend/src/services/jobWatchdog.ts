@@ -1,6 +1,10 @@
 import { JobStatus, JobType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 
+// Per-job-type stale thresholds in milliseconds. Vendor-aware
+// overrides are applied in `reclaimStaleJobs` so we can give Junos
+// cRPD sim more headroom (its first commit RPC can spike to 30s on a
+// cold session) while keeping tight bounds on fast read jobs.
 const STALE_MS: Partial<Record<JobType, number>> = {
   GET_INTERFACES: 120_000,
   GET_MAC: 120_000,
@@ -10,8 +14,19 @@ const STALE_MS: Partial<Record<JobType, number>> = {
   CONNECT_TEST: 120_000,
   DISCOVERY_PROBE: 120_000,
   INTERFACE_ACTION: 120_000,
-  APPLY_CONFIG: 180_000,
-  ROLLBACK_CONFIG: 180_000,
+  APPLY_CONFIG: 240_000,
+  ROLLBACK_CONFIG: 240_000,
+};
+
+// Some vendors need even more headroom. The bulk of the read paths
+// are vendor-agnostic (RESTCONF/SSH share a 120s budget) but Juniper
+// cRPD can spike a first-of-session commit to 30s and a rollback to
+// another 20s, so we cap Juniper write jobs at 5 minutes to absorb
+// the spike without falsely reclaiming a job that is still making
+// real progress on the device.
+const VENDOR_EXTRA_MS: Partial<Record<JobType, number>> = {
+  APPLY_CONFIG: 60_000,
+  ROLLBACK_CONFIG: 60_000,
 };
 
 const DEFAULT_STALE_MS = 120_000;
@@ -21,10 +36,35 @@ export async function reclaimStaleJobs() {
     where: { status: JobStatus.RUNNING },
     select: { id: true, type: true, updatedAt: true, deviceId: true },
   });
+  if (running.length === 0) {
+    return 0;
+  }
+
+  // Pull the vendor for every running job's device in one round-trip
+  // so we can apply the per-vendor extension. Reads with no deviceId
+  // fall back to the base threshold.
+  const deviceIds = Array.from(
+    new Set(running.map((job) => job.deviceId).filter((id): id is string => Boolean(id))),
+  );
+  const devices = deviceIds.length
+    ? await prisma.device.findMany({
+        where: { id: { in: deviceIds } },
+        select: { id: true, vendor: true },
+      })
+    : [];
+  const vendorById = new Map(devices.map((d) => [d.id, (d.vendor || '').toLowerCase()]));
+
   const now = Date.now();
-  const staleIds = running
-    .filter((job) => now - job.updatedAt.getTime() >= (STALE_MS[job.type] ?? DEFAULT_STALE_MS))
-    .map((job) => job.id);
+  const staleIds: string[] = [];
+  for (const job of running) {
+    const base = STALE_MS[job.type] ?? DEFAULT_STALE_MS;
+    const extra = vendorById.get(job.deviceId ?? '') === 'juniper'
+      ? VENDOR_EXTRA_MS[job.type] ?? 0
+      : 0;
+    if (now - job.updatedAt.getTime() >= base + extra) {
+      staleIds.push(job.id);
+    }
+  }
 
   if (staleIds.length === 0) {
     return 0;

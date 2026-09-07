@@ -21,9 +21,9 @@ After this lands, every job type works on every vendor:
 | `GET_ARP` | RESTCONF | eAPI show ip arp | RESTCONF + SSH fallback | NX-API REST |
 | `GET_MAC` | RESTCONF | eAPI show mac | SSH fallback | NX-API REST |
 | `GET_CONFIG` | RESTCONF | eAPI show run | RESTCONF | NX-API REST |
-| `APPLY_CONFIG` | RESTCONF | eAPI enable+conf+cmds | NETCONF `<edit-config>` | NX-API CLI cmds |
+| `APPLY_CONFIG` | RESTCONF | eAPI enable+conf+cmds | **NETCONF** `<edit-config>` + `commit` | NX-API CLI cmds |
 | `ROLLBACK_CONFIG` | RESTCONF `rollback N` | eAPI `rollback rescue-config` | SSH `configure replace flash:pre.config` | NX-API CLI `rollback running-config checkpoint` |
-| `INTERFACE_ACTION` | RESTCONF set | eAPI cmds | NETCONF | NX-API cmds |
+| `INTERFACE_ACTION` | RESTCONF set | eAPI cmds | **NETCONF** `<edit-config>` | NX-API cmds |
 | `GET_LOGS` | syslog UDP push | syslog UDP push | syslog UDP push | syslog UDP push |
 | `MANAGED_CHECK` | RESTCONF probe | eAPI show ver | RESTCONF `ietf-system` | NX-API REST `show version` |
 
@@ -52,7 +52,7 @@ worker/netconsole_worker/
 │   ├── managed_check.py
 │   └── registry.py                 # each task delegates to backend
 ├── junos_rest.py                   # unchanged -- wrapped by backends/juniper.py
-├── ssh_client.py                   # unchanged -- reused for SSH fallback
+├── ssh_client.py                   # CHANGED: + netconf_interface_action() helper
 └── config.py                       # CHANGED: new env vars
 ```
 
@@ -308,8 +308,74 @@ trivial. Auth = HTTP Basic. JSON-RPC 2.0 envelopes.
 
 ### Cisco IOS-XE (`backends/iosxe.py`)
 
-RESTCONF first; SSH CLI fallback when RESTCONF returns 501/404 or
-`Cisco-IOS-XE-mac-address-table-oper` 404s (very common on 16.x).
+NETCONF (port 830) first for config ops; SSH CLI fallback when NETCONF returns
+connection refused (device doesn't have `netconf-yang` enabled). RESTCONF
+(HTTPS :443) not used in practice — the device's HTTPS listener times out even
+with `ip http secure-server` configured, and YANG model paths return 404 on many
+IOS-XE image versions.
+
+```python
+class IOSxeBackend(DeviceBackend):
+    def interface_action(self, device, *, action, iface, vlan):
+        # Primary: NETCONF <edit-config> targeting <running/> with Cisco-IOS-XE-native YANG.
+        # shut   → <shutdown nc:operation="merge"/>   (add element = admin down)
+        # no-shut → <shutdown nc:operation="delete"/>  (remove element = admin up)
+        nc_result = netconf_interface_action(
+            host=device.ip,
+            username=self.config.ssh_user,
+            password=self.config.ssh_password,
+            iface_name=iface,
+            action=action,          # "shut" | "no-shut"
+            port=830,
+            timeout=30,
+        )
+        if nc_result["ok"]:
+            return {
+                "implemented": True,
+                "source": "netconf",
+                "action": action,
+                "interface": iface,
+                "vlan": vlan,
+                "adminStatus": nc_result["adminStatus"],
+                "message": nc_result["message"],
+            }
+        # NETCONF failed (e.g. device has no netconf-yang) — fall back to SSH CLI
+        logger.warning("NETCONF %s failed, falling back to SSH CLI: %s",
+                       action, nc_result.get("error", ""))
+        return self._ssh_fallback(...)
+```
+
+The worker already has `ncclient` installed (used by `netconf_interface_action` in
+`worker/netconsole_worker/ssh_client.py`). SSH fallback uses `run_ssh_commands_session`
+to keep config mode open across multiple CLI lines.
+
+```python
+# NETCONF XML for Cisco IOS-XE native YANG:
+def _build_nc_iface_shutdown(name: str, shutdown: bool) -> str:
+    op = "merge" if shutdown else "delete"   # shut=add element, no-shut=remove element
+    return (
+        '<nc:edit-config xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0">'
+        '<nc:target><nc:running/></nc:target>'
+        '<nc:config>'
+        '<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">'
+        '<interface>'
+        '<GigabitEthernet><name>{short_name}</name>'
+        f'<shutdown nc:operation="{op}"/>'
+        '</GigabitEthernet>'
+        '</interface>'
+        '</native>'
+        '</nc:config>'
+        '</nc:edit-config>'
+    )
+```
+
+> **Device-side config needed:** IOS-XE device must have `netconf-yang` and
+> `netconf ssh` configured. On 17.x+ this is enabled by default on most images.
+> Check with `show running-config | include netconf`.
+
+> **NETCONF over SSH on IOS-XE uses port 830.** The SSH subsystem name is
+> `netconf`. Banner check: `SSH-2.0-Cisco-1.25` on port 22 (IOS CLI),
+> `SSH-2.0-...` on port 830 (NETCONF subsystem).
 
 ```python
 class IOSxeBackend(DeviceBackend):
@@ -347,11 +413,10 @@ class IOSxeBackend(DeviceBackend):
                                   parser=parse_cisco_ios_show_run)
 
     def apply_config(self, device, config, *, log):
-        # IOS-XE has no native commit semantics -- use NETCONF <edit-config>
-        # running, then `<commit>` in a follow-up call.
+        # IOS-XE uses ':writable-running:1.0' NETCONF -- no separate commit needed.
+        # `<edit-config target="running"/>` applies immediately.
         nc_client = netconf_connect(device)
         nc_client.edit_config(target="running", config=config)
-        nc_client.commit()
         return {"implemented": True, "source": "iosxe-netconf", "message": f"Committed to {device.name}"}
 
     def rollback_config(self, device, rollback):
@@ -487,7 +552,7 @@ predictable; one normalizer function per shape.
 | `worker/netconsole_worker/backends/base.py` | NEW | ABC |
 | `worker/netconsole_worker/backends/juniper.py` | NEW | wraps junos_rest.py |
 | `worker/netconsole_worker/backends/eos.py` | NEW | eAPI client |
-| `worker/netconsole_worker/backends/iosxe.py` | NEW | RESTCONF + NETCONF |
+| `worker/netconsole_worker/backends/iosxe.py` | CHANGED | NETCONF primary for interface_action; SSH fallback |
 | `worker/netconsole_worker/backends/nxos.py` | NEW | NX-API REST + CLI |
 | `worker/netconsole_worker/parsers/eos_*.py` | NEW | (4 files) |
 | `worker/netconsole_worker/parsers/cisco_ios_*.py` | NEW | (5 files) |

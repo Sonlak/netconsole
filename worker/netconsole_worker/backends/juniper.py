@@ -69,10 +69,74 @@ def _rest_creds(config: Any) -> dict[str, Any]:
 
 
 def _set_commands(config: str) -> list[str]:
+    """Turn a free-form config string into Junos `set` / `delete` lines.
+
+    Junos only accepts lines that start with `set`, `delete`, `deactivate`,
+    `activate`, `protect`, `unprotect`, `edit`, `top`, `up`, `exit`,
+    `commit`, `rollback`, `show`, `load`, `save`, `rename`, `copy`, `set`
+    (alias), or `configure`. Anything else (HTML comments `<!-- ... -->`,
+    C-style `/* ... */`, leading `!`, blank lines, plain prose) is
+    stripped before sending to the device. C-style comments in particular
+    reach the Junos parser as a literal "unknown command: /*" error and
+    leave the candidate database in a modified state, which the next
+    commit then fails on.
+    """
     commands: list[str] = []
+    in_block_comment = False
     for line in config.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(("#", "!")):
+        if not stripped:
+            continue
+        if stripped.startswith("#") or stripped.startswith("!"):
+            continue
+        # Handle /* ... */ block comments
+        if in_block_comment:
+            end = stripped.find("*/")
+            if end < 0:
+                continue
+            stripped = stripped[end + 2 :].strip()
+            in_block_comment = False
+            if not stripped:
+                continue
+        if stripped.startswith("/*"):
+            end = stripped.find("*/", 2)
+            if end < 0:
+                # Block comment continues to the next line
+                in_block_comment = True
+                continue
+            stripped = stripped[end + 2 :].strip()
+            if not stripped:
+                continue
+        # Drop inline /* ... */ too — Junos can't ignore them mid-line
+        if "/*" in stripped and "*/" in stripped:
+            stripped = stripped[: stripped.find("/*")] + stripped[stripped.find("*/") + 2 :]
+            stripped = stripped.strip()
+            if not stripped:
+                continue
+        # Junos "set" commands must start with a known verb. Anything
+        # else (HTML `<!--`, plain text, leftover prose from a copy/paste)
+        # is dropped to avoid polluting the candidate database.
+        verb = stripped.split(None, 1)[0].lower()
+        if verb not in {
+            "set",
+            "delete",
+            "deactivate",
+            "activate",
+            "protect",
+            "unprotect",
+            "edit",
+            "top",
+            "up",
+            "exit",
+            "commit",
+            "rollback",
+            "show",
+            "load",
+            "save",
+            "rename",
+            "copy",
+            "configure",
+        }:
             continue
         commands.append(stripped)
     return commands
@@ -351,7 +415,11 @@ class JuniperBackend(DeviceBackend):
                 device.ip,
                 commands,
                 log=log,
-                timeout=60.0,
+                # 90s gives the lab cRPD sim enough headroom for the
+                # first-of-session <commit-configuration> spike (we have
+                # observed 20-32s cold-starts on Junos cRPD). Watchdog
+                # in the backend is 300s for Juniper (see jobWatchdog.ts).
+                timeout=90.0,
                 **creds,
             )
             if applied["ok"]:

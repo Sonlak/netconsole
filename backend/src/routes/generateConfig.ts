@@ -145,6 +145,44 @@ async function enqueue(
   res.status(202).json({ job, saved: device.savedConfig });
 }
 
+/**
+ * Lightweight payload sanity check before we enqueue an APPLY_CONFIG or
+ * ROLLBACK_CONFIG job. The worker has its own comment-stripping
+ * (`_set_commands` in `worker/netconsole_worker/backends/juniper.py`)
+ * but that runs AFTER the candidate database has already been opened
+ * on the device. Catching obvious garbage here turns a confusing
+ * "configuration database modified" failure on the device into a
+ * clear 400 response so the operator can fix the input.
+ */
+function validateConfigPayload(
+  content: string,
+  vendor: string,
+): { ok: true } | { ok: false; error: string } {
+  if (!content.trim()) {
+    return { ok: false, error: 'Config rỗng — nhập nội dung trước khi commit' };
+  }
+  // Disallow characters/sequences that no vendor accepts in config and
+  // that would leave the device in a half-loaded state if sent through.
+  if (content.includes('\u0000')) {
+    return { ok: false, error: 'Config chứa ký tự NULL (0x00) — không hợp lệ' };
+  }
+  if (/<\s*script\b/i.test(content) || /<\?xml/i.test(content)) {
+    return { ok: false, error: 'Config chứa markup HTML/XML nguyên — không gửi được xuống thiết bị' };
+  }
+  // Juniper-specific: `/* ... */` C-style comments are not valid in set
+  // format and produce a fatal parser error mid-load.
+  if (vendor.toLowerCase() === 'juniper') {
+    if (/\/\*/.test(content) || /\*\//.test(content)) {
+      return {
+        ok: false,
+        error:
+          'Juniper không chấp nhận comment C-style (/* ... */). Dùng # hoặc xoá comment đó trước khi commit.',
+      };
+    }
+  }
+  return { ok: true };
+}
+
 generateConfigRouter.post('/devices/:id/commit', async (req, res) => {
   const device = await prisma.device.findUnique({
     where: { id: req.params.id },
@@ -165,6 +203,12 @@ generateConfigRouter.post('/devices/:id/commit', async (req, res) => {
       : device.savedConfig?.content) ?? '';
   if (!content.trim()) {
     res.status(400).json({ error: 'Chưa có config để commit — lưu trên tool trước' });
+    return;
+  }
+
+  const validation = validateConfigPayload(content, device.vendor);
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
     return;
   }
 
@@ -268,6 +312,7 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
       name: true,
       ip: true,
       status: true,
+      vendor: true,
       savedConfig: { select: { committedContent: true } },
     },
   });
@@ -293,6 +338,19 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
     const content = useLiteral
       ? literalContent
       : renderConfigTemplate(effectiveRole as ConfigRole, device);
+
+    // Reject the whole bulk deploy early if the payload would crash the
+    // Junos parser on any Juniper target in the selection. Catching it
+    // here means the operator sees the failure once instead of having
+    // half the batch land and the other half leave the candidate
+    // database in a "modified" state on every remaining device.
+    if (useLiteral) {
+      const validation = validateConfigPayload(content, device.vendor);
+      if (!validation.ok) {
+        skipped.push({ deviceId, reason: validation.error });
+        continue;
+      }
+    }
     const previous = device.savedConfig?.committedContent ?? '';
 
     await prisma.deviceSavedConfig.upsert({
