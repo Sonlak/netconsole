@@ -2,6 +2,7 @@ import cors from 'cors';
 import compression from 'compression';
 import express from 'express';
 import { devicesRouter } from './routes/devices.js';
+import { registerDeviceOperationRoutes } from './routes/deviceOperations.js';
 import { discoveryRouter } from './routes/discovery.js';
 import { jobsRouter } from './routes/jobs.js';
 import { arpAddressesRouter } from './routes/arpAddresses.js';
@@ -148,6 +149,9 @@ app.get('/api/health', (_req, res) => {
 
 // Auth routes - không cần auth để login/register
 app.use('/api/auth', authRateLimit, authRouter);
+
+// Register per-device operation routes (config/arp/mac/connect) on the devices router
+registerDeviceOperationRoutes(devicesRouter);
 
 // Protected API routes - tất cả cần auth
 app.use('/api/devices', authMiddleware, strictRateLimit, devicesRouter);
