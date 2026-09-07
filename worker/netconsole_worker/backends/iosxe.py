@@ -16,9 +16,8 @@ from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
-from netconsole_worker.parsers.show_arp import parse_juniper_arp_table, parse_cisco_arp_table
-
-from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table, parse_cisco_mac_table
+from netconsole_worker.parsers.show_arp import parse_cisco_arp_table
+from netconsole_worker.parsers.show_mac_table import parse_cisco_mac_table
 from netconsole_worker.ssh_client import run_ssh_command
 
 logger = logging.getLogger(__name__)
