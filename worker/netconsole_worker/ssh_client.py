@@ -373,8 +373,8 @@ def run_ssh_commands_session(
     Uses ``sshpass + ssh -tt`` to open a PTY session and pipe all commands
     through stdin, reading responses after each one.
     """
-    import logging, re, subprocess
-    log = logging.getLogger(__name__)
+    import re
+    import subprocess
 
     # Assemble commands with markers between them.
     # We use a unique marker per invocation and echo it to stderr (fd 2)
@@ -816,7 +816,6 @@ def _xml_to_ios_text(elem, indent: int = 0) -> list[str]:
             # → " switchport trunk native vlan 1"
             for sub in child:
                 stag = _ns(sub.tag)
-                grandchildren = list(sub)
                 if stag == "allowed-vlan":
                     v = sub.find("{%s}vlans" % _NS_NATIVE)
                     if v is not None:
