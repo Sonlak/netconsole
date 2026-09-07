@@ -22,6 +22,8 @@ from netconsole_worker.junos_rest import (
     fetch_interfaces_set_config,
     fetch_log_information,
     fetch_vlan_information,
+    get_rest_pool,
+    post_junos_rpc,
     probe_device_identity,
     rollback_configuration,
 )
@@ -535,6 +537,86 @@ class JuniperBackend(DeviceBackend):
             }
 
         raise RuntimeError(rest_error or "ROLLBACK_CONFIG requires JUNOS_REST or LAB_SSH")
+
+    def recover_junos(self, device: DeviceInfo) -> dict[str, Any]:
+        """Clear a stuck Junos candidate database.
+
+        Called when the operator hits "Recover Junos" in the UI after
+        a load+commit cycle left the device in a "configuration
+        database modified" state. Posts `<discard-changes/>` over
+        RESTCONF (preferred) or via SSH CLI (fallback) and reports
+        what happened. After a successful discard, the next APPLY_CONFIG
+        starts from a clean candidate database.
+        """
+        log = f"NetConsole recover_junos {device.name}"
+        creds = _rest_creds(self.config)
+
+        if self.config.juniper.enabled:
+            pool = get_rest_pool()
+            client = pool.borrow(
+                device.ip,
+                creds["port"],
+                creds["username"],
+                creds["password"],
+                creds["scheme"],
+                creds["verify_tls"],
+                timeout=30.0,
+            )
+            result = post_junos_rpc(
+                device.ip,
+                "<discard-changes/>",
+                client=client,
+                scheme=creds["scheme"],
+                port=creds["port"],
+            )
+            raw = result.get("raw") or ""
+            # <discard-changes/> returns an <xnm:error> only when there
+            # is nothing to discard; that is a no-op success, not a
+            # failure.
+            ok = result["ok"] or "nothing to discard" in raw.lower()
+            if ok:
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "message": f"Discarded pending changes on {device.name}",
+                    "raw": compact_raw(raw),
+                }
+            return {
+                "implemented": False,
+                "source": "junos-rest",
+                "message": result.get("error") or "Junos REST discard failed",
+                "raw": compact_raw(raw),
+            }
+
+        if self.config.ssh_enabled:
+            ssh = run_ssh_command(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                command="configure exclusive; rollback 0; commit and-quit",
+                timeout=45,
+            )
+            if ssh.get("sshOk"):
+                output = ssh.get("output") or ""
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli",
+                    "output": output,
+                    "message": f"Discarded pending changes on {device.name}",
+                }
+            return {
+                "implemented": False,
+                "source": "ssh-cli",
+                "message": ssh.get("error") or "Junos SSH discard failed",
+            }
+
+        return {
+            "implemented": False,
+            "source": None,
+            "message": "RECOVER_JUNOS requires JUNOS_REST or LAB_SSH",
+        }
+        _ = log  # reserved for future audit logging
 
     def interface_action(
         self,

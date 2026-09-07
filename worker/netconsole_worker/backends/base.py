@@ -115,3 +115,12 @@ class DeviceBackend(ABC):
     def connect_test(self, device: DeviceInfo) -> dict[str, Any]:
         """Liveness probe; default falls back to a `show version` SSH call."""
         return {"connected": False, "protocol": "ssh", "message": "not implemented"}
+
+    def recover_junos(self, device: DeviceInfo) -> dict[str, Any]:
+        """Juniper-only: post `<discard-changes/>` to clear a stuck candidate
+        database. Other vendors raise NotImplementedError so the operator
+        sees a clear "not supported" message instead of a silent no-op.
+        """
+        raise NotImplementedError(
+            f"recover_junos is not implemented for backend {self.source!r}"
+        )

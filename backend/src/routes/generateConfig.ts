@@ -154,6 +154,110 @@ async function enqueue(
  * "configuration database modified" failure on the device into a
  * clear 400 response so the operator can fix the input.
  */
+// Single source of truth for Junos "set" verbs accepted by the device.
+// Mirrors the whitelist in `worker/netconsole_worker/backends/juniper.py::_set_commands`
+// — any verb outside this list will reach the Junos parser as
+// "unknown command" and leave the candidate database in a modified
+// state (then the next commit fails with "configuration database
+// modified"). We surface the same whitelist at the API layer so the
+// operator gets a clear 400 instead of a worker-side silent skip.
+export const JUNIPER_SET_VERBS: ReadonlySet<string> = new Set([
+  'set',
+  'delete',
+  'deactivate',
+  'activate',
+  'protect',
+  'unprotect',
+  'edit',
+  'top',
+  'up',
+  'exit',
+  'commit',
+  'rollback',
+  'show',
+  'load',
+  'save',
+  'rename',
+  'copy',
+  'configure',
+]);
+
+const COMMENT_PREFIXES = ['#', '!'];
+const BLOCK_COMMENT_START = '/*';
+const BLOCK_COMMENT_END = '*/';
+
+/** Strip the same constructs `_set_commands` strips in the worker, so the
+ *  pre-check matches the worker whitelist line-for-line. Returns the
+ *  remaining lines *with their original index* so we can report which
+ *  source line was rejected. */
+function stripJuniperNoise(
+  content: string,
+): Array<{ line: string; index: number }> {
+  const out: Array<{ line: string; index: number }> = [];
+  const lines = content.split(/\r?\n/);
+  let inBlock = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    let line = lines[i].trim();
+    if (!line) continue;
+    if (inBlock) {
+      const end = line.indexOf(BLOCK_COMMENT_END);
+      if (end < 0) continue;
+      line = line.slice(end + BLOCK_COMMENT_END.length).trim();
+      inBlock = false;
+      if (!line) continue;
+    }
+    if (line.startsWith(COMMENT_PREFIXES[0]) || line.startsWith(COMMENT_PREFIXES[1])) {
+      continue;
+    }
+    if (line.startsWith(BLOCK_COMMENT_START)) {
+      const end = line.indexOf(BLOCK_COMMENT_END, BLOCK_COMMENT_START.length);
+      if (end < 0) {
+        inBlock = true;
+        continue;
+      }
+      line = line.slice(end + BLOCK_COMMENT_END.length).trim();
+      if (!line) continue;
+    }
+    // Drop inline /* ... */
+    const blockStart = line.indexOf(BLOCK_COMMENT_START);
+    const blockEnd = line.indexOf(BLOCK_COMMENT_END);
+    if (blockStart >= 0 && blockEnd > blockStart) {
+      line = (line.slice(0, blockStart) + line.slice(blockEnd + BLOCK_COMMENT_END.length)).trim();
+      if (!line) continue;
+    }
+    out.push({ line, index: i + 1 }); // 1-indexed for human messages
+  }
+  return out;
+}
+
+function validateJuniperSetLines(
+  content: string,
+): { ok: true } | { ok: false; error: string } {
+  const cleaned = stripJuniperNoise(content);
+  const bad: Array<{ line: string; index: number; verb: string }> = [];
+  for (const { line, index } of cleaned) {
+    const verb = line.split(/\s+/, 1)[0]?.toLowerCase() ?? '';
+    if (!JUNIPER_SET_VERBS.has(verb)) {
+      bad.push({ line, index, verb });
+    }
+  }
+  if (bad.length === 0) return { ok: true };
+  // Show up to 3 offenders so the operator can find them quickly without
+  // dumping the whole config in the error toast.
+  const sample = bad
+    .slice(0, 3)
+    .map((b) => `  dòng ${b.index}: "${b.verb}" (snippet: ${b.line.slice(0, 40)})`)
+    .join('\n');
+  const more = bad.length > 3 ? `\n  … và ${bad.length - 3} dòng khác.` : '';
+  return {
+    ok: false,
+    error:
+      `Juniper: ${bad.length} dòng không bắt đầu bằng verb hợp lệ (set/delete/deactivate/activate/edit/commit/...).\n` +
+      `${sample}${more}\n` +
+      `Mỗi dòng phải bắt đầu bằng "set …", "delete …", v.v. — kiểm tra lại nội dung trước khi commit.`,
+  };
+}
+
 function validateConfigPayload(
   content: string,
   vendor: string,
@@ -178,6 +282,10 @@ function validateConfigPayload(
         error:
           'Juniper không chấp nhận comment C-style (/* ... */). Dùng # hoặc xoá comment đó trước khi commit.',
       };
+    }
+    const setCheck = validateJuniperSetLines(content);
+    if (!setCheck.ok) {
+      return setCheck;
     }
   }
   return { ok: true };
@@ -254,6 +362,37 @@ generateConfigRouter.post('/devices/:id/rollback', async (req, res) => {
     device.id,
     JobType.ROLLBACK_CONFIG,
     { rollback: 1, previous: device.savedConfig?.rollbackContent ?? '' },
+    res,
+  );
+});
+
+/**
+ * Recovery endpoint for Juniper devices stuck in
+ * "configuration database modified" state (e.g. after a botched
+ * commit or repeated syntax-error retries). Enqueues an APPLY_CONFIG
+ * job with `recover: 'discard-junos'`; the worker detects the sentinel
+ * in `tasks/registry.py::ApplyConfigTask.run` and short-circuits to
+ * `JuniperBackend.recover_junos()` which posts `<discard-changes/>`
+ * over RESTCONF (SSH fallback).
+ *
+ * Response shape is the same as `/devices/:id/rollback`: `{ job }`.
+ */
+generateConfigRouter.post('/devices/:id/recover-junos', async (req, res) => {
+  const device = await prisma.device.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!device) {
+    res.status(404).json({ error: 'Device not found' });
+    return;
+  }
+  if (device.vendor.toLowerCase() !== 'juniper') {
+    res.status(409).json({ error: 'recover-junos chỉ hỗ trợ thiết bị Juniper' });
+    return;
+  }
+  await enqueue(
+    device.id,
+    JobType.APPLY_CONFIG,
+    { recover: 'discard-junos' },
     res,
   );
 });
