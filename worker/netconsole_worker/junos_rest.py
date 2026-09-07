@@ -234,6 +234,13 @@ def format_junos_rpc_error(text: str) -> str | None:
 
     lowered = (text or "").lower()
     if "<xnm:error" not in lowered and "<rpc-error" not in lowered and "<error-message>" not in lowered:
+        # No recognised error wrapper found.  Fall back to a snippet of the raw
+        # response so the operator at least sees something useful instead of
+        # the generic "commit-configuration failed" message.
+        stripped = (text or "").strip()
+        if stripped:
+            snippet = stripped[:300]
+            return f"device error: {snippet}"
         return None
 
     blocks = re.findall(
