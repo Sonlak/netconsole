@@ -51,8 +51,6 @@ Full detail: `docs/agents/05-gotchas.md`
 
 ## Active TODOs
 
-- **Notification silently swallowed on commit success** -- `reportFinal()` in `frontend/src/lib/jobNotifier.tsx` uses AntD static API (`import { notification } from 'antd'`). Toast fires but does not render on UI. Most likely cause: AntD 5 static API + React 19 StrictMode + `unstableSetRender` interaction (the docs warn this can silently no-op in StrictMode dev). Fix: switch to `App.useApp().notification` inside `jobNotifier.tsx`. Low-risk frontend patch.
-- **`/api/jobs` lacks `type` filter + offset pagination** (line 48-65 of `backend/src/routes/jobs.ts`) -- hard-coded `take: 100` means audit-by-script is impossible and the UI jobs page is a lie once you have > 100 jobs. Add `type`, `offset`, `limit` query params + validate against the `JobType` enum.
 - **`mustChangePassword` redirect not wired** -- `ProtectedRoute` needs to redirect to `/change-password-required` when flag is true
 - **Rollback schema-drift**: `rollback.yml` fails if `prisma db push` must drop tables with data. Need `--accept-data-loss` flag or schema-drift detection
 - **Off-host backup copy**: `backup_postgres.sh` dumps locally; no rsync to Tailscale NAS or B2 yet
