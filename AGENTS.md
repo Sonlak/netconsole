@@ -52,7 +52,7 @@ Full detail: `docs/agents/05-gotchas.md`
 - **`mustChangePassword` redirect not wired** -- `ProtectedRoute` needs to redirect to `/change-password-required` when flag is true
 - **Rollback schema-drift**: `rollback.yml` fails if `prisma db push` must drop tables with data. Need `--accept-data-loss` flag or schema-drift detection
 - **Off-host backup copy**: `backup_postgres.sh` dumps locally; no rsync to Tailscale NAS or B2 yet
-- **Multi-vendor worker (EOS + Cisco IOS-XE + NX-OS)** -- add `backends/{eos,iosxe,nxos}.py` + parsers + env vars; full plan in `docs/agents/08-vendor-extension-plan.md`, device configs in `docs/agents/09-vendor-device-configs.md`. Rollout order: refactor `backends/juniper.py` first (zero regression) -> EOS -> IOS-XE -> NX-OS -> frontend vendor Select. New libs: `ncclient`, `ntc-templates`, `textfsm`. Lab: confirm `ceos` / `csr1000v` / `n9kv` images + decide shared vs per-device credentials (still env-var-only in v1). NOTE: user requested 2026-09-07; response blocked by token budget -- pick up next session
+- **Per-device vendor credentials (Phase 2)** -- shared `ENABLE_*_API` env vars are fine for v1, but prod users will want per-device override (e.g. a single Arista in a fleet of Junipers). Plan: add `Device.connectorJson` JSON column; `select_backend` reads per-device creds first, env fallback second. Schema migration is a one-line `prisma db push`, but the worker needs new env-var resolution paths. Backlog only -- not started.
 
 ---
 
