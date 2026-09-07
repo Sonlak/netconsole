@@ -16,9 +16,9 @@ from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
-from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for SSH fallback
-from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse  # reused for SSH fallback
-from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table  # reused
+from netconsole_worker.parsers.show_arp import parse_juniper_arp_table, parse_cisco_arp_table
+
+from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table, parse_cisco_mac_table
 from netconsole_worker.ssh_client import run_ssh_command
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,29 @@ class IOSxeBackend(DeviceBackend):
     # -- READ --------------------------------------------------------------
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
+        # Prefer SSH — `show interfaces` gives speed/MTU/description/mac.
+        # RESTCONF ietf-interfaces is sparse on this lab image.
+        rest_error: str | None = None
+        if self.config.ssh_enabled:
+            fb = self._ssh_fallback(device, "show interfaces", None)
+            if fb["ok"]:
+                lines = (fb["output"] or "").splitlines()
+                interfaces = _parse_cisco_interfaces(lines)
+                if interfaces:
+                    return {
+                        "implemented": True,
+                        "source": "ssh-cli",
+                        "command": "show interfaces",
+                        "interfaces": interfaces,
+                        "message": "Lab SSH interfaces OK",
+                        "raw": fb["output"],
+                    }
+                ssh_error = "SSH show interfaces returned no data"
+            else:
+                ssh_error = fb["error"] or "SSH failed"
+        else:
+            ssh_error = None
+
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/ietf-interfaces:interfaces")
             if r["ok"]:
@@ -127,47 +150,39 @@ class IOSxeBackend(DeviceBackend):
                         "command": "ietf-interfaces:interfaces",
                         "interfaces": interfaces,
                         "message": "IOS-XE RESTCONF interfaces OK",
+                        "restError": ssh_error,
                     }
                 rest_error = "RESTCONF returned no interfaces"
             else:
                 rest_error = r["error"]
-        else:
-            rest_error = None
 
-        # SSH fallback to `show ip interface brief` (parse with Juniper's
-        # `parse_interfaces_terse` — it's vendor-agnostic enough for our
-        # purposes; a tighter IOS-XE parser can land later).
-        if self.config.ssh_enabled:
-            fb = self._ssh_fallback(device, "show ip interface brief", parse_interfaces_terse)
-            if fb["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "ssh-cli",
-                    "command": "show ip interface brief",
-                    "interfaces": fb["parsed"] or [],
-                    "message": "SSH fallback OK" if rest_error else "Lab SSH interfaces OK",
-                    "raw": fb["output"],
-                    "restError": rest_error,
-                }
-            return {
-                "implemented": False,
-                "source": "ssh-cli",
-                "interfaces": [],
-                "message": fb["error"] or "SSH failed",
-                "restError": rest_error,
-            }
         return {
             "implemented": False,
             "interfaces": [],
             "source": None,
-            "message": rest_error or "Enable IOSXE_API or LAB_SSH",
+            "message": rest_error or ssh_error or "Enable IOSXE_API or LAB_SSH",
             "restError": rest_error,
         }
 
     def get_arp(self, device: DeviceInfo) -> dict[str, Any]:
-        # IOS-XE YANG ARP coverage is patchy. Try RESTCONF first; fall
-        # back to SSH immediately if 404.
-        rest_error: str | None = None
+        # Prefer SSH (`show ip arp`) — Cisco IOS-XE 17.x RESTCONF YANG
+        # returns empty `Cisco-IOS-XE-arp-oper:arp-data` even when the
+        # ARP table is populated, so SSH is the reliable path.
+        if self.config.ssh_enabled:
+            fb = self._ssh_fallback(device, "show ip arp", parse_cisco_arp_table)
+            if fb["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli",
+                    "command": "show ip arp",
+                    "entries": fb["parsed"] or [],
+                    "message": "Lab SSH ARP OK",
+                    "raw": fb["output"],
+                }
+            ssh_error = fb["error"] or "SSH failed"
+        else:
+            ssh_error = None
+
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/Cisco-IOS-XE-arp-oper:arp-data")
             if r["ok"]:
@@ -178,41 +193,24 @@ class IOSxeBackend(DeviceBackend):
                     "command": "Cisco-IOS-XE-arp-oper:arp-data",
                     "entries": entries,
                     "message": "IOS-XE RESTCONF ARP OK" if entries else "IOS-XE RESTCONF ARP OK (empty)",
+                    "restError": ssh_error,
                 }
             rest_error = r["error"]
-
-        if self.config.ssh_enabled:
-            fb = self._ssh_fallback(device, "show ip arp", parse_juniper_arp_table)
-            if fb["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "ssh-cli",
-                    "command": "show ip arp",
-                    "entries": fb["parsed"] or [],
-                    "message": "SSH fallback OK" if rest_error else "Lab SSH ARP OK",
-                    "raw": fb["output"],
-                    "restError": rest_error,
-                }
-            return {
-                "implemented": False,
-                "source": "ssh-cli",
-                "entries": [],
-                "message": fb["error"] or "SSH failed",
-                "restError": rest_error,
-            }
+        else:
+            rest_error = None
 
         return {
             "implemented": False,
             "entries": [],
             "source": None,
-            "message": rest_error or "Enable IOSXE_API or LAB_SSH",
+            "message": rest_error or ssh_error or "Enable IOSXE_API or LAB_SSH",
             "restError": rest_error,
         }
 
     def get_mac(self, device: DeviceInfo) -> dict[str, Any]:
         # No stable IOS-XE YANG MAC table — SSH only.
         if self.config.ssh_enabled:
-            fb = self._ssh_fallback(device, "show mac address-table", parse_juniper_mac_table)
+            fb = self._ssh_fallback(device, "show mac address-table", parse_cisco_mac_table)
             if fb["ok"]:
                 return {
                     "implemented": True,
@@ -237,6 +235,27 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def get_config(self, device: DeviceInfo) -> dict[str, Any]:
+        # Prefer SSH CLI because RESTCONF returns JSON (Cisco YANG model)
+        # which the frontend Config Studio can't render as code. SSH returns
+        # the actual `show running-config` text — same shape as Juniper/Arista.
+        if self.config.ssh_enabled:
+            ssh_result = run_ssh_command(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                command="show running-config",
+            )
+            if ssh_result.get("sshOk"):
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli",
+                    "config": ssh_result["output"] or "",
+                    "command": "show running-config",
+                    "message": f"Collected running config from {device.name}",
+                }
+            ssh_error = ssh_result.get("error") or "SSH failed"
+
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/Cisco-IOS-XE-native:native?depth=unbounded")
             if r["ok"]:
@@ -251,25 +270,7 @@ class IOSxeBackend(DeviceBackend):
         else:
             rest_error = None
 
-        if self.config.ssh_enabled:
-            ssh_result = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="show running-config",
-            )
-            if not ssh_result["sshOk"]:
-                raise RuntimeError(ssh_result["error"] or rest_error or "SSH get-config failed")
-            return {
-                "implemented": True,
-                "source": "ssh-cli",
-                "config": ssh_result["output"] or "",
-                "command": "show running-config",
-                "message": f"Collected running config from {device.name}",
-                "restError": rest_error,
-            }
-        raise RuntimeError(rest_error or "GET_CONFIG requires IOSXE_API or LAB_SSH")
+        raise RuntimeError(rest_error or ssh_error or "GET_CONFIG requires IOSXE_API or LAB_SSH")
 
     # -- WRITE -------------------------------------------------------------
 
@@ -501,6 +502,89 @@ def _dump_json(payload: Any) -> str:
     import json
 
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _parse_cisco_interfaces(lines: list[str]) -> list[dict[str, Any]]:
+    """Parse Cisco IOS `show interfaces` text output.
+
+    Each interface block starts with a line like:
+      GigabitEthernet1 is administratively down, line protocol is down
+    We extract name, adminStatus, operStatus, speed, MTU, mac, description.
+    """
+    out: list[dict[str, Any]] = []
+
+    # Find interface block boundaries (lines that start with an interface name).
+    block_starts: list[int] = []
+    for i, line in enumerate(lines):
+        # Interface name line: starts with alphanumeric (no leading space) and
+        # contains ` is ` to mark the admin-status clause.
+        if not line or line[0].isspace():
+            continue
+        if re.search(r"\s+is\s+", line):
+            block_starts.append(i)
+
+    for idx, start in enumerate(block_starts):
+        end = block_starts[idx + 1] if idx + 1 < len(block_starts) else len(lines)
+        block_lines = lines[start:end]
+        block_text = "\n".join(block_lines)
+        first_line = block_lines[0]
+
+        # Extract name: everything before the first ` is `.
+        name_m = re.match(r"^(\S+)", first_line)
+        name = name_m.group(1) if name_m else first_line.split()[0]
+
+        # Admin/oper status.
+        status_m = re.search(
+            r"is\s+((?:administratively\s+)?up|down),\s+line\s+protocol\s+is\s+((?:administratively\s+)?up|down)",
+            first_line,
+        )
+        admin = "up" if status_m and status_m.group(1) == "up" else "down"
+        oper = "up" if status_m and status_m.group(2) == "up" else "down"
+
+        # Speed.
+        speed: int | None = None
+        sm = re.search(r"(\d+)\s*(Mbps|Gbps)", block_text, re.IGNORECASE)
+        if sm:
+            val = int(sm.group(1))
+            speed = val if sm.group(2).upper() == "MBPS" else val * 1000
+
+        # MTU.
+        mtu: int | None = None
+        mtu_m = re.search(r"MTU\s+(\d+)\s+bytes", block_text)
+        if mtu_m:
+            mtu = int(mtu_m.group(1))
+
+        # MAC: "Hardware is ..., address is 5000.0007.0000"
+        mac: str | None = None
+        mac_m = re.search(r"address\s+is\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})", block_text)
+        if mac_m:
+            mac = _normalize_cisco_mac(mac_m.group(1))
+
+        # Description.
+        desc: str | None = None
+        desc_m = re.search(r"Description:\s+(.+)$", block_text, re.MULTILINE)
+        if desc_m:
+            desc = desc_m.group(1).strip()
+
+        out.append({
+            "name": name,
+            "adminStatus": admin,
+            "operStatus": oper,
+            "description": desc,
+            "speed": speed,
+            "mtu": mtu,
+            "macAddress": mac,
+        })
+    return out
+
+
+def _normalize_cisco_mac(mac: str) -> str:
+    """`5000.0007.0003` → `50:00:00:07:00:03`."""
+    parts = mac.split(".")
+    if len(parts) != 3:
+        return mac
+    # Each 4-hex-char group represents the lower 16 bits of an octet.
+    return ":".join(p.lower() for p in parts)
 
 
 def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
