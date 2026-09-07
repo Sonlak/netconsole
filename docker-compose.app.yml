@@ -137,6 +137,28 @@ services:
       JUNOS_REST_VERIFY_TLS: "false"
       JUNOS_REST_USER: netconsole
       JUNOS_REST_PASSWORD: Admin@123
+      # Multi-vendor APIs (added 2026-09-07). ENABLE_*_API flags gate
+      # whether the vendor backend will be used for matching devices.
+      # Disabled by default; flip true on a per-host basis when you've
+      # provisioned a real Arista / Cisco device with matching creds.
+      EOS_API_ENABLED: "true"
+      EOS_API_SCHEME: http
+      EOS_API_PORT: "443"
+      EOS_API_VERIFY_TLS: "false"
+      EOS_API_USER: netconsole
+      EOS_API_PASSWORD: Admin@123
+      IOSXE_API_ENABLED: "true"
+      IOSXE_API_SCHEME: https
+      IOSXE_API_PORT: "443"
+      IOSXE_API_VERIFY_TLS: "false"
+      IOSXE_API_USER: netconsole
+      IOSXE_API_PASSWORD: Admin@123
+      NXOS_API_ENABLED: "true"
+      NXOS_API_SCHEME: http
+      NXOS_API_PORT: "80"
+      NXOS_API_VERIFY_TLS: "false"
+      NXOS_API_USER: netconsole
+      NXOS_API_PASSWORD: Admin@123
       KEA_API_URL: http://172.31.0.10:8000/
       KEA_STANDBY_API_URL: http://172.31.0.11:8000/
       KEA_TIMEOUT_MS: "5000"
@@ -180,6 +202,28 @@ services:
       JUNOS_REST_VERIFY_TLS: "false"
       JUNOS_REST_USER: netconsole
       JUNOS_REST_PASSWORD: Admin@123
+      # Multi-vendor APIs (added 2026-09-07). ENABLE_*_API flags gate
+      # whether the vendor backend will be used for matching devices.
+      # Disabled by default; flip true on a per-host basis when you've
+      # provisioned a real Arista / Cisco device with matching creds.
+      EOS_API_ENABLED: "true"
+      EOS_API_SCHEME: http
+      EOS_API_PORT: "443"
+      EOS_API_VERIFY_TLS: "false"
+      EOS_API_USER: netconsole
+      EOS_API_PASSWORD: Admin@123
+      IOSXE_API_ENABLED: "true"
+      IOSXE_API_SCHEME: https
+      IOSXE_API_PORT: "443"
+      IOSXE_API_VERIFY_TLS: "false"
+      IOSXE_API_USER: netconsole
+      IOSXE_API_PASSWORD: Admin@123
+      NXOS_API_ENABLED: "true"
+      NXOS_API_SCHEME: http
+      NXOS_API_PORT: "80"
+      NXOS_API_VERIFY_TLS: "false"
+      NXOS_API_USER: netconsole
+      NXOS_API_PASSWORD: Admin@123
     networks:
       netconsole:
         ipv4_address: 172.31.0.4

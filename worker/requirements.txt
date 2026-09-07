@@ -3,3 +3,15 @@ httpx>=0.28.1
 pydantic>=2.11.0
 pydantic-settings>=2.9.0
 paramiko>=3.5.0
+# Multi-vendor support (added 2026-09-07):
+#   - ncclient: NETCONF client (used by IOS-XE apply_config when RESTCONF
+#     path is insufficient — currently we SSH-fallback instead, but the
+#     dep is pre-staged so we can switch without a separate pip cycle).
+#   - textfsm + ntc-templates: structured-text parsing for Cisco IOS / NX-OS
+#     CLI output. Not yet wired into the new vendor backends (we reuse the
+#     existing Junos parsers as a first cut) but on the critical path for
+#     the next iteration when we need precise ARP/MAC table parsing for
+#     IOS-XE.
+ncclient>=0.6.13
+textfsm>=1.1.3
+ntc-templates>=2.2.1
