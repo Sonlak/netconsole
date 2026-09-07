@@ -69,7 +69,7 @@ class NxosBackend(DeviceBackend):
             timeout=30.0,
         )
         try:
-            resp = client.get(f"{self.MO}/{mo_path}.json", timeout=30.0)
+            resp = client.get(f"{creds['scheme']}://{device.ip}:{creds['port']}{self.MO}/{mo_path}.json", timeout=30.0)
         except Exception as exc:  # noqa: BLE001
             pool.invalidate(
                 host=device.ip, port=creds["port"], username=creds["username"], scheme=creds["scheme"]
@@ -106,7 +106,7 @@ class NxosBackend(DeviceBackend):
             }
         }
         try:
-            resp = client.post(self.INS, json=payload, timeout=45.0)
+            resp = client.post(f"{creds['scheme']}://{device.ip}:{creds['port']}{self.INS}", json=payload, timeout=45.0)
         except Exception as exc:  # noqa: BLE001
             pool.invalidate(
                 host=device.ip, port=creds["port"], username=creds["username"], scheme=creds["scheme"]

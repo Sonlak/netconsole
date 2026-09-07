@@ -72,8 +72,9 @@ class IOSxeBackend(DeviceBackend):
             timeout=30.0,
         )
         try:
+            url = f"{creds['scheme']}://{device.ip}:{creds['port']}{self.BASE}{path}"
             resp = client.get(
-                f"{self.BASE}{path}",
+                url,
                 headers={"Accept": "application/yang-data+json"},
                 timeout=30.0,
             )

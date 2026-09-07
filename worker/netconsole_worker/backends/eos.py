@@ -86,8 +86,9 @@ class EOSBackend(DeviceBackend):
                 "format": fmt,
             },
         }
+        url = f"{creds['scheme']}://{device.ip}:{creds['port']}/command-api"
         try:
-            resp = client.post("/command-api", json=payload, timeout=45.0)
+            resp = client.post(url, json=payload, timeout=45.0)
         except Exception as exc:  # noqa: BLE001
             pool.invalidate(
                 host=device.ip, port=creds["port"], username=creds["username"], scheme=creds["scheme"]
