@@ -111,6 +111,54 @@ def _slice_eos_interface_block(section_output: str, iface: str) -> str:
     return "\n".join(out_lines)
 
 
+def _serialize_eos_json_config(result: list[dict[str, Any]]) -> str:
+    """Serialize EOS JSON structured running-config to plain text.
+
+    EOS 4.33+ returns `show running-config` with `format: json` as a
+    structured JSON object with keys:
+      - header:  list of lines (already prefixed with `!`)
+      - comments: list of comment lines
+      - cmds:    dict of top-level commands; values are either None (no
+                 subcommands) or a dict containing a "cmds" sub-dict.
+
+    We serialize it back to the same text format that `format: text`
+    would have returned on older EOS.
+    """
+    if not result:
+        return ""
+    first = result[0]
+    if not isinstance(first, dict):
+        return str(first)
+
+    lines: list[str] = []
+
+    # 1. Header lines (already have `!` prefix).
+    for h in first.get("header", []):
+        lines.append(str(h))
+
+    # 2. Comments.
+    for c in first.get("comments", []):
+        lines.append(f"!{c}" if not str(c).startswith("!") else str(c))
+
+    def _emit_cmds(cmds: dict[str, Any], indent: int = 0) -> None:
+        sub = cmds.get("cmds") if isinstance(cmds, dict) else None
+        if sub is None:
+            return
+        prefix = " " * indent
+        for cmd, subval in sub.items():
+            lines.append(f"{prefix}{cmd}")
+            if isinstance(subval, dict):
+                _emit_cmds(subval, indent + 1)
+
+    # 3. Top-level commands.
+    for cmd, val in first.get("cmds", {}).items():
+        lines.append(cmd)
+        if isinstance(val, dict):
+            _emit_cmds(val, indent=1)
+
+    return "\n".join(lines)
+
+
 class EOSBackend(DeviceBackend):
     """Arista EOS backend (eAPI over HTTPS)."""
 
@@ -324,13 +372,21 @@ class EOSBackend(DeviceBackend):
 
     def get_config(self, device: DeviceInfo) -> dict[str, Any]:
         if self.config.eos.enabled:
-            r = self._run_cmds(device, [{"cmd": "show running-config", "format": "text"}])
+            r = self._run_cmds(device, [{"cmd": "show running-config", "format": "json"}])
             if r["ok"]:
-                # eAPI JSON returns a list of {cmd, output} dicts.
+                # EOS 4.33+ returns structured JSON even with format=text.
+                # Handle both: "output" key (legacy text) and structured
+                # JSON (header + cmds).
                 config = ""
                 if r["result"]:
                     first = r["result"][0]
-                    config = first.get("output") if isinstance(first, dict) else str(first)
+                    if isinstance(first, dict):
+                        if "output" in first:
+                            config = first["output"] or ""
+                        else:
+                            config = _serialize_eos_json_config(r["result"])
+                    else:
+                        config = str(first)
                 return {
                     "implemented": True,
                     "source": "eos-api",
@@ -636,6 +692,21 @@ class EOSBackend(DeviceBackend):
 # -------------------- EOS parsers -------------------------------------------
 
 
+_EOS_IFACE_STATUS = {
+    "connected": "up",
+    "notconnect": "down",
+    "errdisabled": "down",
+    "disabled": "down",
+}
+
+
+def _eos_status(raw: str | None) -> str:
+    """Normalize EOS interface/protocol status to 'up' / 'down'."""
+    if not raw:
+        return "unknown"
+    return _EOS_IFACE_STATUS.get(raw.lower(), raw.lower())
+
+
 def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """`show interfaces` JSON → list of {name, adminStatus, operStatus, ...}."""
     if not result:
@@ -648,8 +719,8 @@ def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         out.append({
             "name": name,
-            "adminStatus": body.get("interfaceStatus") or body.get("adminStatus"),
-            "operStatus": body.get("lineProtocolStatus") or body.get("operStatus"),
+            "adminStatus": _eos_status(body.get("interfaceStatus")),
+            "operStatus": _eos_status(body.get("lineProtocolStatus")),
             "description": body.get("description"),
             "speed": body.get("bandwidth"),
             "mtu": body.get("mtu"),
