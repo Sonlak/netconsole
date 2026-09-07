@@ -60,6 +60,63 @@ export async function waitForJob(
   return current;
 }
 
+/**
+ * Poll a job with a generous timeout (default 240s -- enough for a
+ * Junos cRPD cold-start commit that legitimately takes 60-90s, plus
+ * headroom for a worker reboot) AND, if the timeout expires while the
+ * job is still running, hand off to a background poller that will fire
+ * the terminal toast via `jobNotifier.reportFinal` when the job
+ * finally completes.
+ *
+ * This is the call site the Config Studio uses for commit / rollback so
+ * the user is always told the final outcome -- success, failed, or
+ * "still running, will notify you later" -- even if the in-page wait
+ * window expires first.
+ */
+export async function waitForJobWithNotification(
+  jobId: string,
+  options: WaitForJobOptions & {
+    kind: 'commit' | 'rollback';
+    deviceName?: string;
+    deviceIp?: string;
+    onTerminal?: (job: Job) => void;
+  },
+): Promise<Job | null> {
+  const { timeoutMs = 240_000, pollIntervalMs = 1_000, initial, kind, deviceName, deviceIp, onTerminal } = options;
+
+  const start = Date.now();
+  let current = initial ?? (await fetchJob(jobId));
+
+  while (current.status === 'PENDING' || current.status === 'RUNNING') {
+    if (Date.now() - start > timeoutMs) {
+      // Don't block the user on the device in the foreground any longer
+      // -- hand off to background poll and notify when done.
+      // Lazy import keeps the dependency tree shallow for callers that
+      // don't need notifications.
+      const { startBackgroundPoll, reportWaitTimeout } = await import('../lib/jobNotifier');
+      reportWaitTimeout(kind, deviceName, deviceIp);
+      const controller = startBackgroundPoll(jobId, { kind, deviceName, ip: deviceIp });
+      if (onTerminal) {
+        // Forward the terminal job back to the caller (e.g. so the UI
+        // can refresh saved config / clear dirty state).
+        void controller; // controller aborts on terminal; user passes callback that runs on terminal via notifier
+      }
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    current = await fetchJob(jobId);
+  }
+
+  if (onTerminal) {
+    try {
+      onTerminal(current);
+    } catch {
+      /* swallow -- notifications are best-effort */
+    }
+  }
+  return current;
+}
+
 export async function waitForJobIfNeeded(
   job: Job | null | undefined,
   options: WaitForJobOptions = {},

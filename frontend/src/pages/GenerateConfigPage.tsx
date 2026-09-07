@@ -46,7 +46,12 @@ import {
   type ConfigTemplateMeta,
   type DeviceSavedConfig,
 } from '@/api/generateConfig';
-import { JobWaitTimeoutError, waitForJob, waitForJobIfNeeded } from '@/api/jobs';
+import {
+  JobWaitTimeoutError,
+  waitForJobIfNeeded,
+  waitForJobWithNotification,
+} from '@/api/jobs';
+import { reportFinal } from '@/lib/jobNotifier';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
 import { PageSkeleton } from '@/components/common/PageSkeleton';
@@ -314,30 +319,47 @@ function SingleDevicePanel() {
       onOk: async () => {
         setCommitting(true);
         setDeviceRpcError(null);
+        let jobId: string | null = null;
         try {
           const { job } = await commitGenerateConfig(deviceId, { content: draft, role });
-          try {
-            const finished = await waitForJob(job.id, { timeoutMs: 90000 });
-            if (finished.status === 'FAILED') {
-              throw new Error(finished.error || 'Commit failed');
-            }
-            const next = await ackCommitJob(job.id);
-            setSaved(next);
-            setBaseline(draft);
-            await loadState(deviceId, { keepDraft: true });
-            message.success('Committed to device');
-          } catch (cause) {
-            if (cause instanceof JobWaitTimeoutError) {
-              message.warning(
-                <span>
-                  Commit still running — <Link to={`/jobs?q=${job.id}`}>open Jobs</Link>
-                </span>,
-              );
-              return;
-            }
-            throw cause;
+          jobId = job.id;
+          const finished = await waitForJobWithNotification(job.id, {
+            kind: 'commit',
+            deviceName: selectedDevice.name,
+            deviceIp: selectedDevice.ip,
+            timeoutMs: 240_000,
+            onTerminal: (final) => {
+              // Inline terminal toast in addition to the background one
+              // (the notifier also fires from backgroundPoll; this is the
+              // synchronous path for jobs that finished inside the wait).
+              reportFinal('commit', selectedDevice.name, selectedDevice.ip, final);
+            },
+          });
+          if (finished === null) {
+            // Background poll was started -- the user already saw a
+            // "still running" warning. Don't try to ack or reload state
+            // here, we don't know yet whether the job succeeded.
+            return;
           }
+          if (finished.status === 'FAILED') {
+            throw new Error(finished.error || 'Commit failed');
+          }
+          const next = await ackCommitJob(job.id);
+          setSaved(next);
+          setBaseline(draft);
+          await loadState(deviceId, { keepDraft: true });
         } catch (cause) {
+          if (cause instanceof JobWaitTimeoutError) {
+            // Defensive -- waitForJobWithNotification returns null on
+            // timeout rather than throwing. Keeping the branch in case
+            // some future call site uses the bare waitForJob.
+            message.warning(
+              <span>
+                Commit still running — <Link to={`/jobs?q=${jobId ?? ''}`}>open Jobs</Link>
+              </span>,
+            );
+            return;
+          }
           const detail = cause instanceof Error ? cause.message : 'Commit failed';
           showDeviceRpcError('Commit failed', detail);
         } finally {
@@ -360,31 +382,41 @@ function SingleDevicePanel() {
       onOk: async () => {
         setRollingBack(true);
         setDeviceRpcError(null);
+        let jobId: string | null = null;
         try {
           const { job } = await rollbackGenerateConfig(deviceId);
-          try {
-            const finished = await waitForJob(job.id, { timeoutMs: 90000 });
-            if (finished.status === 'FAILED') {
-              throw new Error(finished.error || 'Rollback failed');
-            }
-            const next = await ackRollbackJob(job.id);
-            setSaved(next);
-            setDraft(next.content);
-            setBaseline(next.content);
-            await loadState(deviceId, { keepDraft: true });
-            message.success('Rolled back on device');
-          } catch (cause) {
-            if (cause instanceof JobWaitTimeoutError) {
-              message.warning(
-                <span>
-                  Rollback still running — <Link to={`/jobs?q=${job.id}`}>open Jobs</Link>
-                </span>,
-              );
-              return;
-            }
-            throw cause;
+          jobId = job.id;
+          const finished = await waitForJobWithNotification(job.id, {
+            kind: 'rollback',
+            deviceName: selectedDevice.name,
+            deviceIp: selectedDevice.ip,
+            timeoutMs: 240_000,
+            onTerminal: (final) => {
+              reportFinal('rollback', selectedDevice.name, selectedDevice.ip, final);
+            },
+          });
+          if (finished === null) {
+            // Background poll will toast the outcome; nothing more we
+            // can do here without knowing the result.
+            return;
           }
+          if (finished.status === 'FAILED') {
+            throw new Error(finished.error || 'Rollback failed');
+          }
+          const next = await ackRollbackJob(job.id);
+          setSaved(next);
+          setDraft(next.content);
+          setBaseline(next.content);
+          await loadState(deviceId, { keepDraft: true });
         } catch (cause) {
+          if (cause instanceof JobWaitTimeoutError) {
+            message.warning(
+              <span>
+                Rollback still running — <Link to={`/jobs?q=${jobId ?? ''}`}>open Jobs</Link>
+              </span>,
+            );
+            return;
+          }
           const detail = cause instanceof Error ? cause.message : 'Rollback failed';
           showDeviceRpcError('Rollback failed', detail);
         } finally {
