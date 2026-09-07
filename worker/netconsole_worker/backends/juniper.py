@@ -55,7 +55,11 @@ from netconsole_worker.parsers.vlan_rpc import (
     apply_vlan_membership,
     parse_vlan_information_rpc,
 )
-from netconsole_worker.ssh_client import run_junos_commands, run_ssh_command
+from netconsole_worker.ssh_client import (
+    run_junos_apply_over_ssh,
+    run_junos_commands,
+    run_ssh_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,13 +453,18 @@ class JuniperBackend(DeviceBackend):
             if not previous_ssh["sshOk"]:
                 raise RuntimeError(previous_ssh["error"] or rest_error or "Failed to snapshot running config")
 
-            applied = run_ssh_command(
+            # Use an interactive shell (PTY) session so each `set` line is
+            # sent on its own line and parsed by Junos as if typed at the
+            # CLI. The previous non-interactive `;`-joined form produced
+            # "syntax error, expecting <command>" on every line and a final
+            # "unknown command: commit" on cRPD sims.
+            applied = run_junos_apply_over_ssh(
                 host=device.ip,
                 username=self.config.ssh_user,
                 password=self.config.ssh_password,
+                commands=commands,
                 port=self.config.ssh_port,
-                command="configure exclusive; " + " ; ".join(commands) + "; commit and-quit",
-                timeout=45,
+                timeout=90,
             )
             if not applied["sshOk"]:
                 raise RuntimeError(applied["error"] or rest_error or "Failed to commit config")

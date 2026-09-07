@@ -452,6 +452,118 @@ def run_ssh_commands_session(
     }
 
 
+def run_junos_apply_over_ssh(
+    host: str,
+    username: str,
+    password: str,
+    commands: list[str],
+    *,
+    port: int = 22,
+    timeout: int = 90,
+) -> dict[str, Any]:
+    """Apply a Junos `set` config via an interactive SSH shell session.
+
+    Why this exists: the previous code path used ``run_ssh_command`` with
+    ``command="configure exclusive; " + " ; ".join(commands) + "; commit and-quit"``
+    on a non-interactive exec channel. On Junos cRPD that produced
+    ``error: syntax error, expecting <command>: <verb>`` for every line and
+    finally ``error: unknown command: commit`` because the csh-style parser
+    on a non-TTY exec channel doesn't accept ``;`` between ``set`` stanzas
+    the way an interactive shell does.
+
+    The fix: open a PTY shell (``invoke_shell``), send each line as if
+    typed at the prompt (separated by ``\n``), and wait for the ``>`` or
+    ``#`` prompt between commands. The session stays in ``configure
+    exclusive`` until ``commit and-quit`` exits config mode.
+    """
+    import re
+    import time as _time
+
+    pool = get_pool()
+    entry = pool.borrow(host, port, username, password, timeout=timeout)
+    client = entry.client
+    output_lines: list[str] = []
+    try:
+        shell = client.invoke_shell(term="vt100", width=512, height=512)
+        shell.settimeout(15)
+
+        def _read_until_prompt(deadline_s: float) -> str:
+            """Read shell bytes until we see a Junos prompt or deadline.
+
+            Junos shell uses one of three trailing chars on its prompt:
+            ``>`` for operational mode, ``#`` for configure/edit mode,
+            ``%`` for the error sub-mode. We look for that char immediately
+            followed by a newline (so we don't trip on ``>`` inside an
+            echoed description string). The ``[edit]`` banner is also
+            emitted on entering configure mode, so we accept that as a
+            legitimate non-final signal and keep reading.
+            """
+            buf = ""
+            while _time.time() < deadline_s:
+                if shell.recv_ready():
+                    chunk = shell.recv(65535).decode("utf-8", errors="replace")
+                    buf += chunk
+                    stripped = buf.rstrip()
+                    if not stripped:
+                        continue
+                    # Final chars on a Junos prompt line: >, #, %.
+                    if len(stripped) >= 2 and stripped[-2] in "> #%" and stripped[-1] == " ":
+                        return buf
+                    if stripped.endswith("[edit]"):
+                        # Mid-banner, keep draining.
+                        continue
+                else:
+                    _time.sleep(0.1)
+            return buf
+
+        def _send(line: str) -> str:
+            shell.send(line + "\n")
+            # Per-line budget. Most lines return in <1s; the commit
+            # itself can spike 20-30s on cRPD cold start. Give each
+            # line 30s; the outer `timeout` is enforced separately by
+            # paramiko on the borrowed connection.
+            return _read_until_prompt(_time.time() + 30)
+
+        # Drain the initial banner so we don't mistake it for a prompt.
+        _time.sleep(0.3)
+        if shell.recv_ready():
+            output_lines.append(shell.recv(65535).decode("utf-8", errors="replace"))
+
+        # Enter exclusive config mode first so the candidate DB is locked.
+        output_lines.append(_send("configure exclusive"))
+
+        # Send each set/delete line on its own line.
+        for cmd in commands:
+            output_lines.append(_send(cmd))
+
+        # Commit and exit config mode.
+        commit_out = _send("commit and-quit")
+        output_lines.append(commit_out)
+
+        shell.close()
+    except Exception as exc:  # noqa: BLE001 - lab boundary
+        pool.invalidate(host, port, username)
+        return {
+            "sshOk": False,
+            "output": "\n".join(output_lines),
+            "error": str(exc),
+        }
+
+    full_output = "\n".join(output_lines)
+    # Strip ANSI escape sequences for error scanning.
+    clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", full_output).lower()
+    has_error = (
+        "error:" in clean
+        or "\n% " in clean
+        or clean.rstrip().endswith("%")
+    )
+    return {
+        "sshOk": not has_error,
+        "output": full_output,
+        "error": (full_output.strip() if has_error else None),
+    }
+
+
 # ---------------------------------------------------------------------------
 # NETCONF helpers for Cisco IOS-XE
 # ---------------------------------------------------------------------------
