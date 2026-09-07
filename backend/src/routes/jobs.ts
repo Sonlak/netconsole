@@ -45,24 +45,62 @@ const INTERACTIVE_JOB_TYPES: JobType[] = [
 const REFRESH_JOB_TYPES: JobType[] = [JobType.GET_CONFIG, JobType.GET_INTERFACES];
 
 // User-facing: list recent jobs for the dashboard/jobs page. Requires any authenticated user.
+//
+// Query params (all optional):
+//   status    filter by JobStatus (e.g. "PENDING", "RUNNING", "SUCCESS", "FAILED")
+//   type      filter by JobType (e.g. "APPLY_CONFIG", "GET_LOGS"). Multi-value: ?type=A&type=B
+//   deviceId  filter by device UUID
+//   limit     page size, default 100, max 500
+//   offset    skip first N rows (for pagination when > limit jobs match)
+//
+// Without `type` and `deviceId`, the response is the latest N jobs across
+// all types, which on a busy fleet is dominated by GET_LOGS -- so
+// audit-by-script needs to pass at least one of these filters.
 jobsRouter.get('/', authMiddleware, async (req, res) => {
   const status =
     typeof req.query.status === 'string' && req.query.status in JobStatus
       ? (req.query.status as JobStatus)
       : undefined;
 
+  const types = (Array.isArray(req.query.type) ? req.query.type : [req.query.type])
+    .filter((t): t is string => typeof t === 'string' && t.length > 0)
+    .filter((t) => t in JobType) as JobType[];
+
+  const deviceId =
+    typeof req.query.deviceId === 'string' && req.query.deviceId.length > 0
+      ? req.query.deviceId
+      : undefined;
+
+  const limitRaw = Number(req.query.limit);
+  const limit = Number.isFinite(limitRaw)
+    ? Math.min(Math.max(Math.trunc(limitRaw), 1), 500)
+    : 100;
+
+  const offsetRaw = Number(req.query.offset);
+  const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? Math.trunc(offsetRaw) : 0;
+
+  const where: Prisma.JobWhereInput = {
+    ...(status ? { status } : {}),
+    ...(types.length ? { type: { in: types } } : {}),
+    ...(deviceId ? { deviceId } : {}),
+  };
+
   const jobs = await prisma.job.findMany({
-    where: status ? { status } : undefined,
+    where,
     include: {
       device: {
         select: { id: true, name: true, ip: true, site: true },
       },
     },
     orderBy: { createdAt: 'desc' },
-    take: 100,
+    take: limit,
+    skip: offset,
   });
 
-  res.json(jobs);
+  // Also surface total so clients can paginate without a second round-trip.
+  const total = await prisma.job.count({ where });
+
+  res.json({ jobs, total, limit, offset });
 });
 
 // Worker-only: claim the next pending job(s). Requires `role: "worker"`.

@@ -14,6 +14,7 @@ const { JWT_SECRET } = vi.hoisted(() => {
 // Mock prisma BEFORE importing the router
 const jobFindMany = vi.fn();
 const jobUpdate = vi.fn();
+const jobCount = vi.fn();
 
 vi.mock('../../src/lib/prisma.js', () => ({
   prisma: {
@@ -21,6 +22,7 @@ vi.mock('../../src/lib/prisma.js', () => ({
       findMany: (...args: unknown[]) => jobFindMany(...args),
       findUnique: (...args: unknown[]) => jobFindMany(...args),
       update: (...args: unknown[]) => jobUpdate(...args),
+      count: (...args: unknown[]) => jobCount(...args),
     },
   },
 }));
@@ -101,12 +103,14 @@ describe('worker auth on /jobs endpoints', () => {
 
   it('GET /jobs returns 200 with an authenticated user token', async () => {
     jobFindMany.mockResolvedValue([]);
+    jobCount.mockResolvedValue(0);
     const res = await fetch(`${baseUrl}/`, {
       headers: { Authorization: `Bearer ${makeAdminToken()}` },
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(Array.isArray(body)).toBe(true);
+    expect(Array.isArray(body.jobs)).toBe(true);
+    expect(typeof body.total).toBe('number');
   });
 
   it('PATCH /jobs/:id/claim returns 401 without a token', async () => {
