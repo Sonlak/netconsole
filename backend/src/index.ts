@@ -3,6 +3,7 @@ import compression from 'compression';
 import express from 'express';
 import { devicesRouter } from './routes/devices.js';
 import { registerDeviceOperationRoutes } from './routes/deviceOperations.js';
+import { devicePingRouter } from './routes/devicePing.js';
 import { discoveryRouter } from './routes/discovery.js';
 import { jobsRouter } from './routes/jobs.js';
 import { arpAddressesRouter } from './routes/arpAddresses.js';
@@ -10,6 +11,7 @@ import { dhcpRouter } from './routes/dhcp.js';
 import { interfacesRouter } from './routes/interfaces.js';
 import { macAddressesRouter } from './routes/macAddresses.js';
 import { scheduleDevicePing } from './services/devicePing.js';
+import { scheduleManagedCheck } from './services/managedCheck.js';
 import { scheduleArpCollection } from './services/arpAddress.js';
 import { scheduleMacCollection } from './services/macAddress.js';
 import { scheduleInterfacesCollection } from './services/interfaces.js';
@@ -82,6 +84,8 @@ const httpServer = app.listen(port, () => {
 
   scheduleDevicePing(pingIntervalSeconds);
   console.log(`Ping monitor enabled (every ${pingIntervalSeconds}s)`);
+  scheduleManagedCheck(pingIntervalSeconds);
+  console.log(`Managed check enabled (every ${pingIntervalSeconds}s)`);
   scheduleMacCollection(macCollectIntervalSeconds);
   console.log(`MAC auto-collect enabled (every ${macCollectIntervalSeconds}s)`);
   scheduleArpCollection(arpCollectIntervalSeconds);
@@ -155,6 +159,7 @@ registerDeviceOperationRoutes(devicesRouter);
 
 // Protected API routes - tất cả cần auth
 app.use('/api/devices', authMiddleware, strictRateLimit, devicesRouter);
+app.use('/api/ping', authMiddleware, strictRateLimit, devicePingRouter);
 app.use('/api/discovery', authMiddleware, scanRateLimit, discoveryRouter);
 app.use('/api/mac-addresses', authMiddleware, moderateRateLimit, macAddressesRouter);
 app.use('/api/arp-addresses', authMiddleware, moderateRateLimit, arpAddressesRouter);

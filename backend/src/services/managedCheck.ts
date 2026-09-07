@@ -236,3 +236,18 @@ export async function applyManagedCheckResult(job: Job) {
 
   return updated;
 }
+
+export function scheduleManagedCheck(intervalSeconds: number) {
+  const intervalMs = Math.max(intervalSeconds, 30) * 1000;
+  const run = async () => {
+    try {
+      const result = await startManagedCheckAll();
+      console.log(`[managed-check] checked ${result.checked} device(s), queued ${result.queued} job(s)`);
+    } catch (error) {
+      console.error('[managed-check] scheduled run failed:', error);
+    }
+  };
+  // Run immediately on startup, then on the interval
+  void run();
+  return setInterval(run, intervalMs);
+}
