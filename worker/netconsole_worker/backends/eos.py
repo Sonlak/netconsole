@@ -655,30 +655,46 @@ class EOSBackend(DeviceBackend):
             rest_error = None
 
         if self.config.ssh_enabled:
-            ssh_result = run_ssh_command(
+            ssh_version = run_ssh_command(
                 host=device.ip,
                 username=self.config.ssh_user,
                 password=self.config.ssh_password,
                 port=self.config.ssh_port,
                 command="show version",
             )
-            if not ssh_result["sshOk"]:
+            if not ssh_version["sshOk"]:
                 return {
                     "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-                    "message": ssh_result["error"] or "SSH failed",
+                    "message": ssh_version["error"] or "SSH failed",
                     "source": "ssh-cli",
                     "restError": rest_error,
                 }
             from netconsole_worker.parsers.show_version import parse_show_version
 
-            parsed = parse_show_version(device.vendor or "Arista", ssh_result["output"])
+            parsed = parse_show_version(device.vendor or "Arista", ssh_version["output"])
+
+            # Also test show running-config so the managed-check banner shows green
+            show_run_ok = False
+            show_run_output = ""
+            if ssh_version["sshOk"]:
+                ssh_run = run_ssh_command(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    port=self.config.ssh_port,
+                    command="show running-config",
+                )
+                if ssh_run["sshOk"] and len(ssh_run.get("output", "")) > 50:
+                    show_run_ok = True
+                    show_run_output = ssh_run["output"]
+
             return {
-                "checks": {"ping": True, "ssh": True, "showVersion": True, "showRun": False},
-                "showVersion": ssh_result["output"],
-                "showRun": "",
+                "checks": {"ping": True, "ssh": True, "showVersion": True, "showRun": show_run_ok},
+                "showVersion": ssh_version["output"],
+                "showRun": show_run_output,
                 "parsed": parsed,
                 "source": "ssh-cli",
-                "message": "Lab SSH show version OK",
+                "message": "Lab SSH show version OK" if show_run_ok else "Lab SSH show version OK; show running-config " + ("OK" if show_run_ok else "FAILED"),
                 "restError": rest_error,
             }
 
