@@ -18,7 +18,13 @@ from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_cisco_arp_table
 from netconsole_worker.parsers.show_mac_table import parse_cisco_mac_table
-from netconsole_worker.ssh_client import run_ssh_command
+from netconsole_worker.ssh_client import (
+    netconf_get_interface_config,
+    netconf_interface_action,
+    netconf_set_access_vlan,
+    run_ssh_command,
+    run_ssh_commands_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -292,23 +298,25 @@ class IOSxeBackend(DeviceBackend):
         # terminal` mode. The device commits immediately on each line.
         # A `commit` is implicit.
         if self.config.ssh_enabled:
-            outputs: list[dict[str, str]] = []
-            for cmd in ["configure terminal", *commands, "end"]:
-                ssh_result = run_ssh_command(
-                    host=device.ip,
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    port=self.config.ssh_port,
-                    command=cmd,
+            # All commands must run in one SSH session so `configure terminal`
+            # config mode persists across all config lines.
+            all_cmds = ["configure terminal", *commands, "end"]
+            session_result = run_ssh_commands_session(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                commands=all_cmds,
+                timeout=60,
+            )
+            if not session_result["sshOk"]:
+                raise RuntimeError(
+                    session_result["error"] or "SSH session failed for apply_config"
                 )
-                if not ssh_result["sshOk"]:
-                    raise RuntimeError(ssh_result["error"] or f"SSH failed on: {cmd}")
-                output = ssh_result["output"] or ""
-                outputs.append({"command": cmd, "output": output})
-                low = output.lower().strip()
-                # IOS-XE CLI errors: "% Invalid input detected at '^' marker."
-                if low.startswith("% "):
-                    raise RuntimeError(output.strip() or f"Command failed: {cmd}")
+            outputs = session_result["outputs"]
+            for out in outputs:
+                if out["error"] and out["error"].lower().startswith("% "):
+                    raise RuntimeError(out["error"] or "Config command failed")
             return {
                 "implemented": True,
                 "source": "ssh-cli",
@@ -375,6 +383,74 @@ class IOSxeBackend(DeviceBackend):
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 
+        if action in ("shut", "no-shut", "set-access-vlan", "show-run"):
+            # NETCONF primary (gotcha #14). Reliable, atomic, structured
+            # output for show-run. SSH remains the fallback path.
+            nc_result = None
+            if action in ("shut", "no-shut"):
+                nc_result = netconf_interface_action(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    iface_name=iface,
+                    action=action,
+                    port=830,
+                    timeout=30,
+                )
+            elif action == "set-access-vlan":
+                if not vlan:
+                    raise RuntimeError("set-access-vlan requires a vlan argument")
+                nc_result = netconf_set_access_vlan(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    iface_name=iface,
+                    vlan=int(vlan),
+                    port=830,
+                    timeout=30,
+                )
+            elif action == "show-run":
+                nc_result = netconf_get_interface_config(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    iface_name=iface,
+                    port=830,
+                    timeout=30,
+                )
+
+            if nc_result and nc_result.get("ok"):
+                # Build a uniform success envelope so the frontend doesn't
+                # care which backend won.
+                admin = (
+                    "down"
+                    if action == "shut"
+                    else "up"
+                    if action == "no-shut"
+                    else None
+                )
+                return {
+                    "implemented": True,
+                    "source": "netconf",
+                    "action": action,
+                    "interface": iface,
+                    "vlan": vlan or None,
+                    "commands": [],
+                    "outputs": [],
+                    "message": nc_result.get("message", f"Interface action {action} OK on {iface}"),
+                    "adminStatus": admin,
+                    "accessVlan": vlan if action == "set-access-vlan" else None,
+                    "config": nc_result.get("config") if action == "show-run" else None,
+                }
+            # NETCONF failed — fall back to SSH CLI
+            logger.warning(
+                "NETCONF %s on %s failed (%s), falling back to SSH CLI",
+                action,
+                iface,
+                (nc_result or {}).get("error", ""),
+            )
+
+        # Build CLI commands (SSH fallback for all actions including shut/no-shut)
         commands: list[str] = []
         if action == "shut":
             commands = ["configure terminal", f"interface {iface}", "shutdown", "end"]
@@ -396,22 +472,29 @@ class IOSxeBackend(DeviceBackend):
             raise RuntimeError(f"Unsupported interface action for IOS-XE: {action}")
 
         if not self.config.ssh_enabled:
-            raise RuntimeError("Interface actions on IOS-XE require LAB_SSH")
-        outputs: list[dict[str, str]] = []
-        for cmd in commands:
-            ssh_result = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command=cmd,
+            raise RuntimeError("Interface actions on IOS-XE require LAB_SSH or NETCONF")
+
+        # All commands must run in one SSH session so `configure terminal`
+        # config mode persists across all config lines.
+        session_result = run_ssh_commands_session(
+            host=device.ip,
+            username=self.config.ssh_user,
+            password=self.config.ssh_password,
+            port=self.config.ssh_port,
+            commands=commands,
+            timeout=30,
+        )
+        if not session_result["sshOk"]:
+            raise RuntimeError(
+                session_result["error"] or "SSH session failed for interface action"
             )
-            if not ssh_result["sshOk"]:
-                raise RuntimeError(ssh_result["error"] or f"SSH failed on: {cmd}")
-            outputs.append({"command": cmd, "output": ssh_result["output"]})
-            low = (ssh_result["output"] or "").lower().strip()
-            if action != "show-run" and low.startswith("% "):
-                raise RuntimeError((ssh_result["output"] or "").strip() or f"Command failed: {cmd}")
+
+        outputs: list[dict[str, str]] = session_result["outputs"]
+        for out in outputs:
+            if out["error"] and not out["error"].lower().startswith("% "):
+                # Only hard-fail on true CLI errors; ignore info banners
+                raise RuntimeError(out["error"] or "Command failed in session")
+
         return {
             "implemented": True,
             "source": "ssh-cli",
