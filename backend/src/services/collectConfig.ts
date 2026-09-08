@@ -33,16 +33,34 @@ export async function collectDeviceConfig(deviceId: string, createdById: string 
     return { job: job!, device, queued: true as const };
   }
 
-  // RESTCONF path: do the HTTP call OUTSIDE the lock (it can take seconds),
-  // then commit a SUCCESS row. We still want device-lock semantics so a
-  // second click can't run two parallel get-configuration RPCs against the
-  // same device. Wrap the whole thing: take lock → check inflight →
-  // REST → insert SUCCESS → release.
+  // RESTCONF path: try the HTTP call first (fast, single round-trip).
+  // If it fails (device unreachable / REST disabled / timeout), fall back to
+  // the job queue so the worker picks it up via SSH.  We still hold the
+  // advisory lock during the REST call so two concurrent clicks can't run
+  // two parallel get-configuration RPCs against the same device.
   const rest = await fetchConfigurationSet(device.ip);
   if (!rest.ok || !rest.config) {
-    throw new Error(rest.error || 'Junos REST get-configuration failed');
+    // REST failed — fall back to job queue (same path as when REST is disabled).
+    console.log(`[config] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+    const outcome = await prisma.$transaction(async (tx) =>
+      tryCreateDeviceJob(tx, device.id, JobType.GET_CONFIG, createdById),
+    );
+
+    if (outcome.kind === 'busy') {
+      const err = new Error('Device busy');
+      (err as Error & { code?: string; lockedBy?: unknown }).code = 'device_locked';
+      (err as Error & { lockedBy?: unknown }).lockedBy = outcome.error.blockingJob;
+      throw err;
+    }
+
+    const job = await prisma.job.findUnique({
+      where: { id: outcome.job.id },
+      include: { device: true },
+    });
+    return { job: job!, device, queued: true as const };
   }
 
+  // REST succeeded — commit the result directly.
   const job = await prisma.$transaction(async (tx) => {
     const outcome = await tryCreateDeviceJob(tx, device.id, JobType.GET_CONFIG, createdById);
     if (outcome.kind === 'busy') {
