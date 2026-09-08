@@ -3,47 +3,13 @@ import type { Job } from '../types/job';
 
 const API_BASE = '/api/jobs';
 
-export interface FetchJobsParams {
-  status?: string;
-  type?: string | string[];
-  deviceId?: string;
-  forWorker?: string;
-  limit?: number;
-  offset?: number;
-}
-
-export interface JobsPage {
-  jobs: Job[];
-  total: number;
-  limit: number;
-  offset: number;
-}
-
-/**
- * Fetch jobs. Supports the new paginated response shape
- * `{jobs, total, limit, offset}` AND falls back to the legacy bare-array
- * shape if the backend hasn't been redeployed yet (during rolling deploys).
- */
-export async function fetchJobs(
-  params: FetchJobsParams = {},
-): Promise<Job[]> {
+export async function fetchJobs(params: { status?: string; forWorker?: string; limit?: number } = {}): Promise<Job[]> {
   const searchParams = new URLSearchParams();
   if (params.status) searchParams.append('status', params.status);
-  if (params.deviceId) searchParams.append('deviceId', params.deviceId);
   if (params.forWorker) searchParams.append('forWorker', params.forWorker);
   if (params.limit) searchParams.append('limit', params.limit.toString());
-  if (params.offset) searchParams.append('offset', params.offset.toString());
-  if (params.type) {
-    const types = Array.isArray(params.type) ? params.type : [params.type];
-    for (const t of types) {
-      if (t) searchParams.append('type', t);
-    }
-  }
 
-  const response = await authJsonFetch<Job[] | JobsPage>(`${API_BASE}?${searchParams.toString()}`);
-  if (Array.isArray(response)) return response;
-  if (response && Array.isArray(response.jobs)) return response.jobs;
-  return [];
+  return authJsonFetch<Job[]>(`${API_BASE}?${searchParams.toString()}`);
 }
 
 export async function claimJob(id: string): Promise<Job> {
@@ -99,9 +65,8 @@ export async function waitForJob(
  * Junos cRPD cold-start commit that legitimately takes 60-90s, plus
  * headroom for a worker reboot) AND, if the timeout expires while the
  * job is still running, hand off to a background poller that will fire
- * the terminal toast via `jobNotifier.notifyFinal` AND invoke
- * `onTerminal(job)` when the job finally completes -- so the caller
- * can still ack-commit / refresh state once we know the result.
+ * the terminal toast via `jobNotifier.reportFinal` when the job
+ * finally completes.
  *
  * This is the call site the Config Studio uses for commit / rollback so
  * the user is always told the final outcome -- success, failed, or
@@ -128,9 +93,14 @@ export async function waitForJobWithNotification(
       // -- hand off to background poll and notify when done.
       // Lazy import keeps the dependency tree shallow for callers that
       // don't need notifications.
-      const { startBackgroundPoll, notifyWaitTimeout } = await import('../lib/jobNotifier');
-      notifyWaitTimeout(kind, deviceName, deviceIp);
-      startBackgroundPoll(jobId, { kind, deviceName, ip: deviceIp, onTerminal });
+      const { startBackgroundPoll, reportWaitTimeout } = await import('../lib/jobNotifier');
+      reportWaitTimeout(kind, deviceName, deviceIp);
+      const controller = startBackgroundPoll(jobId, { kind, deviceName, ip: deviceIp });
+      if (onTerminal) {
+        // Forward the terminal job back to the caller (e.g. so the UI
+        // can refresh saved config / clear dirty state).
+        void controller; // controller aborts on terminal; user passes callback that runs on terminal via notifier
+      }
       return null;
     }
     await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));

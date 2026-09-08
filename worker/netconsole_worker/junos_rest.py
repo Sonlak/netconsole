@@ -234,13 +234,6 @@ def format_junos_rpc_error(text: str) -> str | None:
 
     lowered = (text or "").lower()
     if "<xnm:error" not in lowered and "<rpc-error" not in lowered and "<error-message>" not in lowered:
-        # No recognised error wrapper found.  Fall back to a snippet of the raw
-        # response so the operator at least sees something useful instead of
-        # the generic "commit-configuration failed" message.
-        stripped = (text or "").strip()
-        if stripped:
-            snippet = stripped[:300]
-            return f"device error: {snippet}"
         return None
 
     blocks = re.findall(
@@ -509,74 +502,6 @@ def fetch_interfaces_set_config(
     )
 
 
-def _detect_user_editing_lock(raw: str) -> bool:
-    """Return True if the response indicates the Junos mgd is locked by another
-    user session ("Users currently editing the configuration: ...").
-
-    This happens on cRPD sims when the boot-time auto-login session is still
-    inside [edit] from a previous reboot. The user `netconsole` cannot commit
-    or load-configuration while mgd holds the exclusive lock. We need the
-    application to recover on its own -- otherwise the operator sees
-    "configuration database modified" or hangs for the full watchdog timeout.
-    """
-    text = (raw or "").lower()
-    return "users currently editing the configuration" in text
-
-
-def _logout_other_users(
-    host: str,
-    username: str,
-    password: str,
-    port: int,
-) -> bool:
-    """Try to forcibly log out every other user holding an mgd edit session.
-
-    Uses the SSH pool so we reuse the existing paramiko connection. Requires
-    `netconsole` to have permission to run `request system logout user ...
-    terminal ...` (which it does on the lab cRPD sims).
-
-    Returns True if at least one logout succeeded. We can't ask Junos for the
-    current set of mgd sessions over RESTCONF, so we iterate over a small list
-    of likely (user, terminal) tuples. cRPD auto-logs in as `root u0` on boot;
-    any other stale entry uses the same defaults.
-    """
-    from netconsole_worker.ssh_client import run_ssh_command
-
-    candidates = [
-        "root terminal u0",
-        "root terminal pts/0",
-        "root terminal p0",
-        "netconsole terminal pts/0",
-        "netconsole terminal u0",
-    ]
-    kicked = False
-    for term in candidates:
-        # `request system logout user X terminal Y` succeeds for any session
-        # the caller is allowed to kill -- we don't need the exact PID. We just
-        # need to issue the command and look for the "logout-user: done" /
-        # "logout-user: error: permission denied" markers in stderr.
-        result = run_ssh_command(
-            host=host,
-            username=username,
-            password=password,
-            port=port,
-            command=f"request system logout user {term}",
-            timeout=15,
-        )
-        if result.get("sshOk"):
-            output = (result.get("output") or "") + (result.get("error") or "")
-            if "logout-user: done" in output.lower() or "logout-user: done" in output:
-                kicked = True
-                logger.info(
-                    "junos %s: kicked stale mgd session holder %s",
-                    host, term,
-                )
-        else:
-            logger.debug("junos %s: logout attempt for %s returned: %s",
-                         host, term, result.get("error"))
-    return kicked
-
-
 def apply_set_configuration(
     host: str,
     commands: list[str],
@@ -643,42 +568,15 @@ def apply_set_configuration(
     # First attempt
     load_ok, load_raw, load_ms = _load()
     if not load_ok:
-        # Recovery path 1: stale mgd edit session from a previous boot/login
-        # (very common on cRPD sims). Try to forcibly log it out, then retry
-        # the load+commit cycle once on the same pooled socket. Anything else
-        # (syntax error, permission denied, ...) we surface to the caller so
-        # the operator sees the real reason.
-        if _detect_user_editing_lock(load_raw):
-            logger.warning(
-                "junos %s: load hit 'Users currently editing the configuration', "
-                "trying to kick stale mgd sessions before retrying",
-                host,
-            )
-            _logout_other_users(host, username, password, port)
-            time.sleep(0.5)
-            load_ok2, load_raw2, load_ms2 = _load()
-            if load_ok2:
-                load_ok, load_raw, load_ms = load_ok2, load_raw2, load_ms2
-            else:
-                detail = format_junos_rpc_error(load_raw2) or "load failed after lock kick"
-                return {
-                    "ok": False,
-                    "stage": "load-lock",
-                    "error": f"load failed (after kicking stale mgd session): {detail}",
-                    "raw": load_raw2,
-                    "loadMs": load_ms2,
-                    "commitMs": 0,
-                }
-        else:
-            detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
-            return {
-                "ok": False,
-                "stage": "load",
-                "error": f"load failed: {detail}",
-                "raw": load_raw,
-                "loadMs": load_ms,
-                "commitMs": 0,
-            }
+        detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
+        return {
+            "ok": False,
+            "stage": "load",
+            "error": f"load failed: {detail}",
+            "raw": load_raw,
+            "loadMs": load_ms,
+            "commitMs": 0,
+        }
 
     commit_ok, commit_raw, commit_ms = _commit()
     if not commit_ok:
@@ -727,32 +625,6 @@ def apply_set_configuration(
                 "loadMs": load_ms2,
                 "commitMs": commit_ms2,
             }
-        # Recover from "Users currently editing the configuration" by kicking
-        # stale mgd sessions on the SSH side, then re-running the full cycle.
-        if "users currently editing the configuration" in err_text:
-            logger.warning(
-                "junos %s: commit hit 'Users currently editing the configuration', "
-                "kicking stale mgd sessions and retrying",
-                host,
-            )
-            _logout_other_users(host, username, password, port)
-            time.sleep(0.5)
-            post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
-            load_ok2, load_raw2, load_ms2 = _load()
-            if load_ok2:
-                commit_ok2, commit_raw2, commit_ms2 = _commit()
-                if commit_ok2:
-                    return {
-                        "ok": True,
-                        "stage": "commit",
-                        "error": None,
-                        "raw": f"{load_raw2}\n{commit_raw2}\n(recovered after kicking stale mgd session)",
-                        "loadMs": load_ms2,
-                        "commitMs": commit_ms2,
-                    }
-                commit_raw = commit_raw2
-                commit_ms = commit_ms2
-            # Fall through to the generic failure path with the latest raw.
         # Non-recoverable commit error: discard the bad change so the next
         # job starts from a clean database, then report the real failure.
         post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)

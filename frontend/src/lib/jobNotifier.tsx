@@ -5,43 +5,24 @@
  *  - We want a single place that decides toast wording + duration so the
  *    UI stays consistent (and easy to tweak when the user asks "more
  *    verbosely" / "less noisy").
- *  - When the in-page wait window hits (Juniper cRPD can legitimately
- *    take 60-90s on a cold-start commit, plus a slow restart), the
- *    user should still see the SUCCESS or FAILED toast once the job
- *    actually terminates -- not just the "Commit still running"
- *    warning we used to show.
- *
- * History (read this before "simplifying"):
- *  - Original implementation used the AntD static API
- *    (`import { notification } from 'antd'`). On React 19 + StrictMode +
- *    `unstableSetRender` (see main.tsx) this silently no-op'd -- the
- *    user got no toast at all on SUCCESS / FAILED. Worked in dev with
- *    the static API only because dev runs without StrictMode.
- *  - Fix: route everything through `App.useApp()` context-aware
- *    notification. To make the background poll (which runs outside the
- *    React tree, after component unmount) keep working, we cache the
- *    hook return values in a module-level object via `bindJobNotifier`,
- *    called once from a top-level component that lives inside `<App>`.
+ *  - When the 90-second wait timeout hits (Juniper cRPD can legitimately
+ *    take 60-90s on a cold-start commit, plus a slow restart), the user
+ *    should still see the SUCCESS or FAILED toast once the job actually
+ *    terminates -- not just the "Commit still running" warning we used
+ *    to show.
  *
  * Behaviour:
- *  - useJobNotifier()  -> React hook, returns context-aware notify fns.
- *    Use this for inline commit/rollback handlers.
- *  - bindJobNotifier(api)  -> set the module-level api so background
- *    poll + non-component callers can fire toasts reliably.
- *  - notifyFinal(kind, ..., job)  -> fires via api if bound, else
- *    falls back to static `notification` (best-effort).
- *  - notifyWaitTimeout(kind, ...) -> message.warning
- *  - startBackgroundPoll(jobId, opts) -> polls until terminal, then
- *    fires notifyFinal. ALSO invokes `onTerminal` callback when the
- *    job terminates, so the caller can ack-commit / refresh state
- *    without waiting in the foreground.
+ *  - reportFinal(...)   -> success / failed toast with details + a link
+ *    to the Jobs page filtered to this job id. 6s for success, 8s for
+ *    failed (user needs longer to read the device-side error).
+ *  - reportBackgroundStarted(...) -> 4s info toast saying "still
+ *    running, will notify you when done".
+ *  - The poll loop is bound to a single AbortController so navigating
+ *    away (component unmount) cancels it cleanly.
  */
 
-import { App, message as staticMessage, notification as staticNotification } from 'antd';
+import { notification, message } from 'antd';
 import { Link } from 'react-router-dom';
-import { useEffect, useMemo } from 'react';
-import type { NotificationInstance } from 'antd/es/notification/interface';
-import type { MessageInstance } from 'antd/es/message/interface';
 
 import { JobWaitTimeoutError } from '../api/jobs';
 import { authJsonFetch } from '../api/http';
@@ -55,74 +36,14 @@ function deviceLabel(deviceName: string | undefined, ip: string | undefined): st
 }
 
 /**
- * Module-level notifier API. Populated by `bindJobNotifier(api)` from a
- * component mounted inside `<App>` (see `JobNotifierHost` in App.tsx).
- * When unset (e.g. background poll fires before React hydrates), calls
- * fall back to the static API -- which works for in-page, single-tab
- * cases thanks to `unstableSetRender` in main.tsx, but is unreliable on
- * React 19 + StrictMode. Hence the hook path being preferred.
- */
-interface NotifierApi {
-  notification: Pick<NotificationInstance, 'success' | 'error' | 'warning' | 'info'>;
-  message: Pick<MessageInstance, 'success' | 'error' | 'warning' | 'info' | 'loading'>;
-}
-
-let apiRef: NotifierApi | null = null;
-
-export function bindJobNotifier(api: NotifierApi): void {
-  apiRef = api;
-}
-
-function getApi(): NotifierApi {
-  if (apiRef) return apiRef;
-  return {
-    notification: staticNotification,
-    message: staticMessage,
-  };
-}
-
-/**
- * React hook for components that live inside `<App>`. Returns stable
- * notify functions bound to the App context's notification/message
- * instances. Also calls `bindJobNotifier` so background polls
- * initiated from this component use the same context.
- */
-export function useJobNotifier() {
-  const { notification, message } = App.useApp();
-  const stable = useMemo<NotifierApi>(
-    () => ({ notification, message }),
-    [notification, message],
-  );
-  useEffect(() => {
-    bindJobNotifier(stable);
-  }, [stable]);
-  return useMemo(
-    () => ({
-      notifyFinal: (
-        kind: 'commit' | 'rollback',
-        deviceName: string | undefined,
-        ip: string | undefined,
-        job: Job,
-      ) => reportFinal(kind, deviceName, ip, job, stable),
-      notifyWaitTimeout: (kind: 'commit' | 'rollback', deviceName?: string, ip?: string) =>
-        reportWaitTimeout(kind, deviceName, ip, stable),
-    }),
-    [stable],
-  );
-}
-
-/**
- * Fire the terminal toast for a job. Safe to call from anywhere --
- * uses the bound context-aware api when available, falls back to the
- * static API otherwise (still works for in-page toasts after
- * `unstableSetRender` is wired).
+ * Fire the terminal toast for a job. Used both inside the inline wait
+ * loop and after we hand the job off to the background poller.
  */
 export function reportFinal(
   kind: 'commit' | 'rollback',
   deviceName: string | undefined,
   ip: string | undefined,
   job: Job,
-  api: NotifierApi = getApi(),
 ): void {
   const device = deviceLabel(deviceName, ip);
   const verb = kind === 'commit' ? 'Commit' : 'Rollback';
@@ -131,7 +52,7 @@ export function reportFinal(
   if (job.status === 'SUCCESS') {
     const durMs = computeDurationMs(job);
     const durLabel = durMs != null ? ` · ${formatDur(durMs)}` : '';
-    api.notification.success({
+    notification.success({
       message: `${verb} thành công`,
       description: (
         <span>
@@ -139,30 +60,29 @@ export function reportFinal(
           <Link to={jobsPath}>mở Jobs</Link>
         </span>
       ),
-      duration: 12,
+      duration: 6,
       placement: 'topRight',
     });
     return;
   }
 
   if (job.status === 'FAILED') {
-    const detail = job.error || 'unknown error';
-    api.notification.error({
+    notification.error({
       message: `${verb} thất bại`,
       description: (
         <span>
-          <code>{device}</code>: {detail}{' '}
+          <code>{device}</code>: {job.error || 'unknown error'}{' '}
           <Link to={jobsPath}>xem chi tiết</Link>
         </span>
       ),
-      duration: 30,
+      duration: 8,
       placement: 'topRight',
     });
     return;
   }
 
   // Still not terminal (caller error). Treat as warning so we never silently drop.
-  api.notification.warning({
+  notification.warning({
     message: `${verb} chưa kết thúc`,
     description: (
       <span>
@@ -170,19 +90,14 @@ export function reportFinal(
         <Link to={jobsPath}>mở Jobs</Link>
       </span>
     ),
-    duration: 12,
+    duration: 6,
     placement: 'topRight',
   });
 }
 
-export function reportWaitTimeout(
-  kind: 'commit' | 'rollback',
-  deviceName?: string,
-  ip?: string,
-  api: NotifierApi = getApi(),
-): void {
+export function reportWaitTimeout(kind: 'commit' | 'rollback', deviceName?: string, ip?: string): void {
   const device = deviceLabel(deviceName, ip);
-  api.message.warning({
+  message.warning({
     content: (
       <span>
         {kind === 'commit' ? 'Commit' : 'Rollback'} <code>{device}</code> đang chạy nền
@@ -194,26 +109,17 @@ export function reportWaitTimeout(
 }
 
 /**
- * Alias of `reportWaitTimeout` for call sites that prefer the verb-led
- * naming used by `useJobNotifier().notifyWaitTimeout`.
- */
-export const notifyWaitTimeout = reportWaitTimeout;
-
-/**
  * Continue polling `jobId` in the background until it terminates, then
- * fire `notifyFinal` AND invoke the `onTerminal` callback so the caller
- * can ack-commit / refresh state without waiting in the foreground.
- * Returns the AbortController so the caller can stop polling (e.g. on
- * unmount). The controller aborts on terminal state automatically.
+ * fire a notification. Returns the AbortController so the caller can
+ * stop polling (e.g. on unmount). The controller aborts on terminal
+ * state automatically.
+ *
+ * `kind`, `deviceName`, `ip` are passed in so the final toast is
+ * meaningful without needing to re-read the device list.
  */
 export function startBackgroundPoll(
   jobId: string,
-  options: {
-    kind: 'commit' | 'rollback';
-    deviceName?: string;
-    ip?: string;
-    onTerminal?: (job: Job) => void;
-  },
+  options: { kind: 'commit' | 'rollback'; deviceName?: string; ip?: string },
 ): AbortController {
   const controller = new AbortController();
   const poll = async () => {
@@ -222,13 +128,6 @@ export function startBackgroundPoll(
         const job = await authJsonFetch<Job>(`/api/jobs/${jobId}`);
         if (job.status === 'SUCCESS' || job.status === 'FAILED') {
           reportFinal(options.kind, options.deviceName, options.ip, job);
-          if (options.onTerminal) {
-            try {
-              options.onTerminal(job);
-            } catch {
-              /* swallow -- caller-side error handling is its own job */
-            }
-          }
           controller.abort();
           return;
         }

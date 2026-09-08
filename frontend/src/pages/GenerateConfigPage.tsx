@@ -51,7 +51,7 @@ import {
   waitForJobIfNeeded,
   waitForJobWithNotification,
 } from '@/api/jobs';
-import { useJobNotifier } from '@/lib/jobNotifier';
+import { reportFinal } from '@/lib/jobNotifier';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
 import { PageSkeleton } from '@/components/common/PageSkeleton';
@@ -98,7 +98,6 @@ export default function GenerateConfigPage() {
 }
 
 function SingleDevicePanel() {
-  const { notifyFinal: notifyJobFinal } = useJobNotifier();
   const { site, setSite, get, patch } = useSiteFilter();
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
   const [templates, setTemplates] = useState<ConfigTemplateMeta[]>([]);
@@ -333,7 +332,7 @@ function SingleDevicePanel() {
               // Inline terminal toast in addition to the background one
               // (the notifier also fires from backgroundPoll; this is the
               // synchronous path for jobs that finished inside the wait).
-              notifyJobFinal('commit', selectedDevice.name, selectedDevice.ip, final);
+              reportFinal('commit', selectedDevice.name, selectedDevice.ip, final);
             },
           });
           if (finished === null) {
@@ -393,7 +392,7 @@ function SingleDevicePanel() {
             deviceIp: selectedDevice.ip,
             timeoutMs: 240_000,
             onTerminal: (final) => {
-              notifyJobFinal('rollback', selectedDevice.name, selectedDevice.ip, final);
+              reportFinal('rollback', selectedDevice.name, selectedDevice.ip, final);
             },
           });
           if (finished === null) {

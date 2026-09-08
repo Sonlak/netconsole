@@ -55,16 +55,6 @@ class ApplyConfigTask(BaseTask):
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
         payload = job.payload or {}
-        # Recovery sentinel: backend enqueues an APPLY_CONFIG job with
-        # `recover: 'discard-junos'` when the operator wants to clear
-        # the candidate database of a Juniper device stuck in a
-        # "configuration database modified" state. We short-circuit
-        # before _set_commands() strips the comment line and instead
-        # hand the work to the Juniper backend's recovery helper, which
-        # posts <discard-changes/> over RESTCONF and reports the result.
-        if payload.get("recover") == "discard-junos":
-            return _backend(device).recover_junos(device)
-
         config = str(payload.get("config") or "").strip()
         if not config:
             raise RuntimeError("APPLY_CONFIG payload.config is empty")

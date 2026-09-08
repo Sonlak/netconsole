@@ -21,6 +21,7 @@ type Props = {
 
 const TERMINAL: JobStatus[] = ['SUCCESS', 'FAILED'];
 const POLL_INTERVAL_MS = 2_000;
+const AUTO_CLOSE_DELAY_MS = 6_000;
 
 type BrowserNotificationPermission = 'default' | 'denied' | 'granted';
 
@@ -54,6 +55,7 @@ export function BulkDeployProgressModal({ open, jobs, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const notifiedRef = useRef(false);
   const summaryShownRef = useRef(false);
+  const autoCloseTimerRef = useRef<number | null>(null);
 
   const jobIdsKey = useMemo(() => jobs.map((j) => j.id).join(','), [jobs]);
 
@@ -112,6 +114,9 @@ export function BulkDeployProgressModal({ open, jobs, onClose }: Props) {
               `${failed} of ${fetched.length} job(s) failed. Open NetConsole to review.`,
             );
           }
+          autoCloseTimerRef.current = window.setTimeout(() => {
+            if (!cancelled) onClose();
+          }, AUTO_CLOSE_DELAY_MS);
         }
       } catch (cause) {
         if (cancelled) return;
@@ -124,6 +129,10 @@ export function BulkDeployProgressModal({ open, jobs, onClose }: Props) {
     return () => {
       cancelled = true;
       window.clearInterval(interval);
+      if (autoCloseTimerRef.current !== null) {
+        window.clearTimeout(autoCloseTimerRef.current);
+        autoCloseTimerRef.current = null;
+      }
     };
   }, [open, jobs, onClose]);
 
@@ -170,17 +179,24 @@ export function BulkDeployProgressModal({ open, jobs, onClose }: Props) {
               ? `Done. ${counts.SUCCESS}/${total} succeeded.`
               : `Polling ${total} job(s) every ${POLL_INTERVAL_MS / 1000}s — ${finished}/${total} finished.`}
           </Typography.Text>
-          <Button onClick={onClose}>
-            Close
+          <Button onClick={onClose} disabled={!allTerminal}>
+            {allTerminal ? 'Close' : 'Hide (keep tracking)'}
           </Button>
           <Link to="/jobs?type=APPLY_CONFIG" onClick={onClose}>
-            <Button type="primary">
+            <Button type="primary" disabled={!allTerminal}>
               Open Jobs page
             </Button>
           </Link>
         </Space>
       }
-      onCancel={onClose}
+      onCancel={() => {
+        if (allTerminal) onClose();
+        // While polling, X just hides the modal — polling keeps running in
+        // the background so the next time the user opens it, the result is
+        // already there.
+      }}
+      closable={allTerminal}
+      maskClosable={false}
     >
       {error ? (
         <Alert
