@@ -102,9 +102,10 @@ export function PortsPanel({
       else if (!options?.silent) setLoading(true);
       try {
         if (options?.collect) {
-          const { job } = await collectDeviceInterfaces(deviceId);
-          const finished = await waitForJob(job.id, { timeoutMs: 45000 });
-          if (finished.status === 'FAILED') throw new Error(finished.error || 'Interface collection failed');
+          // Backend does REST-first (no job queue for read). Wait briefly so
+          // the SUCCESS row commits before we re-fetch the cached result.
+          await collectDeviceInterfaces(deviceId);
+          await new Promise((r) => setTimeout(r, 300));
         }
         const inventory = await fetchDeviceInterfaces(deviceId);
         setInterfaces(Array.isArray(inventory.interfaces) ? inventory.interfaces : []);
@@ -113,11 +114,7 @@ export function PortsPanel({
         setError(null);
         setHasLoaded(true);
       } catch (cause) {
-        if (cause instanceof JobWaitTimeoutError) {
-          message.warning(cause.message);
-        } else {
-          setError(toError(cause, 'Could not load interfaces'));
-        }
+        setError(toError(cause, 'Could not load interfaces'));
       } finally {
         setLoading(false);
         setCollecting(false);

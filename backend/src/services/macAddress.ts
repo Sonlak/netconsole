@@ -3,6 +3,8 @@ import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { getLatestJobResult, jobPriority } from './deviceOperations.js';
+import { fetchMacTable } from './junosRest.js';
+import { fetchIosxeMacTable } from './iosxeRest.js';
 
 export type MacTableEntry = {
   mac: string;
@@ -204,4 +206,73 @@ export function scheduleMacCollection(intervalSeconds: number) {
   return setInterval(() => {
     void run();
   }, intervalMs);
+}
+
+/**
+ * Collect MAC table for a single device via direct REST call (bypasses job queue).
+ *
+ * - Juniper: calls `fetchMacTable()` which uses Junos RESTCONF.
+ * - IOS-XE:  always falls back to job queue (no stable YANG for MAC table;
+ *             worker uses SSH `show mac address-table`).
+ * - Other:   always uses job queue.
+ *
+ * Always writes a SUCCESS job row so GET /api/devices/:id/mac returns fresh data.
+ * Returns `{ job, queued }` where `queued=true` means a worker job was also
+ * queued as a fallback.
+ */
+export async function collectMacForDevice(
+  deviceId: string,
+  createdById: string | null,
+): Promise<{ job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null }; queued: boolean }> {
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    throw new Error('Device not found');
+  }
+
+  const vendor = (device.vendor ?? '').toLowerCase();
+
+  // Juniper: try REST first
+  if (vendor === 'juniper') {
+    const rest = await fetchMacTable(device.ip);
+    if (rest.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_MAC,
+          status: JobStatus.SUCCESS,
+          priority: jobPriority(JobType.GET_MAC),
+          ...(createdById ? { createdById } : {}),
+          result: {
+            implemented: true,
+            source: 'junos-rest',
+            entries: rest.entries,
+            command: 'get-ethernet-switching-table-information',
+            message: `Collected MAC table from ${device.name} via REST`,
+            collectMs: rest.collectMs,
+          } as object,
+        },
+      });
+      console.log(`[mac] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.entries.length} entries)`);
+      return { job, queued: false };
+    }
+    console.warn(`[mac] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+  }
+
+  // IOS-XE: no YANG for MAC table — always queue worker job (SSH fallback)
+  if (vendor === 'cisco') {
+    console.warn(`[mac] ${device.ip} IOS-XE has no YANG MAC model, using job queue`);
+  }
+
+  // Default: create a PENDING job (worker handles vendor-specific logic)
+  const job = await prisma.job.create({
+    data: {
+      deviceId: device.id,
+      type: JobType.GET_MAC,
+      status: JobStatus.PENDING,
+      priority: jobPriority(JobType.GET_MAC),
+      ...(createdById ? { createdById } : {}),
+    },
+    select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+  });
+  return { job, queued: true };
 }

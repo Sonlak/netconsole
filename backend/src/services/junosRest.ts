@@ -222,6 +222,10 @@ export async function probeJunosRestIdentity(host: string): Promise<{
   return { ok: true, fields, raw: mergedRaw };
 }
 
+// ----------------------------------------------------------------
+// XML/JSON helpers for Junos RPC responses
+// ----------------------------------------------------------------
+
 function extractXmlBody(text: string): string {
   let body = (text || '').trim();
   if (!body) return '';
@@ -239,6 +243,269 @@ function extractXmlBody(text: string): string {
     return body.trim();
   }
   return body;
+}
+
+function xmlChildText(xml: string, ...tagNames: string[]): string {
+  for (const tag of tagNames) {
+    // match <tag>...</tag> where tag may have namespace prefix
+    const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`<([\\w:-]+:)?${escaped}(?:\\s[^>]*)?>([^<]*)</([\\w:-]+:)?${escaped}>`, 'i');
+    const m = re.exec(xml);
+    if (m) return m[2]?.trim() ?? '';
+  }
+  return '';
+}
+
+function xmlChildrenOf(xml: string, parentTag: string): string[] {
+  // Extract all child blocks of a parent element
+  const escaped = parentTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<([\\w:-]+:)?${escaped}(?:\\s[^>]*)?>([\\s\\S]*?)</([\\w:-]+:)?${escaped}>`, 'i');
+  const m = re.exec(xml);
+  if (!m) return [];
+  const inner = m[2];
+  const children: string[] = [];
+  // Split on top-level child tags (not perfect but sufficient for these RPCs)
+  const childRe = /<([\w:-]+(?::[\w:-]+)?)[^>]*>([^<]*(?:<(?!\/\1)[^<]*)*)<\/\1>/gi;
+  let child;
+  while ((child = childRe.exec(inner)) !== null) {
+    children.push(child[0]);
+  }
+  return children;
+}
+
+// ----------------------------------------------------------------
+// ARP table parser
+// ----------------------------------------------------------------
+
+export type JunosArpEntry = {
+  ip: string;
+  mac: string;
+  hostname: string;
+  interface: string;
+  flags: string;
+};
+
+function normalizeMac(mac: string): string {
+  // Accept : / . / bare hex — normalize to aa:bb:cc:dd:ee:ff
+  const hex = mac.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length !== 12) return mac;
+  return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`.toLowerCase();
+}
+
+function isLoopbackOrLinkLocal(ip: string): boolean {
+  try {
+    // eslint-disable-next-line no-unused-vars
+    const parts = ip.split('.').map(Number);
+    if (parts.length === 4) {
+      if (parts[0] === 127) return true;
+      if (parts[0] === 169 && parts[1] === 254) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function parseArpEntryBlock(xml: string): JunosArpEntry | null {
+  const ip = xmlChildText(xml, 'ip-address', 'ip', 'address');
+  const mac = normalizeMac(xmlChildText(xml, 'mac-address', 'mac'));
+  if (!ip || !mac) return null;
+  const interface_ = xmlChildText(xml, 'interface-name', 'interface') || '-';
+  const hostname = xmlChildText(xml, 'hostname', 'name') || ip;
+  const flags = xmlChildText(xml, 'arp-flags', 'flags') || 'none';
+  if (isLoopbackOrLinkLocal(ip)) return null;
+  return { ip, mac, hostname, interface: interface_, flags };
+}
+
+function parseArpTableXml(xml: string): JunosArpEntry[] {
+  const blocks = xmlChildrenOf(xml, 'arp-table-information');
+  const entries: JunosArpEntry[] = [];
+  for (const block of blocks) {
+    const entry = parseArpEntryBlock(block);
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+// ----------------------------------------------------------------
+// MAC table parser
+// ----------------------------------------------------------------
+
+export type JunosMacEntry = {
+  mac: string;
+  vlan: string;
+  tag: string;
+  interface: string;
+  flags: string;
+  type: string;
+  sessId: string;
+};
+
+const MAC_FLAG_LABELS: Record<string, string> = {
+  S: 'static',
+  D: 'dynamic',
+  L: 'locally learned',
+  C: 'control',
+  R: 'remote',
+};
+
+function flagToType(flags: string): string {
+  const first = (flags || 'D').trim()[0]?.toUpperCase() || 'D';
+  return MAC_FLAG_LABELS[first] ?? first.toLowerCase();
+}
+
+function parseMacEntryBlock(xml: string): JunosMacEntry | null {
+  const mac = normalizeMac(xmlChildText(xml, 'l2ng-l2-mac-address', 'mac-address', 'mac'));
+  if (!mac) return null;
+  const vlan = xmlChildText(xml, 'l2ng-l2-vlan-id', 'vlan-id', 'vlan') || '-';
+  const interface_ = xmlChildText(xml, 'l2ng-l2-mac-logical-interface', 'mac-logical-interface', 'interface-name', 'interface') || '-';
+  const flagsRaw = xmlChildText(xml, 'l2ng-l2-mac-flags', 'l2ng-l2-mac-entry-flags', 'mac-flags', 'mac-type') || 'D';
+  const flags = flagsRaw.slice(0, 8);
+  const sessId = xmlChildText(xml, 'l2ng-l2-mac-sequence-number', 'sess-id') || '0';
+  return {
+    mac,
+    vlan,
+    tag: '-',
+    interface: interface_,
+    flags,
+    type: flagToType(flags),
+    sessId,
+  };
+}
+
+function parseMacTableXml(xml: string): JunosMacEntry[] {
+  const blocks = xmlChildrenOf(xml, 'ethernet-switching-table-information');
+  const entries: JunosMacEntry[] = [];
+  for (const block of blocks) {
+    const entry = parseMacEntryBlock(block);
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+// ----------------------------------------------------------------
+// Interface terse parser
+// ----------------------------------------------------------------
+
+export type JunosInterfaceEntry = {
+  name: string;
+  adminStatus: string;
+  operStatus: string;
+  description: string;
+  mode: string;
+  accessVlan: string;
+  address: string;
+  mtu: string;
+  speed: string;
+};
+
+const KEEP_IFACE_RE = /^(ge-|xe-|et-|ae\d|irb|vlan|lo0|me0|fxp0|em0)/i;
+
+function keepIface(name: string): boolean {
+  return Boolean(name) && KEEP_IFACE_RE.test(name);
+}
+
+const TERSE_RE = /^(?:\S+\s+){2}(?:\S+\s+)?(\S+)\s+(up|down)\s+(up|down)\s+(\S+)(?:\s+(\S+))?/i;
+
+function parseTerseLine(line: string): JunosInterfaceEntry | null {
+  // Format: Interface  Admin  Link  Proto  Local  (or just Interface Admin Link Proto)
+  // e.g.: ge-0/0/0    up    up    up
+  const parts = line.trim().split(/\s+/);
+  if (parts.length < 4) return null;
+  const name = parts[0];
+  if (!keepIface(name)) return null;
+  const admin = parts[1]?.toLowerCase() ?? 'up';
+  const oper = parts[2]?.toLowerCase() ?? 'up';
+  const proto = (parts[3] ?? '').toLowerCase();
+  const mode = proto === 'inet' ? 'inet' : proto === 'eth-switch' || proto === 'ethernet-switching' ? 'eth-switch' : '';
+  const address = proto === 'inet' ? (parts[4] ?? '') : '';
+  return {
+    name,
+    adminStatus: admin,
+    operStatus: oper,
+    description: '',
+    mode,
+    accessVlan: '',
+    address,
+    mtu: '',
+    speed: '',
+  };
+}
+
+// ----------------------------------------------------------------
+// Public REST functions
+// ----------------------------------------------------------------
+
+export async function fetchArpTable(host: string): Promise<{
+  ok: boolean;
+  entries: JunosArpEntry[];
+  collectMs: number;
+  error?: string;
+}> {
+  if (!restEnabled()) {
+    return { ok: false, entries: [], collectMs: 0, error: 'JUNOS_REST_ENABLED=false' };
+  }
+  const started = Date.now();
+  const result = await callRpc(host, 'get-arp-table-information', 20000);
+  if (!result.ok) {
+    return { ok: false, entries: [], collectMs: Date.now() - started, error: result.error };
+  }
+  const xml = extractXmlBody(result.raw);
+  if (!xml) {
+    return { ok: false, entries: [], collectMs: Date.now() - started, error: 'Empty ARP response' };
+  }
+  const entries = parseArpTableXml(xml);
+  return { ok: true, entries, collectMs: Date.now() - started };
+}
+
+export async function fetchMacTable(host: string): Promise<{
+  ok: boolean;
+  entries: JunosMacEntry[];
+  collectMs: number;
+  error?: string;
+}> {
+  if (!restEnabled()) {
+    return { ok: false, entries: [], collectMs: 0, error: 'JUNOS_REST_ENABLED=false' };
+  }
+  const started = Date.now();
+  const result = await callRpc(host, 'get-ethernet-switching-table-information', 20000);
+  if (!result.ok) {
+    return { ok: false, entries: [], collectMs: Date.now() - started, error: result.error };
+  }
+  const xml = extractXmlBody(result.raw);
+  if (!xml) {
+    return { ok: false, entries: [], collectMs: Date.now() - started, error: 'Empty MAC response' };
+  }
+  const entries = parseMacTableXml(xml);
+  return { ok: true, entries, collectMs: Date.now() - started };
+}
+
+export async function fetchInterfaceList(host: string): Promise<{
+  ok: boolean;
+  interfaces: JunosInterfaceEntry[];
+  collectMs: number;
+  error?: string;
+}> {
+  if (!restEnabled()) {
+    return { ok: false, interfaces: [], collectMs: 0, error: 'JUNOS_REST_ENABLED=false' };
+  }
+  const started = Date.now();
+  // Use terse= to get a compact interface list (much faster than full XML)
+  const result = await callRpc(host, 'get-interface-information', 20000);
+  if (!result.ok) {
+    return { ok: false, interfaces: [], collectMs: Date.now() - started, error: result.error };
+  }
+  const raw = result.raw || '';
+  const lines = raw.split('\n');
+  const interfaces: JunosInterfaceEntry[] = [];
+  for (const line of lines) {
+    const entry = parseTerseLine(line);
+    if (entry) interfaces.push(entry);
+  }
+  if (interfaces.length === 0) {
+    return { ok: false, interfaces: [], collectMs: Date.now() - started, error: 'No interfaces in response' };
+  }
+  return { ok: true, interfaces, collectMs: Date.now() - started };
 }
 
 function unescapeXml(text: string): string {

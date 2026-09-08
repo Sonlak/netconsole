@@ -23,7 +23,7 @@ export async function fetchDeviceInterfaces(
 
 export async function collectDeviceInterfaces(
   deviceId: string,
-): Promise<{ job: Job; message?: string }> {
+): Promise<{ job: Job; queued: boolean }> {
   const response = await authFetch(`${API_BASE}/${deviceId}/collect`, { method: 'POST' });
   return handleResponse(response);
 }

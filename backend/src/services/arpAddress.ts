@@ -3,6 +3,8 @@ import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { getLatestJobResult, jobPriority } from './deviceOperations.js';
+import { fetchArpTable } from './junosRest.js';
+import { fetchIosxeArpTable } from './iosxeRest.js';
 
 export type ArpTableEntry = {
   ip: string;
@@ -151,4 +153,97 @@ export function scheduleArpCollection(intervalSeconds: number) {
   return setInterval(() => {
     void run();
   }, intervalMs);
+}
+
+/**
+ * Collect ARP table for a single device via direct REST call (bypasses job queue).
+ *
+ * - Juniper: calls `fetchArpTable()` which uses Junos RESTCONF.
+ * - IOS-XE:   calls `fetchIosxeArpTable()` which uses Cisco RESTCONF YANG.
+ *             Falls back to job queue if YANG returns empty (SSH fallback via worker).
+ * - Other:    always uses job queue (worker handles vendor-specific logic).
+ *
+ * Always writes a SUCCESS job row so GET /api/devices/:id/arp returns fresh data.
+ * Returns `{ job, queued }` where `queued=true` means a worker job was also
+ * queued as a fallback (e.g. IOS-XE with empty YANG response).
+ */
+export async function collectArpForDevice(
+  deviceId: string,
+  createdById: string | null,
+): Promise<{ job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null }; queued: boolean }> {
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    throw new Error('Device not found');
+  }
+
+  const vendor = (device.vendor ?? '').toLowerCase();
+
+  // Juniper: try REST first
+  if (vendor === 'juniper') {
+    const rest = await fetchArpTable(device.ip);
+    if (rest.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_ARP,
+          status: JobStatus.SUCCESS,
+          priority: jobPriority(JobType.GET_ARP),
+          ...(createdById ? { createdById } : {}),
+          result: {
+            implemented: true,
+            source: 'junos-rest',
+            entries: rest.entries,
+            command: 'get-arp-table-information',
+            message: `Collected ARP table from ${device.name} via REST`,
+            collectMs: rest.collectMs,
+          } as object,
+        },
+      });
+      console.log(`[arp] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.entries.length} entries)`);
+      return { job, queued: false };
+    }
+    // REST failed — fall through to job queue so worker can retry
+    console.warn(`[arp] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+  }
+
+  // IOS-XE: try RESTCONF (YANG ARP is often empty on lab images)
+  if (vendor === 'cisco') {
+    const rest = await fetchIosxeArpTable(device.ip);
+    if (rest.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_ARP,
+          status: JobStatus.SUCCESS,
+          priority: jobPriority(JobType.GET_ARP),
+          ...(createdById ? { createdById } : {}),
+          result: {
+            implemented: true,
+            source: 'iosxe-rest',
+            entries: rest.entries,
+            command: 'Cisco-IOS-XE-arp-oper:arp-data',
+            message: `Collected ARP table from ${device.name} via RESTCONF`,
+            collectMs: rest.collectMs,
+          } as object,
+        },
+      });
+      console.log(`[arp] ${device.ip} collected via RESTCONF in ${rest.collectMs}ms (${rest.entries.length} entries)`);
+      return { job, queued: false };
+    }
+    // YANG empty or failed — fall through to job queue (worker SSH fallback)
+    console.warn(`[arp] ${device.ip} RESTCONF ARP failed (${rest.error}), falling back to job queue`);
+  }
+
+  // Default: create a PENDING job (worker handles vendor-specific logic)
+  const job = await prisma.job.create({
+    data: {
+      deviceId: device.id,
+      type: JobType.GET_ARP,
+      status: JobStatus.PENDING,
+      priority: jobPriority(JobType.GET_ARP),
+      ...(createdById ? { createdById } : {}),
+    },
+    select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+  });
+  return { job, queued: true };
 }

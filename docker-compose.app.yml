@@ -139,6 +139,12 @@ services:
       JUNOS_REST_VERIFY_TLS: "false"
       JUNOS_REST_USER: netconsole
       JUNOS_REST_PASSWORD: Admin@123
+      IOSXE_API_ENABLED: "true"
+      IOSXE_API_SCHEME: https
+      IOSXE_API_PORT: "443"
+      IOSXE_API_VERIFY_TLS: "false"
+      IOSXE_API_USER: netconsole
+      IOSXE_API_PASSWORD: Admin@123
       # Multi-vendor APIs (added 2026-09-07). ENABLE_*_API flags gate
       # whether the vendor backend will be used for matching devices.
       # Disabled by default; flip true on a per-host basis when you've

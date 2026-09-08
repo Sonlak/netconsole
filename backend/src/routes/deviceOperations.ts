@@ -7,6 +7,8 @@ import {
   getLatestJobResult,
   stubPayload,
 } from '../services/deviceOperations.js';
+import { collectArpForDevice } from '../services/arpAddress.js';
+import { collectMacForDevice } from '../services/macAddress.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
@@ -79,13 +81,31 @@ export function registerDeviceOperationRoutes(router: import('express').Router) 
     void readOperation(idParam(req), JobType.GET_ARP, res),
   );
   router.post('/:id/arp', authMiddleware, (req, res) =>
-    void triggerOperation(idParam(req), JobType.GET_ARP, res, userId(req)),
+    void (async () => {
+      try {
+        const result = await collectArpForDevice(idParam(req), userId(req));
+        res.status(result.queued ? 202 : 200).json(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'ARP collection failed';
+        const status = message === 'Device not found' ? 404 : 502;
+        res.status(status).json({ error: message });
+      }
+    })(),
   );
   router.get('/:id/mac', (req, res) =>
     void readOperation(idParam(req), JobType.GET_MAC, res),
   );
   router.post('/:id/mac', authMiddleware, (req, res) =>
-    void triggerOperation(idParam(req), JobType.GET_MAC, res, userId(req)),
+    void (async () => {
+      try {
+        const result = await collectMacForDevice(idParam(req), userId(req));
+        res.status(result.queued ? 202 : 200).json(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'MAC collection failed';
+        const status = message === 'Device not found' ? 404 : 502;
+        res.status(status).json({ error: message });
+      }
+    })(),
   );
   router.post('/:id/connect', authMiddleware, (req, res) =>
     void triggerOperation(idParam(req), JobType.CONNECT_TEST, res, userId(req)),

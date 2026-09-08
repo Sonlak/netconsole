@@ -195,18 +195,14 @@ function DeviceNetworkTable({ deviceId, kind }: { deviceId: string; kind: 'arp' 
   const handleCollect = async () => {
     setCollecting(true);
     try {
-      const trigger = kind === 'arp' ? await triggerDeviceArp(deviceId) : await triggerDeviceMac(deviceId);
-      if (trigger.job?.id) {
-        const job = await waitForJob(trigger.job.id);
-        await load();
-        if (job.status === 'SUCCESS') message.success(`Collected ${kind.toUpperCase()}`);
-        else message.error(job.error ?? `${kind.toUpperCase()} collection failed`);
-      } else {
-        await load();
-      }
+      await (kind === 'arp' ? triggerDeviceArp(deviceId) : triggerDeviceMac(deviceId));
+      // Backend writes a SUCCESS job and returns immediately. Brief pause so the
+      // DB write commits before we re-fetch.
+      await new Promise((r) => setTimeout(r, 300));
+      await load();
+      message.success(`Collected ${kind.toUpperCase()}`);
     } catch (cause) {
-      if (cause instanceof JobWaitTimeoutError) message.warning(cause.message);
-      else message.error(cause instanceof Error ? cause.message : 'Could not collect');
+      message.error(cause instanceof Error ? cause.message : 'Could not collect');
     } finally {
       setCollecting(false);
     }

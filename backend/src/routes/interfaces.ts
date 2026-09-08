@@ -1,8 +1,8 @@
 import { Router } from 'express';
 import {
+  collectInterfacesForDevice,
   getLatestInterfacesJob,
   parseInterfaceActionPayload,
-  queueGetInterfaces,
   queueInterfaceAction,
 } from '../services/interfaces.js';
 import { prisma } from '../lib/prisma.js';
@@ -56,12 +56,14 @@ interfacesRouter.get('/:deviceId', async (req, res) => {
 
 interfacesRouter.post('/:deviceId/collect', async (req, res) => {
   const deviceId = String(req.params.deviceId);
-  const job = await queueGetInterfaces(deviceId);
-  if (!job) {
-    res.status(404).json({ error: 'Device not found' });
-    return;
+  try {
+    const result = await collectInterfacesForDevice(deviceId);
+    res.status(result.queued ? 202 : 200).json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Interface collection failed';
+    const status = message === 'Device not found' ? 404 : 502;
+    res.status(status).json({ error: message });
   }
-  res.status(202).json({ job, message: 'GET_INTERFACES job queued' });
 });
 
 interfacesRouter.post('/:deviceId/actions', async (req, res) => {

@@ -3,6 +3,8 @@ import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { reclaimStaleJobs } from './jobWatchdog.js';
 import { jobPriority } from './deviceOperations.js';
+import { fetchInterfaceList } from './junosRest.js';
+import { fetchIosxeInterfaceList } from './iosxeRest.js';
 
 export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
 
@@ -217,4 +219,103 @@ export async function queueInterfaceAction(deviceId: string, payload: InterfaceA
       },
     },
   });
+}
+
+/**
+ * Collect interface list for a single device via direct REST call (bypasses job queue).
+ *
+ * - Juniper: calls `fetchInterfaceList()` using Junos RESTCONF terse RPC.
+ * - IOS-XE:  calls `fetchIosxeInterfaceList()` using ietf-interfaces YANG.
+ *             Falls back to job queue if REST returns empty.
+ * - Other:   always uses job queue.
+ *
+ * Writes a SUCCESS job row so GET /api/interfaces/:deviceId returns fresh data.
+ * Returns `{ job, queued }` where `queued=true` means a worker job was also
+ * queued as a fallback (e.g. IOS-XE with sparse YANG response).
+ */
+export async function collectInterfacesForDevice(
+  deviceId: string,
+): Promise<{ job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null }; queued: boolean }> {
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    throw new Error('Device not found');
+  }
+
+  const vendor = (device.vendor ?? '').toLowerCase();
+
+  // Juniper: try REST first
+  if (vendor === 'juniper') {
+    const rest = await fetchInterfaceList(device.ip);
+    if (rest.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_INTERFACES,
+          status: JobStatus.SUCCESS,
+          priority: 100,
+          result: {
+            implemented: true,
+            source: 'junos-rest',
+            interfaces: rest.interfaces,
+            command: 'get-interface-information terse',
+            message: `Collected interfaces from ${device.name} via REST`,
+            collectMs: rest.collectMs,
+          } as object,
+        },
+        select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+      });
+      console.log(`[interfaces] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.interfaces.length} interfaces)`);
+      return { job, queued: false };
+    }
+    console.warn(`[interfaces] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+  }
+
+  // IOS-XE: try RESTCONF first
+  if (vendor === 'cisco') {
+    const rest = await fetchIosxeInterfaceList(device.ip);
+    if (rest.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_INTERFACES,
+          status: JobStatus.SUCCESS,
+          priority: 100,
+          result: {
+            implemented: true,
+            source: 'iosxe-rest',
+            interfaces: rest.interfaces,
+            command: 'ietf-interfaces:interfaces',
+            message: `Collected interfaces from ${device.name} via RESTCONF`,
+            collectMs: rest.collectMs,
+          } as object,
+        },
+        select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+      });
+      console.log(`[interfaces] ${device.ip} collected via RESTCONF in ${rest.collectMs}ms (${rest.interfaces.length} interfaces)`);
+      return { job, queued: false };
+    }
+    console.warn(`[interfaces] ${device.ip} RESTCONF failed (${rest.error}), falling back to job queue`);
+  }
+
+  // Default: queue a job (worker handles vendor-specific logic)
+  const existing = await prisma.job.findFirst({
+    where: {
+      deviceId,
+      type: JobType.GET_INTERFACES,
+      status: { in: [JobStatus.PENDING, JobStatus.RUNNING] },
+    },
+  });
+  if (existing) {
+    return { job: existing, queued: true };
+  }
+  const job = await prisma.job.create({
+    data: {
+      deviceId: device.id,
+      type: JobType.GET_INTERFACES,
+      status: JobStatus.PENDING,
+      priority: 100,
+    },
+    select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+  });
+  return { job, queued: true };
 }
