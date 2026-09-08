@@ -370,8 +370,6 @@ def apply_set_configuration(
     Returns the same shape as ``junos_rest.apply_set_configuration`` so
     the caller (JuniperBackend.apply_config) can use either interchangeably.
     """
-    import time as _t
-
     _ = log
 
     pool = get_nc_pool()

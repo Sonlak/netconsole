@@ -592,7 +592,7 @@ class JuniperBackend(DeviceBackend):
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 
-            applied = apply_set_configuration(
+            applied = rest_apply_set_configuration(
                 device.ip,
                 commands,
                 log=f"NetConsole {action} {iface}",
