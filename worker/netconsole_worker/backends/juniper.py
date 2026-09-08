@@ -436,42 +436,7 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = applied.get("error") or "Junos REST load/commit failed"
 
-        if self.config.ssh_enabled:
-            previous_ssh = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="show configuration | display set",
-            )
-            if not previous_ssh["sshOk"]:
-                raise RuntimeError(previous_ssh["error"] or rest_error or "Failed to snapshot running config")
-
-            applied = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="configure exclusive; " + " ; ".join(commands) + "; commit and-quit",
-                timeout=45,
-            )
-            if not applied["sshOk"]:
-                raise RuntimeError(applied["error"] or rest_error or "Failed to commit config")
-            output = (applied["output"] or "").lower()
-            if "error:" in output:
-                raise RuntimeError(applied["output"].strip())
-
-            return {
-                "implemented": True,
-                "source": "ssh-cli",
-                "previous": previous_ssh["output"] or "",
-                "config": config,
-                "output": applied["output"] or "",
-                "message": f"Committed config to {device.name}",
-                "restError": rest_error,
-            }
-
-        raise RuntimeError(rest_error or "APPLY_CONFIG requires JUNOS_REST or LAB_SSH")
+        raise RuntimeError(rest_error or "APPLY_CONFIG requires JUNOS_REST enabled and a reachable device")
 
     def rollback_config(
         self,
@@ -500,41 +465,7 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rolled.get("error") or "Junos REST rollback failed"
 
-        if self.config.ssh_enabled:
-            rolled = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command=f"configure exclusive; rollback {rollback}; commit and-quit",
-                timeout=45,
-            )
-            if not rolled["sshOk"]:
-                raise RuntimeError(rolled["error"] or rest_error or "Rollback SSH failed")
-            output = (rolled["output"] or "").lower()
-            if "error:" in output:
-                raise RuntimeError(rolled["output"].strip())
-
-            current = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="show configuration | display set",
-            )
-            if not current["sshOk"]:
-                raise RuntimeError(current["error"] or rest_error or "Failed to read config after rollback")
-
-            return {
-                "implemented": True,
-                "source": "ssh-cli",
-                "output": rolled["output"] or "",
-                "config": current["output"] or "",
-                "message": f"Rolled back config on {device.name}",
-                "restError": rest_error,
-            }
-
-        raise RuntimeError(rest_error or "ROLLBACK_CONFIG requires JUNOS_REST or LAB_SSH")
+        raise RuntimeError(rest_error or "ROLLBACK_CONFIG requires JUNOS_REST enabled and a reachable device")
 
     def interface_action(
         self,
