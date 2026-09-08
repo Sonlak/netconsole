@@ -671,6 +671,52 @@ def apply_set_configuration(
                 "loadMs": load_ms2,
                 "commitMs": commit_ms2,
             }
+        # An empty response body (len=0) on HTTP 200 is a classic stale-socket
+        # symptom: the commit landed on the device but the response was lost.
+        # Treat it identically to the explicit stale-socket tokens below.
+        if not commit_raw:
+            logger.warning(
+                "junos %s: commit returned empty body (stale socket suspected), "
+                "invalidating pool and retrying load+commit",
+                host,
+            )
+            _pool.invalidate(host, port, username, scheme)
+            client = _pool.borrow(host, port, username, password, scheme, verify_tls, timeout=timeout)
+            load_ok2, load_raw2, load_ms2 = _load(client)
+            if load_ok2:
+                commit_ok2, commit_raw2, commit_ms2 = _commit(client)
+                if commit_ok2 or not commit_raw2:
+                    # commit_ok2: fresh socket returned success
+                    # not commit_raw2: retry also got empty body = commit landed
+                    return {
+                        "ok": True,
+                        "stage": "commit",
+                        "error": None,
+                        "raw": f"{load_raw2}\n{commit_raw2}\n(recovered after empty-response retry)",
+                        "loadMs": load_ms2,
+                        "commitMs": commit_ms2,
+                    }
+                # Still failed with a real error — discard and surface it.
+                post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+                detail = format_junos_rpc_error(commit_raw2) or "commit failed on retry"
+                return {
+                    "ok": False,
+                    "stage": "commit-retry",
+                    "error": f"commit failed (after empty-response retry): {detail}",
+                    "raw": commit_raw2,
+                    "loadMs": load_ms2,
+                    "commitMs": commit_ms2,
+                }
+            # Re-load also failed — discard and report.
+            post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+            return {
+                "ok": False,
+                "stage": "load-retry",
+                "error": "load failed after empty commit response",
+                "raw": load_raw2 or "",
+                "loadMs": load_ms2,
+                "commitMs": 0,
+            }
         # Non-recoverable commit error: discard the bad change so the next
         # job starts from a clean database, then report the real failure.
         # If the error looks like a stale-socket (pool entry gone stale
