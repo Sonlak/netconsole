@@ -7,6 +7,7 @@ import {
   suggestRole,
   type ConfigRole,
 } from '../services/labConfigTemplates.js';
+import { jobPriority } from '../services/deviceOperations.js';
 
 export const generateConfigRouter = Router();
 
@@ -137,6 +138,7 @@ async function enqueue(
       deviceId,
       type,
       status: JobStatus.PENDING,
+      priority: jobPriority(type),
       ...(payload !== undefined ? { payload } : {}),
     },
     include: { device: true },
@@ -233,6 +235,7 @@ generateConfigRouter.post('/devices/:id/commit', async (req, res) => {
       deviceId: device.id,
       type: JobType.APPLY_CONFIG,
       status: JobStatus.PENDING,
+      priority: jobPriority(JobType.APPLY_CONFIG),
       payload: { config: content, role, previous },
     },
     include: { device: true },
@@ -364,6 +367,7 @@ generateConfigRouter.post('/bulk-commit', async (req, res) => {
         deviceId: device.id,
         type: JobType.APPLY_CONFIG,
         status: JobStatus.PENDING,
+        priority: jobPriority(JobType.APPLY_CONFIG),
         payload: {
           config: content,
           role: effectiveRole,

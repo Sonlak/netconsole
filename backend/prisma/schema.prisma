@@ -85,6 +85,12 @@ model Job {
   device    Device?   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   type      JobType
   status    JobStatus @default(PENDING)
+  /// Job pickup priority. HIGH = Config Studio (APPLY_CONFIG, ROLLBACK_CONFIG,
+  /// manual GET_CONFIG/GET_INTERFACES) — worker must skip past these before
+  /// touching collection jobs. NORMAL = scheduled GET_ARP/GET_MAC/GET_CONFIG
+  /// from collection intervals. Workers MUST sort by priority DESC, createdAt
+  /// ASC when polling PENDING.
+  priority  Int       @default(0)
   payload   Json?
   result    Json?
   error     String?
@@ -101,6 +107,7 @@ model Job {
   @@index([status])
   @@index([createdById])
   @@index([deviceId, status])
+  @@index([status, priority, createdAt])
 }
 
 enum LogSeverity {

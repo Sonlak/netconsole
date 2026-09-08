@@ -2,6 +2,7 @@ import { JobStatus, JobType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { reclaimStaleJobs } from './jobWatchdog.js';
+import { jobPriority } from './deviceOperations.js';
 
 export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
 
@@ -126,6 +127,7 @@ export async function queueGetInterfaces(deviceId: string, options?: { force?: b
       deviceId,
       type: JobType.GET_INTERFACES,
       status: JobStatus.PENDING,
+      priority: jobPriority(JobType.GET_INTERFACES),
     },
     include: {
       device: { select: deviceSelect },
@@ -203,6 +205,7 @@ export async function queueInterfaceAction(deviceId: string, payload: InterfaceA
       deviceId,
       type: JobType.INTERFACE_ACTION,
       status: JobStatus.PENDING,
+      priority: jobPriority(JobType.INTERFACE_ACTION),
       payload: payload as Prisma.InputJsonValue,
     },
     include: {

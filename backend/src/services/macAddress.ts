@@ -2,7 +2,7 @@ import { JobStatus, JobType } from '@prisma/client';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
-import { getLatestJobResult } from './deviceOperations.js';
+import { getLatestJobResult, jobPriority } from './deviceOperations.js';
 
 export type MacTableEntry = {
   mac: string;
@@ -165,6 +165,7 @@ export async function queueMacCollection(options?: {
         deviceId: device.id,
         type: JobType.GET_MAC,
         status: JobStatus.PENDING,
+        priority: jobPriority(JobType.GET_MAC),
       },
       include: {
         device: {

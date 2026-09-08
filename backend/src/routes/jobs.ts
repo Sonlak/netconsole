@@ -66,6 +66,14 @@ jobsRouter.get('/', authMiddleware, async (req, res) => {
 });
 
 // Worker-only: claim the next pending job(s). Requires `role: "worker"`.
+//
+// Priority order (config-studio jobs MUST be picked up before collection jobs
+// even if they were created later):
+//   1. Config Studio interactive: APPLY_CONFIG / ROLLBACK_CONFIG / MANAGED_CHECK
+//      / INTERFACE_ACTION / CONNECT_TEST / DISCOVERY_PROBE (priority HIGH)
+//   2. Manual refresh: GET_CONFIG / GET_INTERFACES (priority HIGH)
+//   3. Scheduled collection: GET_ARP / GET_MAC / scheduled GET_CONFIG
+//      (priority NORMAL — uses the index [status, priority, createdAt])
 jobsRouter.get('/queue', workerAuth, async (req, res) => {
   const include = {
     device: {
@@ -85,7 +93,9 @@ jobsRouter.get('/queue', workerAuth, async (req, res) => {
         ...(seen.length ? { id: { notIn: seen } } : {}),
       },
       include,
-      orderBy: { createdAt: 'asc' },
+      // Priority DESC then FIFO so config-studio jobs ALWAYS jump the queue
+      // ahead of any backlogged collection jobs.
+      orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
       take: take - picked.length,
     });
     for (const row of rows) {

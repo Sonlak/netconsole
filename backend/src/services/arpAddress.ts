@@ -2,7 +2,7 @@ import { JobStatus, JobType } from '@prisma/client';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
-import { getLatestJobResult } from './deviceOperations.js';
+import { getLatestJobResult, jobPriority } from './deviceOperations.js';
 
 export type ArpTableEntry = {
   ip: string;
@@ -112,6 +112,7 @@ export async function queueArpCollection(options?: {
         deviceId: device.id,
         type: JobType.GET_ARP,
         status: JobStatus.PENDING,
+        priority: jobPriority(JobType.GET_ARP),
       },
       include: {
         device: {

@@ -4,6 +4,7 @@ import { queueArpCollection } from './arpAddress.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { queueInterfacesCollection } from './interfaces.js';
 import { queueMacCollection } from './macAddress.js';
+import { jobPriority } from './deviceOperations.js';
 
 export async function queueConfigCollection(options?: {
   deviceIds?: string[];
@@ -36,6 +37,7 @@ export async function queueConfigCollection(options?: {
         deviceId: device.id,
         type: JobType.GET_CONFIG,
         status: JobStatus.PENDING,
+        priority: jobPriority(JobType.GET_CONFIG),
       },
       include: {
         device: {

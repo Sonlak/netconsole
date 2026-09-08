@@ -15,6 +15,27 @@ export type DeviceBusyError = {
 };
 
 /**
+ * Job types that originate from the Config Studio UI and MUST be picked up
+ * by the worker ahead of any scheduled collection jobs. Config Studio jobs
+ * are the ones an admin triggered interactively — they should never wait
+ * behind a backlog of GET_ARP/GET_MAC scans.
+ */
+const HIGH_PRIORITY_TYPES = new Set<JobType>([
+  JobType.APPLY_CONFIG,
+  JobType.ROLLBACK_CONFIG,
+  JobType.MANAGED_CHECK,
+  JobType.INTERFACE_ACTION,
+  JobType.CONNECT_TEST,
+  JobType.DISCOVERY_PROBE,
+  JobType.GET_CONFIG,
+  JobType.GET_INTERFACES,
+]);
+
+export function jobPriority(type: JobType): number {
+  return HIGH_PRIORITY_TYPES.has(type) ? 100 : 0;
+}
+
+/**
  * Try to create a job for a device, serialised by Postgres advisory lock.
  * Returns either { kind: 'created', job } or { kind: 'busy', error }.
  * Caller decides how to map the busy case to HTTP (POST /api/jobs uses 409,
@@ -72,6 +93,7 @@ export async function tryCreateDeviceJob(
       deviceId,
       type,
       status: JobStatus.PENDING,
+      priority: jobPriority(type),
       ...(createdById ? { createdById } : {}),
       ...(payload !== undefined ? { payload } : {}),
     },

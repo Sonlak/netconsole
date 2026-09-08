@@ -9,6 +9,7 @@ import {
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
+import { jobPriority } from './deviceOperations.js';
 
 export type DeviceLogRow = {
   id: string;
@@ -211,6 +212,7 @@ export async function queueLogsCollection(options?: { deviceIds?: string[]; forc
         deviceId: device.id,
         type: JobType.GET_LOGS,
         status: JobStatus.PENDING,
+        priority: jobPriority(JobType.GET_LOGS),
         payload,
       },
       include: {

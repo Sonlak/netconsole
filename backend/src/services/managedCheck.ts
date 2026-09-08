@@ -3,6 +3,7 @@ import { prisma } from '../lib/prisma.js';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { queueDeviceTabCollections } from './deviceTabCollection.js';
 import { pingHost } from './ping.js';
+import { jobPriority } from './deviceOperations.js';
 
 export type ManagedChecks = {
   ping: boolean;
@@ -88,6 +89,7 @@ export async function startManagedCheck(deviceId: string) {
       deviceId: device.id,
       type: JobType.MANAGED_CHECK,
       status: JobStatus.PENDING,
+      priority: jobPriority(JobType.MANAGED_CHECK),
     },
     include: { device: true },
   });
