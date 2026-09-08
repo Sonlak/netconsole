@@ -74,6 +74,10 @@ jobsRouter.get('/', authMiddleware, async (req, res) => {
 //   2. Manual refresh: GET_CONFIG / GET_INTERFACES (priority HIGH)
 //   3. Scheduled collection: GET_ARP / GET_MAC / scheduled GET_CONFIG
 //      (priority NORMAL — uses the index [status, priority, createdAt])
+//
+// Device lock: a device with an existing RUNNING job is skipped so two workers
+// never operate on the same device concurrently. This mirrors the advisory-lock
+// check in tryCreateDeviceJob so the queue and the job-creation path agree.
 jobsRouter.get('/queue', workerAuth, async (req, res) => {
   const include = {
     device: {
@@ -98,7 +102,22 @@ jobsRouter.get('/queue', workerAuth, async (req, res) => {
       orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
       take: take - picked.length,
     });
+    // Filter out PENDING jobs whose device already has a RUNNING job.
+    // We check ALL running job deviceIds at once (single query) so the
+    // filter is cheap even for a large pending queue.
+    const runningDeviceIds = new Set(
+      (
+        await prisma.job.findMany({
+          where: { status: JobStatus.RUNNING },
+          select: { deviceId: true },
+        })
+      )
+        .map((r) => r.deviceId)
+        .filter((id): id is string => id !== null),
+    );
     for (const row of rows) {
+      // Skip if this device has an active (RUNNING) job — device is busy.
+      if (row.deviceId && runningDeviceIds.has(row.deviceId)) continue;
       seen.push(row.id);
       picked.push(row);
     }
