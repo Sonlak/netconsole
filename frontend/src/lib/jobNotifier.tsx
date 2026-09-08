@@ -60,7 +60,7 @@ export function reportFinal(
           <Link to={jobsPath}>mở Jobs</Link>
         </span>
       ),
-      duration: 6,
+      duration: 10,
       placement: 'topRight',
     });
     return;
@@ -75,7 +75,7 @@ export function reportFinal(
           <Link to={jobsPath}>xem chi tiết</Link>
         </span>
       ),
-      duration: 8,
+      duration: 12,
       placement: 'topRight',
     });
     return;
@@ -90,7 +90,7 @@ export function reportFinal(
         <Link to={jobsPath}>mở Jobs</Link>
       </span>
     ),
-    duration: 6,
+    duration: 8,
     placement: 'topRight',
   });
 }

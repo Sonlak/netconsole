@@ -190,7 +190,7 @@ services:
       API_BASE_URL: http://172.31.0.3:3000/api
       POLL_INTERVAL_SECONDS: 1
       WORKER_NAME: netconsole-worker
-      WORKER_CONCURRENCY: "4"
+      WORKER_CONCURRENCY: "8"
       WORKER_AUTH_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3b3JrZXIiLCJyb2xlIjoid29ya2VyIiwidHlwZSI6IndvcmtlciIsImlhdCI6MTc4ODYyMzI3OSwiZXhwIjoxODIwMTU5Mjc5fQ.bELHMgB561GkhTyo8jGiHUQKKa22O_DhnoUoSKsmJLU"
       LAB_SSH_ENABLED: "true"
       LAB_SSH_USER: netconsole

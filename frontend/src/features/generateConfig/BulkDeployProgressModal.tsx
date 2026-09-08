@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { CheckCircleTwoTone, CloseCircleTwoTone, LoadingOutlined, MinusCircleOutlined } from '@ant-design/icons';
-import { Alert, Button, List, Modal, Space, Tag, Typography, message } from 'antd';
+import { Alert, Button, List, Modal, Space, Tag, Typography, message, notification } from 'antd';
 import { fetchJobsByIds } from '@/api/jobs';
 import type { Job, JobStatus } from '@/types/job';
 import { JOB_TYPE_LABELS } from '@/types/job';
@@ -21,7 +21,7 @@ type Props = {
 
 const TERMINAL: JobStatus[] = ['SUCCESS', 'FAILED'];
 const POLL_INTERVAL_MS = 2_000;
-const AUTO_CLOSE_DELAY_MS = 6_000;
+const AUTO_CLOSE_DELAY_MS = 10_000;
 
 type BrowserNotificationPermission = 'default' | 'denied' | 'granted';
 
@@ -104,8 +104,30 @@ export function BulkDeployProgressModal({ open, jobs, onClose }: Props) {
                 }.`;
           if (failed === 0) {
             message.success(summary);
+            notification.success({
+              message: `Bulk deploy · ${succeeded}/${fetched.length} OK`,
+              description: (
+                <span>
+                  {succeeded} device(s) đã nhận config thành công.{' '}
+                  <Link to="/jobs?type=APPLY_CONFIG">xem Jobs</Link>
+                </span>
+              ),
+              duration: 10,
+              placement: 'topRight',
+            });
           } else {
             message.warning(summary);
+            notification.warning({
+              message: `Bulk deploy · ${succeeded} OK · ${failed} failed`,
+              description: (
+                <span>
+                  Có {failed} device(s) lỗi.{' '}
+                  <Link to="/jobs?type=APPLY_CONFIG">xem Jobs</Link>
+                </span>
+              ),
+              duration: 12,
+              placement: 'topRight',
+            });
           }
           if (failed > 0 && !notifiedRef.current) {
             notifiedRef.current = true;
