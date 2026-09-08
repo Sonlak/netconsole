@@ -12,14 +12,6 @@ export type DevicePingOutcome = {
   reason?: string;
 };
 
-function hasFullManagedChecks(checks: unknown): boolean {
-  if (!checks || typeof checks !== 'object') {
-    return false;
-  }
-  const value = checks as Record<string, unknown>;
-  return Boolean(value.ping && value.ssh && value.showVersion && value.showRun);
-}
-
 export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingOutcome> {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
   if (!device) {
@@ -39,13 +31,26 @@ export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingO
   }
 
   const ping = await pingHost(device.ip);
-  const nextStatus = ping.alive
-    ? device.status === DeviceStatus.MANAGED || hasFullManagedChecks(device.managedChecks)
+  // Status logic:
+  //   - If ping fails → OFFLINE
+  //   - If ping succeeds AND device is already MANAGED → stay MANAGED
+  //     (MAINTENANCE is filtered out above)
+  //   - If ping succeeds AND device is OFFLINE/UNKNOWN → ONLINE (first time)
+  //   - Otherwise → leave unchanged
+  //
+  // BUG fix: the previous `nextStatus` expression could downgrade a MANAGED
+  // device back to ONLINE if `hasFullManagedChecks` returned false (e.g.
+  // immediately after a commit reset the managedChecks row). This caused
+  // 409 "Thiết bị phải MANAGED trước khi commit" right after a successful
+  // commit. MANAGED is an admin-promoted status — only the admin (or the
+  // commit/rollback path) should be able to clear it, never ping.
+  const nextStatus: DeviceStatus = !ping.alive
+    ? DeviceStatus.OFFLINE
+    : device.status === DeviceStatus.MANAGED
       ? DeviceStatus.MANAGED
       : device.status === DeviceStatus.OFFLINE || device.status === DeviceStatus.UNKNOWN
         ? DeviceStatus.ONLINE
-        : device.status
-    : DeviceStatus.OFFLINE;
+        : device.status;
 
   await prisma.device.update({
     where: { id: device.id },
