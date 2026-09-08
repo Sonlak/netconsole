@@ -372,7 +372,156 @@ ssh netconsole@<device-ip> 'show ip arp'
 
 ---
 
-## D. Required configuration on the NetConsole side
+## D. Juniper Junos (SRX / MX / EX / QFX / cRPD)
+
+Junos supports NETCONF out of the box. No extra package needed; just turn on
+the service, ensure SSH is up, and create a user with the right login class.
+
+### D.1 Create the service user with the `netconf` (or `super-user`) login class
+
+Junos uses **login classes** instead of privilege levels. NetConsole pushes
+full configs, so the user needs `permissions all` (or at minimum
+`interface`, `configuration`, `system`, `snmp`, `view`).
+
+```junos
+configure
+
+# Login class with all permissions (recommended for NetConsole)
+set system login class netconsole-ui permissions all
+
+# Create the user under that class
+set system login user netconsole class netconsole-ui
+set system login user netconsole authentication plain-text-password
+# -> paste Admin@123 (or your chosen password) twice at the prompts
+set system login user netconsole full-name "NetConsole Service Account"
+
+# Confirm and persist
+commit
+exit
+```
+
+> **Why not `super-user`?** `super-user` works too, but it conflicts with
+> most org audit policies. The `netconsole-ui` class with `permissions all`
+> is equivalent in capability but a clearer name for an ops audit trail.
+
+### D.2 Enable NETCONF over SSH (port 830)
+
+```junos
+configure
+
+# Bind the NETCONF XML subsystem onto SSH -- default port 830
+set system services netconf ssh
+
+# (Optional) Pin a specific port. Most devices leave 830.
+# set system services netconf ssh port 830
+
+# SSH must be up too (default in modern Junos, but explicit is safer)
+set system services ssh
+set system services ssh connection-limit 50
+
+commit
+exit
+```
+
+Verify with `show system services | match netconf`:
+```
+ssh;
+netconf {
+    ssh;
+}
+```
+
+### D.3 Open port 830 in the firewall (if `family inet filter` exists)
+
+Most modern Junos boxes **don't** have an explicit `family inet filter`
+on the management interface, so port 830 is open by default. But if your
+bank policy attaches a filter (e.g. `set interfaces lo0 unit 0 family inet filter input MGMT_FILTER`), add this:
+
+```junos
+configure
+
+# Inside the relevant filter term(s)
+set firewall family inet filter MGMT_FILTER term netconsole-allow from protocol tcp
+set firewall family inet filter MGMT_FILTER term netconsole-allow from destination-port 830
+set firewall family inet filter MGMT_FILTER term netconsole-allow from source-address 10.10.20.20/32
+set firewall family inet filter MGMT_FILTER term netconsole-allow then accept
+
+# Order matters: put a "permit" rule *before* the implicit deny-else term
+# Typical placement: after "established/related" but before "reject"
+insert firewall family inet filter MGMT_FILTER term netconsole-allow before term reject-all
+
+commit
+exit
+```
+
+> **cRPD / vQFX / vMX / vSRX:** the lab containers in this project bind
+> `lo0` for `local` services and the host-side `eth0` for `NETCONF over
+> SSH to port 830`. There is no firewall filter by default; if you add
+> one, the insert pattern above still applies.
+
+### D.4 (Optional) Traceoptions for debugging
+
+```junos
+configure
+
+# Keep only when troubleshooting -- generates noisy logs
+set system services netconf ssh traceoptions file netconf.log size 10m
+set system services netconf ssh traceoptions flag all
+
+commit
+exit
+```
+
+> Disable after debugging:
+> `delete system services netconf ssh traceoptions` + `commit`.
+
+### D.5 Verify on the device
+
+```junos
+show system services | match netconf       # NETCONF over SSH enabled
+show system login class netconsole-ui      # permissions all
+show configuration system login user netconsole
+show netconf-state                          # live NETCONF sessions
+```
+
+Smoke test directly from any box with `xmlstarlet` or `nc`:
+
+```bash
+# Confirm SSH banner + port 830 is listening
+ssh -p 830 -o StrictHostKeyChecking=no -o ConnectTimeout=5 netconsole@<device-ip> echo OK
+
+# Get Junos config schema via NETCONF hello (raw XML)
+ssh -p 830 -o StrictHostKeyChecking=no netconsole@<device-ip> \
+  netconf-xml 2>/dev/null || true
+# (Junos responds with `<hello xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">`)
+```
+
+### D.6 Smoke test from the NetConsole worker side
+
+```bash
+# Inside the worker container, with JUNOS_NETCONF_SSH_ENABLED=true
+docker exec -it netconsole-worker python -c "
+from netconsole_worker.junos_netconf import JunosNetconfSSH
+import os
+backend = os.environ['API_BASE_URL'].replace('/api','')
+j = JunosNetconfSSH(
+    host=os.environ['LAB_F2_IP'],
+    user='netconsole',
+    password='Admin@123',
+    port=830,
+)
+print('lock:', j.lock())
+print('get-config preview:', j.get_config('candidate')[:120])
+j.unlock()
+print('OK')
+"
+```
+
+Expected: `lock: True`, then `get-config preview: <configuration>...`, then `OK`.
+
+---
+
+## E. Required configuration on the NetConsole side
 
 Whichever vendor(s) you enable above, make sure the NetConsole worker can
 reach the device IPs on the management plane:
@@ -398,6 +547,12 @@ NXOS_API_USER: netconsole
 NXOS_API_PASSWORD: Admin@123
 NXOS_API_SCHEME: http
 NXOS_API_PORT: "80"
+
+# Juniper Junos -- NETCONF over SSH (port 830), per gotcha #14
+JUNOS_NETCONF_SSH_ENABLED: "true"
+JUNOS_NETCONF_SSH_PORT: "830"
+JUNOS_NETCONF_USERNAME: netconsole
+JUNOS_NETCONF_PASSWORD: Admin@123
 ```
 
 Syslog UDP port on the NetConsole VPS is already exposed in
@@ -406,7 +561,7 @@ Syslog UDP port on the NetConsole VPS is already exposed in
 
 ---
 
-## E. Security checklist (all vendors)
+## F. Security checklist (all vendors)
 
 1. Replace `Admin@123` with a per-device secret generated from
    `scripts/rotate_secrets.sh`; store it in GitHub Secrets and inject as
@@ -434,7 +589,7 @@ Syslog UDP port on the NetConsole VPS is already exposed in
 
 ---
 
-## F. Per-vendor quick reference (one-screen cheat sheet)
+## G. Per-vendor quick reference (one-screen cheat sheet)
 
 | Setting | EOS | IOS-XE | NX-OS |
 |---|---|---|---|
