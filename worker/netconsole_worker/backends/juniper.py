@@ -440,6 +440,7 @@ class JuniperBackend(DeviceBackend):
                     "raw": compact_raw(applied.get("raw") or ""),
                 }
             rest_error = applied.get("error") or "NETCONF SSH load/commit failed"
+            log("NETCONF SSH failed, falling back to RESTCONF: %s", rest_error)
 
         # --- RESTCONF (fallback) ---
         if self.config.juniper.enabled:
@@ -452,7 +453,7 @@ class JuniperBackend(DeviceBackend):
                 **creds,
             )
             if applied["ok"]:
-                return {
+                result: dict[str, Any] = {
                     "implemented": True,
                     "source": "junos-rest",
                     "previous": previous or "",
@@ -463,6 +464,11 @@ class JuniperBackend(DeviceBackend):
                     "message": f"Committed config to {device.name}",
                     "raw": compact_raw(applied.get("raw") or ""),
                 }
+                # Surface the NETCONF failure so operators can see why
+                # this device fell back instead of silently degrading.
+                if rest_error:
+                    result["netconfFallbackError"] = rest_error
+                return result
             rest_error = applied.get("error") or "Junos REST load/commit failed"
 
         raise RuntimeError(
