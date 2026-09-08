@@ -127,7 +127,10 @@ export async function queueGetInterfaces(deviceId: string, options?: { force?: b
       deviceId,
       type: JobType.GET_INTERFACES,
       status: JobStatus.PENDING,
-      priority: jobPriority(JobType.GET_INTERFACES),
+      // Background tab collection — keep at HIGH (100), not URGENT (200).
+      // URGENT is reserved for user-driven UI actions so they jump the
+      // queue ahead of this background sweep.
+      priority: 100,
     },
     include: {
       device: { select: deviceSelect },

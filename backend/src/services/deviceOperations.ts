@@ -20,6 +20,14 @@ export type DeviceBusyError = {
  * are the ones an admin triggered interactively — they should never wait
  * behind a backlog of GET_ARP/GET_MAC scans.
  */
+// Interactive / manual jobs always claim the front of the queue. These
+// are the actions a user takes from the UI (commit, rollback, manage check,
+// ping, fetch config, refresh interfaces) and MUST jump ahead of any
+// background ARP/MAC sweep regardless of when the background job was
+// queued.
+//
+// Background / scheduled collection (GET_ARP, GET_MAC) keeps the default
+// priority of 0 so it never starves user actions.
 const HIGH_PRIORITY_TYPES = new Set<JobType>([
   JobType.APPLY_CONFIG,
   JobType.ROLLBACK_CONFIG,
@@ -31,8 +39,26 @@ const HIGH_PRIORITY_TYPES = new Set<JobType>([
   JobType.GET_INTERFACES,
 ]);
 
+// "Urgent" priority: only used by jobs created by a user-driven action
+// (manual collect, manual interface refresh, commit, rollback, managed
+// check, interface action). These need to win over background collections
+// AND over a previously-queued auto-scheduled GET_CONFIG / GET_INTERFACES
+// from the same device so the user does not see "Device busy" because of
+// a 30-second-old background poll.
+const URGENT_PRIORITY_TYPES = new Set<JobType>([
+  JobType.APPLY_CONFIG,
+  JobType.ROLLBACK_CONFIG,
+  JobType.MANAGED_CHECK,
+  JobType.INTERFACE_ACTION,
+  JobType.CONNECT_TEST,
+  JobType.DISCOVERY_PROBE,
+  JobType.GET_CONFIG,
+]);
+
 export function jobPriority(type: JobType): number {
-  return HIGH_PRIORITY_TYPES.has(type) ? 100 : 0;
+  if (URGENT_PRIORITY_TYPES.has(type)) return 200;
+  if (HIGH_PRIORITY_TYPES.has(type)) return 100;
+  return 0;
 }
 
 /**
@@ -73,19 +99,45 @@ export async function tryCreateDeviceJob(
   });
 
   if (blocking) {
-    return {
-      kind: 'busy',
-      error: {
-        code: 'device_locked',
-        blockingJob: {
-          id: blocking.id,
-          type: blocking.type,
-          status: blocking.status,
-          createdAt: blocking.createdAt,
-          createdByUsername: blocking.createdBy?.username ?? null,
+    // Pre-emption: a URGENT (user-driven) job is allowed to cancel a
+    // lower-priority blocking job from the same device. Background ARP /
+    // MAC sweeps that are still PENDING get dropped here; an in-flight
+    // RUNNING job gets marked FAILED with a clear message so the worker
+    // either notices it before it does damage, or the operator sees why
+    // the previous job was aborted when they open the Jobs page.
+    const incomingPriority = jobPriority(type);
+    if (URGENT_PRIORITY_TYPES.has(type) && (blocking.priority ?? 0) < incomingPriority) {
+      if (blocking.status === JobStatus.PENDING) {
+        // Background collection not yet picked up — safe to delete.
+        await tx.job.delete({ where: { id: blocking.id } });
+      } else {
+        // RUNNING — we can't safely kill the worker's socket, but we
+        // mark the row FAILED so it stops blocking the queue. The worker
+        // will see the row has already been terminalised when it tries
+        // to claim the next job and will drop the (already-done) work.
+        await tx.job.update({
+          where: { id: blocking.id },
+          data: {
+            status: JobStatus.FAILED,
+            error: `Pre-empted by ${type} job (higher priority)`,
+          },
+        });
+      }
+    } else {
+      return {
+        kind: 'busy',
+        error: {
+          code: 'device_locked',
+          blockingJob: {
+            id: blocking.id,
+            type: blocking.type,
+            status: blocking.status,
+            createdAt: blocking.createdAt,
+            createdByUsername: blocking.createdBy?.username ?? null,
+          },
         },
-      },
-    };
+      };
+    }
   }
 
   const job = await tx.job.create({

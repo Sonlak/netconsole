@@ -37,7 +37,10 @@ export async function queueConfigCollection(options?: {
         deviceId: device.id,
         type: JobType.GET_CONFIG,
         status: JobStatus.PENDING,
-        priority: jobPriority(JobType.GET_CONFIG),
+        // Background refresh — keep at HIGH (100), not URGENT (200).
+        // URGENT is reserved for user-driven UI actions; otherwise the
+        // scheduled sweep would starve manual commits in the queue.
+        priority: 100,
       },
       include: {
         device: {
