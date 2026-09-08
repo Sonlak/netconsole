@@ -548,7 +548,28 @@ def apply_set_configuration(
         host, port, username, password, scheme, verify_tls, timeout=timeout
     )
 
-    def _load() -> tuple[bool, str, int]:
+    # Socket errors that suggest the pooled connection went stale while
+    # sitting idle (e.g. firewall RST). Any of these means we should
+    # invalidate the pool entry and retry the whole load+commit cycle on
+    # a fresh socket.
+    _STALE_SOCKET_TOKENS = (
+        "remote protocol error",
+        "peer closed connection",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "read error",
+        "write error",
+        "connect error",
+        "timed out",
+        "timeout",
+    )
+
+    def _is_stale_socket_error(text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(token in lowered for token in _STALE_SOCKET_TOKENS)
+
+    def _load(client: httpx.Client) -> tuple[bool, str, int]:
         load_started = _time.perf_counter()
         loaded = post_junos_rpc(host, load_body.decode(), client=client, scheme=scheme, port=port)
         load_ms = int((_time.perf_counter() - load_started) * 1000)
@@ -557,7 +578,7 @@ def apply_set_configuration(
             return False, load_raw, load_ms
         return True, load_raw, load_ms
 
-    def _commit() -> tuple[bool, str, int]:
+    def _commit(client: httpx.Client) -> tuple[bool, str, int]:
         commit_started = _time.perf_counter()
         commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
         commit_ms = int((_time.perf_counter() - commit_started) * 1000)
@@ -566,19 +587,43 @@ def apply_set_configuration(
         return ok, commit_raw, commit_ms
 
     # First attempt
-    load_ok, load_raw, load_ms = _load()
+    load_ok, load_raw, load_ms = _load(client)
     if not load_ok:
-        detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
-        return {
-            "ok": False,
-            "stage": "load",
-            "error": f"load failed: {detail}",
-            "raw": load_raw,
-            "loadMs": load_ms,
-            "commitMs": 0,
-        }
+        err_text = (format_junos_rpc_error(load_raw) or load_raw or "").strip()
+        # Stale-socket recovery: kill the pool entry and retry once on a
+        # fresh socket. Genuine Junos errors (syntax, permission) reach
+        # the device in `raw` and will not match the socket tokens.
+        if _is_stale_socket_error(err_text):
+            logger.warning(
+                "junos %s: load failed with stale-socket error (%s), "
+                "invalidating pool and retrying",
+                host, err_text[:120],
+            )
+            _pool.invalidate(host, port, username, scheme)
+            client = _pool.borrow(host, port, username, password, scheme, verify_tls, timeout=timeout)
+            load_ok, load_raw, load_ms = _load(client)
+            if not load_ok:
+                detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
+                return {
+                    "ok": False,
+                    "stage": "load-retry",
+                    "error": f"load failed (after socket retry): {detail}",
+                    "raw": load_raw,
+                    "loadMs": load_ms,
+                    "commitMs": 0,
+                }
+        else:
+            detail = format_junos_rpc_error(load_raw) or "load-configuration failed"
+            return {
+                "ok": False,
+                "stage": "load",
+                "error": f"load failed: {detail}",
+                "raw": load_raw,
+                "loadMs": load_ms,
+                "commitMs": 0,
+            }
 
-    commit_ok, commit_raw, commit_ms = _commit()
+    commit_ok, commit_raw, commit_ms = _commit(client)
     if not commit_ok:
         # Recover from "configuration database modified" by discarding any
         # stale pending changes and re-trying the whole load+commit cycle.
@@ -592,7 +637,7 @@ def apply_set_configuration(
                 host,
             )
             post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
-            load_ok2, load_raw2, load_ms2 = _load()
+            load_ok2, load_raw2, load_ms2 = _load(client)
             if not load_ok2:
                 detail = format_junos_rpc_error(load_raw2) or "load failed on retry"
                 return {
@@ -603,7 +648,7 @@ def apply_set_configuration(
                     "loadMs": load_ms2,
                     "commitMs": commit_ms,
                 }
-            commit_ok2, commit_raw2, commit_ms2 = _commit()
+            commit_ok2, commit_raw2, commit_ms2 = _commit(client)
             if not commit_ok2:
                 # Best-effort discard so we don't leave pending changes for
                 # the next caller even on a permanent failure.
@@ -627,6 +672,52 @@ def apply_set_configuration(
             }
         # Non-recoverable commit error: discard the bad change so the next
         # job starts from a clean database, then report the real failure.
+        # If the error looks like a stale-socket (pool entry gone stale
+        # between load and commit), invalidate the pool and retry once
+        # before giving up — load has already mutated the candidate db
+        # so a fresh commit RPC on a fresh socket should land cleanly.
+        if _is_stale_socket_error(err_text):
+            logger.warning(
+                "junos %s: commit failed with stale-socket error (%s), "
+                "invalidating pool and retrying load+commit",
+                host, err_text[:120],
+            )
+            _pool.invalidate(host, port, username, scheme)
+            client = _pool.borrow(host, port, username, password, scheme, verify_tls, timeout=timeout)
+            load_ok2, load_raw2, load_ms2 = _load(client)
+            if load_ok2:
+                commit_ok2, commit_raw2, commit_ms2 = _commit(client)
+                if commit_ok2:
+                    return {
+                        "ok": True,
+                        "stage": "commit",
+                        "error": None,
+                        "raw": f"{load_raw2}\n{commit_raw2}\n(recovered after socket retry)",
+                        "loadMs": load_ms2,
+                        "commitMs": commit_ms2,
+                    }
+                # Still failed — discard and surface the new error.
+                post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+                detail = format_junos_rpc_error(commit_raw2) or "commit failed on socket retry"
+                return {
+                    "ok": False,
+                    "stage": "commit-retry",
+                    "error": f"commit failed (after socket retry): {detail}",
+                    "raw": commit_raw2,
+                    "loadMs": load_ms2,
+                    "commitMs": commit_ms2,
+                }
+            # load itself failed on the new socket — discard & surface.
+            post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+            detail = format_junos_rpc_error(load_raw2) or "load failed on socket retry"
+            return {
+                "ok": False,
+                "stage": "load-retry",
+                "error": f"load failed (after socket retry): {detail}",
+                "raw": load_raw2,
+                "loadMs": load_ms2,
+                "commitMs": commit_ms,
+            }
         post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
         detail = format_junos_rpc_error(commit_raw) or "commit-configuration failed"
         return {
