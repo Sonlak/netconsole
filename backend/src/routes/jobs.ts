@@ -45,21 +45,35 @@ const INTERACTIVE_JOB_TYPES: JobType[] = [
 const REFRESH_JOB_TYPES: JobType[] = [JobType.GET_CONFIG, JobType.GET_INTERFACES];
 
 // User-facing: list recent jobs for the dashboard/jobs page. Requires any authenticated user.
+//
+// Supports `?limit=` (1..1000, default 100) and `?offset=` (default 0). The
+// `?type=` filter narrows by job type, used by the config-studio logs panel.
 jobsRouter.get('/', authMiddleware, async (req, res) => {
   const status =
     typeof req.query.status === 'string' && req.query.status in JobStatus
       ? (req.query.status as JobStatus)
       : undefined;
+  const type =
+    typeof req.query.type === 'string' && req.query.type in JobType
+      ? (req.query.type as JobType)
+      : undefined;
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 1000);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+  const where: Prisma.JobWhereInput = {};
+  if (status) where.status = status;
+  if (type) where.type = type;
 
   const jobs = await prisma.job.findMany({
-    where: status ? { status } : undefined,
+    where: Object.keys(where).length ? where : undefined,
     include: {
       device: {
-        select: { id: true, name: true, ip: true, site: true },
+        select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
       },
     },
     orderBy: { createdAt: 'desc' },
-    take: 100,
+    take: limit,
+    skip: offset,
   });
 
   res.json(jobs);
