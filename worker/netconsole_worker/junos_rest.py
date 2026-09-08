@@ -583,7 +583,7 @@ def apply_set_configuration(
         commit = post_junos_rpc(host, "<commit-configuration/>", client=client, scheme=scheme, port=port)
         commit_ms = int((_time.perf_counter() - commit_started) * 1000)
         commit_raw = commit.get("raw") or ""
-        logger.debug("junos %s: commit raw (len=%d): %s", host, len(commit_raw), commit_raw[:500])
+        logger.debug("junos %s: commit raw (len=%d): %s", host, len(commit_raw), commit_raw[:2000])
         ok = commit["ok"] and "<commit-success" in commit_raw
         return ok, commit_raw, commit_ms
 
