@@ -155,12 +155,6 @@ services:
       EOS_API_VERIFY_TLS: "false"
       EOS_API_USER: netconsole
       EOS_API_PASSWORD: Admin@123
-      IOSXE_API_ENABLED: "true"
-      IOSXE_API_SCHEME: https
-      IOSXE_API_PORT: "443"
-      IOSXE_API_VERIFY_TLS: "false"
-      IOSXE_API_USER: netconsole
-      IOSXE_API_PASSWORD: Admin@123
       NXOS_API_ENABLED: "true"
       NXOS_API_SCHEME: http
       NXOS_API_PORT: "80"
