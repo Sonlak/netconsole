@@ -12,7 +12,7 @@ from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
 from netconsole_worker.junos_rest import (
-    apply_set_configuration,
+    apply_set_configuration as rest_apply_set_configuration,
     compact_raw,
     fetch_arp_table,
     fetch_configuration,
@@ -23,7 +23,11 @@ from netconsole_worker.junos_rest import (
     fetch_log_information,
     fetch_vlan_information,
     probe_device_identity,
-    rollback_configuration,
+    rollback_configuration as rest_rollback_configuration,
+)
+from netconsole_worker.junos_netconf import (
+    apply_set_configuration as nc_apply_set_configuration,
+    rollback_configuration as nc_rollback_configuration,
 )
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.arp_table_rpc import parse_arp_table_rpc
@@ -408,17 +412,42 @@ class JuniperBackend(DeviceBackend):
             raise RuntimeError("APPLY_CONFIG has no set/delete commands")
 
         rest_error: str | None = None
-        creds = _rest_creds(self.config)
 
-        if self.config.juniper.enabled:
-            applied = apply_set_configuration(
+        # --- NETCONF-over-SSH (primary) ---
+        if self.config.junos_netconf_ssh:
+            nc_user = self.config.ssh_user
+            nc_pass = self.config.ssh_password
+            nc_port = self.config.junos_netconf_ssh_port
+            applied = nc_apply_set_configuration(
                 device.ip,
                 commands,
                 log=log,
-                # 90s gives the lab cRPD sim enough headroom for the
-                # first-of-session <commit-configuration> spike (we have
-                # observed 20-32s cold-starts on Junos cRPD). Watchdog
-                # in the backend is 300s for Juniper (see jobWatchdog.ts).
+                username=nc_user,
+                password=nc_pass,
+                port=nc_port,
+                timeout=90.0,
+            )
+            if applied["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "junos-netconf-ssh",
+                    "previous": previous or "",
+                    "config": config,
+                    "commands": commands,
+                    "loadMs": applied.get("loadMs"),
+                    "commitMs": applied.get("commitMs"),
+                    "message": f"Committed config to {device.name} via NETCONF SSH",
+                    "raw": compact_raw(applied.get("raw") or ""),
+                }
+            rest_error = applied.get("error") or "NETCONF SSH load/commit failed"
+
+        # --- RESTCONF (fallback) ---
+        if self.config.juniper.enabled:
+            creds = _rest_creds(self.config)
+            applied = rest_apply_set_configuration(
+                device.ip,
+                commands,
+                log=log,
                 timeout=90.0,
                 **creds,
             )
@@ -436,7 +465,10 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = applied.get("error") or "Junos REST load/commit failed"
 
-        raise RuntimeError(rest_error or "APPLY_CONFIG requires JUNOS_REST enabled and a reachable device")
+        raise RuntimeError(
+            rest_error
+            or "APPLY_CONFIG requires JUNOS_NETCONF_SSH or JUNOS_REST enabled"
+        )
 
     def rollback_config(
         self,
@@ -450,10 +482,40 @@ class JuniperBackend(DeviceBackend):
             rollback = 1
 
         rest_error: str | None = None
-        creds = _rest_creds(self.config)
 
+        # --- NETCONF-over-SSH (primary) ---
+        if self.config.junos_netconf_ssh:
+            nc_user = self.config.ssh_user
+            nc_pass = self.config.ssh_password
+            nc_port = self.config.junos_netconf_ssh_port
+            rolled = nc_rollback_configuration(
+                device.ip,
+                rollback=rollback,
+                username=nc_user,
+                password=nc_pass,
+                port=nc_port,
+                timeout=90.0,
+            )
+            if rolled["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "junos-netconf-ssh",
+                    "rollback": rollback,
+                    "config": previous or "",
+                    "message": f"Rolled back config on {device.name} via NETCONF SSH",
+                    "raw": compact_raw(rolled.get("raw") or ""),
+                }
+            rest_error = rolled.get("error") or "NETCONF SSH rollback failed"
+
+        # --- RESTCONF (fallback) ---
         if self.config.juniper.enabled:
-            rolled = rollback_configuration(device.ip, rollback=rollback, timeout=60.0, **creds)
+            creds = _rest_creds(self.config)
+            rolled = rest_rollback_configuration(
+                device.ip,
+                rollback=rollback,
+                timeout=60.0,
+                **creds,
+            )
             if rolled["ok"]:
                 return {
                     "implemented": True,
@@ -465,7 +527,10 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rolled.get("error") or "Junos REST rollback failed"
 
-        raise RuntimeError(rest_error or "ROLLBACK_CONFIG requires JUNOS_REST enabled and a reachable device")
+        raise RuntimeError(
+            rest_error
+            or "ROLLBACK_CONFIG requires JUNOS_NETCONF_SSH or JUNOS_REST enabled"
+        )
 
     def interface_action(
         self,

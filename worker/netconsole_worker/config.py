@@ -17,7 +17,11 @@ class Settings(BaseSettings):
     lab_ssh_password: str = "lab123"
     lab_ssh_port: int = 22
 
-    # Juniper Junos — RESTCONF (existing).
+    # Juniper Junos — NETCONF-over-SSH (primary for apply/rollback).
+    junos_netconf_ssh_enabled: bool = False
+    junos_netconf_ssh_port: int = 830
+
+    # Juniper Junos — RESTCONF (fallback when NETCONF SSH is disabled).
     junos_rest_enabled: bool = False
     junos_rest_scheme: str = "https"
     junos_rest_port: int = 8443

@@ -58,6 +58,11 @@ class VendorConfig:
 class BackendConfig:
     """All vendor configs in one bundle, populated at startup."""
 
+    # Juniper Junos — NETCONF-over-SSH (primary for apply/rollback).
+    junos_netconf_ssh: bool = False
+    junos_netconf_ssh_port: int = 830
+
+    # Juniper Junos — RESTCONF (fallback when NETCONF SSH is disabled).
     juniper: VendorConfig = field(default_factory=VendorConfig)
     eos: VendorConfig = field(default_factory=VendorConfig)
     iosxe: VendorConfig = field(default_factory=VendorConfig)
@@ -74,6 +79,8 @@ class BackendConfig:
         from netconsole_worker.config import settings
 
         return cls(
+            junos_netconf_ssh=settings.junos_netconf_ssh_enabled,
+            junos_netconf_ssh_port=settings.junos_netconf_ssh_port,
             juniper=VendorConfig(
                 enabled=settings.junos_rest_enabled,
                 scheme=settings.junos_rest_scheme,
