@@ -50,6 +50,12 @@ def _build_hello() -> str:
         "<capability>http://xml.juniper.net/netconf/junos/1.0</capability>"
         "</capabilities>"
         "</hello>"
+        # RFC 6241 §4.1: every NETCONF message ends with ]]>]]>.
+        # The device's NETCONF parser reads until it sees this terminator.
+        # Without it, the device holds the hello open (expecting more hello
+        # data) and never sends its own hello — the SSH session closes
+        # before the RPC is ever forwarded to the subsystem.
+        f"\n{_NC_END}"
     )
 
 
