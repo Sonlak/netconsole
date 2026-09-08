@@ -229,6 +229,7 @@ class JunosNETCONFPool:
                 "-o", "PreferredAuthentications=password",
                 "-o", "PubkeyAuthentication=no",
                 "-o", "BatchMode=no",
+                "-T",                          # needed for subsystem with piped stdin
                 "-s",                          # invoke subsystem
                 f"{username}@{host}",
                 "-p", str(port),
