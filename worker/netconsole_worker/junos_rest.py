@@ -798,7 +798,9 @@ def rollback_configuration(
     timeout: float = 45.0,
 ) -> dict[str, Any]:
     index = max(0, min(int(rollback), 49))
-    load_body = f"<load-configuration><rollback>{index}</rollback></load-configuration>"
+    # Junos spec: rollback is an *attribute* on <load-configuration>, not a
+    # child element.  <rollback>N</rollback> is malformed and silently no-ops.
+    load_body = f'<load-configuration rollback="{index}"/>'
     common = {
         "username": username,
         "password": password,

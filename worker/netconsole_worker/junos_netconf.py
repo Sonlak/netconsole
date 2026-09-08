@@ -305,9 +305,11 @@ def rollback_configuration(
 ) -> dict[str, Any]:
     """Rollback Junos config via NETCONF-over-SSH CLI."""
     index = max(0, min(int(rollback), 49))
+    # Junos spec: rollback is an *attribute* on <load-configuration>, not a
+    # child element.  <rollback>N</rollback> is malformed and silently no-ops.
     load_rpc = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        f"<rpc><load-configuration><rollback>{index}</rollback></load-configuration></rpc>"
+        f'<rpc><load-configuration rollback="{index}"/></rpc>'
     )
     commit_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><commit-configuration/></rpc>'
     discard_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><discard-changes/></rpc>'
