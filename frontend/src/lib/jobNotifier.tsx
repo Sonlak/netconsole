@@ -21,7 +21,9 @@
  *    away (component unmount) cancels it cleanly.
  */
 
-import { notification, message } from 'antd';
+import { notification as staticNotification, message as staticMessage } from 'antd';
+import type { NotificationInstance } from 'antd/es/notification/interface';
+import type { MessageInstance } from 'antd/es/message/interface';
 import { Link } from 'react-router-dom';
 
 import { JobWaitTimeoutError } from '../api/jobs';
@@ -29,6 +31,33 @@ import { authJsonFetch } from '../api/http';
 import type { Job } from '../types/job';
 
 const TERMINAL_POLL_MS = 3_000;
+
+// The AntD `App.useApp()` hook returns bound `notification` and `message`
+// instances that respect the active ConfigProvider (theme tokens, locale,
+// z-index). The legacy static `notification.success({...})` calls do
+// NOT see ConfigProvider context, which is why the existing "Commit
+// thanh cong" toast was never appearing for users running under a theme
+// provider. We let callers inject the bound instance via setNotifierApi()
+// once at mount; if no instance is provided we fall back to the static
+// API so the helper still works in tests / Storybook.
+interface NotifierApi {
+  notification: NotificationInstance;
+  message: MessageInstance;
+}
+
+let boundApi: NotifierApi | null = null;
+
+export function setNotifierApi(api: NotifierApi | null): void {
+  boundApi = api;
+}
+
+function notify(): NotificationInstance {
+  return boundApi?.notification ?? staticNotification;
+}
+
+function toast(): MessageInstance {
+  return boundApi?.message ?? staticMessage;
+}
 
 function deviceLabel(deviceName: string | undefined, ip: string | undefined): string {
   if (deviceName && ip) return `${deviceName} (${ip})`;
@@ -52,7 +81,7 @@ export function reportFinal(
   if (job.status === 'SUCCESS') {
     const durMs = computeDurationMs(job);
     const durLabel = durMs != null ? ` · ${formatDur(durMs)}` : '';
-    notification.success({
+    notify().success({
       message: `${verb} thành công`,
       description: (
         <span>
@@ -67,7 +96,7 @@ export function reportFinal(
   }
 
   if (job.status === 'FAILED') {
-    notification.error({
+    notify().error({
       message: `${verb} thất bại`,
       description: (
         <span>
@@ -82,7 +111,7 @@ export function reportFinal(
   }
 
   // Still not terminal (caller error). Treat as warning so we never silently drop.
-  notification.warning({
+  notify().warning({
     message: `${verb} chưa kết thúc`,
     description: (
       <span>
@@ -97,7 +126,7 @@ export function reportFinal(
 
 export function reportWaitTimeout(kind: 'commit' | 'rollback', deviceName?: string, ip?: string): void {
   const device = deviceLabel(deviceName, ip);
-  message.warning({
+  toast().warning({
     content: (
       <span>
         {kind === 'commit' ? 'Commit' : 'Rollback'} <code>{device}</code> đang chạy nền

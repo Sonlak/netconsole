@@ -37,12 +37,14 @@ import {
   Tooltip,
   Typography,
   theme,
+  App as AntApp,
 } from 'antd';
 import type { MenuProps } from 'antd';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { useSite, SITE_OPTIONS } from '@/components/site-provider';
 import { useTheme } from '@/components/theme-provider';
 import { useAuth } from '@/hooks/useAuth';
+import { setNotifierApi } from '@/lib/jobNotifier';
 
 const { Header, Sider, Content } = Layout;
 
@@ -94,6 +96,21 @@ export default function AppLayout() {
   const { token } = theme.useToken();
   const { theme: colorMode, toggle } = useTheme();
   const { site, setSite } = useSite();
+  // Bind notification / message / modal to the AntApp context so static
+  // `notification.success({...})` calls (e.g. from the job notifier
+  // after commit) actually render with the current theme tokens.
+  const { notification, message } = AntApp.useApp();
+
+  useEffect(() => {
+    // Push the bound notification/message instances into the notifier
+    // module so commit / rollback completion toasts respect the
+    // ConfigProvider theme. The bound instances are stable for the
+    // lifetime of this App component, so a single setNotifierApi on
+    // mount is enough.
+    setNotifierApi({ notification, message });
+    return () => setNotifierApi(null);
+  }, [notification, message]);
+
   const [collapsed, setCollapsed] = useState(false);
   const [commandOpen, setCommandOpen] = useState(false);
   const current = pageMeta(location.pathname);
@@ -149,7 +166,14 @@ export default function AppLayout() {
   ];
 
   return (
-    <Layout className="nc-app-shell">
+    <AntApp
+      // Bind a single App context so children calling
+      // `App.useApp()` (notifier, status banners) share the same
+      // theme/config tokens as the static `notification.success(...)`
+      // calls we make from the job notifier.
+      component={false}
+    >
+      <Layout className="nc-app-shell">
       <Sider
         collapsible
         collapsed={collapsed}
@@ -272,7 +296,8 @@ export default function AppLayout() {
         <div className="nc-app-footer-copy">© 2026 SonLak.</div>
       </footer>
       <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} items={NAV} />
-    </Layout>
+      </Layout>
+    </AntApp>
   );
 }
 
