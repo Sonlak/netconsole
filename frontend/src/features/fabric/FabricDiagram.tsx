@@ -1133,10 +1133,11 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
           key={`tier-band-screen-${band.tone}`}
           className={`nc-fabric-tier-band nc-fabric-tier-band-screen is-${band.tone}`}
           style={{
-            // Align band left edge with the panned/zoomed canvas content.
-            left:   viewport.x + band.left  * viewport.scale,
+            // left:0 anchors the band to the left edge of .nc-fabric
+            // (the CSS right:0 then stretches it full-width).
+            // top/height use viewport coords so the band moves with pan/zoom.
+            left:   0,
             top:    viewport.y + band.top   * viewport.scale,
-            width:  (band.right - band.left) * viewport.scale,
             height: Math.max(1, band.height * viewport.scale),
           }}
         />
