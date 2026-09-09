@@ -13,22 +13,35 @@
   - Added `_is_noise_output()`: strips `set ok` / `set rpc-reply ok` noise from bare `<ok/>` replies.
 
 - **`worker/netconsole_worker/backends/juniper.py`**:
-  - Rewrote `interface_action()` to mirror `apply_config`/`rollback_config` (commit 212fbd9):
-    - **show-run**: RESTCONF scoped → NETCONF scoped → NETCONF full → SSH CLI.
-    - **writes (shut/no-shut/set-access-vlan)**: NETCONF SSH → RESTCONF → SSH CLI.
-  - Added `netconf_get_configuration_to_set` to imports.
+  - Rewrote `interface_action()` for write actions (shut/no-shut/set-access-vlan): RESTCONF-primary → NETCONF SSH fast-fallback (15s timeout) → SSH CLI.
+  - Show-run unchanged: RESTCONF → NETCONF SSH → SSH CLI.
+
+- **`backend/src/services/jobWatchdog.ts`**:
+  - Added `INTERFACE_ACTION: 120_000` to `VENDOR_EXTRA_MS` for Juniper (total 240s, consistent with APPLY_CONFIG).
 
 ## Root cause
 
-`interface_action` was on the old routing: RESTCONF-first for writes, RESTCONF-only for show-run. Junos cRPD RESTCONF is flaky (gotcha #15: stale-socket, first-commit spike 20-30s). The `apply_config` path was already fixed in commit 212fbd9, but `interface_action` was missed.
+`interface_action` write path had two problems:
+1. **NETCONF SSH first for writes** — NETCONF-over-SSH cold-start on Junos cRPD spikes 20-30s (gotcha #15). Measured on LAB-F2-AS-01: NETCONF SSH timeout fires at 27s, then RESTCONF succeeds in ~17s. Total write time ~44s.
+2. **Watchdog 120s** — job sat PENDING 95-160s (worker queue backlog) + 44s execution = easily over 120s watchdog → killed as "hung RPC".
 
-## Transport routing summary
+## Benchmark results (LAB-F2-AS-01, Junos cRPD 24.4R1.9)
+
+| Action | Transport used | Execution time | Notes |
+|--------|---------------|----------------|-------|
+| show-run (read) | RESTCONF | ~24s total | 95s PENDING + 24s RUNNING |
+| shut (write) | RESTCONF (NETCONF timed out) | loadMs=9354 + commitMs=7581 ≈ 17s | NETCONF SSH timeout 27s then RESTCONF success |
+| no-shut (write) | RESTCONF | ~17s | Same pattern |
+
+## Transport routing (corrected 2026-09-09)
 
 | Action | Path 1 | Path 2 | Path 3 |
 |--------|--------|--------|--------|
-| show-run | RESTCONF | NETCONF SSH | SSH CLI |
-| shut / no-shut / set-access-vlan | **NETCONF SSH** | RESTCONF | SSH CLI |
+| show-run | RESTCONF (~2-5s) | NETCONF SSH | SSH CLI |
+| shut / no-shut / set-access-vlan | **RESTCONF (~17s)** | NETCONF SSH (15s timeout) | SSH CLI |
+
+Note: Originally had NETCONF SSH primary for writes — benchmark proved this wrong. RESTCONF is faster on Junos cRPD for both reads and writes.
 
 ## What's left
 
-(None — all 5 unit tests pass for `xml_to_set_format`.)
+(None — verified on live lab device.)
