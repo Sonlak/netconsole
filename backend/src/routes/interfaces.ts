@@ -6,6 +6,7 @@ import {
   queueInterfaceAction,
 } from '../services/interfaces.js';
 import { prisma } from '../lib/prisma.js';
+import { runIosxeSshApply } from '../services/labSsh.js';
 
 export const interfacesRouter = Router();
 
@@ -133,5 +134,83 @@ interfacesRouter.get('/:deviceId/show-run', async (req, res) => {
     config: text || `! (no config returned for ${iface})`,
     source: 'iosxe-rest',
     raw: rc.raw,
+  });
+});
+
+/**
+ * Synchronous IOS-XE SSH apply (bypasses the worker job queue).
+ *
+ * The worker container can't reach lab IOS-XE on port 22 directly
+ * (broken pipe — same problem the show-run RESTCONF proxy solves).
+ * So the worker, after determining the local SSH path produced no output,
+ * POSTs the planned commands here and the backend container pushes them.
+ *
+ * Auth: same `authMiddleware` as the rest of /api. Used by:
+ *   - worker `IOSxeBackend.apply_config` as fallback after SSH produces
+ *     zero output (signals a broken pipe to the lab device)
+ *
+ * Body: { commands: string[] }
+ * Response: { ok: true, commandCount, outputs } | { ok: false, error, outputs? }
+ *
+ * NOTE: this path is for the `apply_config` Config Studio flow on lab
+ * IOS-XE. Real prod devices with NETCONF/candidate support should still
+ * flow through the normal queue (see backend config gotcha #14).
+ */
+interfacesRouter.post('/:deviceId/apply-ssh', async (req, res) => {
+  const deviceId = String(req.params.deviceId);
+  const commandsRaw: unknown[] = Array.isArray(req.body?.commands) ? req.body.commands : [];
+  if (commandsRaw.length === 0) {
+    res.status(400).json({ error: 'Body must be { commands: string[] }' });
+    return;
+  }
+  const commands = commandsRaw
+    .filter((c): c is string => typeof c === 'string')
+    .map((c: string) => c.trim())
+    .filter((c: string) => c.length > 0);
+  if (commands.length === 0) {
+    res.status(400).json({ error: 'commands is empty after trim' });
+    return;
+  }
+
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    res.status(404).json({ error: 'Device not found' });
+    return;
+  }
+  if (device.vendor !== 'Cisco') {
+    res.status(400).json({
+      error: `apply-ssh is only wired for Cisco IOS-XE (got ${device.vendor})`,
+    });
+    return;
+  }
+
+  const sshUser = process.env.LAB_SSH_USER ?? 'netconsole';
+  const sshPassword = process.env.LAB_SSH_PASSWORD ?? 'Admin@123';
+  const sshPort = Number.parseInt(process.env.LAB_SSH_PORT ?? '22', 10);
+
+  const result = await runIosxeSshApply(device.ip, {
+    username: sshUser,
+    password: sshPassword,
+    port: sshPort,
+    commands,
+    promptTimeoutMs: 8000,
+    overallTimeoutMs: 90_000,
+  });
+
+  if (!result.ok) {
+    res.status(502).json({
+      ok: false,
+      source: 'iosxe-ssh-backend',
+      error: result.error,
+      outputs: result.outputs ?? [],
+    });
+    return;
+  }
+  res.json({
+    ok: true,
+    source: 'iosxe-ssh-backend',
+    commandCount: result.commandCount,
+    outputs: result.outputs ?? [],
+    message: `Applied ${result.commandCount} commands via backend SSH`,
   });
 });

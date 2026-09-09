@@ -380,6 +380,53 @@ class IOSxeBackend(DeviceBackend):
         except Exception:  # noqa: BLE001
             return None
 
+    def _apply_via_backend_ssh(
+        self,
+        device: DeviceInfo,
+        commands: list[str],
+    ) -> dict[str, Any] | None:
+        """Fallback path: ask the backend to push the commands over SSH.
+
+        The worker container can't reach lab IOS-XE on port 22 directly
+        (broken pipe — see docs/agents/12-...). The backend container can.
+        We POST the command list to /api/interfaces/<id>/apply-ssh on the
+        backend, which opens an ssh2 shell channel, sends `configure
+        terminal` + each line + `end`, and captures output.
+
+        Returns None if the backend path is unreachable / rejected (caller
+        should fall back to its own error message). Returns a dict with
+        `ok` + `outputs` on success/failure from the backend.
+        """
+        from netconsole_worker.config import settings as _settings
+
+        device_id = getattr(device, "id", None) or getattr(device, "device_id", None)
+        if not device_id:
+            return None
+        try:
+            import httpx
+
+            token = _settings.worker_auth_token
+            base = _settings.api_base_url.rstrip("/")
+            url = f"{base}/interfaces/{device_id}/apply-ssh"
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(url, json={"commands": commands}, headers=headers)
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"backend apply-ssh returned {resp.status_code}: {resp.text[:200]}",
+                    "outputs": [],
+                }
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False,
+                "error": f"backend apply-ssh call failed: {exc}",
+                "outputs": [],
+            }
+
     def apply_config(
         self,
         device: DeviceInfo,
@@ -410,9 +457,25 @@ class IOSxeBackend(DeviceBackend):
                 timeout=60,
             )
             if not session_result["sshOk"]:
-                raise RuntimeError(
-                    session_result["error"] or "SSH session failed for apply_config"
+                # Worker-side SSH didn't work (broken pipe / empty output).
+                # Try backend proxy which has a working route to lab IOS-XE.
+                backend = self._apply_via_backend_ssh(device, commands)
+                if backend and backend.get("ok"):
+                    return {
+                        "implemented": True,
+                        "source": "ssh-backend",
+                        "config": config,
+                        "commands": commands,
+                        "outputs": backend.get("outputs", []),
+                        "message": f"Committed config to {device.name} via backend SSH proxy",
+                        "previous": previous or "",
+                    }
+                detail = (
+                    (backend or {}).get("error")
+                    or session_result.get("error")
+                    or "SSH session failed for apply_config"
                 )
+                raise RuntimeError(f"apply_config failed (worker SSH + backend proxy both failed): {detail}")
             outputs = session_result["outputs"]
             for out in outputs:
                 if out["error"] and out["error"].lower().startswith("% "):
@@ -424,6 +487,21 @@ class IOSxeBackend(DeviceBackend):
             verify_result = self._verify_iosxe_config(device, config)
             if verify_result:
                 if not verify_result["verified"]:
+                    # Worker SSH nominally succeeded but the device has no
+                    # record of the config — try the backend proxy too, just
+                    # in case the worker SSH was a no-op but the device is
+                    # reachable from the backend.
+                    backend = self._apply_via_backend_ssh(device, commands)
+                    if backend and backend.get("ok"):
+                        return {
+                            "implemented": True,
+                            "source": "ssh-backend",
+                            "config": config,
+                            "commands": commands,
+                            "outputs": backend.get("outputs", []),
+                            "message": f"Committed config to {device.name} via backend SSH proxy (worker verify failed)",
+                            "previous": previous or "",
+                        }
                     raise RuntimeError(
                         f"apply_config: SSH OK but backend RESTCONF verification "
                         f"failed — config may not be on device. "
