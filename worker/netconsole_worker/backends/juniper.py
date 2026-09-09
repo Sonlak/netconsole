@@ -680,18 +680,41 @@ class JuniperBackend(DeviceBackend):
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 
-            # Write path: NETCONF SSH → RESTCONF → SSH CLI.
-            # Mirrors apply_config / rollback_config (commit 212fbd9) so
-            # the same Junos cRPD quirks (RESTCONF stale-socket, first-commit
-            # spike) are handled the same way across every config write.
+            # Write path: RESTCONF (primary) → NETCONF SSH (fallback) → SSH CLI.
+            #
+            # Measurements on Junos cRPD (lab):
+            #   - RESTCONF load+commit: ~17s (reliable, always works)
+            #   - NETCONF SSH cold-start: 20-30s (gotcha #15) — can time out
+            #     at 27s before failing, adding 27s of dead time to the job.
+            # Putting RESTCONF first avoids the NETCONF cold-start penalty.
+            # NETCONF SSH stays as a fallback in case RESTCONF is broken.
             source = None
             applied: dict[str, Any] | None = None
+            netconf_error: str | None = None
+            rest_error: str | None = None
 
-            # --- 1. NETCONF SSH (primary) ---
-            if self.config.junos_netconf_ssh:
+            # --- 1. RESTCONF (primary — faster on cRPD than NETCONF SSH cold-start) ---
+            rest_result = rest_apply_set_configuration(
+                device.ip,
+                commands,
+                log=f"NetConsole {action} {iface}",
+                **creds,
+            )
+            if rest_result["ok"]:
+                applied = rest_result
+                source = "junos-rest"
+            else:
+                rest_error = rest_result.get("error") or "Junos REST configure failed"
+
+            # --- 2. NETCONF SSH (fallback when RESTCONF fails or is disabled) ---
+            if applied is None and self.config.junos_netconf_ssh:
                 nc_user = creds["username"]
                 nc_pass = creds["password"]
                 nc_port = self.config.junos_netconf_ssh_port
+                # 15s timeout: enough for NETCONF SSH to succeed on a warm
+                # connection, but fast enough to fail quickly if the session
+                # is cold (avoiding the 20-30s Junos cRPD spike burning
+                # budget on a fallback path that rarely gets hit).
                 nc_result = nc_apply_set_configuration(
                     device.ip,
                     commands,
@@ -699,7 +722,7 @@ class JuniperBackend(DeviceBackend):
                     username=nc_user,
                     password=nc_pass,
                     port=nc_port,
-                    timeout=90.0,
+                    timeout=15.0,
                 )
                 if nc_result["ok"]:
                     applied = nc_result
@@ -710,20 +733,6 @@ class JuniperBackend(DeviceBackend):
                         "junos %s %s %s: NETCONF SSH failed (%s), trying RESTCONF",
                         device.ip, action, iface, netconf_error,
                     )
-
-            # --- 2. RESTCONF (fallback when NETCONF unavailable or failed) ---
-            if applied is None:
-                rest_result = rest_apply_set_configuration(
-                    device.ip,
-                    commands,
-                    log=f"NetConsole {action} {iface}",
-                    **creds,
-                )
-                if rest_result["ok"]:
-                    applied = rest_result
-                    source = "junos-rest"
-                else:
-                    rest_error = rest_result.get("error") or "Junos REST configure failed"
 
             if applied is not None:
                 result: dict[str, Any] = {
