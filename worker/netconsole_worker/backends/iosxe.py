@@ -469,13 +469,13 @@ class IOSxeBackend(DeviceBackend):
         elif action == "show-run":
             # Cisco IOS-XE default session uses `terminal pager` which paginates
             # `show running-config` with `--More--` prompts and reads back as
-            # empty string when our pipeline (no TTY input) eats them. Prefixing
-            # `terminal length 0` disables the pager for the session, and the
-            # `| section` filter scopes the output to just this interface so we
-            # don't dump the whole running-config.
+            # empty string when our pipeline (no TTY input) eats them. The
+            # `| no-more` redirector is a *pipe* filter on the command itself,
+            # not a terminal mode change, so it works without interactive PTY
+            # handling. Scopes output to just this interface so we don't
+            # dump the whole running-config.
             commands = [
-                "terminal length 0",
-                f"show running-config interface {iface}",
+                f"show running-config interface {iface} | no-more",
             ]
         else:
             raise RuntimeError(f"Unsupported interface action for IOS-XE: {action}")
