@@ -13,7 +13,6 @@ from ipaddress import ip_address
 from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
-from netconsole_worker.config import settings
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
@@ -135,10 +134,10 @@ class IOSxeBackend(DeviceBackend):
             return {"ok": False, "error": "device.id missing"}
         try:
             import httpx
-            from netconsole_worker.config import settings
+            from netconsole_worker.config import settings as _settings
 
-            token = settings.worker_auth_token
-            base = settings.api_base_url.rstrip("/")
+            token = _settings.worker_auth_token
+            base = _settings.api_base_url.rstrip("/")
             url = f"{base}/interfaces/{device_id}/show-run"
             headers: dict[str, str] = {}
             if token:
