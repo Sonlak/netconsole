@@ -320,6 +320,66 @@ class IOSxeBackend(DeviceBackend):
 
     # -- WRITE -------------------------------------------------------------
 
+    def _verify_iosxe_config(self, device: DeviceInfo, config: str) -> dict[str, Any] | None:
+        """Post-apply verify via backend RESTCONF proxy.
+
+        After pushing config via SSH CLI (which the worker container often can't
+        capture output from), confirm the config is actually on the device by
+        asking the backend to GET the relevant YANG subtree via RESTCONF.
+
+        Returns None if the device doesn't support this path (not Cisco IOS-XE
+        with RESTCONF). Returns a dict with verification results otherwise.
+        """
+        from netconsole_worker.config import settings as _settings
+
+        device_id = getattr(device, "id", None) or getattr(device, "device_id", None)
+        if not device_id:
+            return None
+        try:
+            import httpx
+
+            token = _settings.worker_auth_token
+            base = _settings.api_base_url.rstrip("/")
+            # Ask the backend to do a show-run for a representative interface.
+            # We pick the first interface from the config lines.
+            commands = _text_to_cmds(config)
+            # Try to extract an interface name from the config
+            iface_hint = ""
+            for c in commands:
+                if c.startswith("interface "):
+                    iface_hint = c[len("interface ") :].strip()
+                    break
+            if not iface_hint:
+                return None  # nothing verifiable in this config
+            # URL-encode the interface name (e.g. "GigabitEthernet1/0/1")
+            encoded = iface_hint.replace("/", "%2F")
+            url = f"{base}/interfaces/{device_id}/show-run?iface={encoded}"
+            headers: dict[str, str] = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            cfg_text = data.get("config") or ""
+            # Basic sanity: if the verified config contains at least one of the
+            # config lines, consider the apply confirmed.
+            # Skip the check for non-interface configs (vlan, spanning-tree, etc.)
+            verified = any(
+                c in cfg_text or c.replace(" ", "", 1) in cfg_text.replace(" ", "", 1)
+                for c in commands[:8]  # check first 8 lines
+                if c.strip() and not c.startswith("!")
+            )
+            return {
+                "verified": verified,
+                "source": "iosxe-rest",
+                "device_config": cfg_text,
+                "message": "Config verified via backend RESTCONF" if verified else "Config NOT found on device — may not have applied",
+            }
+        except Exception:  # noqa: BLE001
+            return None
+
     def apply_config(
         self,
         device: DeviceInfo,
@@ -337,7 +397,6 @@ class IOSxeBackend(DeviceBackend):
         # IOS-XE has no native atomic commit semantics via RESTCONF; the
         # accepted pattern is: push config lines via SSH CLI in `configure
         # terminal` mode. The device commits immediately on each line.
-        # A `commit` is implicit.
         if self.config.ssh_enabled:
             # All commands must run in one SSH session so `configure terminal`
             # config mode persists across all config lines.
@@ -358,6 +417,32 @@ class IOSxeBackend(DeviceBackend):
             for out in outputs:
                 if out["error"] and out["error"].lower().startswith("% "):
                     raise RuntimeError(out["error"] or "Config command failed")
+            # Even when sshOk=True and no IOS errors, the worker container often
+            # can't capture output from lab IOS-XE (sshpass pipe returns empty).
+            # Verify via backend RESTCONF so the operator doesn't get a false
+            # SUCCESS when the config never reached the device.
+            verify_result = self._verify_iosxe_config(device, config)
+            if verify_result:
+                if not verify_result["verified"]:
+                    raise RuntimeError(
+                        f"apply_config: SSH OK but backend RESTCONF verification "
+                        f"failed — config may not be on device. "
+                        f"Detail: {verify_result['message']}"
+                    )
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli+iosxe-rest",
+                    "config": config,
+                    "commands": commands,
+                    "outputs": outputs,
+                    "message": f"Committed and verified config on {device.name}",
+                    "previous": previous or "",
+                    "verify": verify_result,
+                }
+            # Can't verify — fall through to reporting SSH success as-is.
+            # The ssh_client fix (all-empty-output → sshOk=False) will catch
+            # broken sessions in most cases; but if we got here the SSH exit
+            # was clean and we have no verify path, so report what we know.
             return {
                 "implemented": True,
                 "source": "ssh-cli",
@@ -369,11 +454,9 @@ class IOSxeBackend(DeviceBackend):
             }
 
         if self.config.iosxe.enabled:
-            # No NETCONF wired here yet (ncclient dep planned). Surface
-            # a clear error rather than silently no-op.
             raise RuntimeError(
-                "IOS-XE RESTCONF config-apply requires NETCONF (ncclient); "
-                "fall back to LAB_SSH for now."
+                "apply_config on IOS-XE requires NETCONF (ncclient not yet wired "
+                "for config push). Use LAB_SSH or configure NETCONF support."
             )
 
         raise RuntimeError("APPLY_CONFIG requires LAB_SSH (IOS-XE NETCONF is on the roadmap)")

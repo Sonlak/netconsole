@@ -458,6 +458,23 @@ def run_ssh_commands_session(
         })
 
     first_error = next((o for o in outputs if o["error"]), None)
+
+    # Even when sshpass exits 0 and no IOS errors are detected, a session that
+    # returns zero bytes of output for every command is almost always a broken
+    # pipe (device closed the channel before echoing anything, auth silently
+    # failed, or network dropped the response). Treat it as a hard failure so
+    # callers like `apply_config` don't report SUCCESS when nothing reached the
+    # device.
+    all_empty = all(not o["output"] for o in outputs)
+    if first_error is None and all_empty and combined.strip():
+        # There IS output from the session but no command got anything back —
+        # likely a pager eating the response or a config-mode glitch.
+        first_error = {"error": "No output from device (possible pager or session glitch)", "command": "", "output": ""}
+    elif first_error is None and all_empty and not combined.strip():
+        # Session produced zero bytes total — auth/network failure or device
+        # closed the channel before the first echo marker.
+        first_error = {"error": f"No output captured (sshpass exit {proc.returncode} — check auth/network)", "command": "", "output": ""}
+
     return {
         "sshOk": first_error is None,
         "outputs": outputs,
