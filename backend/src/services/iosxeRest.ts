@@ -215,3 +215,119 @@ export async function fetchIosxeInterfaceList(host: string): Promise<{
   }
   return { ok: true, interfaces, collectMs: Date.now() - started };
 }
+
+/**
+ * Fetch the running-config subtree for a single IOS-XE interface.
+ *
+ * Equivalent to `show running-config interface <name>` but via the structured
+ * YANG model (`Cisco-IOS-XE-native`). Returned `config` is a JSON tree so
+ * the worker/frontend can format it as needed (the worker renders IOS CLI
+ * text from the tree for parity with the SSH-fallback path).
+ *
+ * This path works from the backend container because it can reach
+ * 10.10.20.x; the worker container often can't open outbound connections
+ * to lab devices (no NAT/route), so we expose this through the backend and
+ * have the worker call back into us instead of SSHing directly.
+ */
+export async function fetchIosxeInterfaceRunningConfig(
+  host: string,
+  iface: string,
+): Promise<{
+  ok: boolean;
+  config: unknown;
+  raw: string;
+  error?: string;
+}> {
+  if (!iosxeRestEnabled()) {
+    return { ok: false, config: null, raw: '', error: 'IOSXE_API_ENABLED=false' };
+  }
+  // Split "GigabitEthernet4" → ("GigabitEthernet", "4")
+  const m = /^([A-Za-z]+?)(\d.*)$/.exec(iface);
+  if (!m) {
+    return { ok: false, config: null, raw: '', error: `Cannot parse interface name: ${iface}` };
+  }
+  const type = m[1];
+  const name = m[2];
+  const path = `/Cisco-IOS-XE-native:native/interface/${type}=${encodeURIComponent(name)}`;
+  const result = await rcGet(host, path, 15000);
+  if (!result.ok) {
+    return { ok: false, config: null, raw: '', error: result.error };
+  }
+  return { ok: true, config: result.payload, raw: result.raw };
+}
+
+/**
+ * Convert the Cisco-IOS-XE-native YANG tree returned by RESTCONF into
+ * IOS-CLI-style text so it renders identically to `show running-config
+ * interface X`. Best-effort — covers the interface-block keywords we care
+ * about (description, switchport, shutdown, spanning-tree, channel-group).
+ */
+export function iosxeInterfaceConfigToText(tree: unknown, iface: string): string {
+  if (!tree || typeof tree !== 'object') return '';
+  // Native YANG wraps the interface list under `Cisco-IOS-XE-native:interface`.
+  const root = tree as Record<string, unknown>;
+  const nativeIface = root['Cisco-IOS-XE-native:interface'];
+  if (!nativeIface || typeof nativeIface !== 'object') {
+    // ietf-interfaces fallback (sparse)
+    return jsonToLines(tree as Record<string, unknown>, `interface ${iface}`, 0);
+  }
+  const ifaceObj = nativeIface as Record<string, unknown>;
+  const block = (ifaceObj as Record<string, unknown>)[ifaceObj && Object.keys(ifaceObj)[0] ?? ''];
+  if (!block) return '';
+  const blockObj = block as Record<string, unknown>;
+  const entry = Object.values(blockObj)[0] as Record<string, unknown> | undefined;
+  if (!entry || typeof entry !== 'object') return '';
+  const lines: string[] = [`interface ${iface}`];
+  walk(entry, lines, 1);
+  lines.push('!');
+  return lines.join('\n');
+}
+
+function walk(node: unknown, lines: string[], depth: number): void {
+  if (!node || typeof node !== 'object') {
+    if (node !== '' && node !== undefined && node !== null) {
+      // append to last line
+      lines[lines.length - 1] += ` ${String(node)}`;
+    }
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.startsWith('xmlns')) continue;
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'object' && !Array.isArray(value)) {
+      // nested block keyword
+      const inner = Object.values(value as Record<string, unknown>);
+      if (inner.length === 1 && typeof inner[0] !== 'object') {
+        lines.push(`${' '.repeat(depth * 2)}${key} ${inner[0]}`);
+      } else {
+        lines.push(`${' '.repeat(depth * 2)}${key}`);
+        walk(value, lines, depth + 1);
+      }
+    } else if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === 'object') {
+          lines.push(`${' '.repeat(depth * 2)}${key}`);
+          walk(item, lines, depth + 1);
+        } else {
+          lines.push(`${' '.repeat(depth * 2)}${key} ${String(item)}`);
+        }
+      }
+    } else if (typeof value === 'boolean') {
+      // IOS-XE presence containers serialize as ""; treat boolean true as presence
+      if (value) lines.push(`${' '.repeat(depth * 2)}${key}`);
+    } else if (value !== '') {
+      lines.push(`${' '.repeat(depth * 2)}${key} ${String(value)}`);
+    } else {
+      // empty string from YANG = presence container
+      lines.push(`${' '.repeat(depth * 2)}${key}`);
+    }
+  }
+}
+
+function jsonToLines(node: Record<string, unknown>, prefix: string, depth: number): string {
+  const lines: string[] = [prefix];
+  walk(node, lines, depth + 1);
+  lines.push('!');
+  return lines.join('\n');
+}

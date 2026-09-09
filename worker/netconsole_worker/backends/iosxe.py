@@ -13,6 +13,7 @@ from ipaddress import ip_address
 from typing import Any
 
 from netconsole_worker.backends.base import DeviceBackend
+from netconsole_worker.config import settings
 from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
@@ -117,6 +118,47 @@ class IOSxeBackend(DeviceBackend):
         output = ssh_result["output"]
         parsed = parser(output) if parser else None
         return {"ok": True, "output": output, "parsed": parsed}
+
+    def _backend_show_run(self, device: DeviceInfo, iface: str) -> dict[str, Any]:
+        """Fetch the running-config text for one IOS-XE interface by calling
+        back into the backend's RESTCONF proxy.
+
+        The worker container often can't open outbound SSH/RESTCONF to lab
+        IOS-XE devices on 10.10.20.x (no NAT/route from the docker bridge),
+        but the backend container can. The backend exposes
+        `GET /api/interfaces/:deviceId/show-run?iface=X` which proxies
+        `Cisco-IOS-XE-native:native/interface/<X>=<id>` and renders it as
+        IOS-CLI text — identical to `show running-config interface X`.
+        """
+        device_id = getattr(device, "id", None) or getattr(device, "device_id", None)
+        if not device_id:
+            return {"ok": False, "error": "device.id missing"}
+        try:
+            import httpx
+            from netconsole_worker.config import settings
+
+            token = settings.worker_auth_token
+            base = settings.api_base_url.rstrip("/")
+            url = f"{base}/interfaces/{device_id}/show-run"
+            headers: dict[str, str] = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.get(url, params={"iface": iface}, headers=headers)
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"backend show-run HTTP {resp.status_code}: {resp.text[:200]}",
+                }
+            data = resp.json()
+            return {
+                "ok": True,
+                "config": data.get("config") or "",
+                "message": data.get("source") and f"RESTCONF via backend ({data['source']})" or "RESTCONF via backend",
+                "source": data.get("source") or "iosxe-rest",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"backend show-run call failed: {exc}"}
 
     # -- READ --------------------------------------------------------------
 
@@ -382,6 +424,33 @@ class IOSxeBackend(DeviceBackend):
             iface = _validate_iface(iface)
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
+
+        if action == "show-run":
+            # Path 1: backend RESTCONF proxy. Fastest + most reliable on
+            # lab IOS-XE 17.x where the worker container can't open direct
+            # outbound SSH/NETCONF to 10.10.20.x (no NAT/route from docker
+            # bridge). The backend calls RESTCONF `Cisco-IOS-XE-native`
+            # on port 443 and renders it as IOS-CLI text.
+            backend_result = self._backend_show_run(device, iface)
+            if backend_result.get("ok") and backend_result.get("config"):
+                return {
+                    "implemented": True,
+                    "source": "iosxe-rest",
+                    "action": action,
+                    "interface": iface,
+                    "vlan": vlan or None,
+                    "commands": [],
+                    "outputs": [],
+                    "message": backend_result.get("message", f"Interface {iface} show-run OK"),
+                    "adminStatus": None,
+                    "accessVlan": None,
+                    "config": backend_result["config"],
+                }
+            logger.warning(
+                "IOS-XE show-run backend RESTCONF failed for %s (%s), trying NETCONF",
+                iface,
+                backend_result.get("error", ""),
+            )
 
         if action in ("shut", "no-shut", "set-access-vlan", "show-run"):
             # NETCONF primary (gotcha #14). Reliable, atomic, structured

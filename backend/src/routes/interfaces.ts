@@ -85,3 +85,53 @@ interfacesRouter.post('/:deviceId/actions', async (req, res) => {
 
   res.status(202).json({ job, message: `INTERFACE_ACTION ${payload.action} queued` });
 });
+
+/**
+ * Synchronous IOS-XE show-run via backend RESTCONF (skip the job queue).
+ *
+ * The worker container often cannot reach lab IOS-XE devices on 10.10.20.x
+ * directly (no NAT/route from the docker bridge), but the backend can. So
+ * we expose the `Cisco-IOS-XE-native:native/interface/<X>=<id>` RESTCONF
+ * lookup here and let the worker call back into the API for show-run.
+ *
+ * Auth: same `authMiddleware` as the rest of /api. Used by:
+ *   - worker `IOSxeBackend.interface_action(show-run)` as primary path
+ *   - could be used by future frontends that want a synchronous preview
+ */
+interfacesRouter.get('/:deviceId/show-run', async (req, res) => {
+  const deviceId = String(req.params.deviceId);
+  const iface = String(req.query.iface ?? '').trim();
+  if (!iface) {
+    res.status(400).json({ error: 'Missing ?iface=' });
+    return;
+  }
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    res.status(404).json({ error: 'Device not found' });
+    return;
+  }
+  if (device.vendor !== 'Cisco') {
+    res.status(400).json({ error: `show-run via RESTCONF is only wired for Cisco IOS-XE (got ${device.vendor})` });
+    return;
+  }
+
+  const {
+    fetchIosxeInterfaceRunningConfig,
+    iosxeInterfaceConfigToText,
+  } = await import('../services/iosxeRest.js');
+
+  const rc = await fetchIosxeInterfaceRunningConfig(device.ip, iface);
+  if (!rc.ok) {
+    res.status(502).json({ error: rc.error ?? 'RESTCONF failed', source: 'iosxe-rest' });
+    return;
+  }
+  const text = iosxeInterfaceConfigToText(rc.config, iface);
+  res.json({
+    ok: true,
+    deviceId: device.id,
+    interface: iface,
+    config: text || `! (no config returned for ${iface})`,
+    source: 'iosxe-rest',
+    raw: rc.raw,
+  });
+});
