@@ -272,7 +272,10 @@ export function iosxeInterfaceConfigToText(tree: unknown, iface: string): string
     return jsonToLines(tree as Record<string, unknown>, `interface ${iface}`, 0);
   }
   const ifaceObj = nativeIface as Record<string, unknown>;
-  const block = (ifaceObj as Record<string, unknown>)[ifaceObj && Object.keys(ifaceObj)[0] ?? ''];
+  const firstKey = Object.keys(ifaceObj)[0] ?? '';
+  const block =
+    (ifaceObj as Record<string, unknown>)['GigabitEthernet'] ??
+    (firstKey ? (ifaceObj as Record<string, unknown>)[firstKey] : undefined);
   if (!block) return '';
   const blockObj = block as Record<string, unknown>;
   const entry = Object.values(blockObj)[0] as Record<string, unknown> | undefined;
