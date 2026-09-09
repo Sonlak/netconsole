@@ -66,31 +66,21 @@ message  = None
 
 User now sees a meaningful error instead of "Committed config to …".
 
-## What's left
+## Status (2026-09-09 16:45)
 
-The **real problem**: SSH from worker container to `10.10.20.x:22`
-doesn't work. Even if we patch every SSH code path, the worker has no
-path that captures output for IOS-XE config writes.
+**FIXED.** Pipeline now actually pushes config to IOS-XE devices.
 
-Three options to actually push config to the device:
-
-1. **Move `apply_config` to backend** — backend calls sshpass to
-   `10.10.20.212:22`. The backend container can already reach the
-   device (proven by `show-run` via RESTCONF), so SSH from backend
-   may work. Need to add NETCONF for partial-config too.
-2. **Worker uses backend as proxy for SSH apply_config** — same code
-   path, but the SSH command runs from the backend container.
-   Cleanest split since the backend is the only thing that can
-   reach the device.
-3. **Add `ncclient` to backend and wire NETCONF SSH on port 830**
-   for config push — IOS-XE supports `:writable-running:1.0` but
-   NOT `:candidate:1.0`, so target `<running/>` directly.
-
-None of these are trivial. The current PR fix is a **detector** —
-it stops the silent-success bug. A **fixer** (one of the above)
-is still needed for Config Studio to be useful on IOS-XE devices.
+- Worker SSH still broken (worker container can't reach 10.10.20.x port 22)
+- Worker falls back to backend SSH proxy at `POST /api/interfaces/:id/apply-ssh`
+- Backend opens ssh2 shell to device, sends `configure terminal` + full
+  config batch (sub-blocks like `vlan 201 / name FOO` work) + `end`,
+  captures per-line output, rejects on `% ` markers
+- Verified live on LAB-F3-AS-02: applied `description NETCONSOLE_PROXY_TEST`
+  → show-run via RESTCONF confirms it's on the device → rolled back
 
 ## Commits
 
-- `e5e061a` fix(iosxe): add verify step after SSH apply_config +
-  detect zero-output sessions
+- `b250675` fix(iosxe): backend SSH proxy for apply_config
+- `12f259d` fix(iosxe): batch-send config in apply-ssh to support sub-blocks
+- `e5e061a` fix(iosxe): detect zero-output SSH sessions
+- `c270ddc` docs(agents): log this issue + remaining work
