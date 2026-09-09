@@ -573,9 +573,21 @@ textarea.nc-code-area {
   stroke: color-mix(in srgb, #5b9dff 32%, transparent);
 }
 
+/* Screen-space band backgrounds (HTML divs) — fill/stroke above don't apply.
+   Background colors render the tier band visibly across the full .nc-fabric width. */
+.nc-fabric-tier-band-screen.is-core {
+  background: linear-gradient(180deg, color-mix(in srgb, #5b9dff 14%, transparent) 0%, color-mix(in srgb, #5b9dff 8%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, #5b9dff 28%, transparent);
+}
+
 .nc-fabric-tier-band.is-dist {
   fill: color-mix(in srgb, #a78bfa 6%, transparent);
   stroke: color-mix(in srgb, #a78bfa 32%, transparent);
+}
+
+.nc-fabric-tier-band-screen.is-dist {
+  background: linear-gradient(180deg, color-mix(in srgb, #a78bfa 14%, transparent) 0%, color-mix(in srgb, #a78bfa 8%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, #a78bfa 28%, transparent);
 }
 
 .nc-fabric-tier-band.is-access {
@@ -583,9 +595,19 @@ textarea.nc-code-area {
   stroke: color-mix(in srgb, #34d399 32%, transparent);
 }
 
+.nc-fabric-tier-band-screen.is-access {
+  background: linear-gradient(180deg, color-mix(in srgb, #34d399 14%, transparent) 0%, color-mix(in srgb, #34d399 8%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, #34d399 28%, transparent);
+}
+
 .nc-fabric-tier-band.is-leaf {
   fill: color-mix(in srgb, #6ee7b7 4%, transparent);
   stroke: color-mix(in srgb, #6ee7b7 20%, transparent);
+}
+
+.nc-fabric-tier-band-screen.is-leaf {
+  background: linear-gradient(180deg, color-mix(in srgb, #6ee7b7 10%, transparent) 0%, color-mix(in srgb, #6ee7b7 6%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, #6ee7b7 22%, transparent);
 }
 
 /* Bus lane — horizontal routing channel between tiers */
