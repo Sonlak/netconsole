@@ -426,6 +426,8 @@ def run_ssh_commands_session(
             "error": f"SSH session timed out after {timeout}s",
         }
 
+    combined = proc.stdout + proc.stderr
+
     # If sshpass itself failed (auth refused, banner timeout, host unreachable),
     # returncode will be non-zero even when stdout/stderr are empty. Surface
     # that as a hard error instead of silently treating it as success.
@@ -438,8 +440,6 @@ def run_ssh_commands_session(
                 f"(no output captured — likely auth/network failure)"
             ),
         }
-
-    combined = proc.stdout + proc.stderr
 
     # Split output by marker
     parts = re.split(re.escape(marker), combined)
