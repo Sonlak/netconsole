@@ -443,7 +443,7 @@ class JuniperBackend(DeviceBackend):
                     "raw": compact_raw(applied.get("raw") or ""),
                 }
             rest_error = applied.get("error") or "NETCONF SSH load/commit failed"
-            log("NETCONF SSH failed, falling back to RESTCONF: %s", rest_error)
+            logger.warning("NETCONF SSH failed, falling back to RESTCONF: %s", rest_error)
 
         # --- RESTCONF (fallback) ---
         if self.config.juniper.enabled:
