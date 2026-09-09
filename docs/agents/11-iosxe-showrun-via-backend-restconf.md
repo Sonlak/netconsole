@@ -87,4 +87,8 @@ Live on LAB-F3-AS-02 / 10.10.20.212:
 
 ## What's left
 
-(None — verified on live lab device. CI green, deploy green.)
+- **APPLY_CONFIG on IOS-XE**: see `12-iosxe-apply-config-still-broken.md` —
+  the worker container cannot push config to lab IOS-XE (SSH `apply_config`
+  silently no-ops). The fix in `e5e061a` now surfaces the failure, but a
+  real NETCONF-via-backend path is still needed for the job to actually
+  land on the device.
