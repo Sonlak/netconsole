@@ -22,6 +22,7 @@ from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for SSH fallback
 from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
+from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
 from netconsole_worker.ssh_client import run_ssh_command
 
 logger = logging.getLogger(__name__)
@@ -508,78 +509,43 @@ class NxosBackend(DeviceBackend):
         raise RuntimeError("Interface actions require NXOS_API or LAB_SSH")
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
-        if self.config.nxos.enabled:
-            r = self._mo_get(device, "show-version-1")
-            if r["ok"]:
-                parsed = _parse_nxos_show_version(r["payload"])
-                hostname = (parsed.get("hostname") or "").strip()
-                if hostname:
-                    parsed["description"] = f"Hostname {hostname} (NX-API)"
-                return {
-                    "checks": {
-                        "ping": True,
-                        "ssh": True,
-                        "showVersion": bool(parsed.get("hostname") or parsed.get("model") or parsed.get("version")),
-                        "showRun": bool(r.get("raw")),
-                    },
-                    "showVersion": r.get("raw") or "",
-                    "showRun": r.get("raw") or "",
-                    "parsed": parsed,
-                    "source": "nxos-nxapi",
-                    "message": "NX-API identity OK",
-                }
-            rest_error = r["error"]
-        else:
-            rest_error = None
-
-        if self.config.ssh_enabled:
-            ssh_version = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="show version",
+        # Managed check is now a lightweight TCP probe (see probe.py).
+        # NX-OS exposes NX-API REST + NX-API CLI on the same port (80 by
+        # default for lab). We probe that port as `rest` and SSH (22) as
+        # `ssh`. No NX-API call, no SSH login, no `show version`, no
+        # `show running-config`.
+        ssh_open = probe_ssh(device.ip, self.config.ssh_port)
+        rest_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.nxos.port, timeout=1.5
             )
-            if not ssh_version["sshOk"]:
-                return {
-                    "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-                    "message": ssh_version["error"] or "SSH failed",
-                    "source": "ssh-cli",
-                    "restError": rest_error,
-                }
-            from netconsole_worker.parsers.show_version import parse_show_version
+            if self.config.nxos.enabled
+            else False
+        )
 
-            parsed = parse_show_version(device.vendor or "Cisco", ssh_version["output"])
-
-            # Also test show running-config so the managed-check banner shows green
-            show_run_ok = False
-            show_run_output = ""
-            if ssh_version["sshOk"]:
-                ssh_run = run_ssh_command(
-                    host=device.ip,
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    port=self.config.ssh_port,
-                    command="show running-config",
-                )
-                if ssh_run["sshOk"] and len(ssh_run.get("output", "")) > 50:
-                    show_run_ok = True
-                    show_run_output = ssh_run["output"]
-
-            return {
-                "checks": {"ping": True, "ssh": True, "showVersion": True, "showRun": show_run_ok},
-                "showVersion": ssh_version["output"],
-                "showRun": show_run_output,
-                "parsed": parsed,
-                "source": "ssh-cli",
-                "message": "Lab SSH show version OK" if show_run_ok else "Lab SSH show version OK; show running-config " + ("OK" if show_run_ok else "FAILED"),
-                "restError": rest_error,
-            }
+        if rest_open:
+            source = "nxos-nxapi-tcp"
+            message = "NX-OS NX-API TCP reachable"
+        elif ssh_open:
+            source = "ssh-tcp"
+            message = "Lab SSH TCP reachable (NX-API not enabled or unreachable)"
+        else:
+            source = None
+            message = "Neither SSH nor NX-OS NX-API TCP reachable"
 
         return {
-            "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-            "message": rest_error or "Enable NXOS_API or LAB_SSH",
-            "source": None,
+            "checks": {
+                "ping": True,
+                "ssh": ssh_open,
+                "rest": rest_open,
+                "showVersion": False,
+                "showRun": False,
+            },
+            "showVersion": "",
+            "showRun": "",
+            "parsed": {"vendor": "Cisco"},
+            "source": source,
+            "message": message,
         }
 
 

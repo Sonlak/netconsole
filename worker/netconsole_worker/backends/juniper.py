@@ -60,6 +60,7 @@ from netconsole_worker.parsers.vlan_rpc import (
     apply_vlan_membership,
     parse_vlan_information_rpc,
 )
+from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
 from netconsole_worker.ssh_client import run_junos_commands, run_ssh_command
 
 logger = logging.getLogger(__name__)
@@ -820,68 +821,60 @@ class JuniperBackend(DeviceBackend):
         }
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
-        creds = _rest_creds(self.config)
-        if self.config.juniper.enabled:
-            rest = probe_device_identity(device.ip, **creds)
-            if rest["ok"]:
-                parsed = rest["fields"]
-                hostname = (parsed.get("hostname") or "").strip()
-                if hostname:
-                    parsed["description"] = f"Hostname {hostname} (Junos REST)"
-                return {
-                    "checks": {
-                        "ping": True,
-                        "ssh": True,
-                        "showVersion": bool(parsed.get("hostname") or parsed.get("model") or parsed.get("version")),
-                        "showRun": bool(rest.get("raw")),
-                    },
-                    "showVersion": rest.get("raw") or "",
-                    "showRun": rest.get("raw") or "",
-                    "parsed": parsed,
-                    "source": "junos-rest",
-                    "message": "Junos REST identity OK",
-                }
-            rest_error = rest.get("error") or "Junos REST identity failed"
-            if not self.config.ssh_enabled:
-                return {
-                    "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-                    "message": rest_error,
-                    "source": "junos-rest",
-                }
-
-        if self.config.ssh_enabled:
-            ssh_result = run_junos_commands(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
+        # Managed check is now a lightweight TCP probe (see probe.py).
+        # Junos exposes NETCONF-over-SSH on 830 and RESTCONF on 8443 by
+        # default. We probe both — either one counts as `rest` so a
+        # device configured with only one of them still passes. No
+        # RESTCONF GET, no SSH login, no `show version`, no `show
+        # configuration | display set`. The old implementation pushed
+        # the full set-format config on every probe, which flooded
+        # auth.log and burned SSH pool slots.
+        ssh_open = probe_ssh(device.ip, self.config.ssh_port)
+        netconf_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.junos_netconf_ssh_port, timeout=1.5
             )
-            if ssh_result["sshOk"]:
-                from netconsole_worker.parsers.show_version import parse_show_version
+            if self.config.junos_netconf_ssh
+            else False
+        )
+        restconf_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.juniper.port, timeout=1.5
+            )
+            if self.config.juniper.enabled
+            else False
+        )
+        api_open = netconf_open or restconf_open
 
-                parsed = parse_show_version(device.vendor or "Juniper", ssh_result["showVersion"])
-                return {
-                    "checks": {
-                        "ping": True,
-                        "ssh": True,
-                        "showVersion": bool(ssh_result["showVersion"].strip()),
-                        "showRun": bool(ssh_result["showRun"].strip()),
-                    },
-                    "showVersion": ssh_result["showVersion"],
-                    "showRun": ssh_result["showRun"],
-                    "parsed": parsed,
-                    "source": "ssh-cli",
-                    "message": "Lab SSH probe OK",
-                }
-            return {
-                "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-                "message": ssh_result["error"] or "Lab SSH failed",
-                "source": "ssh-cli",
-            }
+        if api_open:
+            source = "junos-rest-tcp"
+            message = (
+                "Junos NETCONF SSH TCP reachable"
+                if netconf_open and not restconf_open
+                else "Junos RESTCONF TCP reachable"
+                if restconf_open and not netconf_open
+                else "Junos NETCONF SSH + RESTCONF TCP reachable"
+            )
+        elif ssh_open:
+            source = "ssh-tcp"
+            message = "Lab SSH TCP reachable (Junos API not enabled or unreachable)"
+        else:
+            source = None
+            message = "Neither SSH nor Junos API TCP reachable"
 
         return {
-            "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-            "message": "Enable EOS_API/IOSXE_API/NXOS_API/JUNOS_REST or LAB_SSH to probe the device",
+            "checks": {
+                "ping": True,
+                "ssh": ssh_open,
+                "rest": api_open,
+                "showVersion": False,
+                "showRun": False,
+            },
+            "showVersion": "",
+            "showRun": "",
+            "parsed": {"vendor": "Juniper"},
+            "source": source,
+            "message": message,
         }
 
     def get_logs(self, device: DeviceInfo, filename: str | None) -> dict[str, Any]:

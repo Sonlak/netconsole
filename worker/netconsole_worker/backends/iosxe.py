@@ -18,6 +18,7 @@ from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_cisco_arp_table
 from netconsole_worker.parsers.show_mac_table import parse_cisco_mac_table
+from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
 from netconsole_worker.ssh_client import (
     netconf_get_interface_config,
     netconf_interface_action,
@@ -748,76 +749,60 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
-        if self.config.iosxe.enabled:
-            r = self._rc_get(device, "/ietf-system:system")
-            if r["ok"]:
-                payload = r["payload"].get("ietf-system:system", {}) if isinstance(r["payload"], dict) else {}
-                hostname = payload.get("hostname", "")
-                return {
-                    "checks": {
-                        "ping": True,
-                        "ssh": True,
-                        "showVersion": bool(hostname),
-                        "showRun": bool(r.get("raw")),
-                    },
-                    "showVersion": r.get("raw") or "",
-                    "showRun": r.get("raw") or "",
-                    "parsed": {"hostname": hostname, "vendor": "Cisco"},
-                    "source": "iosxe-rest",
-                    "message": "IOS-XE RESTCONF identity OK",
-                }
-            rest_error = r["error"]
-        else:
-            rest_error = None
-
-        if self.config.ssh_enabled:
-            ssh_version = run_ssh_command(
-                host=device.ip,
-                username=self.config.ssh_user,
-                password=self.config.ssh_password,
-                port=self.config.ssh_port,
-                command="show version",
+        # Managed check is now a lightweight TCP probe (see probe.py).
+        # IOS-XE exposes both RESTCONF (443) and NETCONF-over-SSH (830);
+        # we probe the RESTCONF port as the `rest` flag and SSH (22) as
+        # the `ssh` flag. No `ietf-system:system` RESTCONF GET, no SSH
+        # login, no `show version`, no `show running-config`. The old
+        # implementation burned 2 SSH sessions per probe on every device
+        # and the full running-config payload flooded the SSH pool.
+        ssh_open = probe_ssh(device.ip, self.config.ssh_port)
+        rest_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.iosxe.port, timeout=1.5
             )
-            if not ssh_version["sshOk"]:
-                return {
-                    "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-                    "message": ssh_version["error"] or "SSH failed",
-                    "source": "ssh-cli",
-                    "restError": rest_error,
-                }
-            from netconsole_worker.parsers.show_version import parse_show_version
+            if self.config.iosxe.enabled
+            else False
+        )
+        netconf_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.junos_netconf_ssh_port, timeout=1.5
+            )
+            if self.config.junos_netconf_ssh
+            else False
+        )
+        # `rest` is the catch-all flag for the API gate. Either RESTCONF
+        # or NETCONF SSH being reachable counts as "rest OK" — IOS-XE
+        # boxes are usually configured with one or both (gotcha #14).
+        api_open = rest_open or netconf_open
 
-            parsed = parse_show_version(device.vendor or "Cisco", ssh_version["output"])
-
-            # Also test show running-config so the managed-check banner shows green
-            show_run_ok = False
-            show_run_output = ""
-            if ssh_version["sshOk"]:
-                ssh_run = run_ssh_command(
-                    host=device.ip,
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    port=self.config.ssh_port,
-                    command="show running-config",
-                )
-                if ssh_run["sshOk"] and len(ssh_run.get("output", "")) > 50:
-                    show_run_ok = True
-                    show_run_output = ssh_run["output"]
-
-            return {
-                "checks": {"ping": True, "ssh": True, "showVersion": True, "showRun": show_run_ok},
-                "showVersion": ssh_version["output"],
-                "showRun": show_run_output,
-                "parsed": parsed,
-                "source": "ssh-cli",
-                "message": "Lab SSH show version OK" if show_run_ok else "Lab SSH show version OK; show running-config " + ("OK" if show_run_ok else "FAILED"),
-                "restError": rest_error,
-            }
+        if api_open:
+            source = "iosxe-rest-tcp"
+            message = (
+                "IOS-XE RESTCONF TCP reachable"
+                if rest_open
+                else "IOS-XE NETCONF SSH TCP reachable (RESTCONF not enabled or unreachable)"
+            )
+        elif ssh_open:
+            source = "ssh-tcp"
+            message = "Lab SSH TCP reachable (IOS-XE API not enabled or unreachable)"
+        else:
+            source = None
+            message = "Neither SSH nor IOS-XE API TCP reachable"
 
         return {
-            "checks": {"ping": True, "ssh": False, "showVersion": False, "showRun": False},
-            "message": rest_error or "Enable IOSXE_API or LAB_SSH",
-            "source": None,
+            "checks": {
+                "ping": True,
+                "ssh": ssh_open,
+                "rest": api_open,
+                "showVersion": False,
+                "showRun": False,
+            },
+            "showVersion": "",
+            "showRun": "",
+            "parsed": {"vendor": "Cisco"},
+            "source": source,
+            "message": message,
         }
 
 
