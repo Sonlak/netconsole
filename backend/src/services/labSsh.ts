@@ -170,40 +170,98 @@ export async function runIosxeSshApply(
     stream.write('configure terminal\r\n');
     await readUntilPrompt(stream, promptRe, promptTimeoutMs);
 
-    // Send each command, wait for prompt, capture output
-    for (const cmd of options.commands) {
-      const trimmed = cmd.trim();
-      if (!trimmed || trimmed.startsWith('!')) continue; // skip blanks and IOS comments
+    // Build a script that sends every command then exits config mode.
+    // Key insight: IOS-XE sub-blocks (e.g. `vlan 990` then `  name FOO`)
+    // require NO prompt-barrier between parent and child. The device stays in
+    // sub-config mode until it sees a line that ends the block (e.g. `exit`,
+    // a new top-level command, or `end`). So we send the entire script as
+    // one batch with embedded newlines, then wait for the final # prompt.
+    //
+    // Lines that are pure noise (empty, IOS comments "! ...") are skipped.
+    const ios_commands = options.commands
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0 && !c.startsWith('!'));
 
-      stream.write(`${trimmed}\r\n`);
-      const raw = await readUntilPrompt(stream, promptRe, promptTimeoutMs);
+    if (ios_commands.length === 0) {
+      stream.write('end\r\n');
+      await readUntilPrompt(stream, promptRe, promptTimeoutMs).catch(() => undefined);
+      return { ok: true, commandCount: 0, outputs: [] };
+    }
 
-      // Pull just the chunk between the echo and the trailing prompt.
-      // IOS echoes the command back, then prints the result.
-      const lines = raw.split(/\r?\n/);
-      // Drop first line (echo of the command) and last line (prompt itself)
-      const body = lines.slice(1, lines.length >= 2 ? -1 : undefined).join('\n').trim();
-      const isError = body.startsWith('% ') || /% Invalid input detected/i.test(body);
-      outputs.push({
-        command: trimmed,
-        output: body,
-        ...(isError ? { error: body } : {}),
-      });
-      if (isError) {
-        // Best-effort: leave config mode cleanly so the device isn't half-mutated.
-        stream.write('end\r\n');
-        await readUntilPrompt(stream, promptRe, promptTimeoutMs).catch(() => undefined);
-        return {
-          ok: false,
-          error: `IOS-XE rejected command "${trimmed}": ${body}`,
-          outputs,
-        };
+    const script = ios_commands.join('\n') + '\n';
+    stream.write(script);
+    // Wait long enough for the whole script to be absorbed. Long configs with
+    // interface shutdowns can take 5-10 s on IOS-XE; cap at promptTimeoutMs * 4.
+    const absorbTime = Math.min(promptTimeoutMs * 4, 30_000);
+    let raw: string;
+    try {
+      raw = await readUntilPrompt(stream, promptRe, absorbTime);
+    } catch {
+      // If the device is slow (e.g. spanning-tree recalc) the prompt may come
+      // late. Do one more read attempt before declaring failure.
+      try {
+        raw = await readUntilPrompt(stream, promptRe, promptTimeoutMs * 2);
+      } catch {
+        raw = '';
       }
     }
 
-    // Exit config mode cleanly
-    stream.write('end\r\n');
-    await readUntilPrompt(stream, promptRe, promptTimeoutMs).catch(() => undefined);
+    // Parse the output: each line of the raw buffer is either an echo of the
+    // command, an IOS result/error line, or a prompt.  We reconstruct
+    // per-command output by splitting on the echoed command lines.
+    const all_lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    // The last line should be the prompt; everything before it is command
+    // echoes + results.  The echoes start with the first command string.
+    let cur_cmd = '';
+    let cur_body: string[] = [];
+
+    for (const line of all_lines) {
+      // If this line exactly matches one of our commands it is an echo (prompt
+      // is excluded because prompt has trailing # not in commands).
+      if (ios_commands.includes(line.trim())) {
+        // Flush previous command
+        if (cur_cmd) {
+          const body_text = cur_body.join('\n').trim();
+          const is_error =
+            body_text.startsWith('% ') || /% Invalid input detected/i.test(body_text);
+          outputs.push({
+            command: cur_cmd,
+            output: body_text,
+            ...(is_error ? { error: body_text } : {}),
+          });
+          if (is_error) {
+            // Abort: end config mode and report.
+            stream.write('end\r\n');
+            await readUntilPrompt(stream, promptRe, promptTimeoutMs).catch(() => undefined);
+            return {
+              ok: false,
+              error: `IOS-XE rejected "${cur_cmd}": ${body_text}`,
+              outputs,
+            };
+          }
+        }
+        cur_cmd = line.trim();
+        cur_body = [];
+      } else if (cur_cmd) {
+        cur_body.push(line);
+      }
+    }
+    // Flush last command
+    if (cur_cmd) {
+      const body_text = cur_body.join('\n').trim();
+      const is_error =
+        body_text.startsWith('% ') || /% Invalid input detected/i.test(body_text);
+      outputs.push({
+        command: cur_cmd,
+        output: body_text,
+        ...(is_error ? { error: body_text } : {}),
+      });
+      if (is_error) {
+        stream.write('end\r\n');
+        await readUntilPrompt(stream, promptRe, promptTimeoutMs).catch(() => undefined);
+        return { ok: false, error: `IOS-XE rejected "${cur_cmd}": ${body_text}`, outputs };
+      }
+    }
 
     return { ok: true, commandCount: outputs.length, outputs };
   } catch (error) {
