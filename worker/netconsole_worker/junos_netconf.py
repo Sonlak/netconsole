@@ -188,6 +188,15 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
         or "<load-success" in raw_lower
     ):
         return True, ""
+    # <get-configuration> replies don't carry <ok/> — they ship a
+    # <configuration> payload directly. Treat any reply that has the
+    # configuration payload and no error markers as success.
+    if (
+        "<configuration" in raw_lower
+        and "<rpc-error" not in raw_lower
+        and "<error-message" not in raw_lower
+    ):
+        return True, ""
     return False, "Unknown NETCONF error"
 
 
@@ -337,3 +346,69 @@ def rollback_configuration(
         return {"ok": False, "stage": "commit", "error": err, "raw": load_raw}
 
     return {"ok": True, "stage": "commit", "error": None, "raw": load_raw + "\n" + commit_raw}
+
+
+def fetch_interface_configuration(
+    host: str,
+    iface: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Read running config for one interface via NETCONF <get-configuration>.
+
+    Uses xpath filter to scope the read to ``<interfaces><interface><name>X</name>``
+    so we don't pull the whole 30k-line candidate db.  Returns the same
+    shape as ``junos_rest.fetch_interface_configuration`` so the caller can
+    pick RESTCONF or NETCONF interchangeably.
+    """
+    from xml.sax.saxutils import escape
+
+    safe_iface = escape(iface.strip())
+    rpc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<rpc>"
+        '<get-configuration format="set">'
+        f'<configuration><interfaces><interface><name>{safe_iface}</name></interface></interfaces></configuration>'
+        "</get-configuration>"
+        "</rpc>"
+    )
+    ok, raw, _ms = _run_nc_rpc(host, port, username, password, rpc, timeout=timeout)
+    if not ok:
+        return {"ok": False, "stage": "rpc", "error": raw, "payload": "", "raw": ""}
+    rpc_ok, err = _parse_ok_error(raw)
+    if not rpc_ok:
+        return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
+    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
+
+
+def fetch_full_configuration(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 45.0,
+) -> dict[str, Any]:
+    """Read the whole candidate configuration via NETCONF <get-configuration>.
+
+    Used as a fallback when the interface-scoped fetch returns nothing
+    (e.g. the interface has only default settings — Junos omits empty
+    hierarchy nodes from the scoped reply).  The caller is expected to
+    filter the result down to the interfaces stanza.
+    """
+    rpc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<rpc>"
+        '<get-configuration format="set"/>'
+        "</rpc>"
+    )
+    ok, raw, _ms = _run_nc_rpc(host, port, username, password, rpc, timeout=timeout)
+    if not ok:
+        return {"ok": False, "stage": "rpc", "error": raw, "payload": "", "raw": ""}
+    rpc_ok, err = _parse_ok_error(raw)
+    if not rpc_ok:
+        return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
+    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}

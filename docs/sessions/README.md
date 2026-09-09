@@ -7,6 +7,7 @@
 
 | Status | Topic | Files | Last touched |
 | --- | --- | --- | --- |
+| 🟡 Ready to deploy | Juniper `interface_action`: NETCONF SSH primary for shut/no-shut/set-vlan, RESTCONF→NETCONF→SSH for show-run | `worker/junos_netconf.py`, `worker/parsers/configuration_rpc.py`, `worker/backends/juniper.py` | 2026-09-09 09:50 |
 | 🟡 Ready to deploy | Collect reads = REST-first; write ops = NETCONF via queue | `backend/services/junosRest.ts`, `iosxeRest.ts`, `arpAddress.ts`, `macAddress.ts`, `interfaces.ts`, `routes/deviceOperations.ts`, `routes/interfaces.ts`, `docker-compose.app.yml`, `frontend/pages/DeviceDetailPage.tsx`, `frontend/features/ports/PortsPanel.tsx` | 2026-09-08 22:00 |
 | 🟢 Deployed | Config Studio Collect/Commit priority fix (commit 16019cc) | `backend/src/services/deviceOperations.ts` | 2026-09-08 20:20 |
 | 🟢 Deployed | NETCONF SSH Junos end-to-end (commit 212fbd9) | `worker/junos_netconf.py` | 2026-09-08 15:30 |
@@ -28,7 +29,8 @@
 
 | Date | Time | Topic | Files touched | Status |
 | --- | --- | --- | --- | --- |
-| 2026-09-08 | 22:00 | Collect buttons: REST-first reads + NETCONF writes (this session) | `backend/services/junosRest.ts`, `backend/services/iosxeRest.ts` (new), `arpAddress.ts`, `macAddress.ts`, `interfaces.ts`, `routes/deviceOperations.ts`, `routes/interfaces.ts`, `docker-compose.app.yml`, `frontend/pages/DeviceDetailPage.tsx`, `frontend/features/ports/PortsPanel.tsx` | 🟡 Ready to deploy |
+| 2026-09-09 | 09:50 | Juniper `interface_action` fix: NETCONF SSH primary for shut/no-shut/set-vlan, RESTCONF→NETCONF→SSH for show-run | `worker/junos_netconf.py`, `worker/parsers/configuration_rpc.py`, `worker/backends/juniper.py` | 🟡 Ready to deploy |
+| 2026-09-08 | 22:00 | Collect buttons: REST-first reads + NETCONF writes | `backend/services/junosRest.ts`, `backend/services/iosxeRest.ts` (new), `arpAddress.ts`, `macAddress.ts`, `interfaces.ts`, `routes/deviceOperations.ts`, `routes/interfaces.ts`, `docker-compose.app.yml`, `frontend/pages/DeviceDetailPage.tsx`, `frontend/features/ports/PortsPanel.tsx` | 🟡 Ready to deploy |
 | 2026-09-08 | 20:20 | Config Studio Collect/Commit failing with 'Device busy' -- jobPriority URGENT/HIGH split | `backend/src/services/deviceOperations.ts`, `deviceTabCollection.ts`, `interfaces.ts` | 🟢 Deployed |
 | 2026-09-08 | 15:30 | NETCONF SSH Junos end-to-end (commit 212fbd9) | `worker/junos_netconf.py`, `worker/backends/juniper.py`, `worker/Dockerfile`, `docker-compose.app.yml` | 🟢 Deployed |
 | 2026-09-08 | 14:00 | NETCONF SSH Junos attempt 1 -- hello exchange stuck | `worker/junos_netconf.py` | ❌ Superseded by 15:30 |

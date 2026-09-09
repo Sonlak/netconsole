@@ -27,11 +27,14 @@ from netconsole_worker.junos_rest import (
 )
 from netconsole_worker.junos_netconf import (
     apply_set_configuration as nc_apply_set_configuration,
+    fetch_full_configuration as nc_fetch_full_configuration,
+    fetch_interface_configuration as nc_fetch_interface_configuration,
     rollback_configuration as nc_rollback_configuration,
 )
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.arp_table_rpc import parse_arp_table_rpc
 from netconsole_worker.parsers.configuration_rpc import (
+    netconf_get_configuration_to_set,
     parse_configuration_set,
     parse_identity_from_set_config,
 )
@@ -561,36 +564,115 @@ class JuniperBackend(DeviceBackend):
             raise RuntimeError(f"Refusing {action} on management/internal interface {iface}")
 
         rest_error: str | None = None
+        netconf_error: str | None = None
         creds = _rest_creds(self.config)
 
         if action == "show-run":
-            filtered = fetch_interface_configuration(device.ip, iface, **creds)
+            # show-run path: try each transport in order until one returns
+            # real config for the interface.
+            #
+            # 1. RESTCONF scoped fetch (`<get-configuration>` filtered to the
+            #    one interface) — fast and returns the actual set-format
+            #    statements. Best path when the Junos RESTCONF pool is fresh.
+            # 2. NETCONF SSH `<get-configuration>` scoped to the same
+            #    interface — used when RESTCONF is stale / returns empty
+            #    (gotcha #15: cRPD RESTCONF first-call spike).
+            # 3. NETCONF SSH full get-configuration — used when the scoped
+            #    read returns nothing because the interface hierarchy is
+            #    empty (Junos omits empty sub-trees from filtered replies).
+            #    Caller filters to the relevant `set interfaces X ...` lines.
+            # 4. SSH CLI `show configuration interfaces X` — last resort.
             config = ""
+
+            # --- 1. RESTCONF scoped ---
+            filtered = fetch_interface_configuration(device.ip, iface, **creds)
             if filtered["ok"]:
                 config = parse_configuration_set(filtered["payload"] or filtered["raw"])
-            if not config:
-                full = fetch_configuration(device.ip, **creds)
-                if full["ok"]:
-                    config = filter_interface_set_lines(
-                        parse_configuration_set(full["payload"] or full["raw"]),
-                        iface,
+
+            # --- 2/3. NETCONF SSH (scoped, then full) ---
+            if not config and self.config.junos_netconf_ssh:
+                nc_filtered = nc_fetch_interface_configuration(
+                    device.ip,
+                    iface,
+                    username=creds["username"],
+                    password=creds["password"],
+                    port=self.config.junos_netconf_ssh_port,
+                )
+                if nc_filtered["ok"]:
+                    # NETCONF reply is nested XML; convert to set-format
+                    # so the rest of the code can treat RESTCONF and
+                    # NETCONF outputs interchangeably.
+                    nc_config = netconf_get_configuration_to_set(
+                        nc_filtered["payload"] or nc_filtered["raw"]
                     )
-                elif not filtered["ok"]:
-                    rest_error = filtered["error"] or full["error"]
-            if config or filtered["ok"]:
+                    if nc_config:
+                        config = nc_config
+                    else:
+                        # Scoped read returned nothing — interface likely has
+                        # only defaults. Pull the full config and filter.
+                        nc_full = nc_fetch_full_configuration(
+                            device.ip,
+                            username=creds["username"],
+                            password=creds["password"],
+                            port=self.config.junos_netconf_ssh_port,
+                        )
+                        if nc_full["ok"]:
+                            full_set = netconf_get_configuration_to_set(
+                                nc_full["payload"] or nc_full["raw"]
+                            )
+                            config = filter_interface_set_lines(full_set, iface)
+                else:
+                    netconf_error = nc_filtered.get("error")
+
+            # --- 4. SSH CLI fallback ---
+            if not config and self.config.ssh_enabled:
+                ssh_result = run_ssh_command(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    port=self.config.ssh_port,
+                    command=f"show configuration interfaces {iface}",
+                )
+                if ssh_result["sshOk"]:
+                    cli_output = ssh_result["output"] or ""
+                    # Strip the trailing "[edit]" / banner lines from the CLI
+                    # output so callers see only the actual `set` lines.
+                    lines = [
+                        line
+                        for line in cli_output.splitlines()
+                        if line.strip() and not line.strip().startswith("[edit")
+                        and not line.strip().startswith("{master:")
+                    ]
+                    config = "\n".join(lines).strip()
+                else:
+                    rest_error = ssh_result.get("error") or rest_error
+
+            if config:
                 return {
                     "implemented": True,
-                    "source": "junos-rest",
+                    "source": "junos-rest-or-netconf-or-ssh",
                     "action": action,
                     "interface": iface,
-                    "config": config or f"# No configuration for {iface} (defaults)",
-                    "message": (
-                        f"Interface {iface} running config"
-                        if config
-                        else f"No configuration for {iface} (defaults)"
-                    ),
+                    "config": config,
+                    "message": f"Interface {iface} running config",
+                    "restError": rest_error,
+                    "netconfError": netconf_error,
                     "raw": compact_raw(filtered.get("raw") or ""),
                 }
+            # All transports returned nothing — surface a stub rather than
+            # erroring out, so the operator can tell "interface has defaults"
+            # apart from "transport broken".
+            return {
+                "implemented": True,
+                "source": "junos-rest-or-netconf-or-ssh",
+                "action": action,
+                "interface": iface,
+                "config": f"# No configuration for {iface} (defaults)",
+                "message": f"No configuration for {iface} (defaults)",
+                "restError": rest_error,
+                "netconfError": netconf_error,
+                "raw": compact_raw(filtered.get("raw") or ""),
+            }
 
         if action in {"shut", "no-shut", "set-access-vlan"}:
             try:
@@ -598,16 +680,55 @@ class JuniperBackend(DeviceBackend):
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 
-            applied = rest_apply_set_configuration(
-                device.ip,
-                commands,
-                log=f"NetConsole {action} {iface}",
-                **creds,
-            )
-            if applied["ok"]:
-                return {
+            # Write path: NETCONF SSH → RESTCONF → SSH CLI.
+            # Mirrors apply_config / rollback_config (commit 212fbd9) so
+            # the same Junos cRPD quirks (RESTCONF stale-socket, first-commit
+            # spike) are handled the same way across every config write.
+            source = None
+            applied: dict[str, Any] | None = None
+
+            # --- 1. NETCONF SSH (primary) ---
+            if self.config.junos_netconf_ssh:
+                nc_user = creds["username"]
+                nc_pass = creds["password"]
+                nc_port = self.config.junos_netconf_ssh_port
+                nc_result = nc_apply_set_configuration(
+                    device.ip,
+                    commands,
+                    log=f"NetConsole {action} {iface}",
+                    username=nc_user,
+                    password=nc_pass,
+                    port=nc_port,
+                    timeout=90.0,
+                )
+                if nc_result["ok"]:
+                    applied = nc_result
+                    source = "junos-netconf-ssh"
+                else:
+                    netconf_error = nc_result.get("error") or "NETCONF SSH load/commit failed"
+                    logger.warning(
+                        "junos %s %s %s: NETCONF SSH failed (%s), trying RESTCONF",
+                        device.ip, action, iface, netconf_error,
+                    )
+
+            # --- 2. RESTCONF (fallback when NETCONF unavailable or failed) ---
+            if applied is None:
+                rest_result = rest_apply_set_configuration(
+                    device.ip,
+                    commands,
+                    log=f"NetConsole {action} {iface}",
+                    **creds,
+                )
+                if rest_result["ok"]:
+                    applied = rest_result
+                    source = "junos-rest"
+                else:
+                    rest_error = rest_result.get("error") or "Junos REST configure failed"
+
+            if applied is not None:
+                result: dict[str, Any] = {
                     "implemented": True,
-                    "source": "junos-rest",
+                    "source": source,
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
@@ -616,11 +737,31 @@ class JuniperBackend(DeviceBackend):
                     "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
                     "accessVlan": vlan if action == "set-access-vlan" else None,
                     "raw": compact_raw(applied.get("raw") or ""),
+                    "loadMs": applied.get("loadMs"),
+                    "commitMs": applied.get("commitMs"),
                 }
-            rest_error = applied.get("error") or "Junos REST configure failed"
+                # Surface the transport we *didn't* use so operators can see
+                # why this device fell back (or didn't).
+                if source != "junos-netconf-ssh" and netconf_error:
+                    result["netconfFallbackError"] = netconf_error
+                if source != "junos-rest" and rest_error:
+                    result["restFallbackError"] = rest_error
+                return result
+
+            # Both NETCONF and RESTCONF failed. Fall through to SSH CLI
+            # so the operator can at least see the on-device error verbatim.
+            logger.warning(
+                "junos %s %s %s: NETCONF and RESTCONF both failed "
+                "(netconf=%s, rest=%s), falling back to SSH CLI",
+                device.ip, action, iface, netconf_error, rest_error,
+            )
 
         if not self.config.ssh_enabled:
-            raise RuntimeError(rest_error or "Interface actions require JUNOS_REST or LAB_SSH")
+            raise RuntimeError(
+                (netconf_error and f"NETCONF: {netconf_error} ")
+                or (rest_error and f"RESTCONF: {rest_error} ")
+                or "Interface actions require NETCONF, JUNOS_REST, or LAB_SSH"
+            )
 
         commands: list[str] = []
         if action == "shut" or action == "no-shut":
@@ -666,6 +807,7 @@ class JuniperBackend(DeviceBackend):
             "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
             "accessVlan": vlan if action == "set-access-vlan" else None,
             "restError": rest_error,
+            "netconfError": netconf_error,
         }
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:

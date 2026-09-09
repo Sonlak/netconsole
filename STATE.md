@@ -6,12 +6,29 @@
 
 ---
 
-## Last updated: 2026-09-08 22:00 (UTC+7)
+## Last updated: 2026-09-09 09:50 (UTC+7)
 
 ## In-progress task
 
-**Read operations go direct REST, write operations stay NETCONF via queue.**
-In-flight — backend + frontend done, not yet deployed.
+**Juniper `interface_action` fix: done, ready to deploy.**
+
+Files changed (all in `worker/`):
+- `netconsole_worker/junos_netconf.py` — added `fetch_interface_configuration()` and
+  `fetch_full_configuration()` NETCONF helpers; fixed `_parse_ok_error()` to
+  return True for `<get-configuration>` replies (they have `<configuration>` not `<ok>`).
+- `netconsole_worker/parsers/configuration_rpc.py` — added `xml_to_set_format()` (XML
+  → set-format converter) + `netconf_get_configuration_to_set()` +
+  `_is_noise_output()` noise filter.
+- `netconsole_worker/backends/juniper.py` — rewrote `interface_action()`:
+  - **show-run**: RESTCONF scoped → NETCONF scoped → NETCONF full → SSH CLI.
+  - **writes (shut/no-shut/set-access-vlan)**: NETCONF SSH → RESTCONF → SSH CLI.
+  - Mirrors `apply_config` / `rollback_config` pattern (commit 212fbd9).
+
+Routing summary (all Juniper port ops):
+| Action | Path 1 | Path 2 | Path 3 |
+|--------|--------|--------|--------|
+| show-run | RESTCONF | NETCONF SSH | SSH CLI |
+| shut / no-shut / set-access-vlan | **NETCONF SSH** | RESTCONF | SSH CLI |
 
 - **Architecture rule (new, this commit)**:
   - **Collect (read)**: ARP, MAC, interfaces status, show run → backend calls
