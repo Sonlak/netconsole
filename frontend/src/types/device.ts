@@ -3,6 +3,10 @@ export type DeviceStatus = 'MANAGED' | 'ONLINE' | 'OFFLINE' | 'MAINTENANCE' | 'U
 export type ManagedChecks = {
   ping: boolean;
   ssh: boolean;
+  /** RESTCONF / NETCONF / eAPI / NX-API port TCP-reachable. Probe-only; no auth. */
+  rest: boolean;
+  /** Legacy fields — kept in the shape for back-compat with rows
+   * written before 2026-09-09. The worker no longer fetches them. */
   showVersion: boolean;
   showRun: boolean;
 };
@@ -61,6 +65,7 @@ export const DEVICE_FORM_STATUS_OPTIONS = [
 export const MANAGED_CHECK_LABELS: { key: keyof ManagedChecks; label: string }[] = [
   { key: 'ping', label: 'Ping' },
   { key: 'ssh', label: 'SSH' },
+  { key: 'rest', label: 'REST/NETCONF' },
 ];
 
 export { deviceStatusMeta as getStatusMeta } from '@/design/status';
@@ -68,5 +73,13 @@ export { deviceStatusMeta as getStatusMeta } from '@/design/status';
 export { formatPing as formatLastPing } from '@/lib/format';
 
 export function isFullyManaged(checks: ManagedChecks | null | undefined) {
-  return Boolean(checks?.ping && checks?.ssh);
+  if (!checks) return false;
+  // Gate mirrors the backend `isFullyManaged` after 2026-09-09:
+  // ping + ssh + rest. showVersion/showRun are legacy fields kept for
+  // back-compat; if a pre-refactor row still has them set we honor it.
+  if (checks.rest) {
+    return Boolean(checks.ping && checks.ssh);
+  }
+  // Legacy row (no `rest` key): fall back to showVersion + showRun.
+  return Boolean(checks.ping && checks.ssh && checks.showVersion && checks.showRun);
 }

@@ -8,6 +8,7 @@ import { jobPriority } from './deviceOperations.js';
 export type ManagedChecks = {
   ping: boolean;
   ssh: boolean;
+  rest: boolean;
   showVersion: boolean;
   showRun: boolean;
 };
@@ -48,6 +49,7 @@ export async function startManagedCheck(deviceId: string) {
   const pingChecks: ManagedChecks = {
     ping: ping.alive,
     ssh: false,
+    rest: false,
     showVersion: false,
     showRun: false,
   };
@@ -157,7 +159,15 @@ export async function startManagedCheckAll() {
 }
 
 export function isFullyManaged(checks: ManagedChecks): boolean {
-  return checks.ping && checks.ssh && checks.showVersion && checks.showRun;
+  // Gate is now `ping + ssh + rest` (TCP-reachable ports). The previous
+  // implementation also required `showVersion` + `showRun` to be true,
+  // which meant the probe had to actually SSH login and pull
+  // `show running-config` on every check — that burned 2 SSH sessions
+  // and pushed ~5-50 KB per device every 30s. Now the probe is just a
+  // TCP connect (see worker/netconsole_worker/probe.py), so the gate
+  // is correspondingly lighter. showVersion/showRun stay in the shape
+  // for back-compat but are always false in the worker output.
+  return Boolean(checks.ping && checks.ssh && checks.rest);
 }
 
 export async function applyManagedCheckResult(job: Job) {
@@ -189,6 +199,7 @@ export async function applyManagedCheckResult(job: Job) {
   const checks = result.checks ?? {
     ping: true,
     ssh: false,
+    rest: false,
     showVersion: false,
     showRun: false,
   };
@@ -200,7 +211,8 @@ export async function applyManagedCheckResult(job: Job) {
         status: DeviceStatus.ONLINE,
         lastManagedCheckAt: new Date(),
         managedChecks: checks,
-        manageError: result.message ?? 'SSH or show commands not ready (lab integration pending)',
+        manageError:
+          result.message ?? 'SSH or REST/NETCONF API port not reachable',
       },
     });
   }
