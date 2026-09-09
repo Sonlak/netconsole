@@ -203,7 +203,7 @@ def _is_noise_output(text: str) -> bool:
         return True
     # Strip the single `set ok` / `set rpc-reply ok` line from a bare
     # <ok/> reply — not a configuration statement.
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) == 1 and lines[0] in (
         "set ok",
         "set rpc-reply ok",
