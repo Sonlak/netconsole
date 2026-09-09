@@ -1060,25 +1060,37 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
         };
       });
 
-  // Tier background bands — each band hugs its OWN nodes' X-bbox plus a
+  // Tier background bands — each band hugs its own nodes' X-bbox plus a
   // small padding. Empty space between tiers stays the canvas background,
   // not part of any band. Uses tierMeta.tone for the CSS class.
+  const PAD_X = 16;
+  const PAD_Y = 18;
   const tierBands = layout.tierMeta
-    .map((t) => {
+    .map((t, idx) => {
       const tier = layout.tiers[t.rank];
       if (!tier || tier.nodes.length === 0) return null;
       const xs = tier.nodes.map((n) => n.box.x);
       const xe = tier.nodes.map((n) => n.box.x + n.box.w);
-      const xLeft  = Math.min(...xs);
-      const xRight = Math.max(...xe);
-      const PAD_X = 24;
-      const PAD_Y = 18;
+
+      // Rail Y = tier.y + NODE_H/2 (pill is centered on the node midline).
+      const thisRailY = (tier.y ?? MARGIN_Y + t.rank * (NODE_H + TIER_GAP)) + NODE_H / 2;
+      const nextTier  = layout.tierMeta[idx + 1];
+      const nextTierObj = nextTier ? layout.tiers[nextTier.rank] : null;
+      const nextRailY = nextTierObj
+        ? (nextTierObj.y ?? MARGIN_Y + nextTier.rank * (NODE_H + TIER_GAP)) + NODE_H / 2
+        : Math.max(...xe) + 38 / 2 + PAD_Y;
+
+      const bandTop    = thisRailY - 38 / 2 - PAD_Y;
+      const bandBottom = nextRailY + 38 / 2 + PAD_Y;
+      // Band hugs the tier: left = leftmost node left edge, right = rightmost node + pad.
+      const bandLeft  = Math.min(...xs);
+      const bandRight = Math.max(...xe) + PAD_X;
       return {
         tone: t.tone,
-        left:  xLeft - PAD_X,
-        right: xRight + PAD_X,
-        top:   tier.y - PAD_Y,
-        bot:   tier.y + NODE_H + PAD_Y,
+        left:   bandLeft,
+        right:  bandRight,
+        top:    bandTop,
+        height: bandBottom - bandTop,
       };
     })
     .filter((b): b is NonNullable<typeof b> => b !== null);
@@ -1103,17 +1115,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
       <div className="nc-fabric-grid" />
 
-      {/* Tier background bands — rendered as full-width screen-space divs
-          so they reach the tier rail (left edge) regardless of pan/zoom.
-          Each band spans from the left edge of the card to the right edge
-          of the canvas, covering the rail area + the tier nodes. */}
+      {/* Tier background bands — positioned in viewport space so they move
+          with the pan/zoom canvas. Each band spans from leftmost node to
+          rightmost node (plus pad), filling the vertical space of the tier. */}
       {tierBands.map((band) => (
         <div
-          key={`tier-band-screen-${band.tone}`}
+          key={`tier-band-${band.tone}`}
           className={`nc-fabric-tier-band nc-fabric-tier-band-screen is-${band.tone}`}
           style={{
-            top:    viewport.y + band.top * viewport.scale,
-            height: Math.max(1, (band.bot - band.top) * viewport.scale),
+            left:   viewport.x + band.left   * viewport.scale,
+            top:    viewport.y + band.top    * viewport.scale,
+            width:  Math.max(1, (band.right - band.left) * viewport.scale),
+            height: Math.max(1, band.height * viewport.scale),
           }}
         />
       ))}
