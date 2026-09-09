@@ -313,42 +313,15 @@ export async function getFabricTopology(site?: string) {
     }
   }
 
-  // Promote incomplete pair entries to merged using the device-pair key as id.
+  // Promote incomplete pair entries to merged.
+  // Only promote if NO complete entry for this device pair already exists.
+  // Complete entries use (deviceId:port__deviceId:port) as key;
+  // incomplete entries use (deviceId__deviceId) as key. When a complete
+  // entry exists for a device pair, it is the authoritative record and
+  // must NOT be overwritten by an incomplete one.
   for (const link of pairMap.values()) {
-    merged.set(link.id, link);
-  }
-
-  /**
-   * Role-based kind override — per the fabric diagram contract:
-   *   core ↔ core   = peer  (management / L3 redundancy)
-   *   core ↔ dist   = l3   (uplink tier-to-tier)
-   *   dist ↔ dist   = peer  (IR/Aggregation ring)
-   *   dist ↔ access = trunk (layer-2 downlink / VLAN trunk)
-   *   access ↔ access = peer (horizontal stacking links)
-   *
-   * The description-based `parsed.kind` is kept as-is when it carries
-   * useful semantic information (e.g. description explicitly says "TRUNK"
-   * or "PEER"), but the role pair is the authoritative signal when
-   * description is generic (e.g. "LINK_TO_…").
-   *
-   * We apply this after the merge so the override runs on every record
-   * regardless of which interface side originally populated it.
-   */
-  for (const link of merged.values()) {
-    const fromRole = nodeRoleById.get(link.fromDeviceId) ?? 'access';
-    const toRole   = nodeRoleById.get(link.toDeviceId)   ?? 'access';
-    if (fromRole === toRole) {
-      link.kind = 'peer';
-    } else if (
-      (fromRole === 'core' && toRole === 'dist') ||
-      (fromRole === 'dist'  && toRole === 'core')
-    ) {
-      link.kind = 'l3';
-    } else if (
-      (fromRole === 'dist'   && toRole === 'access') ||
-      (fromRole === 'access' && toRole === 'dist')
-    ) {
-      link.kind = 'trunk';
+    if (!merged.has(link.id)) {
+      merged.set(link.id, link);
     }
   }
 
