@@ -1092,7 +1092,10 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       // because there's no rail on the right side and an over-wide band
       // looks noisy.
       const PAD_X = 12;
-      const bandLeft  = MARGIN_X;
+      // Band hugs the tier: left = leftmost node left edge (tight, no extra margin),
+      // right = rightmost node right edge + small pad.
+      const xs = tier.nodes.map((n) => n.box.x);
+      const bandLeft  = Math.min(...xs);
       const bandRight = Math.max(...xe) + PAD_X;
       return {
         tone:   t.tone,
@@ -1124,21 +1127,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
       <div className="nc-fabric-grid" />
 
-      {/* Tier background bands — rendered as full-width screen-space divs
-          so they reach the tier rail (left edge) regardless of pan/zoom.
-          Each band spans from the left edge of the card to the right edge
-          of the canvas, covering the rail area + the tier nodes. */}
+      {/* Tier background bands — each band is centered on its tier's nodes.
+          Span: from rail (left edge of canvas) to rightmost node + small pad,
+          so the band hugs the tier instead of stretching full-canvas width.
+          Position uses viewport coords so the band moves with pan/zoom. */}
       {tierBands.map((band) => (
         <div
-          key={`tier-band-screen-${band.tone}`}
+          key={`tier-band-${band.tone}`}
           className={`nc-fabric-tier-band nc-fabric-tier-band-screen is-${band.tone}`}
           style={{
-            // left:0 anchors band to left edge of .nc-fabric (tier rail area).
-            // width:100% stretches it to the rightmost edge of .nc-fabric,
-            // covering the full canvas width so the band reaches all nodes.
-            left:   0,
-            width:  '100%',
+            left:   viewport.x + band.left  * viewport.scale,
             top:    viewport.y + band.top   * viewport.scale,
+            width:  Math.max(1, (band.right - band.left) * viewport.scale),
             height: Math.max(1, band.height * viewport.scale),
           }}
         />
