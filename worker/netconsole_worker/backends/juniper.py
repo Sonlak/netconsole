@@ -22,7 +22,6 @@ from netconsole_worker.junos_rest import (
     fetch_interfaces_set_config,
     fetch_log_information,
     fetch_vlan_information,
-    probe_device_identity,
     rollback_configuration as rest_rollback_configuration,
 )
 from netconsole_worker.junos_netconf import (
@@ -61,7 +60,7 @@ from netconsole_worker.parsers.vlan_rpc import (
     parse_vlan_information_rpc,
 )
 from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
-from netconsole_worker.ssh_client import run_junos_commands, run_ssh_command
+from netconsole_worker.ssh_client import run_ssh_command
 
 logger = logging.getLogger(__name__)
 
