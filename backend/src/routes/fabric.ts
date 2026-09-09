@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getFabricTopology } from '../services/fabricTopology.js';
+import { getFabricTopology, invalidateFabricCache } from '../services/fabricTopology.js';
 
 export const fabricRouter = Router();
 
@@ -12,4 +12,9 @@ fabricRouter.get('/', async (req, res) => {
       error: error instanceof Error ? error.message : 'Failed to load fabric topology',
     });
   }
+});
+
+fabricRouter.delete('/cache', (_req, res) => {
+  invalidateFabricCache();
+  res.json({ ok: true, message: 'Fabric cache cleared' });
 });
