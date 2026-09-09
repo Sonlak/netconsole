@@ -225,22 +225,6 @@ export async function getFabricTopology(site?: string) {
   /** Fast device-id → role lookup used by the role-based kind override. */
   const nodeRoleById = new Map<string, FabricRole>(nodes.map((n) => [n.id, n.role]));
 
-  /**
-   * Two-stage link deduplication:
-   *
-   * Stage 1 — incomplete entries (at least one port empty):
-   *   key = sorted device pair (e.g. "AS01__DS01")
-   *   → merged into one entry per device pair (port info filled from the most
-   *     complete entry available).
-   *
-   * Stage 2 — complete entries (both ports filled):
-   *   key = linkId with both ports (e.g. "AS01:ge-0/0/2__DS01:ge-0/0/1")
-   *   → each distinct port pair is a separate physical link.
-   *
-   * This handles the case where both ends describe the same cable but one
-   * description has a bare port name (Eth1) that the regex can't normalise
-   * to ge-0/0/1 — both incomplete entries should merge into one.
-   */
   const pairMap = new Map<string, FabricLink>(); // device-pair → best incomplete entry
   const merged  = new Map<string, FabricLink>(); // full linkId → complete entry
 
@@ -332,6 +316,40 @@ export async function getFabricTopology(site?: string) {
   // Promote incomplete pair entries to merged using the device-pair key as id.
   for (const link of pairMap.values()) {
     merged.set(link.id, link);
+  }
+
+  /**
+   * Role-based kind override — per the fabric diagram contract:
+   *   core ↔ core   = peer  (management / L3 redundancy)
+   *   core ↔ dist   = l3   (uplink tier-to-tier)
+   *   dist ↔ dist   = peer  (IR/Aggregation ring)
+   *   dist ↔ access = trunk (layer-2 downlink / VLAN trunk)
+   *   access ↔ access = peer (horizontal stacking links)
+   *
+   * The description-based `parsed.kind` is kept as-is when it carries
+   * useful semantic information (e.g. description explicitly says "TRUNK"
+   * or "PEER"), but the role pair is the authoritative signal when
+   * description is generic (e.g. "LINK_TO_…").
+   *
+   * We apply this after the merge so the override runs on every record
+   * regardless of which interface side originally populated it.
+   */
+  for (const link of merged.values()) {
+    const fromRole = nodeRoleById.get(link.fromDeviceId) ?? 'access';
+    const toRole   = nodeRoleById.get(link.toDeviceId)   ?? 'access';
+    if (fromRole === toRole) {
+      link.kind = 'peer';
+    } else if (
+      (fromRole === 'core' && toRole === 'dist') ||
+      (fromRole === 'dist'  && toRole === 'core')
+    ) {
+      link.kind = 'l3';
+    } else if (
+      (fromRole === 'dist'   && toRole === 'access') ||
+      (fromRole === 'access' && toRole === 'dist')
+    ) {
+      link.kind = 'trunk';
+    }
   }
 
   /**
