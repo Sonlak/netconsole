@@ -260,77 +260,149 @@ export async function fetchIosxeInterfaceRunningConfig(
  * Convert the Cisco-IOS-XE-native YANG tree returned by RESTCONF into
  * IOS-CLI-style text so it renders identically to `show running-config
  * interface X`. Best-effort — covers the interface-block keywords we care
- * about (description, switchport, shutdown, spanning-tree, channel-group).
+ * about (description, switchport, shutdown, spanning-tree, channel-group,
+ * ip address, negotiation).
+ *
+ * Format rules:
+ *   - boolean `true` → just the keyword (presence container)
+ *   - boolean `false` → skip entirely
+ *   - ip.address.primary → `ip address <addr> <mask>` (no indent)
+ *   - namespace-prefixed keys → strip prefix before printing
+ *   - bare numeric leafs (name) → skip (already shown as interface header)
  */
 export function iosxeInterfaceConfigToText(tree: unknown, iface: string): string {
   if (!tree || typeof tree !== 'object') return '';
-  // Native YANG wraps the interface list under `Cisco-IOS-XE-native:interface`.
   const root = tree as Record<string, unknown>;
-  const nativeIface = root['Cisco-IOS-XE-native:interface'];
-  if (!nativeIface || typeof nativeIface !== 'object') {
-    // ietf-interfaces fallback (sparse)
-    return jsonToLines(tree as Record<string, unknown>, `interface ${iface}`, 0);
-  }
-  const ifaceObj = nativeIface as Record<string, unknown>;
-  const firstKey = Object.keys(ifaceObj)[0] ?? '';
-  const block =
-    (ifaceObj as Record<string, unknown>)['GigabitEthernet'] ??
-    (firstKey ? (ifaceObj as Record<string, unknown>)[firstKey] : undefined);
-  if (!block) return '';
-  const blockObj = block as Record<string, unknown>;
-  const entry = Object.values(blockObj)[0] as Record<string, unknown> | undefined;
-  if (!entry || typeof entry !== 'object') return '';
-  const lines: string[] = [`interface ${iface}`];
-  walk(entry, lines, 1);
-  lines.push('!');
-  return lines.join('\n');
-}
 
-function walk(node: unknown, lines: string[], depth: number): void {
-  if (!node || typeof node !== 'object') {
-    if (node !== '' && node !== undefined && node !== null) {
-      // append to last line
-      lines[lines.length - 1] += ` ${String(node)}`;
+  // The response wraps the interface block under the type key.
+  // Find the first non-namespace key that is itself an object/array.
+  const block = Object.entries(root).find(
+    ([k]) => !k.includes(':') || k.startsWith('GigabitEthernet'),
+  );
+  if (!block) return '';
+  const entry = (block[1] as Record<string, unknown>) ?? {};
+  const data = Array.isArray(entry) ? (entry[0] as Record<string, unknown>) : entry;
+  if (!data || typeof data !== 'object') return '';
+
+  const lines: string[] = [`interface ${iface}`];
+
+  for (const [k, v] of Object.entries(data)) {
+    if (k === 'name') continue; // already in header
+    if (v === null || v === undefined) continue;
+
+    // Strip YANG namespace prefix e.g. "Cisco-IOS-XE-ethernet:negotiation" → "negotiation"
+    const key = k.includes(':') ? k.replace(/^[^:]+:/, '') : k;
+
+    if (typeof v === 'boolean') {
+      if (v) lines.push(key); // presence container → just the keyword
+      continue;
     }
-    return;
-  }
-  const obj = node as Record<string, unknown>;
-  for (const [key, value] of Object.entries(obj)) {
-    if (key.startsWith('xmlns')) continue;
-    if (value === undefined || value === null) continue;
-    if (typeof value === 'object' && !Array.isArray(value)) {
-      // nested block keyword
-      const inner = Object.values(value as Record<string, unknown>);
-      if (inner.length === 1 && typeof inner[0] !== 'object') {
-        lines.push(`${' '.repeat(depth * 2)}${key} ${inner[0]}`);
-      } else {
-        lines.push(`${' '.repeat(depth * 2)}${key}`);
-        walk(value, lines, depth + 1);
-      }
-    } else if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item && typeof item === 'object') {
-          lines.push(`${' '.repeat(depth * 2)}${key}`);
-          walk(item, lines, depth + 1);
-        } else {
-          lines.push(`${' '.repeat(depth * 2)}${key} ${String(item)}`);
+    if (typeof v === 'string' && v !== '') {
+      lines.push(`${key} ${v}`);
+      continue;
+    }
+    if (typeof v === 'number') {
+      lines.push(`${key} ${v}`);
+      continue;
+    }
+    if (typeof v !== 'object') continue;
+
+    // Handle nested blocks
+    if (key === 'ip') {
+      const ip = v as Record<string, unknown>;
+      const addr = ip['address'] as Record<string, unknown> | undefined;
+      if (addr) {
+        const primary = addr['primary'] as Record<string, unknown> | undefined;
+        if (primary) {
+          const ipAddr = String(primary['address'] ?? '');
+          const mask = String(primary['mask'] ?? '');
+          if (ipAddr && mask) lines.push(`ip address ${ipAddr} ${mask}`);
         }
       }
-    } else if (typeof value === 'boolean') {
-      // IOS-XE presence containers serialize as ""; treat boolean true as presence
-      if (value) lines.push(`${' '.repeat(depth * 2)}${key}`);
-    } else if (value !== '') {
-      lines.push(`${' '.repeat(depth * 2)}${key} ${String(value)}`);
-    } else {
-      // empty string from YANG = presence container
-      lines.push(`${' '.repeat(depth * 2)}${key}`);
+      // Handle secondary addresses
+      const secondary = addr?.['secondary'] as Array<Record<string, unknown>> | undefined;
+      if (secondary) {
+        for (const sec of secondary) {
+          const ipAddr = String(sec['address'] ?? '');
+          const mask = String(sec['mask'] ?? '');
+          if (ipAddr && mask) lines.push(`ip address ${ipAddr} ${mask} secondary`);
+        }
+      }
+      // Remaining IP options (helper, ospf, etc.) — render as block
+      const remaining = {...addr};
+      delete remaining['primary'];
+      delete remaining['secondary'];
+      const leftover = Object.keys(remaining);
+      if (leftover.length) {
+        lines.push('ip');
+        for (const lk of leftover) {
+          const lv = (remaining as Record<string, unknown>)[lk];
+          if (typeof lv === 'string') lines.push(`  ${lk} ${lv}`);
+          else if (typeof lv === 'boolean' && lv) lines.push(`  ${lk}`);
+        }
+      }
+      continue;
+    }
+
+    if (key === 'negotiation') {
+      const neg = v as Record<string, unknown>;
+      const auto = neg['auto'];
+      if (typeof auto === 'boolean') {
+        lines.push(`negotiation ${auto ? 'auto' : 'auto'}`);
+      }
+      continue;
+    }
+
+    if (key === 'switchport') {
+      lines.push('switchport');
+      const sw = v as Record<string, unknown>;
+      for (const [sk, sv] of Object.entries(sw)) {
+        const skClean = sk.includes(':') ? sk.replace(/^[^:]+:/, '') : sk;
+        if (typeof sv === 'string' && sv !== '') lines.push(`  ${skClean} ${sv}`);
+        else if (typeof sv === 'boolean' && sv) lines.push(`  ${skClean}`);
+        else if (Array.isArray(sv)) {
+          for (const item of sv as unknown[]) {
+            if (typeof item === 'object' && item !== null) {
+              const itemObj = item as Record<string, unknown>;
+              const vlan = String(itemObj['vlan'] ?? '');
+              if (vlan) lines.push(`  ${skClean} vlan ${vlan}`);
+              else {
+                const val = String(Object.values(itemObj)[0] ?? '');
+                if (val) lines.push(`  ${skClean} ${val}`);
+              }
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    if (key === 'description') {
+      lines.push(`description ${v}`);
+      continue;
+    }
+
+    // Generic nested block — render as indented block
+    if (typeof v === 'object') {
+      lines.push(key);
+      const inner = v as Record<string, unknown>;
+      for (const [ik, iv] of Object.entries(inner)) {
+        const ikClean = ik.includes(':') ? ik.replace(/^[^:]+:/, '') : ik;
+        if (typeof iv === 'string' && iv !== '') lines.push(`  ${ikClean} ${iv}`);
+        else if (typeof iv === 'boolean' && iv) lines.push(`  ${ikClean}`);
+        else if (Array.isArray(iv)) {
+          for (const arrItem of iv as unknown[]) {
+            if (typeof arrItem === 'object' && arrItem !== null) {
+              const arrObj = arrItem as Record<string, unknown>;
+              const val = String(Object.values(arrObj)[0] ?? '');
+              if (val) lines.push(`  ${ikClean} ${val}`);
+            }
+          }
+        }
+      }
     }
   }
-}
 
-function jsonToLines(node: Record<string, unknown>, prefix: string, depth: number): string {
-  const lines: string[] = [prefix];
-  walk(node, lines, depth + 1);
   lines.push('!');
   return lines.join('\n');
 }
