@@ -126,9 +126,32 @@ function matchDevice(nodes: FabricNode[], token: string): FabricNode | null {
   return null;
 }
 
-function linkId(a: string, aPort: string, b: string, bPort: string) {
-  const left = `${a}:${aPort || '?'}`;
-  const right = `${b}:${bPort || '?'}`;
+/**
+ * Deterministic link dedup key for merging two interface descriptions that
+ * point to the same physical cable.
+ *
+ * Problem: if the far-end device's description omits the remote port
+ * (e.g. `Eth1` instead of `ge-0/0/1`), the two sides produce different
+ * keys (`DS01:ge-0/0/1__AS01:?` vs `DS01:ge-0/0/1__AS01:Ethernet1`)
+ * and the records are not merged — causing duplicate links in the topology.
+ *
+ * Fix: when either port is empty, normalise both sides to `?` so the key
+ * reflects only the device pair. The complete record (with both ports set)
+ * will overwrite the incomplete one, and both sides get merged on the
+ * next rebuild.
+ */
+function linkId(a: string, aPort: string, b: string, bPort: string): string {
+  const safeA = aPort || '?';
+  const safeB = bPort || '?';
+  // When either side has an unknown port the physical link identity
+  // collapses to the device pair — any further port detail is just
+  // additional metadata, not a distinct link.
+  if (!aPort || !bPort) {
+    const [hi, lo] = a < b ? [b, a] : [a, b];
+    return `${lo}__${hi}`;
+  }
+  const left = `${a}:${safeA}`;
+  const right = `${b}:${safeB}`;
   return left < right ? `${left}__${right}` : `${right}__${left}`;
 }
 
@@ -199,6 +222,9 @@ export async function getFabricTopology(site?: string) {
     };
   });
 
+  /** Fast device-id → role lookup used by the role-based kind override. */
+  const nodeRoleById = new Map<string, FabricRole>(nodes.map((n) => [n.id, n.role]));
+
   const merged = new Map<string, FabricLink>();
 
   for (const node of nodes) {
@@ -246,6 +272,40 @@ export async function getFabricTopology(site?: string) {
         existing.note = `${existing.note} · ${iface.description}`.replace(/^ · /, '');
       }
       if (iface.operStatus === 'down') existing.operStatus = 'down';
+    }
+  }
+
+  /**
+   * Role-based kind override — per the fabric diagram contract:
+   *   core ↔ core   = peer  (management / L3 redundancy)
+   *   core ↔ dist   = l3   (uplink tier-to-tier)
+   *   dist ↔ dist   = peer  (IR/Aggregation ring)
+   *   dist ↔ access = trunk (layer-2 downlink / VLAN trunk)
+   *   access ↔ access = peer (horizontal stacking links)
+   *
+   * The description-based `parsed.kind` is kept as-is when it carries
+   * useful semantic information (e.g. description explicitly says "TRUNK"
+   * or "PEER"), but the role pair is the authoritative signal when
+   * description is generic (e.g. "LINK_TO_…").
+   *
+   * We apply this after the merge so the override runs on every record
+   * regardless of which interface side originally populated it.
+   */
+  for (const link of merged.values()) {
+    const fromRole = nodeRoleById.get(link.fromDeviceId) ?? 'access';
+    const toRole   = nodeRoleById.get(link.toDeviceId)   ?? 'access';
+    if (fromRole === toRole) {
+      link.kind = 'peer';
+    } else if (
+      (fromRole === 'core' && toRole === 'dist') ||
+      (fromRole === 'dist'  && toRole === 'core')
+    ) {
+      link.kind = 'l3';
+    } else if (
+      (fromRole === 'dist'   && toRole === 'access') ||
+      (fromRole === 'access' && toRole === 'dist')
+    ) {
+      link.kind = 'trunk';
     }
   }
 
