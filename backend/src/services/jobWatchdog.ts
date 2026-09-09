@@ -24,9 +24,14 @@ const STALE_MS: Partial<Record<JobType, number>> = {
 // another 20s, so we cap Juniper write jobs at 5 minutes to absorb
 // the spike without falsely reclaiming a job that is still making
 // real progress on the device.
+//
+// INTERFACE_ACTION (shut/no-shut/set-access-vlan/show-run) can take up
+// to 90s per transport (NETCONF SSH load+commit, gotcha #15) plus 30s
+// for a cold-session spike, so Juniper gets +120s extra (240s total).
 const VENDOR_EXTRA_MS: Partial<Record<JobType, number>> = {
   APPLY_CONFIG: 60_000,
   ROLLBACK_CONFIG: 60_000,
+  INTERFACE_ACTION: 120_000,
 };
 
 const DEFAULT_STALE_MS = 120_000;
