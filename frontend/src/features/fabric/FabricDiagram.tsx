@@ -1074,10 +1074,7 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
     .map((t, idx) => {
       const tier = layout.tiers[t.rank];
       if (!tier || tier.nodes.length === 0) return null;
-      const xs   = tier.nodes.map((n) => n.box.x);
-      const xe   = tier.nodes.map((n) => n.box.x + n.box.w);
-      const left  = Math.min(...xs);
-      const right = Math.max(...xe);
+      const xe = tier.nodes.map((n) => n.box.x + n.box.w);
 
       // Rail Y = tier.y + NODE_H/2 (pill is centered on the node midline).
       const thisRailY = (tier.y ?? MARGIN_Y + t.rank * (NODE_H + TIER_GAP)) + NODE_H / 2;
@@ -1089,10 +1086,18 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
       const bandTop    = thisRailY - RAIL_PILL_H / 2 - BAND_PAD_Y;
       const bandBottom = nextRailY + RAIL_PILL_H / 2 + BAND_PAD_Y;
+      // Band LEFT edge always starts at canvas margin (MARGIN_X), so the
+      // band reaches the tier rail on the left. Band RIGHT edge always
+      // ends at the rightmost node — we don't span the full canvas width
+      // because there's no rail on the right side and an over-wide band
+      // looks noisy.
+      const PAD_X = 12;
+      const bandLeft  = MARGIN_X;
+      const bandRight = Math.max(...xe) + PAD_X;
       return {
         tone:   t.tone,
-        left:   left  - BAND_PAD_Y,
-        right:  right + BAND_PAD_Y,
+        left:   bandLeft,
+        right:  bandRight,
         top:    bandTop,
         height: bandBottom - bandTop,
       };
