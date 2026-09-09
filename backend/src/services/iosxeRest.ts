@@ -22,7 +22,7 @@ function iosxeConfig() {
   return {
     scheme: process.env.IOSXE_API_SCHEME || 'https',
     port: Number(process.env.IOSXE_API_PORT ?? 443),
-    verifyTls: process.env.IOSXE_API_VERIFY_TLS !== 'true', // default true = skip cert verify for lab
+    verifyTls: process.env.IOSXE_API_VERIFY_TLS === 'true', // default false = skip cert verify for lab self-signed
     username: process.env.IOSXE_API_USER || process.env.LAB_SSH_USER || 'admin',
     password: process.env.IOSXE_API_PASSWORD || process.env.LAB_SSH_PASSWORD || 'Admin@123',
   };

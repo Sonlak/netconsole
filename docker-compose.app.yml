@@ -118,6 +118,7 @@ services:
     environment:
       DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
       PORT: 3000
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
       PING_INTERVAL_SECONDS: 120
       PING_TIMEOUT_MS: 3000
       MAC_COLLECT_INTERVAL_SECONDS: 300
