@@ -89,7 +89,7 @@ export function reportFinal(
           <Link to={jobsPath}>mở Jobs</Link>
         </span>
       ),
-      duration: 0, // stays open until user clicks Close
+      duration: 15, // auto-close after 15s
       placement: 'topRight',
     });
     return;
