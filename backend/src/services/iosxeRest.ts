@@ -274,10 +274,12 @@ export function iosxeInterfaceConfigToText(tree: unknown, iface: string): string
   if (!tree || typeof tree !== 'object') return '';
   const root = tree as Record<string, unknown>;
 
-  // The response wraps the interface block under the type key.
-  // Find the first non-namespace key that is itself an object/array.
+  // The response wraps the interface block under the type key. The key
+  // is a fully-qualified YANG element name like
+  // `Cisco-IOS-XE-native:GigabitEthernet`. Just take the first object/
+  // array value — there is only one.
   const block = Object.entries(root).find(
-    ([k]) => !k.includes(':') || k.startsWith('GigabitEthernet'),
+    ([, v]) => v && (typeof v === 'object'),
   );
   if (!block) return '';
   const entry = (block[1] as Record<string, unknown>) ?? {};
