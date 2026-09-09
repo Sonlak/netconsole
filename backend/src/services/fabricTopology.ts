@@ -126,9 +126,32 @@ function matchDevice(nodes: FabricNode[], token: string): FabricNode | null {
   return null;
 }
 
-function linkId(a: string, aPort: string, b: string, bPort: string) {
-  const left = `${a}:${aPort || '?'}`;
-  const right = `${b}:${bPort || '?'}`;
+/**
+ * Deterministic link dedup key for merging two interface descriptions that
+ * point to the same physical cable.
+ *
+ * Problem: if the far-end device's description omits the remote port
+ * (e.g. `Eth1` instead of `ge-0/0/1`), the two sides produce different
+ * keys (`DS01:ge-0/0/1__AS01:?` vs `DS01:ge-0/0/1__AS01:Ethernet1`)
+ * and the records are not merged — causing duplicate links in the topology.
+ *
+ * Fix: when either port is empty, normalise both sides to `?` so the key
+ * reflects only the device pair. The complete record (with both ports set)
+ * will overwrite the incomplete one, and both sides get merged on the
+ * next rebuild.
+ */
+function linkId(a: string, aPort: string, b: string, bPort: string): string {
+  const safeA = aPort || '?';
+  const safeB = bPort || '?';
+  // When either side has an unknown port the physical link identity
+  // collapses to the device pair — any further port detail is just
+  // additional metadata, not a distinct link.
+  if (!aPort || !bPort) {
+    const [hi, lo] = a < b ? [b, a] : [a, b];
+    return `${lo}__${hi}`;
+  }
+  const left = `${a}:${safeA}`;
+  const right = `${b}:${safeB}`;
   return left < right ? `${left}__${right}` : `${right}__${left}`;
 }
 
@@ -199,7 +222,27 @@ export async function getFabricTopology(site?: string) {
     };
   });
 
-  const merged = new Map<string, FabricLink>();
+  /** Fast device-id → role lookup used by the role-based kind override. */
+  const nodeRoleById = new Map<string, FabricRole>(nodes.map((n) => [n.id, n.role]));
+
+  /**
+   * Two-stage link deduplication:
+   *
+   * Stage 1 — incomplete entries (at least one port empty):
+   *   key = sorted device pair (e.g. "AS01__DS01")
+   *   → merged into one entry per device pair (port info filled from the most
+   *     complete entry available).
+   *
+   * Stage 2 — complete entries (both ports filled):
+   *   key = linkId with both ports (e.g. "AS01:ge-0/0/2__DS01:ge-0/0/1")
+   *   → each distinct port pair is a separate physical link.
+   *
+   * This handles the case where both ends describe the same cable but one
+   * description has a bare port name (Eth1) that the regex can't normalise
+   * to ge-0/0/1 — both incomplete entries should merge into one.
+   */
+  const pairMap = new Map<string, FabricLink>(); // device-pair → best incomplete entry
+  const merged  = new Map<string, FabricLink>(); // full linkId → complete entry
 
   for (const node of nodes) {
     const job = latest.get(node.id);
@@ -212,40 +255,116 @@ export async function getFabricTopology(site?: string) {
       const peer = matchDevice(nodes, parsed.token);
       if (!peer || peer.id === node.id) continue;
 
-      const id = linkId(node.id, localPort, peer.id, parsed.remotePort);
-      const existing = merged.get(id);
+      // Determine canonical from/to (sorted by device id).
       const fromIsLex = `${node.id}:${localPort}` < `${peer.id}:${parsed.remotePort || '?'}`;
-      const from = fromIsLex ? node : peer;
-      const to = fromIsLex ? peer : node;
+      const from      = fromIsLex ? node : peer;
+      const to        = fromIsLex ? peer : node;
       const fromPort = fromIsLex ? localPort : parsed.remotePort;
-      const toPort = fromIsLex ? parsed.remotePort : localPort;
+      const toPort   = fromIsLex ? parsed.remotePort : localPort;
 
-      if (!existing) {
-        merged.set(id, {
-          id,
-          fromDeviceId: from.id,
-          fromName: from.shortName,
-          fromPort: fromPort || localPort,
-          toDeviceId: to.id,
-          toName: to.shortName,
-          toPort: toPort || parsed.remotePort,
-          kind: parsed.kind,
-          note: String(iface.description || '').trim(),
-          mode: String(iface.mode || ''),
-          operStatus: String(iface.operStatus || ''),
-        });
-        continue;
-      }
+      const devicePairKey = from.id < to.id ? `${from.id}__${to.id}` : `${to.id}__${from.id}`;
+      const completeKey   = `${from.id}:${fromPort}__${to.id}:${toPort}`;
+      const isComplete    = !!fromPort && !!toPort;
 
-      if (!existing.toPort && parsed.remotePort) existing.toPort = parsed.remotePort;
-      if (!existing.fromPort) existing.fromPort = localPort;
-      if (parsed.kind === 'peer' || (parsed.kind === 'trunk' && existing.kind === 'uplink')) {
-        existing.kind = parsed.kind;
+      if (isComplete) {
+        // Complete entry: deduplicate by full (device + port) key.
+        const existing = merged.get(completeKey);
+        if (!existing) {
+          merged.set(completeKey, {
+            id:          completeKey,
+            fromDeviceId: from.id,
+            fromName:     from.shortName,
+            fromPort:     fromPort,
+            toDeviceId:   to.id,
+            toName:       to.shortName,
+            toPort:       toPort,
+            kind:         parsed.kind,
+            note:         String(iface.description || '').trim(),
+            mode:         String(iface.mode || ''),
+            operStatus:   String(iface.operStatus || ''),
+          });
+        } else {
+          // Merge: fill empty fields, upgrade kind.
+          if (!existing.toPort   && toPort)   existing.toPort   = toPort;
+          if (!existing.fromPort && fromPort) existing.fromPort = fromPort;
+          if (parsed.kind === 'peer' || (parsed.kind === 'trunk' && existing.kind === 'uplink')) {
+            existing.kind = parsed.kind;
+          }
+          if (iface.description && !existing.note.includes(String(iface.description))) {
+            existing.note = `${existing.note} · ${iface.description}`.replace(/^ · /, '');
+          }
+          if (iface.operStatus === 'down') existing.operStatus = 'down';
+        }
+      } else {
+        // Incomplete entry: accumulate into pairMap.
+        const existing = pairMap.get(devicePairKey);
+        if (!existing) {
+          pairMap.set(devicePairKey, {
+            id:          devicePairKey,
+            fromDeviceId: from.id,
+            fromName:     from.shortName,
+            fromPort:     fromPort || localPort,
+            toDeviceId:   to.id,
+            toName:       to.shortName,
+            toPort:       toPort   || parsed.remotePort,
+            kind:         parsed.kind,
+            note:         String(iface.description || '').trim(),
+            mode:         String(iface.mode || ''),
+            operStatus:   String(iface.operStatus || ''),
+          });
+        } else {
+          // Fill missing ports from the new entry.
+          if (!existing.fromPort && fromPort) existing.fromPort = fromPort;
+          if (!existing.toPort   && toPort)   existing.toPort   = toPort;
+          // Upgrade kind like the original merge.
+          if (parsed.kind === 'peer' || (parsed.kind === 'trunk' && existing.kind === 'uplink')) {
+            existing.kind = parsed.kind;
+          }
+          if (iface.description && !existing.note.includes(String(iface.description))) {
+            existing.note = `${existing.note} · ${iface.description}`.replace(/^ · /, '');
+          }
+          if (iface.operStatus === 'down') existing.operStatus = 'down';
+        }
       }
-      if (iface.description && !existing.note.includes(String(iface.description))) {
-        existing.note = `${existing.note} · ${iface.description}`.replace(/^ · /, '');
-      }
-      if (iface.operStatus === 'down') existing.operStatus = 'down';
+    }
+  }
+
+  // Promote incomplete pair entries to merged using the device-pair key as id.
+  for (const link of pairMap.values()) {
+    merged.set(link.id, link);
+  }
+
+  /**
+   * Role-based kind override — per the fabric diagram contract:
+   *   core ↔ core   = peer  (management / L3 redundancy)
+   *   core ↔ dist   = l3   (uplink tier-to-tier)
+   *   dist ↔ dist   = peer  (IR/Aggregation ring)
+   *   dist ↔ access = trunk (layer-2 downlink / VLAN trunk)
+   *   access ↔ access = peer (horizontal stacking links)
+   *
+   * The description-based `parsed.kind` is kept as-is when it carries
+   * useful semantic information (e.g. description explicitly says "TRUNK"
+   * or "PEER"), but the role pair is the authoritative signal when
+   * description is generic (e.g. "LINK_TO_…").
+   *
+   * We apply this after the merge so the override runs on every record
+   * regardless of which interface side originally populated it.
+   */
+  for (const link of merged.values()) {
+    const fromRole = nodeRoleById.get(link.fromDeviceId) ?? 'access';
+    const toRole   = nodeRoleById.get(link.toDeviceId)   ?? 'access';
+    if (fromRole === toRole) {
+      link.kind = 'peer';
+    } else if (
+      (fromRole === 'core' && toRole === 'dist') ||
+      (fromRole === 'dist'  && toRole === 'core')
+    ) {
+      link.kind = 'l3';
+    } else if (
+      (fromRole === 'dist'   && toRole === 'access') ||
+      (fromRole === 'access' && toRole === 'dist')
+    ) {
+      link.kind = 'trunk';
     }
   }
 

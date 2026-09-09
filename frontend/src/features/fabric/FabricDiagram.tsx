@@ -1103,6 +1103,21 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
 
       <div className="nc-fabric-grid" />
 
+      {/* Tier background bands — rendered as full-width screen-space divs
+          so they reach the tier rail (left edge) regardless of pan/zoom.
+          Each band spans from the left edge of the card to the right edge
+          of the canvas, covering the rail area + the tier nodes. */}
+      {tierBands.map((band) => (
+        <div
+          key={`tier-band-screen-${band.tone}`}
+          className={`nc-fabric-tier-band nc-fabric-tier-band-screen is-${band.tone}`}
+          style={{
+            top:    viewport.y + band.top * viewport.scale,
+            height: Math.max(1, (band.bot - band.top) * viewport.scale),
+          }}
+        />
+      ))}
+
       <div
         className="nc-fabric-canvas"
         style={{
@@ -1132,20 +1147,6 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
               </marker>
             ))}
           </defs>
-
-          {/* Tier background bands */}
-          <g className="nc-fabric-tier-bands">
-            {tierBands.map((band) => (
-              <rect
-                key={`tier-band-${band.tone}`}
-                x={band.left} y={band.top}
-                width={band.right - band.left}
-                height={band.bot - band.top}
-                rx={14}
-                className={`nc-fabric-tier-band is-${band.tone}`}
-              />
-            ))}
-          </g>
 
           {/* Edges */}
           {edges.map((edge) => {

@@ -557,6 +557,17 @@ textarea.nc-code-area {
   stroke-width: 1;
 }
 
+/* Screen-space full-width tier bands — rendered as HTML divs outside the
+   canvas transform so they always reach the tier rail (left edge). */
+.nc-fabric-tier-band-screen {
+  position: absolute;
+  left: 0;               /* always start at the card's left edge */
+  right: 0;              /* extend to the right edge of the canvas */
+  border-radius: 14px;
+  /* z-index is handled by DOM order (rendered before .nc-fabric-canvas) */
+  pointer-events: none;
+}
+
 .nc-fabric-tier-band.is-core {
   fill: color-mix(in srgb, #5b9dff 6%, transparent);
   stroke: color-mix(in srgb, #5b9dff 32%, transparent);
