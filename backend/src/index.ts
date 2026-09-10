@@ -25,6 +25,7 @@ import { fabricRouter } from './routes/fabric.js';
 import { logsRouter } from './routes/logs.js';
 import { authRouter } from './routes/auth.js';
 import { auditLogRouter } from './routes/auditLog.js';
+import { searchRouter } from './routes/search.js';
 import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
 import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
@@ -170,6 +171,7 @@ app.use('/api/config', authMiddleware, strictRateLimit, generateConfigRouter);
 app.use('/api/logs', authMiddleware, strictRateLimit, logsRouter);
 app.use('/api/jobs', authMiddleware, moderateRateLimit, jobsRouter);
 app.use('/api/audit-log', authMiddleware, strictRateLimit, auditLogRouter);
+app.use('/api/search', authMiddleware, strictRateLimit, searchRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {
