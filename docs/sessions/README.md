@@ -1,6 +1,8 @@
 # Session Log Index
 
 > Auto-loaded memory for any agent. Read this FIRST before doing any work.
+> Pair with `docs/agents/11-deploy-and-vps-ops.md` (deploy/SSH/log cookbook)
+> for any ops task.
 > Each entry = 1 agent session. Format: `### HH:MM -- topic`.
 
 ## Active Work (read first!)
@@ -29,6 +31,8 @@
 
 | Date | Time | Topic | Files touched | Status |
 | --- | --- | --- | --- | --- |
+| 2026-09-10 | 20:40 | EOS modular LLDP port coerce (`521`/`524` → `Ethernet<N>` → `et<N>` on diagram) | `worker/eos.py` | 🟢 Live |
+| 2026-09-10 | 11:10 | Deploy & VPS ops cookbook (file 11) + auto-load chain | `docs/agents/11-deploy-and-vps-ops.md` (new), `.cursor/rules/netconsole-vps-ops.mdc` (new), `.cursor/rules/project-notebook.md`, `AGENTS.md` | 🟢 Live |
 | 2026-09-09 | 09:50 | Juniper `interface_action` fix: NETCONF SSH primary for shut/no-shut/set-vlan, RESTCONF→NETCONF→SSH for show-run | `worker/junos_netconf.py`, `worker/parsers/configuration_rpc.py`, `worker/backends/juniper.py` | 🟡 Ready to deploy |
 | 2026-09-08 | 22:00 | Collect buttons: REST-first reads + NETCONF writes | `backend/services/junosRest.ts`, `backend/services/iosxeRest.ts` (new), `arpAddress.ts`, `macAddress.ts`, `interfaces.ts`, `routes/deviceOperations.ts`, `routes/interfaces.ts`, `docker-compose.app.yml`, `frontend/pages/DeviceDetailPage.tsx`, `frontend/features/ports/PortsPanel.tsx` | 🟡 Ready to deploy |
 | 2026-09-08 | 20:20 | Config Studio Collect/Commit failing with 'Device busy' -- jobPriority URGENT/HIGH split | `backend/src/services/deviceOperations.ts`, `deviceTabCollection.ts`, `interfaces.ts` | 🟢 Deployed |
