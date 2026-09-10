@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
-import { Button, Drawer, Input, Radio, Select, Space, Table, Tooltip, Typography } from 'antd';
+import { Button, Drawer, Input, Select, Space, Table, Tooltip, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
@@ -25,16 +25,35 @@ import type { JobsRange } from '@/api/jobs';
 const STATUSES = Object.keys(JOB_STATUS_META) as JobStatus[];
 const TYPES = Object.keys(JOB_TYPE_LABELS) as JobType[];
 
+const RANGE_LABEL: Record<Exclude<JobsRange, null>, string> = {
+  '1h': 'Last 1 hour',
+  '3h': 'Last 3 hours',
+  '6h': 'Last 6 hours',
+  '12h': 'Last 12 hours',
+  '1d': 'Last 1 day',
+  '3d': 'Last 3 days',
+  '7d': 'Last 7 days',
+  '30d': 'Last 30 days',
+};
+
 const RANGE_OPTIONS: Array<{ value: JobsRange; label: string; title: string }> = [
   { value: null, label: 'All time', title: 'No time filter — show up to 1000 most recent jobs' },
-  { value: '1h', label: 'Last 1 hour', title: 'Jobs created in the last hour' },
-  { value: '24h', label: 'Last 24 hours', title: 'Jobs created in the last 24 hours' },
-  { value: '7d', label: 'Last 7 days', title: 'Jobs created in the last 7 days' },
+  { value: '1h', label: RANGE_LABEL['1h'], title: 'Jobs created in the last hour' },
+  { value: '3h', label: RANGE_LABEL['3h'], title: 'Jobs created in the last 3 hours' },
+  { value: '6h', label: RANGE_LABEL['6h'], title: 'Jobs created in the last 6 hours' },
+  { value: '12h', label: RANGE_LABEL['12h'], title: 'Jobs created in the last 12 hours' },
+  { value: '1d', label: RANGE_LABEL['1d'], title: 'Jobs created in the last day' },
+  { value: '3d', label: RANGE_LABEL['3d'], title: 'Jobs created in the last 3 days' },
+  { value: '7d', label: RANGE_LABEL['7d'], title: 'Jobs created in the last 7 days' },
+  { value: '30d', label: RANGE_LABEL['30d'], title: 'Jobs created in the last 30 days' },
 ];
 
+const VALID_RANGES = new Set<string>(
+  RANGE_OPTIONS.map<string>((opt) => opt.value ?? ''),
+);
+
 function parseRange(value?: string): JobsRange {
-  if (value === '1h' || value === '24h' || value === '7d') return value;
-  return null;
+  return value !== undefined && VALID_RANGES.has(value) ? (value as JobsRange) : null;
 }
 
 function parseStatus(value?: string): JobStatus | 'all' {
@@ -46,13 +65,13 @@ function parseType(value?: string): JobType | 'all' {
 }
 
 export default function JobsPage() {
-  const { jobs, stats, isLoading, isRefreshing, error, lastUpdatedAt, refresh } = useJobs();
   const { get, patch } = useUrlState();
   const { value: searchText, setValue: setSearchText, committed: q } = useUrlSearch('q');
   const statusFilter = parseStatus(get('status'));
   const typeFilter = parseType(get('type'));
   const deviceFilter = get('device') || 'all';
   const rangeFilter = parseRange(get('range'));
+  const { jobs, stats, isLoading, isRefreshing, error, lastUpdatedAt, refresh } = useJobs({ range: rangeFilter });
   const [openJob, setOpenJob] = useState<Job | null>(null);
 
   const deviceOptions = useMemo(() => {
@@ -175,23 +194,35 @@ export default function JobsPage() {
           <DataTableToolbar
             leading={
               <>
-                <Tooltip title='Time window for the loaded jobs. "All time" pulls the most recent 1000 rows from the server; "1h/24h/7d" narrows to that window.'>
-                  <Radio.Group
+                <Tooltip title='Time window for the loaded jobs. "All time" pulls the most recent 1000 rows from the server; the other values narrow to that window.'>
+                  <Select<JobsRange>
                     size="small"
-                    value={rangeFilter ?? null}
-                    onChange={(event) => {
-                      const next = event.target.value as JobsRange;
-                      patch({ range: next === null ? null : next });
-                    }}
-                    optionType="button"
-                    buttonStyle="solid"
-                  >
-                    {RANGE_OPTIONS.map((opt) => (
-                      <Radio.Button key={opt.label} value={opt.value} title={opt.title}>
-                        {opt.label}
-                      </Radio.Button>
-                    ))}
-                  </Radio.Group>
+                    value={rangeFilter}
+                    style={{ width: 160 }}
+                    onChange={(value) => patch({ range: value === null ? null : value })}
+                    placeholder="Time window"
+                    options={[
+                      { value: null, label: 'All time' },
+                      {
+                        label: 'Theo giờ',
+                        options: [
+                          { value: '1h', label: RANGE_LABEL['1h'] },
+                          { value: '3h', label: RANGE_LABEL['3h'] },
+                          { value: '6h', label: RANGE_LABEL['6h'] },
+                          { value: '12h', label: RANGE_LABEL['12h'] },
+                        ],
+                      },
+                      {
+                        label: 'Theo ngày',
+                        options: [
+                          { value: '1d', label: RANGE_LABEL['1d'] },
+                          { value: '3d', label: RANGE_LABEL['3d'] },
+                          { value: '7d', label: RANGE_LABEL['7d'] },
+                          { value: '30d', label: RANGE_LABEL['30d'] },
+                        ],
+                      },
+                    ]}
+                  />
                 </Tooltip>
                 <Select
                   size="small"

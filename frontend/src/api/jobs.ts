@@ -4,12 +4,21 @@ import type { Job } from '../types/job';
 const API_BASE = '/api/jobs';
 
 /**
- * `range` is the time-window filter for the Jobs page toolbar chip.
+ * `range` is the time-window filter for the Jobs page toolbar.
  * `null` means "no time filter" (server returns the most recent N jobs).
- * `1h` / `24h` / `7d` are converted to a `since` ISO timestamp before
+ * Any other value is converted to a `since` ISO timestamp before
  * hitting the API so the server still applies `LIMIT 1000`.
  */
-export type JobsRange = '1h' | '24h' | '7d' | null;
+export type JobsRange =
+  | '1h'
+  | '3h'
+  | '6h'
+  | '12h'
+  | '1d'
+  | '3d'
+  | '7d'
+  | '30d'
+  | null;
 
 export interface FetchJobsParams {
   status?: string;
@@ -162,11 +171,8 @@ export async function fetchJobsByIds(jobIds: string[]): Promise<Job[]> {
  */
 export function jobsRangeToSince(range: JobsRange, now: Date = new Date()): string | null {
   if (!range) return null;
-  const ms =
-    range === '1h'
-      ? 60 * 60 * 1000
-      : range === '24h'
-        ? 24 * 60 * 60 * 1000
-        : 7 * 24 * 60 * 60 * 1000;
-  return new Date(now.getTime() - ms).toISOString();
+  const minutes = range.endsWith('h')
+    ? parseInt(range, 10) * 60
+    : parseInt(range, 10) * 24 * 60;
+  return new Date(now.getTime() - minutes * 60_000).toISOString();
 }
