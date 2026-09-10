@@ -13,14 +13,18 @@
  *   even if one entity type has thousands of matches.
  * - Audit log is ADMIN-only; the route itself enforces this, not the service.
  * - Empty query returns empty results (no "show all" behavior).
+ * - ARP/MAC results are bounded to a 7-day window so the JSON ILIKE scan in
+ *   `Job.result` stays fast even as the table grows; ARP/MAC tables refresh
+ *   every few minutes, so a week covers all live inventory.
  */
 
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { listLogs } from './logs.js';
 import { keaCommand } from './keaDhcp.js';
-import { getArpInventory } from './arpAddress.js';
-import { getMacAddressInventory } from './macAddress.js';
+
+const ARP_SEARCH_WINDOW_DAYS = 7;
+const ARP_SEARCH_WINDOW_MS = ARP_SEARCH_WINDOW_DAYS * 24 * 3600 * 1000;
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -50,6 +54,28 @@ function matches(haystack: string, q: string): boolean {
   const mq = macNorm(q);
   if (mq.length >= 6 && macNorm(haystack).includes(mq)) return true;
   return lower.includes(ql);
+}
+
+type JobRow = { id: string; result: unknown; updatedAt: Date };
+
+async function searchJobResult(
+  jobType: string,
+  q: string,
+  limit: number,
+): Promise<JobRow[]> {
+  const since = new Date(Date.now() - ARP_SEARCH_WINDOW_MS);
+  // Postgres ILIKE on JSON cast — matches anywhere in the JSON text. Bounded
+  // by `since` so the row count stays small.
+  return prisma.$queryRaw<JobRow[]>`
+    SELECT id, result, "updatedAt"
+    FROM "Job"
+    WHERE type::text = ${jobType}
+      AND status::text = 'SUCCESS'
+      AND "updatedAt" >= ${since}
+      AND result::text ILIKE ${'%' + q + '%'}
+    ORDER BY "updatedAt" DESC
+    LIMIT ${limit * 4}
+  `;
 }
 
 // ── searchers ────────────────────────────────────────────────────────────────
@@ -92,34 +118,34 @@ async function searchDevices(q: string, limit: number) {
 
 async function searchArp(q: string, limit: number) {
   try {
-    const inventory = await getArpInventory();
-    const matchesList: Array<{ ip: string; mac: string; hostname: string; deviceName: string }> = [];
-    for (const row of inventory.rows) {
-      if (
-        matches(row.ip, q) ||
-        matches(row.mac, q) ||
-        matches(row.hostname, q) ||
-        matches(row.deviceName, q)
-      ) {
-        matchesList.push({
-          ip: row.ip,
-          mac: row.mac,
-          hostname: row.hostname,
-          deviceName: row.deviceName,
-        });
-        if (matchesList.length >= limit) break;
-      }
-    }
-    return {
-      items: matchesList.map(
-        (m): SearchResultItem => ({
-          primary: m.ip,
-          secondary: `${m.mac} - ${m.hostname || '-'} - ${m.deviceName}`,
+    // Push the filter down to Postgres so we don't pull every ARP row into
+    // memory before filtering in JS. JSON ILIKE in `result::text` is bounded
+    // by the 7-day window and the per-job row count.
+    const jobs = await searchJobResult('GET_ARP', q, limit);
+    const seen = new Set<string>();
+    const items: SearchResultItem[] = [];
+
+    for (const job of jobs) {
+      const entries = (job.result as { entries?: Array<Record<string, unknown>> } | null)?.entries ?? [];
+      for (const e of entries) {
+        const ip = String(e.ip ?? '');
+        const mac = String(e.mac ?? '');
+        const hostname = String(e.hostname ?? '');
+        if (!matches(ip, q) && !matches(mac, q) && !matches(hostname, q)) continue;
+        const key = `${ip}|${mac}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({
+          primary: ip,
+          secondary: `${mac} - ${hostname || '-'}`,
           href: `/arp-addresses?q=${encodeURIComponent(q)}`,
-        })
-      ),
-      total: matchesList.length,
-    };
+        });
+        if (items.length >= limit) break;
+      }
+      if (items.length >= limit) break;
+    }
+
+    return { items, total: items.length };
   } catch {
     return { items: [], total: 0 };
   }
@@ -127,28 +153,31 @@ async function searchArp(q: string, limit: number) {
 
 async function searchMac(q: string, limit: number) {
   try {
-    const inventory = await getMacAddressInventory();
-    const rows: Array<{ mac: string; vlan: string | null; interface: string | null; deviceName: string }> = [];
-    for (const row of inventory.rows ?? []) {
-      const mac = (row as { mac?: string }).mac ?? '';
-      const vlan = (row as { vlan?: string }).vlan ?? null;
-      const ifname = (row as { interface?: string }).interface ?? null;
-      const deviceName = (row as { device?: { name?: string } }).device?.name ?? '';
-      if (matches(mac, q) || matches(vlan ?? '', q) || matches(ifname ?? '', q)) {
-        rows.push({ mac, vlan, interface: ifname, deviceName });
-        if (rows.length >= limit) break;
-      }
-    }
-    return {
-      items: rows.map(
-        (m): SearchResultItem => ({
-          primary: m.mac,
-          secondary: `${m.vlan ?? '-'} - ${m.interface ?? '-'} - ${m.deviceName}`,
+    const jobs = await searchJobResult('GET_MAC', q, limit);
+    const seen = new Set<string>();
+    const items: SearchResultItem[] = [];
+
+    for (const job of jobs) {
+      const entries = (job.result as { entries?: Array<Record<string, unknown>> } | null)?.entries ?? [];
+      for (const e of entries) {
+        const mac = String(e.mac ?? '');
+        const vlan = e.vlan == null ? null : String(e.vlan);
+        const ifname = e.interface == null ? null : String(e.interface);
+        if (!matches(mac, q) && !matches(vlan ?? '', q) && !matches(ifname ?? '', q)) continue;
+        const key = `${mac}|${vlan}|${ifname}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({
+          primary: mac,
+          secondary: `${vlan ?? '-'} - ${ifname ?? '-'}`,
           href: `/mac-addresses?q=${encodeURIComponent(q)}`,
-        })
-      ),
-      total: rows.length,
-    };
+        });
+        if (items.length >= limit) break;
+      }
+      if (items.length >= limit) break;
+    }
+
+    return { items, total: items.length };
   } catch {
     return { items: [], total: 0 };
   }
@@ -308,45 +337,43 @@ export async function searchAll(
 
   const limit = Math.min(Math.max(options?.limitPerGroup ?? DEFAULT_LIMIT, 1), 10);
   const trimmed = q.trim();
+  const tAll = Date.now();
+  const mkTimer = () => Date.now();
 
-  const [deviceResult, arpResult, macResult, logResult, jobResult, auditResult, dhcpResult] =
-    await Promise.allSettled([
-      searchDevices(trimmed, limit),
-      searchArp(trimmed, limit),
-      searchMac(trimmed, limit),
-      searchLogs(trimmed, limit),
-      searchJobs(trimmed, limit),
-      searchAudit(trimmed, limit),
-      searchDhcp(trimmed, limit),
-    ]);
+  const tasks: Array<{
+    kind: SearchResultGroup['kind'];
+    label: string;
+    url: string;
+    p: Promise<{ items: SearchResultItem[]; total: number }>;
+    tStart: number;
+  }> = [
+    { kind: 'device', label: 'Devices', url: '/devices', p: searchDevices(trimmed, limit), tStart: mkTimer() },
+    { kind: 'arp', label: 'ARP', url: '/arp-addresses', p: searchArp(trimmed, limit), tStart: mkTimer() },
+    { kind: 'mac', label: 'MAC', url: '/mac-addresses', p: searchMac(trimmed, limit), tStart: mkTimer() },
+    { kind: 'log', label: 'Logs', url: '/logs', p: searchLogs(trimmed, limit), tStart: mkTimer() },
+    { kind: 'job', label: 'Jobs', url: '/jobs', p: searchJobs(trimmed, limit), tStart: mkTimer() },
+    { kind: 'audit', label: 'Audit', url: '/logs', p: searchAudit(trimmed, limit), tStart: mkTimer() },
+    { kind: 'dhcp', label: 'DHCP Leases', url: '/dhcp', p: searchDhcp(trimmed, limit), tStart: mkTimer() },
+  ];
 
-  const toGroup = (
-    kind: SearchResultGroup['kind'],
-    label: string,
-    result: PromiseSettledResult<{ items: SearchResultItem[]; total: number }>
-  ): SearchResultGroup | null => {
-    if (result.status !== 'fulfilled') return null;
-    const { items, total } = result.value;
-    if (total === 0) return null;
-    return { kind, label, items, total, url: '' };
-  };
+  const settled = await Promise.allSettled(tasks.map((t) => t.p));
 
   const groups: SearchResultGroup[] = [];
-  const d = toGroup('device', 'Devices', deviceResult);
-  if (d) groups.push(d);
-  const a = toGroup('arp', 'ARP', arpResult);
-  if (a) groups.push(a);
-  const m = toGroup('mac', 'MAC', macResult);
-  if (m) groups.push(m);
-  const l = toGroup('log', 'Logs', logResult);
-  if (l) groups.push(l);
-  const j = toGroup('job', 'Jobs', jobResult);
-  if (j) groups.push(j);
-  const au = toGroup('audit', 'Audit', auditResult);
-  if (au) groups.push(au);
-  const dhcp = toGroup('dhcp', 'DHCP Leases', dhcpResult);
-  if (dhcp) groups.push(dhcp);
+  for (let i = 0; i < tasks.length; i++) {
+    const task = tasks[i];
+    const result = settled[i];
+    const ms = Date.now() - task.tStart;
+    if (result.status !== 'fulfilled') {
+      console.warn(`[search] ${task.label}=${ms}ms status=rejected reason=${String(result.reason)}`);
+      continue;
+    }
+    const { items, total } = result.value;
+    console.log(`[search] ${task.label}=${ms}ms hits=${total}`);
+    if (total === 0) continue;
+    groups.push({ kind: task.kind, label: task.label, items, total, url: task.url });
+  }
 
+  console.log(`[search] total=${Date.now() - tAll}ms groups=${groups.length} q=${trimmed}`);
   return groups;
 }
 

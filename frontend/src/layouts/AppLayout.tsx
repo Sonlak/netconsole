@@ -280,7 +280,7 @@ export default function AppLayout() {
         <div className="nc-app-footer-version">NetConsole 1.2.0</div>
         <div className="nc-app-footer-copy">© 2026 SonLak.</div>
       </footer>
-      <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} items={NAV} />
+      <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} />
       </Layout>
     </AntApp>
   );
@@ -289,17 +289,16 @@ export default function AppLayout() {
 function CommandPalette({
   open,
   onClose,
-  items,
 }: {
   open: boolean;
   onClose: () => void;
-  items: NavDef[];
 }) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResultGroup[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -310,53 +309,57 @@ function CommandPalette({
       setResults(null);
       setLoading(false);
       setError(null);
+      setLatencyMs(null);
       setFocusedIndex(-1);
     }
   }, [open]);
 
-  // Fetch search results when query grows to 2+ chars
+  // Debounced fetch — fires 250ms after last keystroke
   useEffect(() => {
     const trimmed = query.trim();
     if (trimmed.length < 2) {
       setResults(null);
       setLoading(false);
+      setLatencyMs(null);
       setFocusedIndex(-1);
       return;
     }
 
     let cancelled = false;
-    setLoading(true);
-    setError(null);
+    const timer = setTimeout(() => {
+      const t0 = performance.now();
+      setLoading(true);
+      setError(null);
 
-    globalSearch(trimmed, 3)
-      .then((groups) => {
-        if (cancelled) return;
-        setResults(groups);
-        setFocusedIndex(groups.length > 0 ? 0 : -1);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Search failed');
-        setResults(null);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      globalSearch(trimmed, 3)
+        .then((groups) => {
+          if (cancelled) return;
+          setResults(groups);
+          setLatencyMs(Math.round(performance.now() - t0));
+          setFocusedIndex(groups.length > 0 ? 0 : -1);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : 'Search failed');
+          setResults(null);
+          setLatencyMs(Math.round(performance.now() - t0));
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 250);
 
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [query]);
 
   // Build flat list of all navigable items for keyboard nav
   const flatItems = useMemo((): Array<{ href: string; label: string }> => {
     if (!results || results.length === 0) {
-      // Static NAV fallback
-      return items
-        .filter((item) =>
-          `${item.label} ${item.hint}`.toLowerCase().includes(query.trim().toLowerCase())
-        )
-        .map((item) => ({ href: item.key, label: item.label }));
+      // Static NAV removed — keyboard nav only navigates real results
+      return [];
     }
     // Search results: "open all" headers + individual rows
     const out: Array<{ href: string; label: string }> = [];
@@ -371,7 +374,7 @@ function CommandPalette({
       }
     }
     return out;
-  }, [results, items, query]);
+  }, [results]);
 
   const handleNavigate = (href: string) => {
     navigate(href);
@@ -452,26 +455,20 @@ function CommandPalette({
         </div>
       )}
 
-      {/* Static NAV fallback when query is short */}
+      {/* Static NAV fallback removed — show hint to type more characters */}
       {!loading && showNav && (
-        <Menu
-          selectable={false}
-          items={items
-            .filter((item) =>
-              `${item.label} ${item.hint}`.toLowerCase().includes(query.trim().toLowerCase())
-            )
-            .map((item) => ({
-              key: item.key,
-              icon: item.icon,
-              label: (
-                <Flex justify="space-between" gap={12}>
-                  <span>{item.label}</span>
-                  <Typography.Text type="secondary">{item.hint}</Typography.Text>
-                </Flex>
-              ),
-            }))}
-          onClick={({ key }) => handleNavigate(key)}
-        />
+        <div style={{
+          padding: '32px 16px',
+          textAlign: 'center',
+          color: 'var(--ant-color-text-secondary, #8c8c8c)',
+        }}>
+          <SearchOutlined style={{ fontSize: 28, color: '#bfbfbf', display: 'block', marginBottom: 8 }} />
+          <Typography.Text type="secondary" style={{ display: 'block' }}>
+            {query.trim().length === 0
+              ? 'Start typing to search across devices, ARP, MAC, logs, jobs…'
+              : `Type ${MIN_QUERY - query.trim().length} more character${MIN_QUERY - query.trim().length > 1 ? 's' : ''} to search`}
+          </Typography.Text>
+        </div>
       )}
 
       {/* Search results */}
@@ -606,24 +603,33 @@ function CommandPalette({
         display: 'flex',
         gap: 16,
         flexWrap: 'wrap',
+        alignItems: 'center',
+        justifyContent: 'space-between',
       }}>
-        {[
-          ['↑↓', 'Navigate'],
-          ['↵', 'Open'],
-          ['Esc', 'Close'],
-        ].map(([key, label]) => (
-          <Typography.Text key={key} type="secondary" style={{ fontSize: 11 }}>
-            <kbd style={{
-              background: '#f5f5f5',
-              border: '1px solid #d9d9d9',
-              borderRadius: 4,
-              padding: '1px 5px',
-              fontFamily: 'inherit',
-              fontSize: 11,
-            }}>{key}</kbd>
-            {' '}{label}
+        <Flex gap={16} wrap="wrap">
+          {[
+            ['↑↓', 'Navigate'],
+            ['↵', 'Open'],
+            ['Esc', 'Close'],
+          ].map(([key, label]) => (
+            <Typography.Text key={key} type="secondary" style={{ fontSize: 11 }}>
+              <kbd style={{
+                background: '#f5f5f5',
+                border: '1px solid #d9d9d9',
+                borderRadius: 4,
+                padding: '1px 5px',
+                fontFamily: 'inherit',
+                fontSize: 11,
+              }}>{key}</kbd>
+              {' '}{label}
+            </Typography.Text>
+          ))}
+        </Flex>
+        {latencyMs !== null && (
+          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+            {latencyMs} ms
           </Typography.Text>
-        ))}
+        )}
       </div>
     </Modal>
   );
