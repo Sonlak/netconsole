@@ -84,11 +84,19 @@ class SSHConnectionPool:
     def _is_alive(self, conn: _PooledConn, host: str, port: int, username: str) -> bool:
         """Return False if the cached connection has been torn down.
 
-        `transport.is_active()` only checks the paramiko-level socket —
-        it can return True while the underlying TCP is half-open. We do
-        one cheap exec to make sure end-to-end is alive before reusing
-        the connection. That round-trip is negligible compared to a
-        fresh TCP+SSH handshake (~200ms+).
+        `transport.is_active()` checks the paramiko-level socket. We rely on
+        it alone — the previous implementation also ran a `show version` exec
+        on every borrow(), but that command path itself opens a channel and
+        counts as SSH traffic in `auth.log` on the device. Every 30-60s the
+        worker re-uses a Junos connection (the new RESTCONF-primary path
+        doesn't even hit SSH, but the IOS-XE RESTCONF pool and the
+        connection pool itself still poke SSH on borrow) and that command
+        could fail on Junos (no `| match /./` regex syntax), causing an evict
+        → reopen → auth loop that flooded auth.log with SSH logins.
+
+        TCP keepalive (60s, set on transport in `borrow`) catches half-open
+        sockets within ~3 missed keepalives. The transport-level check is
+        sufficient and zero-cost — no extra channel open.
         """
         import logging
         log = logging.getLogger(__name__)
@@ -100,29 +108,7 @@ class SSHConnectionPool:
         if not transport.is_active():
             log.debug("alive check fail %s: transport inactive", (host, port, username))
             return False
-        try:
-            # Junos shell uses CLI commands (no /bin/false or /bin/true).
-            # Use a no-op RPC instead: "show version brief | count" — this
-            # returns within ms and confirms the channel is alive.
-            stdin, stdout, stderr = client.exec_command("show version | match /./", timeout=3)
-            try:
-                stdin.close()
-            except Exception:
-                pass
-            data = stdout.read().decode("utf-8", errors="replace")
-            stderr_data = stderr.read().decode("utf-8", errors="replace")
-            exit_status = stdout.channel.recv_exit_status()
-            log.debug(
-                "alive check %s: exit=%d out=%r err=%r",
-                (host, port, username),
-                exit_status,
-                data[:60],
-                stderr_data[:60],
-            )
-            return exit_status == 0 and bool(data.strip())
-        except Exception as e:
-            log.debug("alive check fail %s: %s", (host, port, username), e)
-            return False
+        return True
 
     def borrow(
         self,
