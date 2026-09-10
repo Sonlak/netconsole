@@ -115,3 +115,23 @@ class DeviceBackend(ABC):
     def connect_test(self, device: DeviceInfo) -> dict[str, Any]:
         """Liveness probe; default falls back to a `show version` SSH call."""
         return {"connected": False, "protocol": "ssh", "message": "not implemented"}
+
+    # -- LLDP -------------------------------------------------------------
+
+    def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
+        """Return `{implemented, source, command?, neighbors, error?}`.
+
+        LLDP neighbours tell us which port on this device connects to which
+        port on the remote device.  This is the ground-truth source for the
+        Floor/Fabric topology link map — more accurate than interface
+        descriptions because the protocol populates it automatically.
+
+        Vendors that support LLDP: Juniper Junos, Cisco IOS/IOS-XE, Arista EOS.
+        Returns `implemented=False` when LLDP is not available or not enabled.
+        """
+        return {
+            "implemented": False,
+            "source": None,
+            "neighbors": [],
+            "message": f"LLDP not implemented for {self.source}",
+        }

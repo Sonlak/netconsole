@@ -126,6 +126,34 @@ function matchDevice(nodes: FabricNode[], token: string): FabricNode | null {
   return null;
 }
 
+/** Normalize an LLDP remote port name to lowercase-with-hyphens for display.
+ *
+ * Vendors return different formats:
+ *   Juniper  → "ge-0/0/1"      (already hyphenated, just lowercase)
+ *   IOS-XE   → "Gi0/0/1"       → "gi0/0/1"
+ *   EOS      → "Ethernet1"      → "et1"
+ *   generic  → "Port-channel1"  → "port-channel1"
+ *
+ * This is best-effort: we show the raw value if no known prefix matches.
+ */
+function normalizeLldpPort(port: string): string {
+  const p = (port || '').trim().toLowerCase();
+  // EOS: EthernetN → etN
+  const eosMatch = p.match(/^ethernet(\d+)$/);
+  if (eosMatch) return `et${eosMatch[1]}`;
+  // IOS-XE: GigabitEthernetN → giN, TenGigabitEthernetN → teN
+  const giMatch = p.match(/^(gigabitethernet)(\d.*)$/);
+  if (giMatch) return `gi${giMatch[2]}`;
+  const tiMatch = p.match(/^(tengigabitethernet)(\d.*)$/);
+  if (tiMatch) return `te${tiMatch[2]}`;
+  const fiMatch = p.match(/^(fastethernet)(\d.*)$/);
+  if (fiMatch) return `fa${fiMatch[2]}`;
+  const twogiMatch = p.match(/^(twogigabitethernet)(\d.*)$/);
+  if (twogiMatch) return `twogi${twogiMatch[2]}`;
+  // Leave everything else (ge-, xe-, et-, ae-, po-, etc.) as-is
+  return p;
+}
+
 /**
  * Deterministic link dedup key for merging two interface descriptions that
  * point to the same physical cable.
@@ -155,12 +183,24 @@ function linkId(a: string, aPort: string, b: string, bPort: string): string {
   return left < right ? `${left}__${right}` : `${right}__${left}`;
 }
 
+type LldpNeighbor = {
+  localPort: string;
+  remoteDeviceId: string;
+  remotePort: string;
+  chassisId: string;
+};
+
 type IfaceRow = {
   name?: string;
   description?: string;
   mode?: string;
   operStatus?: string;
   adminStatus?: string;
+};
+
+type JobPayload = {
+  interfaces?: IfaceRow[];
+  lldpNeighbors?: LldpNeighbor[];
 };
 
 export async function getFabricTopology(site?: string) {
@@ -229,7 +269,7 @@ export async function getFabricTopology(site?: string) {
 
   for (const node of nodes) {
     const job = latest.get(node.id);
-    const payload = (job?.result ?? null) as { interfaces?: IfaceRow[] } | null;
+    const payload = (job?.result ?? null) as JobPayload | null;
     const ifaces = Array.isArray(payload?.interfaces) ? payload.interfaces : [];
     for (const iface of ifaces) {
       const localPort = String(iface.name || '').trim();
@@ -272,6 +312,67 @@ export async function getFabricTopology(site?: string) {
         existing.note = `${existing.note} · ${iface.description}`.replace(/^ · /, '');
       }
       if (iface.operStatus === 'down') existing.operStatus = 'down';
+    }
+  }
+
+  /**
+   * LLDP neighbour loop — the authoritative source for physical links.
+   *
+   * LLDP is populated by the protocol itself (not human-typed descriptions),
+   * so it is more reliable than `interface description`.  We process it after
+   * the description loop so LLDP ports can fill in unknown port details from
+   * description-only links, and description kind overrides can supplement
+   * LLDP-only links that have no explicit kind signal.
+   *
+   * Remote device matching uses `matchDevice()` — same logic as description
+   * parsing, so "LAB-F1-DS01" in LLDP matches the device with `shortName="DS01"`.
+   */
+  for (const node of nodes) {
+    const job = latest.get(node.id);
+    const payload = (job?.result ?? null) as JobPayload | null;
+    const neighbors: LldpNeighbor[] = Array.isArray(payload?.lldpNeighbors)
+      ? payload.lldpNeighbors
+      : [];
+    for (const n of neighbors) {
+      const localPort = (n.localPort || '').trim();
+      if (!localPort) continue;
+
+      // Try to match the remote device by hostname
+      const peer = matchDevice(nodes, n.remoteDeviceId);
+      if (!peer || peer.id === node.id) continue;
+
+      const remotePort = normalizeLldpPort(n.remotePort);
+      const id = linkId(node.id, localPort, peer.id, remotePort);
+      const existing = merged.get(id);
+      const fromIsLex = `${node.id}:${localPort}` < `${peer.id}:${remotePort || '?'}`;
+      const from = fromIsLex ? node : peer;
+      const to = fromIsLex ? peer : node;
+      const fromPort = fromIsLex ? localPort : remotePort;
+      const toPort = fromIsLex ? remotePort : localPort;
+
+      if (!existing) {
+        merged.set(id, {
+          id,
+          fromDeviceId: from.id,
+          fromName: from.shortName,
+          fromPort,
+          toDeviceId: to.id,
+          toName: to.shortName,
+          toPort,
+          kind: 'uplink',   // LLDP links default to uplink; role-pair override refines
+          note: `LLDP: ${n.remoteDeviceId}`,
+          mode: '',
+          operStatus: '',
+        });
+        continue;
+      }
+
+      // LLDP is more trustworthy than description — fill in missing port details
+      if (!existing.toPort && remotePort) existing.toPort = remotePort;
+      if (!existing.fromPort) existing.fromPort = localPort;
+      if (!existing.note.startsWith('LLDP:') && n.remoteDeviceId) {
+        existing.note = `LLDP: ${n.remoteDeviceId}`;
+      }
     }
   }
 

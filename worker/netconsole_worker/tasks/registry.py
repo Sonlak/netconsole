@@ -99,7 +99,16 @@ class GetInterfacesTask(BaseTask):
     job_type = "GET_INTERFACES"
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
-        return _backend(device).get_interfaces(device)
+        # Collect interface data (description, status, mode, etc.)
+        interfaces_result = _backend(device).get_interfaces(device)
+        # Collect LLDP neighbours (the ground-truth link map for fabric topology)
+        lldp_result = _backend(device).get_lldp(device)
+        # Merge LLDP into the interfaces result so both flow through in one job
+        interfaces_result["lldpNeighbors"] = lldp_result.get("neighbors", [])
+        if lldp_result.get("implemented"):
+            interfaces_result["lldpSource"] = lldp_result.get("source")
+            interfaces_result["lldpMessage"] = lldp_result.get("message")
+        return interfaces_result
 
 
 class InterfaceActionTask(BaseTask):

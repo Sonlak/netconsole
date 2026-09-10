@@ -810,6 +810,48 @@ class IOSxeBackend(DeviceBackend):
             "config": outputs[-1]["output"] if action == "show-run" and outputs else None,
         }
 
+    def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
+        """Collect LLDP neighbours via SSH CLI `show lldp neighbors`.
+
+        Cisco IOS-XE does not expose a stable RESTCONF YANG model for LLDP,
+        so SSH CLI is the only reliable path.
+        """
+        if not self.config.ssh_enabled:
+            return {
+                "implemented": False,
+                "source": None,
+                "neighbors": [],
+                "message": "SSH not enabled (LAB_SSH=false)",
+            }
+
+        ssh_result = run_ssh_command(
+            host=device.ip,
+            username=self.config.ssh_user,
+            password=self.config.ssh_password,
+            port=self.config.ssh_port,
+            command="show lldp neighbors",
+            timeout=20,
+        )
+        if not ssh_result["sshOk"]:
+            return {
+                "implemented": False,
+                "source": "ssh-cli",
+                "neighbors": [],
+                "message": f"LLDP SSH failed: {ssh_result['error']}",
+            }
+
+        from netconsole_worker.parsers.show_lldp_neighbors import parse_ios_lldp_neighbors
+
+        neighbors = parse_ios_lldp_neighbors(ssh_result["output"] or "")
+        return {
+            "implemented": True,
+            "source": "ssh-cli",
+            "command": "show lldp neighbors",
+            "neighbors": neighbors,
+            "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
+            "raw": ssh_result["output"],
+        }
+
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
         # Managed check is now a lightweight TCP probe (see probe.py).
         # IOS-XE exposes both RESTCONF (443) and NETCONF-over-SSH (830);

@@ -876,6 +876,49 @@ class JuniperBackend(DeviceBackend):
             "message": message,
         }
 
+    def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
+        """Collect LLDP neighbours via SSH CLI `show lldp neighbors`.
+
+        LLDP tells us which port on this device connects to which port on the
+        remote device — the ground-truth link map for the Floor/Fabric topology.
+        Falls back gracefully when LLDP is not enabled on the device.
+        """
+        if not self.config.ssh_enabled:
+            return {
+                "implemented": False,
+                "source": None,
+                "neighbors": [],
+                "message": "SSH not enabled (LAB_SSH=false)",
+            }
+
+        ssh_result = run_ssh_command(
+            host=device.ip,
+            username=self.config.ssh_user,
+            password=self.config.ssh_password,
+            port=self.config.ssh_port,
+            command="show lldp neighbors",
+            timeout=20,
+        )
+        if not ssh_result["sshOk"]:
+            return {
+                "implemented": False,
+                "source": "ssh-cli",
+                "neighbors": [],
+                "message": f"LLDP SSH failed: {ssh_result['error']}",
+            }
+
+        from netconsole_worker.parsers.show_lldp_neighbors import parse_junos_lldp_neighbors
+
+        neighbors = parse_junos_lldp_neighbors(ssh_result["output"] or "")
+        return {
+            "implemented": True,
+            "source": "ssh-cli",
+            "command": "show lldp neighbors",
+            "neighbors": neighbors,
+            "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
+            "raw": ssh_result["output"],
+        }
+
     def get_logs(self, device: DeviceInfo, filename: str | None) -> dict[str, Any]:
         """Junos RESTCONF `get-log-information` on-demand pull.
 

@@ -630,6 +630,64 @@ class EOSBackend(DeviceBackend):
 
         raise RuntimeError("Interface actions require EOS_API or LAB_SSH")
 
+    def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
+        """Collect LLDP neighbours via eAPI `show lldp neighbors` (JSON).
+
+        Falls back to SSH CLI when eAPI is not enabled.
+        """
+        if self.config.eos.enabled:
+            r = self._run_cmds(device, [{"cmd": "show lldp neighbors", "format": "json"}])
+            if r["ok"]:
+                neighbors = _parse_eos_lldp_neighbors_json(r["result"])
+                return {
+                    "implemented": True,
+                    "source": "eos-api",
+                    "command": "show lldp neighbors",
+                    "neighbors": neighbors,
+                    "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
+                }
+            rest_error = r["error"]
+        else:
+            rest_error = None
+
+        if self.config.ssh_enabled:
+            ssh_result = run_ssh_command(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                command="show lldp neighbors",
+                timeout=20,
+            )
+            if ssh_result["sshOk"]:
+                from netconsole_worker.parsers.show_lldp_neighbors import parse_eos_lldp_neighbors
+
+                neighbors = parse_eos_lldp_neighbors(ssh_result["output"] or "")
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli",
+                    "command": "show lldp neighbors",
+                    "neighbors": neighbors,
+                    "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
+                    "raw": ssh_result["output"],
+                    "restError": rest_error,
+                }
+            return {
+                "implemented": False,
+                "source": "ssh-cli",
+                "neighbors": [],
+                "message": f"LLDP SSH failed: {ssh_result['error']}",
+                "restError": rest_error,
+            }
+
+        return {
+            "implemented": False,
+            "source": None,
+            "neighbors": [],
+            "message": rest_error or "Enable EOS_API or LAB_SSH for LLDP",
+            "restError": rest_error,
+        }
+
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
         # Managed check is now a lightweight TCP probe: just confirm the
         # SSH port (22) and the eAPI port (443) accept a connection. No
@@ -808,3 +866,28 @@ def _parse_eos_show_version(result: list[dict[str, Any]]) -> dict[str, Any]:
         "uptime": first.get("uptime"),
         "vendor": "Arista",
     }
+
+
+def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Parse EOS `show lldp neighbors` JSON result.
+
+    EOS eAPI returns one dict per neighbour with keys:
+      lldpNeighbors: [{ localPort, chassisId, portId, portDescription?, systemName? }]
+    """
+    if not result:
+        return []
+    first = result[0]
+    if not isinstance(first, dict):
+        return []
+    neighbors: list[dict[str, Any]] = first.get("lldpNeighbors", [])
+    out: list[dict[str, str]] = []
+    for n in neighbors:
+        if not isinstance(n, dict):
+            continue
+        out.append({
+            "localPort": str(n.get("localPort") or ""),
+            "remoteDeviceId": str(n.get("systemName") or n.get("chassisId") or ""),
+            "remotePort": str(n.get("portId") or ""),
+            "chassisId": str(n.get("chassisId") or ""),
+        })
+    return out
