@@ -213,20 +213,55 @@ class EOSBackend(DeviceBackend):
         result = data.get("result") or []
         return {"ok": True, "result": result, "raw": resp.text}
 
+    def _fetch_eos_descriptions(self, device: DeviceInfo) -> dict[str, str]:
+        """Pull `show interfaces description` and return {iface_name: desc}.
+
+        EOS eAPI `show interfaces` JSON leaves the `description` field
+        empty on 4.28+. The text-mode `show interfaces description`
+        command is the only path that returns the human-typed
+        description string. We call it once per `get_interfaces` and
+        merge by interface name (keys are exact `Ethernet1`,
+        `Ethernet1.10` (subif), `Port-Channel1`, etc.).
+
+        Best-effort: on any failure we return an empty dict so the
+        caller can still serve the rest of the interface data.
+        """
+        r = self._run_cmds(device, [{"cmd": "show interfaces description", "format": "text"}])
+        if not r["ok"]:
+            return {}
+        result = r["result"] or []
+        text = ""
+        if result and isinstance(result[0], dict):
+            text = result[0].get("output") or ""
+        if not text:
+            text = r.get("raw") or ""
+        return _parse_eos_descriptions_text(text)
+
     # -- READ --------------------------------------------------------------
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
         if self.config.eos.enabled:
+            # Pull status + description in two parallel calls so the JSON
+            # blob from `show interfaces` doesn't have to be re-fetched
+            # just to read the description string. EOS eAPI `show interfaces`
+            # JSON returns the `description` field but it is empty on
+            # EOS 4.28+ (the field exists but is not populated by that
+            # command). The actual description text is only emitted by
+            # `show interfaces description`, which we fetch in text mode
+            # and merge in by interface name. This is the path the
+            # fabric-diagram LLDP-bypass fix relies on (Sep 10, 2026:
+            # LLDP on modular EOS returns bogus intfId ports; we fall
+            # back to the human-typed description like Juniper does).
             r = self._run_cmds(device, [{"cmd": "show interfaces", "format": "json"}])
             if r["ok"]:
-                # EOS JSON is verbose (one dict per interface); parse a
-                # lightweight shape: list of {name, adminStatus, operStatus,
-                # description, speed, mtu, macAddress}.
                 interfaces = _parse_eos_interfaces(r["result"])
+                desc_by_name = self._fetch_eos_descriptions(device)
+                if desc_by_name:
+                    _merge_eos_descriptions(interfaces, desc_by_name)
                 return {
                     "implemented": True,
                     "source": "eos-api",
-                    "command": "show interfaces",
+                    "command": "show interfaces + show interfaces description",
                     "interfaces": interfaces,
                     "message": "EOS eAPI show interfaces OK",
                 }
@@ -929,3 +964,94 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
             "chassisId": str(chassis_id),
         })
     return out
+
+
+def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
+    """Parse `show interfaces description` text output.
+
+    EOS text output looks like:
+
+        Interface                      Status         Protocol           Description
+        Et1                            up             up                 LINK_TO_LAB-F6-DS-01_ge-0/0/1
+        Et2                            up             up                 LINK_TO_VPC5_eth0
+        ...
+
+    We extract the last whitespace-delimited column on each line as the
+    description. Interface names appear in column 1; everything after the
+    third column is the description (which may contain spaces and
+    underscores). The header line is skipped.
+
+    Output keys are the full `Ethernet1` / `Port-Channel1` / `Management1`
+    form so they match the keys produced by `_parse_eos_interfaces` —
+    `show interfaces` JSON always uses the long form, while
+    `show interfaces description` text uses the short form.
+    """
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        # Header line: starts with "Interface" (and usually contains "Status")
+        if line.lstrip().lower().startswith("interface"):
+            continue
+        # `*` prefixes indicate an administratively down interface in
+        # some EOS versions — strip it before tokenising.
+        stripped = line.lstrip().lstrip("*").rstrip()
+        parts = stripped.split()
+        if len(parts) < 4:
+            # No description column present on this line.
+            continue
+        name = _eos_short_to_long_iface(parts[0])
+        desc = " ".join(parts[3:]).strip()
+        if desc:
+            out[name] = desc
+    return out
+
+
+def _eos_short_to_long_iface(name: str) -> str:
+    """Map EOS short interface form (`Et1`, `Po1`, `Ma1`, `Vx1`) to long form.
+
+    `show interfaces description` text uses abbreviated forms; the JSON
+    `show interfaces` payload uses the long form (`Ethernet1`,
+    `Port-Channel1`, `Management1`, `Vxlan1`). The merger keys both
+    by the long form so we can join them.
+    """
+    n = (name or "").strip()
+    if not n:
+        return n
+    if n.startswith("Et") and n[2:].isdigit():
+        return "Ethernet" + n[2:]
+    if n.startswith("Po") and n[2:].isdigit():
+        return "Port-Channel" + n[2:]
+    if n.startswith("Ma") and n[2:].isdigit():
+        return "Management" + n[2:]
+    if n.startswith("Vx") and n[2:].isdigit():
+        return "Vxlan" + n[2:]
+    if n.startswith("Lo") and (n[2:].isdigit() or n[2:] == ""):
+        return "Loopback" + n[2:]
+    return n
+
+
+def _merge_eos_descriptions(interfaces: list[dict[str, Any]], desc_by_name: dict[str, str]) -> None:
+    """Fill `description` on each interface row from `desc_by_name`.
+
+    Mutates `interfaces` in place. We only overwrite an existing
+    description if the new value is non-empty AND the existing value
+    is empty/None — `show interfaces` JSON occasionally carries a
+    description string on newer EOS versions, and we don't want to
+    lose that when `show interfaces description` happens to be
+    unavailable for some reason.
+    """
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or "").strip()
+        if not name:
+            continue
+        new_desc = desc_by_name.get(name)
+        if not new_desc:
+            continue
+        old_desc = str(iface.get("description") or "").strip()
+        if not old_desc:
+            iface["description"] = new_desc
