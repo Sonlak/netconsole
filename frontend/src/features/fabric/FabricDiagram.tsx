@@ -648,6 +648,20 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
       if (!tc) continue;
       boxMap[id].x += axisX - tc.centre;
     }
+
+    // After the axis-shift, clamp every node so its left edge is at
+    // least MARGIN_X. Dagre can place one core at a negative X when
+    // rank-2 lives to the right of the centroid (e.g. Floor 1 with a
+    // single F1-AS-01 access); without this clamp, lines leaving the
+    // leftmost port (port 0) are drawn at negative X and disappear
+    // off the canvas, which we saw as "missing L3 link" on the
+    // CORE-01 → DS-01 edge.
+    let minX = Infinity;
+    for (const id of Object.keys(boxMap)) minX = Math.min(minX, boxMap[id].x);
+    if (minX < MARGIN_X) {
+      const dx = MARGIN_X - minX;
+      for (const id of Object.keys(boxMap)) boxMap[id].x += dx;
+    }
   }
 
   // 4) Group positioned nodes by rank for the tier rail and bands.
