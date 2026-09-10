@@ -82,6 +82,8 @@ Full detail: `docs/agents/05-gotchas.md`
 - `.cursor/rules/netconsole-frontend.mdc` -- Frontend (React/Vite/AntD)
 - `.cursor/rules/netconsole-backend.mdc` -- Backend (Express/Prisma/JWT)
 - `.cursor/rules/netconsole-worker.mdc` -- Worker (Python/SSH/RESTCONF)
+- `.cursor/rules/netconsole-vps-ops.mdc` -- SSH / compose flags / log queries / rollback (read before any deploy ops)
+- `.cursor/rules/project-notebook.md` -- auto-load chain (read this FIRST in every session)
 
 ---
 
@@ -98,6 +100,7 @@ Full detail: `docs/agents/05-gotchas.md`
 - `08-vendor-extension-plan.md` -- implementation plan to add EOS/IOS-XE/NX-OS (added 2026-09-07; updated 2026-09-07 16:40 to mark NETCONF as primary config/interface path on IOS-XE)
 - `09-vendor-device-configs.md` -- copy/paste device-side config blocks for EOS/IOS-XE/NX-OS (added 2026-09-07)
 - `10-bulk-config-safety-net.md` -- design notes for pre-apply snapshot (IOS-XE `archive config`, EOS `copy run start` + optional `rescue-config`). Manual rollback via console; +1-2s/device overhead. Backlog, not started.
+- `11-deploy-and-vps-ops.md` -- **deploy pipeline, SSH access, log queries, container IPs, common pitfalls** (read before any deploy/SSH/log task)
 
 ---
 
