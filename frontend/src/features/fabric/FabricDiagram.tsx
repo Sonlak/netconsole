@@ -347,41 +347,14 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
   const rank2ByFloor = new Map<string, FabricNode>();
   for (const n of rank2Nodes) rank2ByFloor.set(n.floor || n.id, n);
   const floors = [...rank2ByFloor.keys()].sort();
-  const FLOOR_COL_WIDE = 320; // px per floor column (node 228 + gap 92)
-
-  // Centroid X per floor from dagre's rank-2 output
-  const floorX: Record<string, number> = {};
-  for (const [fl, n] of rank2ByFloor) {
-    const dn = g.node(n.id) as { x: number };
-    floorX[fl] = dn?.x ?? 0;
-  }
-
-  // Sort floors by their dagre centroid X so ordering is preserved
-  floors.sort((a, b) => (floorX[a] ?? 0) - (floorX[b] ?? 0));
-
-  // Assign a compact column index to each floor
-  const floorColIdx: Record<string, number> = {};
-  floors.forEach((fl, i) => { floorColIdx[fl] = i; });
-
-  // ── 4) Map dagre nodes to top-left boxMap with floor grouping ──────────
-  // Tier-Y baselines (centred Y from dagre for each rank tier). We
-  // need them because rank-2 nodes are arranged in a compact column
-  // (not spread by dagre), so we re-anchor them to a single Y line
-  // per tier rather than trusting dagre's per-node coords.
-  const rank2Y = rank2Nodes[0]
-    ? (g.node(rank2Nodes[0].id) as { y: number }).y
-    : (MARGIN_Y + 2 * (NODE_H + TIER_GAP));
-  const rank3Y = rank3Nodes[0]
-    ? (g.node(rank3Nodes[0].id) as { y: number }).y
-    : (MARGIN_Y + 3 * (NODE_H + TIER_GAP));
-  const rank3NodeH = 68; // second-hop nodes are slightly shorter to save vertical space
-
   // Pre-compute parent ID for every rank-3 node: each rank-3 switch has
-  // at least one rank-2 (first-hop) neighbour. We use those neighbours to
-  // anchor the rank-3 node vertically under its first-hop parent.
+  // at least one rank-2 (first-hop) neighbour. We use those neighbours
+  // to anchor the rank-3 node vertically under its first-hop parent.
   // A rank-3 node may have multiple rank-2 parents (full-mesh typical
   // for second-hop wiring); in that case we average their X so the
   // child lands between its parents.
+  // (Computed early because Pass 2's per-floor column width needs the
+  //  rank-3 parent/sibling structure to size columns correctly.)
   const rank3Parents = new Map<string, string[]>();
   for (const n of rank3Nodes) {
     const parents: string[] = [];
@@ -419,6 +392,79 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     rank3SafeIdx.set(n.id, sibs.findIndex((s) => s.id === n.id));
   }
 
+  // Per-floor column width must accommodate the widest footprint in
+  // that column. For a floor with a single rank-2 node and a rank-3
+  // sibling pair underneath (NODE_W*2 + gap), the column needs at
+  // least that much room. We compute the width per-floor instead of
+  // using a single global FLOOR_COL_WIDE.
+  const floorColumnWidth: Record<string, number> = {};
+  for (const fl of floors) {
+    // Rank-2 footprint inside this floor (multi-AS floor possible).
+    const r2InFloor = rank2Nodes.filter((n) => (n.floor || n.id) === fl);
+    let r2Width = r2InFloor.length > 0 ? (r2InFloor.length - 1) * 92 + NODE_W : NODE_W;
+    // Rank-3 footprint inside this floor (siblings share rank-2 parents
+    // that may be on different floors, but we only count siblings whose
+    // primary rank-2 parent is also on this floor). For typical wiring
+    // every rank-3's parent is on the same floor, so use the widest
+    // sibling group with a parent on this floor.
+    let r3Width = 0;
+    const r3InFloor = rank3Nodes.filter((n) => {
+      const ps = rank3Parents.get(n.id) ?? [];
+      return ps.some((p) => {
+        const parentNode = nodes.find((x) => x.id === p);
+        return parentNode && (parentNode.floor || parentNode.id) === fl;
+      });
+    });
+    // Group by parent center (proxy: parent ids). For each parent
+    // compute its sibling pair width.
+    const byParent = new Map<string, number>();
+    for (const n of r3InFloor) {
+      const ps = rank3Parents.get(n.id) ?? [];
+      for (const p of ps) {
+        const sibs = rank3Nodes.filter((m) => {
+          const mp = rank3Parents.get(m.id) ?? [];
+          return mp.includes(p);
+        });
+        // Widest = NODE_W for single child, NODE_W*2 + 20 for pair.
+        const w = sibs.length >= 2 ? NODE_W * 2 + 20 : NODE_W;
+        const cur = byParent.get(p) ?? 0;
+        if (w > cur) byParent.set(p, w);
+      }
+    }
+    for (const w of byParent.values()) {
+      if (w > r3Width) r3Width = w;
+    }
+    floorColumnWidth[fl] = Math.max(NODE_W + 92, r2Width, r3Width);
+  }
+
+  // Centroid X per floor from dagre's rank-2 output
+  const floorX: Record<string, number> = {};
+  for (const [fl, n] of rank2ByFloor) {
+    const dn = g.node(n.id) as { x: number };
+    floorX[fl] = dn?.x ?? 0;
+  }
+
+  // Sort floors by their dagre centroid X so ordering is preserved
+  floors.sort((a, b) => (floorX[a] ?? 0) - (floorX[b] ?? 0));
+
+  // Assign a compact column index to each floor
+  const floorColIdx: Record<string, number> = {};
+  floors.forEach((fl, i) => { floorColIdx[fl] = i; });
+
+  // ── 4) Map dagre nodes to top-left boxMap with floor grouping ──────────
+  // Tier-Y baselines (centred Y from dagre for each rank tier). We
+  // need them because rank-2 nodes are arranged in a compact column
+  // (not spread by dagre), so we re-anchor them to a single Y line
+  // per tier rather than trusting dagre's per-node coords.
+  const rank2Y = rank2Nodes[0]
+    ? (g.node(rank2Nodes[0].id) as { y: number }).y
+    : (MARGIN_Y + 2 * (NODE_H + TIER_GAP));
+  const rank3Y = rank3Nodes[0]
+    ? (g.node(rank3Nodes[0].id) as { y: number }).y
+    : (MARGIN_Y + 3 * (NODE_H + TIER_GAP));
+  const rank3NodeH = 68; // second-hop nodes are slightly shorter to save vertical space
+
+  // Pre-compute parent ID for every rank-3 node: each rank-3 switch has
   const boxMap: Record<string, Box> = {};
 
   // ── Pass 1: rank 0 + rank 1 (cores, dists) use dagre's centre coords. ──
@@ -447,15 +493,21 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     if (r !== 2) continue;
     const fl = node.floor || node.id;
     const col = floorColIdx[fl] ?? 0;
+    // X for column col = sum of widths of all earlier columns + base MARGIN_X.
+    let xBase = MARGIN_X;
+    for (let i = 0; i < col; i++) {
+      xBase += floorColumnWidth[floors[i]] ?? NODE_W + 92;
+    }
+    const colW = floorColumnWidth[fl] ?? NODE_W + 92;
     const fhNodesInFloor = rank2Nodes.filter((n) => n.floor === node.floor);
     const fhIdx = fhNodesInFloor.indexOf(node);
     const fhCount = Math.max(1, fhNodesInFloor.length);
-    // Max total spread inside the column = FLOOR_COL_WIDE - NODE_W (the
-    // slack). Divide it evenly between the (fhCount - 1) gaps.
-    const maxSpread = FLOOR_COL_WIDE - NODE_W; // 92 px for 320/228
+    // Spread rank-2 nodes within the column based on the column width,
+    // not a hardcoded FLOOR_COL_WIDE.
+    const maxSpread = colW - NODE_W;
     const slotW = fhCount > 1 ? maxSpread / (fhCount - 1) : 0;
     const fhOffset = (fhIdx - (fhCount - 1) / 2) * slotW;
-    const x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2 + fhOffset;
+    const x = xBase + (colW - NODE_W) / 2 + fhOffset;
     const y = rank2Y - NODE_H / 2;
     boxMap[node.id] = { x, y, w: NODE_W, h: NODE_H };
   }
@@ -512,25 +564,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
         x = parentCenterX - NODE_W / 2;
         y = rank3Y - rank3NodeH / 2;
       } else if (siblings.length === 2) {
-        // Two siblings — side-by-side, paired SHIFTED RIGHT under the
-        // parent. Layout reads as: F3-AS-02 sits directly under
-        // F3-AS-01 (same X), F3-AS-03 sits to the right of F3-AS-02
-        // (same Y, side-by-side). The pair shares one horizontal
-        // baseline under the parent.
-        //
-        // User spec (2026-09-03 02:00): "F3-AS-02, F3-AS-03 nằm
-        // ngang hàng, dịch qua phải nằm dưới con F3-AS-01". The pair
-        // starts at parent's left edge and extends right.
+        // Two siblings — side-by-side, CENTERED around parent X. Both
+        // stay inside the floor column so cards on different floors
+        // stay visually separated.
         const gap = 20;
-        const parentLeftX = parentCenterX - NODE_W / 2;
-        if (safeIdx === 0) {
-          // Left sibling — starts at parent's left edge (directly
-          // under parent's left half).
-          x = parentLeftX;
-        } else {
-          // Right sibling — starts after left sibling + gap.
-          x = parentLeftX + NODE_W + gap;
-        }
+        const pairW = NODE_W * 2 + gap;
+        x = parentCenterX - pairW / 2 + safeIdx * (NODE_W + gap);
         y = rank3Y - rank3NodeH / 2;
       } else {
         // 3+ siblings — stack vertically at parent X with dynamic
@@ -544,7 +583,12 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
       // No rank-2 parent known — fall back to the floor column centre.
       const fl = node.floor || node.id;
       const col = floorColIdx[fl] ?? 0;
-      x = MARGIN_X + col * FLOOR_COL_WIDE + (FLOOR_COL_WIDE - NODE_W) / 2;
+      let xBase = MARGIN_X;
+      for (let i = 0; i < col; i++) {
+        xBase += floorColumnWidth[floors[i]] ?? NODE_W + 92;
+      }
+      const colW = floorColumnWidth[fl] ?? NODE_W + 92;
+      x = xBase + (colW - NODE_W) / 2;
       y = rank3Y + (safeIdx - (siblings.length - 1) / 2) * RANK3_STEP_Y - rank3NodeH / 2;
     }
 
@@ -556,17 +600,17 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     };
   }
 
-  // ── Centering pass: per-tier shift so every tier shares ONE vertical ──
-  // axis = the centre of the rank-2 (access first-hop) tier. Rank-2
-  // stays where its floor columns put it; cores, dists, and rank-3 all
-  // shift to align with rank-2's centre.
+  // ── Centering pass: align rank-0/1 (cores, dists) to the centre of
+  // the rank-2 (first-hop access) tier so the upper tiers sit on the
+  // same vertical axis as the access columns. Rank-2 and rank-3 keep
+  // their absolute positions (rank-2 is the column anchor; rank-3 is
+  // anchored under its rank-2 parent).
   //
-  // Why per-tier and not uniform graph-bbox shift: with side-by-side
-  // rank-3 siblings under F3, the rank-3 tier is wider than rank-2
-  // (extends past F3 column). Using the graph bbox centre would drag
-  // rank-2 leftward and could push F1 first-hop off the canvas. Using
-  // rank-2 centre as the axis keeps every tier balanced on the
-  // floor-column axis (F1/F2/F3 first-hop column).
+  // We use rank-2's centre as the axis because rank-2 is the column
+  // anchor — shifting rank-2 would break every rank-3 sibling's parent
+  // alignment. Rank-3 may be wider than rank-2 when side-by-side
+  // siblings overflow a single column; that's a per-floor issue handled
+  // by dynamic floorColumnWidth, not by shifting the whole tier.
   if (Object.keys(boxMap).length > 0) {
     const tierInfo = new Map<number, { left: number; right: number; centre: number }>();
     for (const id of Object.keys(boxMap)) {
@@ -581,13 +625,14 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
         cur.centre = (cur.left + cur.right) / 2;
       }
     }
-    // Rank-2 (access first-hop) is the axis reference.
+    // Rank-2 is the axis reference.
     const axisInfo = tierInfo.get(2);
     let axisX = 0;
     if (axisInfo) {
       axisX = axisInfo.centre;
     } else {
-      // No rank-2 nodes — fall back to the widest tier.
+      // No rank-2 nodes — fall back to the widest tier so the canvas
+      // doesn't collapse to a single column on a degenerate topology.
       let mw = -1;
       for (const info of tierInfo.values()) {
         const w = info.right - info.left;
@@ -596,10 +641,9 @@ function layoutNodes(nodes: FabricNode[], links: FabricLink[]): LayoutResult {
     }
     for (const id of Object.keys(boxMap)) {
       const r = rankById.get(id) ?? 0;
-      // rank-3 stays where Pass 3 placed it (relative to rank-2 parent).
-      // Don't shift it to the rank-2 axis — that drags rank-3 sideways
-      // away from its parent and out of the floor column.
-      if (r === 3) continue;
+      // Only shift rank 0/1 (cores, dists). Rank-2 stays where its
+      // floor columns put it. Rank-3 stays under its rank-2 parent.
+      if (r !== 0 && r !== 1) continue;
       const tc = tierInfo.get(r);
       if (!tc) continue;
       boxMap[id].x += axisX - tc.centre;

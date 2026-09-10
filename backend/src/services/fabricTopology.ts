@@ -158,29 +158,23 @@ function normalizeLldpPort(port: string): string {
  * Deterministic link dedup key for merging two interface descriptions that
  * point to the same physical cable.
  *
- * Problem: if the far-end device's description omits the remote port
- * (e.g. `Eth1` instead of `ge-0/0/1`), the two sides produce different
- * keys (`DS01:ge-0/0/1__AS01:?` vs `DS01:ge-0/0/1__AS01:Ethernet1`)
- * and the records are not merged — causing duplicate links in the topology.
+ * The key MUST be the same whether the link was discovered via
+ * `interface description` (which usually carries only the LOCAL port)
+ * or via `LLDP` (which carries both sides' ports). Otherwise the same
+ * physical cable produces two records and shows up as a duplicate
+ * line on the topology.
  *
- * Fix: when either port is empty, normalise both sides to `?` so the key
- * reflects only the device pair. The complete record (with both ports set)
- * will overwrite the incomplete one, and both sides get merged on the
- * next rebuild.
+ * Strategy: key by canonical (sorted) device pair. Ports are part of
+ * the displayed record but not the dedup key — the canonical case is
+ * exactly one physical link per device pair. Multi-link redundancy
+ * (e.g. dual-homing with two ports per pair) is rare enough that
+ * surfacing a single representative link is better than the current
+ * duplicate-line mess. If you ever need multi-link support, add a
+ * `(device-pair, sorted-ports)` key and merge in the UI.
  */
-function linkId(a: string, aPort: string, b: string, bPort: string): string {
-  const safeA = aPort || '?';
-  const safeB = bPort || '?';
-  // When either side has an unknown port the physical link identity
-  // collapses to the device pair — any further port detail is just
-  // additional metadata, not a distinct link.
-  if (!aPort || !bPort) {
-    const [hi, lo] = a < b ? [b, a] : [a, b];
-    return `${lo}__${hi}`;
-  }
-  const left = `${a}:${safeA}`;
-  const right = `${b}:${safeB}`;
-  return left < right ? `${left}__${right}` : `${right}__${left}`;
+function linkId(a: string, _aPort: string, b: string, _bPort: string): string {
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  return `${lo}__${hi}`;
 }
 
 type LldpNeighbor = {
@@ -278,7 +272,7 @@ export async function getFabricTopology(site?: string) {
       const peer = matchDevice(nodes, parsed.token);
       if (!peer || peer.id === node.id) continue;
 
-      const id = linkId(node.id, localPort, peer.id, parsed.remotePort);
+      const id = linkId(node.id, localPort, peer.id, normalizeLldpPort(parsed.remotePort));
       const existing = merged.get(id);
       const fromIsLex = `${node.id}:${localPort}` < `${peer.id}:${parsed.remotePort || '?'}`;
       const from = fromIsLex ? node : peer;
