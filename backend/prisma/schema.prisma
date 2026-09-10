@@ -107,6 +107,7 @@ model Job {
   @@index([status])
   @@index([createdById])
   @@index([deviceId, status])
+  @@index([deviceId, type, status, updatedAt(sort: Desc)])
   @@index([status, priority, createdAt])
 }
 

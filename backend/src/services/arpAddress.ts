@@ -1,8 +1,8 @@
-import { JobStatus, JobType } from '@prisma/client';
+import { Prisma, JobStatus, JobType } from '@prisma/client';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
-import { getLatestJobResult, jobPriority } from './deviceOperations.js';
+import { jobPriority } from './deviceOperations.js';
 import { fetchArpTable } from './junosRest.js';
 import { fetchIosxeArpTable } from './iosxeRest.js';
 
@@ -29,6 +29,40 @@ type ArpJobResult = {
   message?: string;
 };
 
+/**
+ * Fetch the latest GET_ARP job (with its `result` blob) per device in one
+ * round-trip. Without this, getArpInventory() loops N devices, each calling
+ * prisma.job.findFirst with no LIMIT -- Postgres Seq Scans the entire
+ * GET_ARP table (~46k rows), ~95ms per device, ~1.5s for 9 devices.
+ *
+ * DISTINCT ON gives us "latest by updatedAt per deviceId" in one pass.
+ * Result is keyed by deviceId so the caller can O(1) lookup.
+ */
+async function fetchLatestArpJobsByDevice(
+  deviceIds: string[],
+): Promise<Map<string, { result: ArpJobResult; updatedAt: Date }>> {
+  const out = new Map<string, { result: ArpJobResult; updatedAt: Date }>();
+  if (deviceIds.length === 0) return out;
+  const rows = await prisma.$queryRaw<
+    Array<{ deviceId: string; result: unknown; updatedAt: Date }>
+  >`
+    SELECT DISTINCT ON ("deviceId")
+           "deviceId", result, "updatedAt"
+    FROM "Job"
+    WHERE type = 'GET_ARP'::"JobType"
+      AND status = 'SUCCESS'::"JobStatus"
+      AND "deviceId" IN (${Prisma.join(deviceIds)})
+    ORDER BY "deviceId", "updatedAt" DESC
+  `;
+  for (const row of rows) {
+    out.set(row.deviceId, {
+      result: (row.result ?? {}) as ArpJobResult,
+      updatedAt: row.updatedAt,
+    });
+  }
+  return out;
+}
+
 export async function getArpInventory(): Promise<{
   rows: ArpAddressRow[];
   managedDevices: number;
@@ -36,13 +70,16 @@ export async function getArpInventory(): Promise<{
   lastUpdatedAt: string | null;
 }> {
   const devices = await listCollectableDevices();
+  const latestByDevice = await fetchLatestArpJobsByDevice(
+    devices.map((device) => device.id),
+  );
 
   const rows: ArpAddressRow[] = [];
   let devicesWithData = 0;
 
   for (const device of devices) {
-    const job = await getLatestJobResult(device.id, JobType.GET_ARP);
-    const result = (job?.result ?? {}) as ArpJobResult;
+    const job = latestByDevice.get(device.id);
+    const result = job?.result ?? {};
     const entries = result.entries ?? [];
 
     if (entries.length > 0) {

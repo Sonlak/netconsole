@@ -1,8 +1,8 @@
-import { JobStatus, JobType } from '@prisma/client';
+import { Prisma, JobStatus, JobType } from '@prisma/client';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
-import { getLatestJobResult, jobPriority } from './deviceOperations.js';
+import { jobPriority } from './deviceOperations.js';
 import { fetchMacTable } from './junosRest.js';
 import { fetchIosxeMacTable } from './iosxeRest.js';
 
@@ -43,13 +43,49 @@ function normalizeMac(mac: string): string {
   return mac.toLowerCase().replace(/[^0-9a-f]/g, '');
 }
 
+/**
+ * Fetch the latest successful Job of a given `type` per device in one
+ * round-trip via DISTINCT ON. Returns Map<deviceId, result>.
+ *
+ * Why: `prisma.job.findFirst({where:{deviceId, type, status:SUCCESS},
+ * orderBy:updatedAt desc})` triggers a Parallel Seq Scan on the Job table
+ * (~46k+ rows per type) at ~95ms per device. For 9 devices we spend ~900ms
+ * to ~3.5s depending on how many types we query per page. DISTINCT ON with
+ * IN (devices) returns one row per device in a single ~5ms index lookup.
+ */
+async function fetchLatestJobResultsByDevice(
+  deviceIds: string[],
+  type: JobType,
+): Promise<Map<string, { result: unknown; updatedAt: Date }>> {
+  const out = new Map<string, { result: unknown; updatedAt: Date }>();
+  if (deviceIds.length === 0) return out;
+  const rows = await prisma.$queryRaw<
+    Array<{ deviceId: string; result: unknown; updatedAt: Date }>
+  >`
+    SELECT DISTINCT ON ("deviceId")
+           "deviceId", result, "updatedAt"
+    FROM "Job"
+    WHERE type = ${type}::"JobType"
+      AND status = 'SUCCESS'::"JobStatus"
+      AND "deviceId" IN (${Prisma.join(deviceIds)})
+    ORDER BY "deviceId", "updatedAt" DESC
+  `;
+  for (const row of rows) {
+    out.set(row.deviceId, { result: row.result, updatedAt: row.updatedAt });
+  }
+  return out;
+}
+
 async function buildArpIpLookup(deviceIds: string[]) {
   const byDeviceMac = new Map<string, string>();
   const byMac = new Map<string, string>();
 
-  for (const deviceId of deviceIds) {
-    const job = await getLatestJobResult(deviceId, JobType.GET_ARP);
-    const entries = ((job?.result ?? {}) as ArpJobResult).entries ?? [];
+  const latestArpByDevice = await fetchLatestJobResultsByDevice(
+    deviceIds,
+    JobType.GET_ARP,
+  );
+  for (const [deviceId, job] of latestArpByDevice) {
+    const entries = ((job.result ?? {}) as ArpJobResult).entries ?? [];
     for (const entry of entries) {
       const macNorm = normalizeMac(String(entry.mac ?? ''));
       const ip = String(entry.ip ?? '').trim();
@@ -85,13 +121,18 @@ export async function getMacAddressInventory(): Promise<{
   lastUpdatedAt: string | null;
 }> {
   const devices = await listCollectableDevices();
-  const arpLookup = await buildArpIpLookup(devices.map((device) => device.id));
+  const deviceIds = devices.map((device) => device.id);
+  // One raw query per type instead of N per-device round-trips.
+  const [latestMacByDevice, arpLookup] = await Promise.all([
+    fetchLatestJobResultsByDevice(deviceIds, JobType.GET_MAC),
+    buildArpIpLookup(deviceIds),
+  ]);
 
   const rows: MacAddressRow[] = [];
   let devicesWithData = 0;
 
   for (const device of devices) {
-    const job = await getLatestJobResult(device.id, JobType.GET_MAC);
+    const job = latestMacByDevice.get(device.id);
     const result = (job?.result ?? {}) as MacJobResult;
     const entries = result.entries ?? [];
 
