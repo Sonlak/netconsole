@@ -52,11 +52,11 @@ const corsOptions: cors.CorsOptions = {
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 const pingIntervalSeconds = Number(process.env.PING_INTERVAL_SECONDS) || 60;
-const macCollectIntervalSeconds = Number(process.env.MAC_COLLECT_INTERVAL_SECONDS) || 120;
-const arpCollectIntervalSeconds = Number(process.env.ARP_COLLECT_INTERVAL_SECONDS) || 120;
+const macCollectIntervalSeconds = Number(process.env.MAC_COLLECT_INTERVAL_SECONDS) || 900;
+const arpCollectIntervalSeconds = Number(process.env.ARP_COLLECT_INTERVAL_SECONDS) || 900;
 const interfacesCollectIntervalSeconds =
-  Number(process.env.INTERFACES_COLLECT_INTERVAL_SECONDS) || 120;
-const configCollectIntervalSeconds = Number(process.env.CONFIG_COLLECT_INTERVAL_SECONDS) || 300;
+  Number(process.env.INTERFACES_COLLECT_INTERVAL_SECONDS) || 900;
+const configCollectIntervalSeconds = Number(process.env.CONFIG_COLLECT_INTERVAL_SECONDS) || 900;
 const logsCollectIntervalSeconds = Number(process.env.LOGS_COLLECT_INTERVAL_SECONDS) || 0;
 const syslogUdpPort = Number(process.env.SYSLOG_UDP_PORT) || 1514;
 const logRetentionDays = Number(process.env.LOG_RETENTION_DAYS) || 30;
