@@ -872,7 +872,13 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
     """Parse EOS `show lldp neighbors` JSON result.
 
     EOS eAPI returns one dict per neighbour with keys:
-      lldpNeighbors: [{ localPort, chassisId, portId, portDescription?, systemName? }]
+      lldpNeighbors: [{ port, neighborDevice, neighborPort, ttl }]
+
+    These key names differ from the JSON shape documented in some EOS
+    versions (`localPort`/`systemName`/`portId`/`chassisId`); the
+    `show lldp neighbors` JSON-RPC reply uses the short form everywhere
+    we have seen in the lab fleet (EOS 4.28+). We accept both spellings
+    so the parser works regardless of EOS version.
     """
     if not result:
         return []
@@ -884,10 +890,24 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
     for n in neighbors:
         if not isinstance(n, dict):
             continue
+        # Short-form keys (current EOS 4.28+ JSON-RPC):
+        local_port = n.get("port") or n.get("localPort") or ""
+        remote_device = (
+            n.get("neighborDevice")
+            or n.get("systemName")
+            or n.get("chassisId")
+            or ""
+        )
+        remote_port = (
+            n.get("neighborPort")
+            or n.get("portId")
+            or ""
+        )
+        chassis_id = n.get("chassisId") or remote_device
         out.append({
-            "localPort": str(n.get("localPort") or ""),
-            "remoteDeviceId": str(n.get("systemName") or n.get("chassisId") or ""),
-            "remotePort": str(n.get("portId") or ""),
-            "chassisId": str(n.get("chassisId") or ""),
+            "localPort": str(local_port),
+            "remoteDeviceId": str(remote_device),
+            "remotePort": str(remote_port),
+            "chassisId": str(chassis_id),
         })
     return out
