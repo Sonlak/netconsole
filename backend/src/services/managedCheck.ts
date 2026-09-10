@@ -1,7 +1,6 @@
 import { DeviceStatus, JobStatus, JobType, type Job } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
-import { queueDeviceTabCollections } from './deviceTabCollection.js';
 import { pingHost } from './ping.js';
 import { jobPriority } from './deviceOperations.js';
 
@@ -242,10 +241,6 @@ export async function applyManagedCheckResult(job: Job) {
       managedChecks: checks,
       manageError: null,
     },
-  });
-
-  void queueDeviceTabCollections({ deviceIds: [device.id] }).catch((error) => {
-    console.error(`[tabs] auto-queue failed for ${device.id}`, error);
   });
 
   return updated;
