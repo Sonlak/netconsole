@@ -868,6 +868,26 @@ def _parse_eos_show_version(result: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _coerce_eos_port(value: Any) -> str:
+    """Convert EOS eAPI port value into the canonical Ethernet<N> string.
+
+    EOS reports the `port`/`localPort`/`neighborPort`/`portId` fields in
+    different shapes depending on hardware and EOS version:
+
+    - Modular chassis (e.g. 7280) return a numeric interface ID like
+      `521` (the absolute intfId, not a name).
+    - Fixed platforms (e.g. 7050) return `"Ethernet1"`.
+
+    We turn the numeric form into `Ethernet521` so the backend's
+    `normalizeLldpPort` (which already maps `ethernet<N>` -> `etN`)
+    produces a consistent display value across the fleet.
+    """
+    s = str(value).strip()
+    if s and s.isdigit():
+        return f"Ethernet{s}"
+    return s
+
+
 def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[str, str]]:
     """Parse EOS `show lldp neighbors` JSON result.
 
@@ -891,23 +911,21 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
         if not isinstance(n, dict):
             continue
         # Short-form keys (current EOS 4.28+ JSON-RPC):
-        local_port = n.get("port") or n.get("localPort") or ""
+        local_port = _coerce_eos_port(n.get("port") or n.get("localPort") or "")
         remote_device = (
             n.get("neighborDevice")
             or n.get("systemName")
             or n.get("chassisId")
             or ""
         )
-        remote_port = (
-            n.get("neighborPort")
-            or n.get("portId")
-            or ""
+        remote_port = _coerce_eos_port(
+            n.get("neighborPort") or n.get("portId") or ""
         )
         chassis_id = n.get("chassisId") or remote_device
         out.append({
-            "localPort": str(local_port),
+            "localPort": local_port,
             "remoteDeviceId": str(remote_device),
-            "remotePort": str(remote_port),
+            "remotePort": remote_port,
             "chassisId": str(chassis_id),
         })
     return out
