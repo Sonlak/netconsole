@@ -324,6 +324,54 @@ export async function runLabSshProbe(
   }
 }
 
+export type IosxeSshCommandResult = {
+  ok: boolean;
+  output: string;
+  error?: string;
+};
+
+export async function runIosxeSshCommand(
+  host: string,
+  command: string,
+  options?: {
+    port?: number;
+    username?: string;
+    password?: string;
+    timeoutMs?: number;
+  },
+): Promise<IosxeSshCommandResult> {
+  const port = options?.port ?? 22;
+  const username = options?.username ?? process.env.LAB_SSH_USER ?? 'admin';
+  const password = options?.password ?? process.env.LAB_SSH_PASSWORD ?? 'Admin@123';
+  const timeoutMs = options?.timeoutMs ?? 20000;
+
+  const conn = new Client();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      conn
+        .on('ready', () => resolve())
+        .on('error', reject)
+        .connect({
+          host,
+          port,
+          username,
+          password,
+          readyTimeout: 15000,
+        });
+    });
+    const output = await execCommand(conn, command, timeoutMs);
+    return { ok: true, output };
+  } catch (error) {
+    return {
+      ok: false,
+      output: '',
+      error: error instanceof Error ? error.message : 'SSH command failed',
+    };
+  } finally {
+    conn.end();
+  }
+}
+
 export function parseJuniperShowVersion(output: string) {
   const parsed: Record<string, string> = { vendor: 'Juniper' };
 

@@ -160,32 +160,53 @@ class IOSxeBackend(DeviceBackend):
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"backend show-run call failed: {exc}"}
 
+    def _backend_mac_collect(self, device_id: str) -> dict[str, Any]:
+        """Collect IOS-XE MAC address table by calling the backend SSH proxy.
+
+        IOS-XE has no stable YANG model for the MAC address table, so there is
+        no RESTCONF path. The worker container can't reach lab IOS-XE on
+        10.10.20.x directly (no route from docker bridge), but the backend
+        container can. The backend exposes
+        `POST /api/mac-addresses/collect/:deviceId` which runs
+        `show mac address-table` over SSH and returns parsed entries.
+
+        Returns `{{ok, entries, error}}`. Callers treat any non-ok result as
+        a signal to fall back to local SSH.
+        """
+        try:
+            import httpx
+            from netconsole_worker.config import settings as _settings
+
+            token = _settings.worker_auth_token
+            base = _settings.api_base_url.rstrip("/")
+            url = f"{base}/mac-addresses/collect/{device_id}"
+            headers: dict[str, str] = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(url, headers=headers)
+            if resp.status_code != 200:
+                return {
+                    "ok": False,
+                    "error": f"backend MAC proxy HTTP {resp.status_code}: {resp.text[:200]}",
+                    "entries": [],
+                }
+            data = resp.json()
+            return {
+                "ok": True,
+                "entries": data.get("entries") or [],
+                "message": data.get("source") or "ssh-cli",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"backend MAC proxy call failed: {exc}", "entries": []}
+
     # -- READ --------------------------------------------------------------
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
-        # Prefer SSH — `show interfaces` gives speed/MTU/description/mac.
-        # RESTCONF ietf-interfaces is sparse on this lab image.
+        # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
+        # Fall back to SSH CLI when RESTCONF is unavailable or returns empty
+        # (sparse on some lab images — `ietf-interfaces` lacks MTU/speed).
         rest_error: str | None = None
-        if self.config.ssh_enabled:
-            fb = self._ssh_fallback(device, "show interfaces", None)
-            if fb["ok"]:
-                lines = (fb["output"] or "").splitlines()
-                interfaces = _parse_cisco_interfaces(lines)
-                if interfaces:
-                    return {
-                        "implemented": True,
-                        "source": "ssh-cli",
-                        "command": "show interfaces",
-                        "interfaces": interfaces,
-                        "message": "Lab SSH interfaces OK",
-                        "raw": fb["output"],
-                    }
-                ssh_error = "SSH show interfaces returned no data"
-            else:
-                ssh_error = fb["error"] or "SSH failed"
-        else:
-            ssh_error = None
-
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/ietf-interfaces:interfaces")
             if r["ok"]:
@@ -197,11 +218,32 @@ class IOSxeBackend(DeviceBackend):
                         "command": "ietf-interfaces:interfaces",
                         "interfaces": interfaces,
                         "message": "IOS-XE RESTCONF interfaces OK",
-                        "restError": ssh_error,
+                        "restError": rest_error,
                     }
                 rest_error = "RESTCONF returned no interfaces"
             else:
                 rest_error = r["error"]
+
+        if self.config.ssh_enabled:
+            fb = self._ssh_fallback(device, "show interfaces", None)
+            if fb["ok"]:
+                lines = (fb["output"] or "").splitlines()
+                interfaces = _parse_cisco_interfaces(lines)
+                if interfaces:
+                    return {
+                        "implemented": True,
+                        "source": "ssh-cli",
+                        "command": "show interfaces",
+                        "interfaces": interfaces,
+                        "message": "SSH fallback OK" if rest_error else "Lab SSH interfaces OK",
+                        "raw": fb["output"],
+                        "restError": rest_error,
+                    }
+                ssh_error = "SSH show interfaces returned no data"
+            else:
+                ssh_error = fb["error"] or "SSH failed"
+        else:
+            ssh_error = None
 
         return {
             "implemented": False,
@@ -212,24 +254,11 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def get_arp(self, device: DeviceInfo) -> dict[str, Any]:
-        # Prefer SSH (`show ip arp`) — Cisco IOS-XE 17.x RESTCONF YANG
-        # returns empty `Cisco-IOS-XE-arp-oper:arp-data` even when the
-        # ARP table is populated, so SSH is the reliable path.
-        if self.config.ssh_enabled:
-            fb = self._ssh_fallback(device, "show ip arp", parse_cisco_arp_table)
-            if fb["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "ssh-cli",
-                    "command": "show ip arp",
-                    "entries": fb["parsed"] or [],
-                    "message": "Lab SSH ARP OK",
-                    "raw": fb["output"],
-                }
-            ssh_error = fb["error"] or "SSH failed"
-        else:
-            ssh_error = None
-
+        # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
+        # Note: `Cisco-IOS-XE-arp-oper:arp-data` can be empty on some lab images
+        # even when the ARP table is populated. Fall back to SSH CLI if RESTCONF
+        # returns no entries.
+        rest_error: str | None = None
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/Cisco-IOS-XE-arp-oper:arp-data")
             if r["ok"]:
@@ -240,11 +269,25 @@ class IOSxeBackend(DeviceBackend):
                     "command": "Cisco-IOS-XE-arp-oper:arp-data",
                     "entries": entries,
                     "message": "IOS-XE RESTCONF ARP OK" if entries else "IOS-XE RESTCONF ARP OK (empty)",
-                    "restError": ssh_error,
+                    "restError": rest_error,
                 }
             rest_error = r["error"]
+
+        if self.config.ssh_enabled:
+            fb = self._ssh_fallback(device, "show ip arp", parse_cisco_arp_table)
+            if fb["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "ssh-cli",
+                    "command": "show ip arp",
+                    "entries": fb["parsed"] or [],
+                    "message": "SSH fallback OK" if rest_error else "Lab SSH ARP OK",
+                    "raw": fb["output"],
+                    "restError": rest_error,
+                }
+            ssh_error = fb["error"] or "SSH failed"
         else:
-            rest_error = None
+            ssh_error = None
 
         return {
             "implemented": False,
@@ -255,7 +298,24 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def get_mac(self, device: DeviceInfo) -> dict[str, Any]:
-        # No stable IOS-XE YANG MAC table — SSH only.
+        # IOS-XE has no stable YANG model for the MAC address table, so
+        # there is no RESTCONF path for this. We call the backend SSH proxy
+        # first (backend container can reach lab IOS-XE on 10.10.20.x even
+        # when the worker container cannot). Fall back to local SSH if the
+        # backend proxy is unavailable or fails.
+        device_id = getattr(device, "id", None) or getattr(device, "device_id", None)
+        if device_id and self.config.iosxe.enabled:
+            backend_result = self._backend_mac_collect(device_id)
+            if backend_result.get("ok") and backend_result.get("entries"):
+                return {
+                    "implemented": True,
+                    "source": "iosxe-rest-via-backend",
+                    "command": "show mac address-table",
+                    "entries": backend_result["entries"],
+                    "message": "IOS-XE MAC via backend SSH proxy OK",
+                    "restError": backend_result.get("error"),
+                }
+
         if self.config.ssh_enabled:
             fb = self._ssh_fallback(device, "show mac address-table", parse_cisco_mac_table)
             if fb["ok"]:
@@ -282,9 +342,24 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def get_config(self, device: DeviceInfo) -> dict[str, Any]:
-        # Prefer SSH CLI because RESTCONF returns JSON (Cisco YANG model)
-        # which the frontend Config Studio can't render as code. SSH returns
-        # the actual `show running-config` text — same shape as Juniper/Arista.
+        # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
+        # Note: RESTCONF returns JSON (Cisco YANG model) rather than CLI text.
+        # The frontend Config Studio can still display it. Fall back to SSH CLI
+        # when RESTCONF is unavailable or when CLI text is needed.
+        rest_error: str | None = None
+        if self.config.iosxe.enabled:
+            r = self._rc_get(device, "/Cisco-IOS-XE-native:native?depth=unbounded")
+            if r["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "iosxe-rest",
+                    "config": _dump_json(r["payload"]),
+                    "command": "Cisco-IOS-XE-native:native",
+                    "message": f"Collected running config from {device.name}",
+                    "restError": rest_error,
+                }
+            rest_error = r["error"]
+
         if self.config.ssh_enabled:
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -300,22 +375,9 @@ class IOSxeBackend(DeviceBackend):
                     "config": ssh_result["output"] or "",
                     "command": "show running-config",
                     "message": f"Collected running config from {device.name}",
+                    "restError": rest_error,
                 }
             ssh_error = ssh_result.get("error") or "SSH failed"
-
-        if self.config.iosxe.enabled:
-            r = self._rc_get(device, "/Cisco-IOS-XE-native:native?depth=unbounded")
-            if r["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "iosxe-rest",
-                    "config": _dump_json(r["payload"]),
-                    "command": "Cisco-IOS-XE-native:native",
-                    "message": f"Collected running config from {device.name}",
-                }
-            rest_error = r["error"]
-        else:
-            rest_error = None
 
         raise RuntimeError(rest_error or ssh_error or "GET_CONFIG requires IOSXE_API or LAB_SSH")
 
