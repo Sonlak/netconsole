@@ -1,31 +1,48 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { fetchJobs } from '@/api/jobs';
+import { fetchJobs, jobsRangeToSince, type JobsRange } from '@/api/jobs';
 import { toError } from '@/lib/errors';
 import type { Job } from '@/types/job';
 
-export function useJobs() {
+const DEFAULT_LIMIT = 1000;
+
+export interface UseJobsOptions {
+  /** Max number of rows the server returns. Defaults to 1000 (the server's hard cap). */
+  limit?: number;
+  /**
+   * Time-window filter. The hook re-fetches automatically when this
+   * changes. `null` = no time filter (server returns the most recent N).
+   */
+  range?: JobsRange;
+}
+
+export function useJobs(options: UseJobsOptions = {}) {
+  const { limit = DEFAULT_LIMIT, range = null } = options;
   const [jobs, setJobs] = useState<Job[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
 
-  const refresh = useCallback(async (options?: { silent?: boolean }) => {
-    const silent = Boolean(options?.silent);
-    if (silent) setIsRefreshing(true);
-    else setIsLoading(true);
-    try {
-      const next = await fetchJobs();
-      setJobs(Array.isArray(next) ? (next as Job[]) : []);
-      setError(null);
-      setLastUpdatedAt(new Date().toISOString());
-    } catch (cause) {
-      setError(toError(cause, 'Could not load jobs'));
-    } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
-    }
-  }, []);
+  const refresh = useCallback(
+    async (refreshOptions?: { silent?: boolean }) => {
+      const silent = Boolean(refreshOptions?.silent);
+      if (silent) setIsRefreshing(true);
+      else setIsLoading(true);
+      try {
+        const since = jobsRangeToSince(range);
+        const next = await fetchJobs({ limit, since: since ?? undefined });
+        setJobs(Array.isArray(next) ? (next as Job[]) : []);
+        setError(null);
+        setLastUpdatedAt(new Date().toISOString());
+      } catch (cause) {
+        setError(toError(cause, 'Could not load jobs'));
+      } finally {
+        setIsLoading(false);
+        setIsRefreshing(false);
+      }
+    },
+    [limit, range],
+  );
 
   useEffect(() => {
     void refresh();

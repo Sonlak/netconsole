@@ -62,7 +62,7 @@ const NAV: NavDef[] = [
   { key: '/interfaces', label: 'Ports', hint: 'Device ports · shut / VLAN', icon: <ApiOutlined /> },
   { key: '/generate-config', label: 'Config Studio', hint: 'Draft · commit · rollback', icon: <FileTextOutlined /> },
   { key: '/dhcp', label: 'DHCP', hint: 'Kea DC · relay', icon: <WifiOutlined /> },
-  { key: '/jobs', label: 'Jobs', hint: 'Recent activity · last 100', icon: <UnorderedListOutlined /> },
+  { key: '/jobs', label: 'Jobs', hint: 'Recent activity · last 1000', icon: <UnorderedListOutlined /> },
   { key: '/settings', label: 'Settings', hint: 'Architecture & theme', icon: <SettingOutlined /> },
 ];
 
@@ -70,7 +70,7 @@ const PAGE_META: Record<string, { title: string; subtitle: string }> = {
   '/': { title: 'Dashboard', subtitle: 'Network ops · NKKN / NTMK' },
   '/logs/alerts': { title: 'Alerts', subtitle: 'Rules · triggered alerts · acknowledge' },
   '/devices': { title: 'Devices', subtitle: 'Core · Dist · Access' },
-  '/jobs': { title: 'Jobs', subtitle: 'Recent activity · last 100' },
+  '/jobs': { title: 'Jobs', subtitle: 'Recent activity · last 1000' },
   '/discovery': { title: 'Discovery', subtitle: 'Scan mgmt · sync inventory' },
   '/fabric': { title: 'Floors / Fabric', subtitle: 'Site topology · port links' },
   '/mac-addresses': { title: 'MAC Address', subtitle: 'Switching table' },

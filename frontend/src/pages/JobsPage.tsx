@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
-import { Button, Drawer, Input, Select, Space, Table, Typography } from 'antd';
+import { Button, Drawer, Input, Radio, Select, Space, Table, Tooltip, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
@@ -20,9 +20,22 @@ import { useUrlSearch, useUrlState } from '@/hooks/useUrlState';
 import { prettyJson, redactForDisplay, summarizeJson } from '@/lib/format';
 import { tablePagination, tableScroll } from '@/lib/table';
 import { JOB_TYPE_LABELS, type Job, type JobStatus, type JobType } from '@/types/job';
+import type { JobsRange } from '@/api/jobs';
 
 const STATUSES = Object.keys(JOB_STATUS_META) as JobStatus[];
 const TYPES = Object.keys(JOB_TYPE_LABELS) as JobType[];
+
+const RANGE_OPTIONS: Array<{ value: JobsRange; label: string; title: string }> = [
+  { value: null, label: 'All time', title: 'No time filter — show up to 1000 most recent jobs' },
+  { value: '1h', label: 'Last 1 hour', title: 'Jobs created in the last hour' },
+  { value: '24h', label: 'Last 24 hours', title: 'Jobs created in the last 24 hours' },
+  { value: '7d', label: 'Last 7 days', title: 'Jobs created in the last 7 days' },
+];
+
+function parseRange(value?: string): JobsRange {
+  if (value === '1h' || value === '24h' || value === '7d') return value;
+  return null;
+}
 
 function parseStatus(value?: string): JobStatus | 'all' {
   return STATUSES.includes(value as JobStatus) ? (value as JobStatus) : 'all';
@@ -39,6 +52,7 @@ export default function JobsPage() {
   const statusFilter = parseStatus(get('status'));
   const typeFilter = parseType(get('type'));
   const deviceFilter = get('device') || 'all';
+  const rangeFilter = parseRange(get('range'));
   const [openJob, setOpenJob] = useState<Job | null>(null);
 
   const deviceOptions = useMemo(() => {
@@ -51,11 +65,15 @@ export default function JobsPage() {
   }, [jobs]);
 
   const filtersActive =
-    Boolean(q.trim()) || statusFilter !== 'all' || typeFilter !== 'all' || deviceFilter !== 'all';
+    Boolean(q.trim()) ||
+    statusFilter !== 'all' ||
+    typeFilter !== 'all' ||
+    deviceFilter !== 'all' ||
+    rangeFilter !== null;
 
   const clearFilters = () => {
     setSearchText('');
-    patch({ status: null, type: null, device: null, q: null });
+    patch({ status: null, type: null, device: null, q: null, range: null });
   };
 
   const filtered = useMemo(() => {
@@ -125,11 +143,14 @@ export default function JobsPage() {
     },
   ];
 
+  const rangeLabel = RANGE_OPTIONS.find((opt) => opt.value === rangeFilter)?.label ?? 'All time';
+
   const chips = [
     q.trim() ? { key: 'q', label: `Search: ${q}` } : null,
     statusFilter !== 'all' ? { key: 'status', label: `Status: ${statusFilter}` } : null,
     typeFilter !== 'all' ? { key: 'type', label: `Type: ${JOB_TYPE_LABELS[typeFilter] ?? typeFilter}` } : null,
     deviceFilter !== 'all' ? { key: 'device', label: `Device: ${deviceOptions.find(([id]) => id === deviceFilter)?.[1] ?? deviceFilter}` } : null,
+    rangeFilter !== null ? { key: 'range', label: `Time: ${rangeLabel}` } : null,
   ].filter(Boolean) as { key: string; label: string }[];
 
   if (isLoading && jobs.length === 0) return <PageSkeleton />;
@@ -141,7 +162,7 @@ export default function JobsPage() {
     <div className="nc-page">
       <StaleDataBanner error={jobs.length ? error : null} onRetry={() => void refresh({ silent: true })} />
       <Typography.Paragraph className="nc-metric-strip">
-        Loaded {stats.total} (last 100) · Pending {stats.pending} · Running {stats.running} · Failed {stats.failed} · Succeeded{' '}
+        Showing {stats.total} {rangeFilter ? `(${rangeLabel})` : '(most recent 1000)'} · Pending {stats.pending} · Running {stats.running} · Failed {stats.failed} · Succeeded{' '}
         {stats.success}
       </Typography.Paragraph>
       <DataTableShell
@@ -154,6 +175,24 @@ export default function JobsPage() {
           <DataTableToolbar
             leading={
               <>
+                <Tooltip title='Time window for the loaded jobs. "All time" pulls the most recent 1000 rows from the server; "1h/24h/7d" narrows to that window.'>
+                  <Radio.Group
+                    size="small"
+                    value={rangeFilter ?? null}
+                    onChange={(event) => {
+                      const next = event.target.value as JobsRange;
+                      patch({ range: next === null ? null : next });
+                    }}
+                    optionType="button"
+                    buttonStyle="solid"
+                  >
+                    {RANGE_OPTIONS.map((opt) => (
+                      <Radio.Button key={opt.label} value={opt.value} title={opt.title}>
+                        {opt.label}
+                      </Radio.Button>
+                    ))}
+                  </Radio.Group>
+                </Tooltip>
                 <Select
                   size="small"
                   value={statusFilter}
@@ -202,7 +241,14 @@ export default function JobsPage() {
         }
       >
         {jobs.length === 0 ? (
-          <EmptyState title="No recent jobs" description="The loaded window (max 100) is empty." />
+          <EmptyState
+            title={rangeFilter ? `No jobs in the ${rangeLabel.toLowerCase()}` : 'No recent jobs'}
+            description={
+              rangeFilter
+                ? 'Loosen the time window or clear filters to see older jobs.'
+                : 'The loaded window (max 1000) is empty.'
+            }
+          />
         ) : (
           <Table
             rowKey="id"

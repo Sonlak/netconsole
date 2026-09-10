@@ -3,11 +3,27 @@ import type { Job } from '../types/job';
 
 const API_BASE = '/api/jobs';
 
-export async function fetchJobs(params: { status?: string; forWorker?: string; limit?: number } = {}): Promise<Job[]> {
+/**
+ * `range` is the time-window filter for the Jobs page toolbar chip.
+ * `null` means "no time filter" (server returns the most recent N jobs).
+ * `1h` / `24h` / `7d` are converted to a `since` ISO timestamp before
+ * hitting the API so the server still applies `LIMIT 1000`.
+ */
+export type JobsRange = '1h' | '24h' | '7d' | null;
+
+export interface FetchJobsParams {
+  status?: string;
+  forWorker?: string;
+  limit?: number;
+  since?: string;
+}
+
+export async function fetchJobs(params: FetchJobsParams = {}): Promise<Job[]> {
   const searchParams = new URLSearchParams();
   if (params.status) searchParams.append('status', params.status);
   if (params.forWorker) searchParams.append('forWorker', params.forWorker);
   if (params.limit) searchParams.append('limit', params.limit.toString());
+  if (params.since) searchParams.append('since', params.since);
 
   return authJsonFetch<Job[]>(`${API_BASE}?${searchParams.toString()}`);
 }
@@ -138,4 +154,19 @@ async function fetchJob(jobId: string): Promise<Job> {
 export async function fetchJobsByIds(jobIds: string[]): Promise<Job[]> {
   if (jobIds.length === 0) return [];
   return Promise.all(jobIds.map(fetchJob));
+}
+
+/**
+ * Convert a JobsRange chip into an ISO timestamp suitable for the
+ * `?since=` query param. Returns null for `null` (no time filter).
+ */
+export function jobsRangeToSince(range: JobsRange, now: Date = new Date()): string | null {
+  if (!range) return null;
+  const ms =
+    range === '1h'
+      ? 60 * 60 * 1000
+      : range === '24h'
+        ? 24 * 60 * 60 * 1000
+        : 7 * 24 * 60 * 60 * 1000;
+  return new Date(now.getTime() - ms).toISOString();
 }

@@ -46,8 +46,10 @@ const REFRESH_JOB_TYPES: JobType[] = [JobType.GET_CONFIG, JobType.GET_INTERFACES
 
 // User-facing: list recent jobs for the dashboard/jobs page. Requires any authenticated user.
 //
-// Supports `?limit=` (1..1000, default 100) and `?offset=` (default 0). The
-// `?type=` filter narrows by job type, used by the config-studio logs panel.
+// Supports `?limit=` (1..1000, default 100) and `?offset=` (default 0).
+// The `?type=` filter narrows by job type (used by the config-studio logs panel).
+// The `?since=<ISO timestamp>` filter limits to jobs created at-or-after that
+// instant (used by the time-range chip on the Jobs page — "last 1h/24h/7d").
 jobsRouter.get('/', authMiddleware, async (req, res) => {
   const status =
     typeof req.query.status === 'string' && req.query.status in JobStatus
@@ -60,9 +62,22 @@ jobsRouter.get('/', authMiddleware, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 1000);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
 
+  // Parse `?since=` defensively. Accept ISO 8601 (e.g. "2026-09-10T10:00:00Z").
+  // Reject anything else with 400 so the frontend can't sneak in a malformed
+  // value and silently get a full table back.
+  let since: Date | undefined;
+  if (typeof req.query.since === 'string' && req.query.since) {
+    const parsed = new Date(req.query.since);
+    if (Number.isNaN(parsed.getTime())) {
+      return res.status(400).json({ error: 'Invalid `since` (expected ISO timestamp)' });
+    }
+    since = parsed;
+  }
+
   const where: Prisma.JobWhereInput = {};
   if (status) where.status = status;
   if (type) where.type = type;
+  if (since) where.createdAt = { gte: since };
 
   const jobs = await prisma.job.findMany({
     where: Object.keys(where).length ? where : undefined,
