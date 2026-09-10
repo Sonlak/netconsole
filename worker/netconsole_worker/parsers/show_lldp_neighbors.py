@@ -23,7 +23,6 @@ ISP router), so `remoteDeviceId` may be an arbitrary hostname string.
 from __future__ import annotations
 
 import re
-from typing import Any
 
 
 # ---------------------------------------------------------------------------
