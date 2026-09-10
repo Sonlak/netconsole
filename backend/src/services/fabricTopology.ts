@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { JobStatus, JobType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 
@@ -208,31 +209,43 @@ export async function getFabricTopology(site?: string) {
       }
     : undefined;
 
-  const [devices, jobs] = await Promise.all([
-    prisma.device.findMany({
-      where,
-      orderBy: [{ name: 'asc' }],
-      select: {
-        id: true,
-        name: true,
-        ip: true,
-        site: true,
-        floor: true,
-        status: true,
-        model: true,
-      },
-    }),
-    prisma.job.findMany({
-      where: {
-        type: JobType.GET_INTERFACES,
-        status: JobStatus.SUCCESS,
-      },
-      orderBy: { updatedAt: 'desc' },
-      select: { deviceId: true, result: true, updatedAt: true },
-    }),
-  ]);
+  const devicesPromise = prisma.device.findMany({
+    where,
+    orderBy: [{ name: 'asc' }],
+    select: {
+      id: true,
+      name: true,
+      ip: true,
+      site: true,
+      floor: true,
+      status: true,
+      model: true,
+    },
+  });
 
+  // Pre-filter Job to only the devices we care about (LAB has 9; others may have ~hundreds).
+  // Without this, prisma.job.findMany loads ALL 47k+ SUCCESS GET_INTERFACES rows and
+  // deserialises every result blob -- ~14s cold call. DISTINCT ON gives us the latest
+  // successful result per device in one pass at the DB layer.
+  //
+  // We start the Job query in parallel with the Device query, but the Job query needs
+  // the device list to build the IN clause. So we kick off Device first, await it,
+  // then run the Job query. Total wall time is the SUM of both (no benefit), but the
+  // alternative (Promise.all with a deferred Job query inside) is more complex and
+  // hides the dependency. Two short queries beat one giant query.
+  const devices = await devicesPromise;
   const deviceIds = new Set(devices.map((d) => d.id));
+  const jobs = deviceIds.size
+    ? await prisma.$queryRaw<{ deviceId: string; result: unknown; updatedAt: Date }[]>`
+        SELECT DISTINCT ON ("deviceId")
+               "deviceId", result, "updatedAt"
+        FROM "Job"
+        WHERE type = 'GET_INTERFACES'::"JobType"
+          AND status = 'SUCCESS'::"JobStatus"
+          AND "deviceId" IN (${Prisma.join([...deviceIds])})
+        ORDER BY "deviceId", "updatedAt" DESC
+      `
+    : [];
   const latest = new Map<string, { result: unknown; updatedAt: Date }>();
   for (const job of jobs) {
     if (!job.deviceId || !deviceIds.has(job.deviceId)) continue;
