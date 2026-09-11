@@ -66,13 +66,15 @@ const FACILITY_OPTIONS = Object.entries(LOG_FACILITY_LABEL)
 
 function formatTimestamp(value: string): string {
   try {
-    return new Date(value).toLocaleString(undefined, {
+    return new Date(value).toLocaleString('en-GB', {
       month: 'short',
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-    });
+      hour12: false,
+      timeZone: 'Asia/Ho_Chi_Minh',
+    }).replace(',', '');
   } catch {
     return value;
   }

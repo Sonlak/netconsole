@@ -1,14 +1,71 @@
-export function formatAbsolute(value: string | null | undefined): string {
+/**
+ * Project-wide display timezone. The NetConsole operator works in Vietnam
+ * (UTC+7), so all user-facing timestamps are formatted in this zone
+ * regardless of the browser's locale. Backend timestamps arrive as ISO
+ * strings (UTC), and `Asia/Ho_Chi_Minh` is a fixed +07:00 offset with no
+ * DST, so this is stable year-round.
+ *
+ * See docs/agents/05-gotchas.md for the original "logs show 7 hours off"
+ * symptom this constant fixes.
+ */
+export const DISPLAY_TIME_ZONE = 'Asia/Ho_Chi_Minh';
+
+const DATE_TIME_OPTIONS: Intl.DateTimeFormatOptions = {
+  year: 'numeric',
+  month: 'short',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  timeZone: DISPLAY_TIME_ZONE,
+};
+
+const SHORT_DATE_TIME_OPTIONS: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  timeZone: DISPLAY_TIME_ZONE,
+};
+
+const COMPACT_DATE_TIME_OPTIONS: Intl.DateTimeFormatOptions = {
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  timeZone: DISPLAY_TIME_ZONE,
+};
+
+export function formatVNDateTime(value: string | null | undefined): string {
   if (!value) return 'Never';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return 'Invalid time';
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  const ss = String(date.getSeconds()).padStart(2, '0');
-  return `${y}-${m}-${d} ${hh}:${mm}:${ss}`;
+  return date.toLocaleString('en-GB', DATE_TIME_OPTIONS).replace(',', '');
+}
+
+export function formatVNShortDateTime(value: string | null | undefined): string {
+  if (!value) return 'Never';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Invalid time';
+  return date.toLocaleString('en-GB', SHORT_DATE_TIME_OPTIONS).replace(',', '');
+}
+
+export function formatVNCompactDateTime(value: string | null | undefined): string {
+  if (!value) return 'Never';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Invalid time';
+  // en-GB yields "dd/mm/yyyy, hh:mm:ss" — turn ", " into " " for "yyyy-mm-dd hh:mm:ss".
+  return date.toLocaleString('en-GB', COMPACT_DATE_TIME_OPTIONS).replace(',', '');
+}
+
+export function formatAbsolute(value: string | null | undefined): string {
+  return formatVNCompactDateTime(value);
 }
 
 export function formatRelative(value: string | null | undefined): string {
