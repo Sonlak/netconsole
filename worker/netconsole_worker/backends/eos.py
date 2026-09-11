@@ -750,6 +750,13 @@ class EOSBackend(DeviceBackend):
             source = None
             message = "Neither SSH nor EOS_API TCP reachable"
 
+        # Fetch uptime via eAPI when available
+        parsed: dict[str, Any] = {"vendor": "Arista"}
+        if rest_open and self.config.eos.enabled:
+            uptime_result = self._run_cmds(device, ["show uptime"])
+            if uptime_result.get("ok"):
+                parsed.update(_parse_eos_uptime(uptime_result.get("result") or []))
+
         return {
             "checks": {
                 "ping": True,
@@ -765,7 +772,7 @@ class EOSBackend(DeviceBackend):
             },
             "showVersion": "",
             "showRun": "",
-            "parsed": {"vendor": "Arista"},
+            "parsed": parsed,
             "source": source,
             "message": message,
         }
@@ -787,6 +794,58 @@ def _eos_status(raw: str | None) -> str:
     if not raw:
         return "unknown"
     return _EOS_IFACE_STATUS.get(raw.lower(), raw.lower())
+
+
+def _parse_eos_uptime(result: list[dict[str, Any]]) -> dict[str, str]:
+    """Parse EOS `show uptime` JSON output into uptimeSeconds + uptime label.
+
+    EOS eAPI returns either:
+    - A float 'upTime' value in seconds (e.g. 110500.57)
+    - A text 'output' field with format like "up 1 day,  6:29"
+    """
+    import re
+
+    if not result:
+        return {}
+    first = result[0] if result else {}
+
+    # Check for numeric upTime (seconds as float)
+    raw_uptime = first.get("upTime")
+    if raw_uptime is not None:
+        try:
+            total_seconds = int(float(raw_uptime))
+            if total_seconds > 0:
+                days = total_seconds // 86400
+                hours = (total_seconds % 86400) // 3600
+                mins = (total_seconds % 3600) // 60
+                parsed: dict[str, str] = {"uptimeSeconds": str(total_seconds)}
+                if days > 0:
+                    parsed["uptime"] = f"{days}d {hours:02d}:{mins:02d}"
+                else:
+                    parsed["uptime"] = f"{hours}:{mins:02d}"
+                return parsed
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback: parse text output
+    raw_output = first.get("output", "")
+    uptime_text = str(raw_output) if raw_output else ""
+
+    match = re.search(r"up\s+(?:(\d+)\s*days?[, ]+)?(\d+):(\d+)(?::(\d+))?", uptime_text)
+    parsed = {}
+    if match:
+        days = int(match.group(1) or 0)
+        hours = int(match.group(2))
+        mins = int(match.group(3))
+        secs = int(match.group(4) or 0)
+        total_seconds = days * 86400 + hours * 3600 + mins * 60 + secs
+        if total_seconds > 0:
+            parsed["uptimeSeconds"] = str(total_seconds)
+            if days > 0:
+                parsed["uptime"] = f"{days}d {hours:02d}:{mins:02d}"
+            else:
+                parsed["uptime"] = f"{hours}:{mins:02d}"
+    return parsed
 
 
 def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:

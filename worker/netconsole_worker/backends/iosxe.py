@@ -894,6 +894,15 @@ class IOSxeBackend(DeviceBackend):
             source = None
             message = "Neither SSH nor IOS-XE API TCP reachable"
 
+        # Fetch uptime via SSH when available (RESTCONF uptime unreliable per gotcha #14)
+        parsed: dict[str, Any] = {"vendor": "Cisco"}
+        if ssh_open and self.config.ssh_enabled:
+            uptime_result = self._ssh_fallback(
+                device, "show version | inc uptime", parser=_parse_iosxe_uptime
+            )
+            if uptime_result.get("ok") and uptime_result.get("parsed"):
+                parsed.update(uptime_result["parsed"])
+
         return {
             "checks": {
                 "ping": True,
@@ -904,10 +913,37 @@ class IOSxeBackend(DeviceBackend):
             },
             "showVersion": "",
             "showRun": "",
-            "parsed": {"vendor": "Cisco"},
+            "parsed": parsed,
             "source": source,
             "message": message,
         }
+
+
+def _parse_iosxe_uptime(output: str) -> dict[str, str]:
+    """Parse IOS-XE `show version | inc uptime` output into uptimeSeconds.
+
+    Expected format: "Router uptime is 1 day, 5 hours, 2 minutes"
+    """
+    import re
+
+    parsed: dict[str, str] = {}
+    match = re.search(
+        r"uptime is\s+(?:(\d+)\s+days?[, ]+)?(\d+)\s+hours?[;, ]+(\d+)\s+minutes?",
+        output,
+        re.IGNORECASE,
+    )
+    if match:
+        days = int(match.group(1) or 0)
+        hours = int(match.group(2))
+        mins = int(match.group(3))
+        total_seconds = days * 86400 + hours * 3600 + mins * 60
+        if total_seconds > 0:
+            parsed["uptimeSeconds"] = str(total_seconds)
+            if days > 0:
+                parsed["uptime"] = f"{days}d {hours:02d}:{mins:02d}"
+            else:
+                parsed["uptime"] = f"{hours}:{mins:02d}"
+    return parsed
 
 
 # -------------------- helpers / parsers --------------------------------------

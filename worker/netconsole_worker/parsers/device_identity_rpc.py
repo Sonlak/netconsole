@@ -83,6 +83,14 @@ def _parse_payload(payload: Any) -> ET.Element | Any:
     if isinstance(payload, (dict, list)):
         return payload
     if isinstance(payload, str) and payload.strip():
+        # Handle multi-message NETCONF responses (hello + rpc-reply separated by ]]>]]>)
+        # The device sends hello first, then the RPC reply, each terminated by ]]>]]>
+        if "]]>]]>" in payload:
+            for chunk in payload.split("]]>]]>"):
+                chunk = chunk.strip()
+                if chunk.startswith("<rpc-reply"):
+                    payload = chunk
+                    break
         try:
             return ET.fromstring(payload)
         except ET.ParseError:

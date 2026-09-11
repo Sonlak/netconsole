@@ -20,6 +20,7 @@ from netconsole_worker.junos_rest import (
     fetch_interface_configuration,
     fetch_interface_information,
     fetch_interfaces_set_config,
+    fetch_junos_rpc,
     fetch_log_information,
     fetch_vlan_information,
     rollback_configuration as rest_rollback_configuration,
@@ -878,16 +879,11 @@ class JuniperBackend(DeviceBackend):
         parsed: dict[str, Any] = {"vendor": "Juniper"}
 
         # Fetch uptime via NETCONF-over-SSH (port 830) when available.
-        # RESTCONF uptime was unreliable (returning wrong values), so NETCONF
-        # is the preferred path.  A 20s timeout gives the device enough
-        # time to respond without blocking the managed-check loop.
-        #
-        # Fallback: if NETCONF fails (e.g. port 830 is OpenSSH instead of
-        # Junos NETCONF subsystem on cRPD lab devices), try CLI via sshpass+ssh.
-        # CLI fallback adds one auth.log line per call at 5-min intervals — still
-        # acceptable for lab use.  This also avoids the paramiko/OpenSSH-10 key
-        # exchange incompatibility (gotcha #4).
-        if netconf_open and self.config.junos_netconf_ssh:
+        # NETCONF SSH is preferred over RESTCONF for uptime (more reliable).
+        # Fallback chain: NETCONF SSH -> RESTCONF -> CLI SSH.
+        # CLI fallback adds one auth.log line per call at 5-min intervals —
+        # acceptable for lab use but RESTCONF is preferred when available.
+        if self.config.junos_netconf_ssh:
             uptime = nc_fetch_system_uptime(
                 device.ip,
                 username=self.config.ssh_user,
@@ -903,9 +899,45 @@ class JuniperBackend(DeviceBackend):
                     ).items()
                     if v
                 })
-            else:
-                # NETCONF subsystem unavailable (e.g. cRPD port 830 = plain SSH).
-                # Fall back to CLI `show system uptime` on port 22.
+            elif restconf_open and self.config.juniper.enabled:
+                # NETCONF failed but RESTCONF port is open — try RESTCONF for uptime.
+                rest_result = fetch_junos_rpc(
+                    device.ip,
+                    "get-system-uptime-information",
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    scheme=self.config.juniper.scheme,
+                    port=self.config.juniper.port,
+                    verify_tls=self.config.juniper.verify_tls,
+                    timeout=30.0,
+                )
+                if rest_result.get("ok"):
+                    parsed.update({
+                        k: v
+                        for k, v in parse_system_uptime(
+                            rest_result.get("payload") or rest_result.get("raw") or ""
+                        ).items()
+                        if v
+                    })
+                elif self.config.ssh_enabled:
+                    # RESTCONF also failed — try CLI as last resort.
+                    uptime_cli = nc_fetch_system_uptime_cli(
+                        device.ip,
+                        username=self.config.ssh_user,
+                        password=self.config.ssh_password,
+                        port=22,
+                        timeout=15.0,
+                    )
+                    if uptime_cli["ok"]:
+                        parsed.update({
+                            k: v
+                            for k, v in parse_system_uptime_cli(
+                                uptime_cli["raw"]
+                            ).items()
+                            if v
+                        })
+            elif self.config.ssh_enabled:
+                # No RESTCONF configured — try CLI directly.
                 uptime_cli = nc_fetch_system_uptime_cli(
                     device.ip,
                     username=self.config.ssh_user,
@@ -921,6 +953,60 @@ class JuniperBackend(DeviceBackend):
                         ).items()
                         if v
                     })
+        elif restconf_open and self.config.juniper.enabled:
+            # No NETCONF SSH configured but RESTCONF is available.
+            rest_result = fetch_junos_rpc(
+                device.ip,
+                "get-system-uptime-information",
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                scheme=self.config.juniper.scheme,
+                port=self.config.juniper.port,
+                verify_tls=self.config.juniper.verify_tls,
+                timeout=30.0,
+            )
+            if rest_result.get("ok"):
+                parsed.update({
+                    k: v
+                    for k, v in parse_system_uptime(
+                        rest_result.get("payload") or rest_result.get("raw") or ""
+                    ).items()
+                    if v
+                })
+            elif self.config.ssh_enabled:
+                # RESTCONF failed — try CLI as last resort.
+                uptime_cli = nc_fetch_system_uptime_cli(
+                    device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    port=22,
+                    timeout=15.0,
+                )
+                if uptime_cli["ok"]:
+                    parsed.update({
+                        k: v
+                        for k, v in parse_system_uptime_cli(
+                            uptime_cli["raw"]
+                        ).items()
+                        if v
+                    })
+        elif self.config.ssh_enabled and ssh_open:
+            # No API configured — try CLI directly.
+            uptime_cli = nc_fetch_system_uptime_cli(
+                device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=22,
+                timeout=15.0,
+            )
+            if uptime_cli["ok"]:
+                parsed.update({
+                    k: v
+                    for k, v in parse_system_uptime_cli(
+                        uptime_cli["raw"]
+                    ).items()
+                    if v
+                })
 
         return {
             "checks": {
