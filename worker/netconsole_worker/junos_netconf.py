@@ -412,3 +412,26 @@ def fetch_full_configuration(
     if not rpc_ok:
         return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
     return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
+
+
+def fetch_system_uptime(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Fetch system uptime via Junos NETCONF <get-system-uptime-information>.
+
+    Returns raw XML payload so the caller can reuse the existing
+    `parse_system_uptime` parser from device_identity_rpc.py.
+    """
+    rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><get-system-uptime-information/></rpc>'
+    ok, raw, _ms = _run_nc_rpc(host, port, username, password, rpc, timeout=timeout)
+    if not ok:
+        return {"ok": False, "stage": "rpc", "error": raw, "payload": "", "raw": ""}
+    rpc_ok, err = _parse_ok_error(raw)
+    if not rpc_ok:
+        return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
+    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}

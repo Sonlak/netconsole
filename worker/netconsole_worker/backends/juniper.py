@@ -28,6 +28,7 @@ from netconsole_worker.junos_netconf import (
     apply_set_configuration as nc_apply_set_configuration,
     fetch_full_configuration as nc_fetch_full_configuration,
     fetch_interface_configuration as nc_fetch_interface_configuration,
+    fetch_system_uptime as nc_fetch_system_uptime,
     rollback_configuration as nc_rollback_configuration,
 )
 from netconsole_worker.models import DeviceInfo
@@ -55,6 +56,7 @@ from netconsole_worker.parsers.show_interfaces import (
 )
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
 from netconsole_worker.parsers.syslog_rpc import parse_log_payload
+from netconsole_worker.parsers.device_identity_rpc import parse_system_uptime
 from netconsole_worker.parsers.show_lldp_neighbors import (
     parse_junos_lldp_neighbors_xml,
 )
@@ -872,6 +874,29 @@ class JuniperBackend(DeviceBackend):
             source = None
             message = "Neither SSH nor Junos API TCP reachable"
 
+        parsed: dict[str, Any] = {"vendor": "Juniper"}
+
+        # Fetch uptime via NETCONF-over-SSH (port 830) when available.
+        # RESTCONF uptime was unreliable (returning wrong values), so NETCONF
+        # is the preferred path.  A 20s timeout gives the device enough
+        # time to respond without blocking the managed-check loop.
+        if netconf_open and self.config.junos_netconf_ssh:
+            uptime = nc_fetch_system_uptime(
+                device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.junos_netconf_ssh_port,
+                timeout=20.0,
+            )
+            if uptime["ok"]:
+                parsed.update({
+                    k: v
+                    for k, v in parse_system_uptime(
+                        uptime["payload"] or uptime["raw"]
+                    ).items()
+                    if v
+                })
+
         return {
             "checks": {
                 "ping": True,
@@ -882,7 +907,7 @@ class JuniperBackend(DeviceBackend):
             },
             "showVersion": "",
             "showRun": "",
-            "parsed": {"vendor": "Juniper"},
+            "parsed": parsed,
             "source": source,
             "message": message,
         }
