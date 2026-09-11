@@ -26,7 +26,7 @@ import type { AddressInfo } from 'node:net';
 import { prisma } from '../lib/prisma.js';
 import {
   type LogEntry,
-  persistLogsForJob,
+  persistLogs,
 } from './logs.js';
 import {
   type ParsedSyslog,
@@ -92,28 +92,9 @@ async function resolveDeviceFromPacket(parsed: ParsedSyslog, senderIp: string | 
 }
 
 /**
- * Build a synthetic Job row for a syslog ingest batch so we get the same
- * idempotency / dedupe behaviour as job-based collection.
- *
- * Why a Job row at all? `DeviceLog.jobId @unique` ties rows to a Job. For
- * UDP-batched syslog we point all rows in the same packet at one Job so
- * retries & deletes are coherent.
- */
-async function claimSyntheticJobForPacket(deviceId: string | null): Promise<string> {
-  const job = await prisma.job.create({
-    data: {
-      deviceId,
-      type: 'GET_LOGS',
-      status: 'SUCCESS',
-      result: { source: 'syslog-udp', entries: [] },
-      error: null,
-    },
-  });
-  return job.id;
-}
-
-/**
  * Flush a batch of parsed syslog lines to the DB and fire alert matches.
+ * Logs are persisted directly into DeviceLog without a Job row so they
+ * don't appear in the jobs list.
  * Returns the number of rows actually persisted.
  */
 async function flushPacket(
@@ -138,16 +119,9 @@ async function flushPacket(
     message: entry.message,
   }));
 
-  // Only create a synthetic GET_LOGS job if at least one entry will survive
-  // the filters in persistLogsForJob.  Otherwise we pollute the job list with
-  // phantom SUCCESS jobs that have no associated DeviceLog rows.
-  const jobId = await claimSyntheticJobForPacket(device?.id ?? null);
-  const persisted = await persistLogsForJob(jobId, entries, hostname);
-  // Roll back the synthetic job if nothing was actually persisted so the job
-  // list stays clean (no phantom GET_LOGS entries with zero DeviceLog rows).
-  if (persisted === 0) {
-    await prisma.job.delete({ where: { id: jobId } }).catch(() => {/* already gone is fine */});
-  }
+  // Persist logs directly without a synthetic Job row.
+  // Logs appear in the device logs page but not in the jobs list.
+  const persisted = await persistLogs(device?.id ?? null, entries, hostname);
   if (persisted > 0) {
     // Fire alert evaluation in the background; never block the socket.
     void emitAlertsForLogs(device?.id ?? null, entries);

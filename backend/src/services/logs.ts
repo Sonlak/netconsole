@@ -328,6 +328,69 @@ function normalizeFacility(value: unknown): LogFacility {
   return FACILITY_MAP[lower] ?? 'UNKNOWN';
 }
 
+/**
+ * Persist log entries from syslog UDP receiver directly into DeviceLog.
+ * No Job row is created so these logs only appear in the device logs page,
+ * not in the jobs list.
+ */
+export async function persistLogs(deviceId: string | null, entries: LogEntry[], hostnameFallback: string): Promise<number> {
+  if (!entries.length) return 0;
+
+  const candidateRows: Prisma.DeviceLogCreateManyInput[] = [];
+  const candidateKeys = new Set<string>();
+  for (const entry of entries) {
+    const timestamp = parseTimestamp(entry.timestamp);
+    if (!timestamp) continue;
+    const severity = normalizeSeverity(entry.severity);
+    const facility = normalizeFacility(entry.facility);
+    const hostname = (entry.hostname || hostnameFallback || 'unknown').slice(0, 128);
+    const message = (entry.message || '').slice(0, 4000);
+    const key = [deviceId ?? 'unknown', timestamp.toISOString(), hostname, message].join('\u0000');
+    if (candidateKeys.has(key)) continue;
+    candidateKeys.add(key);
+    candidateRows.push({
+      deviceId,
+      hostname,
+      severity,
+      facility,
+      timestamp,
+      message,
+      program: entry.program ?? null,
+      pid: entry.pid ?? null,
+      tag: entry.tag ?? null,
+      jobId: null,
+    });
+  }
+
+  if (!candidateRows.length) return 0;
+
+  // Filter out rows that already exist in the DB (dedup within this batch)
+  const existing = await prisma.deviceLog.findMany({
+    where: {
+      deviceId,
+      OR: candidateRows.map((row) => ({
+        timestamp: row.timestamp as Date,
+        hostname: row.hostname as string,
+        message: row.message as string,
+      })),
+    },
+    select: { timestamp: true, hostname: true, message: true },
+  });
+  const existingKeys = new Set(
+    existing.map((row) => [row.timestamp.toISOString(), row.hostname, row.message].join('\u0000')),
+  );
+
+  const data = candidateRows.filter((row) => {
+    const key = [(row.timestamp as Date).toISOString(), row.hostname as string, row.message as string].join('\u0000');
+    return !existingKeys.has(key);
+  });
+
+  if (!data.length) return 0;
+
+  const result = await prisma.deviceLog.createMany({ data });
+  return result.count;
+}
+
 export async function persistLogsForJob(jobId: string, entries: LogEntry[], hostnameFallback: string): Promise<number> {
   const job = await prisma.job.findUnique({ where: { id: jobId }, include: { device: true } });
   if (!job) return 0;
