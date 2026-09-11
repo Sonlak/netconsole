@@ -53,7 +53,7 @@ function getRoleMeta(role: string) {
 function formatDateTime(value: string | null | undefined): string {
   if (!value) return '—';
   try {
-    return new Date(value).toLocaleString();
+    return new Date(value).toLocaleString(undefined, { timeZone: 'Asia/Ho_Chi_Minh' });
   } catch {
     return '—';
   }
