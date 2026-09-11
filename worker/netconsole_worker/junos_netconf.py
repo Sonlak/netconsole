@@ -153,6 +153,12 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
     """
     raw_lower = raw.lower()
 
+    # Strip namespace prefixes so element-name checks work regardless of
+    # whether the device returns <element> or <nc:element> / <junos:element>.
+    # We remove  "prefix:"  from opening tags and closing tags only — this
+    # leaves xmlns attributes and their values untouched.
+    raw_ns_stripped = re.sub(r"</?[\w.-]+:", lambda m: m.group(0).rpartition(":")[0] + ":", raw_lower)
+
     # Extract any error message first — if present, this takes precedence
     # over a generic <ok/> that may appear in the same <rpc-reply>.
     m = re.search(
@@ -199,15 +205,16 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
         return True, ""
     # <get-system-uptime-information> and other read-only RPCs don't carry
     # <ok/> either — they ship data payloads. Treat any reply that has a known
-    # data element and no error markers as success.
+    # data element and no error markers as success.  Use raw_ns_stripped so
+    # prefixed elements (e.g. <nc:system-uptime-information>) also match.
     if (
         (
-            "<system-uptime-information" in raw_lower
-            or "<system-information" in raw_lower
-            or "<software-information" in raw_lower
-            or "<chassis-inventory" in raw_lower
-            or "<interface-information" in raw_lower
-            or "<lldp-neighbors-information" in raw_lower
+            "<system-uptime-information" in raw_ns_stripped
+            or "<system-information" in raw_ns_stripped
+            or "<software-information" in raw_ns_stripped
+            or "<chassis-inventory" in raw_ns_stripped
+            or "<interface-information" in raw_ns_stripped
+            or "<lldp-neighbors-information" in raw_ns_stripped
         )
         and "<rpc-error" not in raw_lower
         and "<error-message" not in raw_lower
