@@ -64,12 +64,7 @@ function parseTimestamp(value: string | undefined): Date | null {
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
-  // "Sep  3 01:23:45" — RFC 3164 BSD-style timestamps carry no TZ.
-  // Our Junos / Arista / Cisco fleet all runs Asia/Ho_Chi_Minh (UTC+7),
-  // so treat the wall clock as VN local. We then convert to UTC before
-  // storing so the column stays a single uniform instant.
-  // If the candidate lands more than 7 days in the future, it must
-  // belong to last year.
+    // "Sep  3 01:23:45" — append the current year; if "future", roll back one year.
   const m = SHORT_TS_RE.exec(text);
   if (m) {
     const [, monthStr, dayStr, timeStr] = m;
@@ -77,16 +72,13 @@ function parseTimestamp(value: string | undefined): Date | null {
     if (month === undefined) return null;
     const day = Number(dayStr);
     const [hh, mm, ss] = timeStr.split(':').map(Number);
-
-    // VN fixed offset = UTC+7 (no DST). Build the local-time instant then
-    // subtract the offset so a packet stamped "Sep 11 11:14:35" is anchored
-    // to 04:14:35Z, not 11:14:35Z.
     const now = new Date();
-    const wallClock = Date.UTC(now.getUTCFullYear(), month, day, hh, mm, ss);
-    const candidate = new Date(wallClock - 7 * 3600 * 1000);
+    let year = now.getUTCFullYear();
+    const candidate = new Date(Date.UTC(year, month, day, hh, mm, ss));
+    // If the candidate is more than 7 days in the future, it must belong to last year.
     if (candidate.getTime() - now.getTime() > 7 * 86400 * 1000) {
-      const lastYear = Date.UTC(now.getUTCFullYear() - 1, month, day, hh, mm, ss);
-      return new Date(lastYear - 7 * 3600 * 1000);
+      year -= 1;
+      return new Date(Date.UTC(year, month, day, hh, mm, ss));
     }
     return candidate;
   }
