@@ -53,6 +53,7 @@ const corsOptions: cors.CorsOptions = {
 const app = express();
 const port = Number(process.env.PORT) || 3000;
 const pingIntervalSeconds = Number(process.env.PING_INTERVAL_SECONDS) || 60;
+const managedCheckIntervalSeconds = Number(process.env.MANAGED_CHECK_INTERVAL_SECONDS) || 300;
 const macCollectIntervalSeconds = Number(process.env.MAC_COLLECT_INTERVAL_SECONDS) || 900;
 const arpCollectIntervalSeconds = Number(process.env.ARP_COLLECT_INTERVAL_SECONDS) || 900;
 const interfacesCollectIntervalSeconds =
@@ -85,8 +86,8 @@ const httpServer = app.listen(port, () => {
 
   scheduleDevicePing(pingIntervalSeconds);
   console.log(`Ping monitor enabled (every ${pingIntervalSeconds}s)`);
-  scheduleManagedCheck(pingIntervalSeconds);
-  console.log(`Managed check enabled (every ${pingIntervalSeconds}s)`);
+  scheduleManagedCheck(managedCheckIntervalSeconds);
+  console.log(`Managed check enabled (every ${managedCheckIntervalSeconds}s)`);
   scheduleMacCollection(macCollectIntervalSeconds);
   console.log(`MAC auto-collect enabled (every ${macCollectIntervalSeconds}s)`);
   scheduleArpCollection(arpCollectIntervalSeconds);
