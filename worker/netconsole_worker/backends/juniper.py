@@ -59,7 +59,7 @@ from netconsole_worker.parsers.vlan_rpc import (
     apply_vlan_membership,
     parse_vlan_information_rpc,
 )
-from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
+from netconsole_worker.probe import probe_rest_or_netconf
 from netconsole_worker.ssh_client import run_ssh_command
 
 logger = logging.getLogger(__name__)
