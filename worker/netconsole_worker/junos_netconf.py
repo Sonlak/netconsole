@@ -407,6 +407,78 @@ def fetch_interface_configuration(
     return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
 
 
+def fetch_system_uptime_cli(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 22,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Fetch system uptime via Junos CLI `show system uptime` over SSH.
+
+    This is a fallback when NETCONF-over-SSH is unavailable (e.g. cRPD lab
+    devices where port 830 is forwarded to plain OpenSSH instead of the Junos
+    NETCONF subsystem).  Uses subprocess/sshpass to avoid the
+    paramiko/OpenSSH-10 key-exchange incompatibility (gotcha #4).  One
+    auth.log entry per call is acceptable for lab use at 5-min intervals.
+
+    Returns raw CLI output so the caller can reuse `parse_system_uptime`.
+    """
+    safe_pass = password.replace("'", "'\"'\"'")
+    script_content = (
+        "#!/bin/bash\n"
+        'exec /usr/bin/sshpass -p \'' + safe_pass + '\' ssh '
+        "-o StrictHostKeyChecking=no "
+        "-o ConnectTimeout=10 "
+        "-o PreferredAuthentications=password "
+        "-o PubkeyAuthentication=no "
+        "-o BatchMode=no "
+        "-T "
+        f"{username}@{host} -p {port} "
+        "'show system uptime'\n"
+    )
+    start = time.monotonic()
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sh", delete=False
+        ) as f:
+            f.write(script_content)
+            script_path = f.name
+        os.chmod(script_path, 0o700)
+    except Exception as exc:
+        return {"ok": False, "stage": "script", "error": f"failed to create script: {exc}", "payload": "", "raw": ""}
+
+    try:
+        result = subprocess.run(
+            ["/bin/bash", script_path],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        ms = int((time.monotonic() - start) * 1000)
+        return {"ok": False, "stage": "cli", "error": f"timeout after {timeout}s", "payload": "", "raw": ""}
+    except Exception as exc:
+        os.unlink(script_path)
+        return {"ok": False, "stage": "cli", "error": f"failed to run script: {exc}", "payload": "", "raw": ""}
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+    ms = int((time.monotonic() - start) * 1000)
+    raw = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+
+    if "Permission denied" in stderr or "Authentication" in stderr:
+        return {"ok": False, "stage": "cli", "error": "authentication failed", "payload": "", "raw": raw}
+    if not raw or "System booted" not in raw:
+        return {"ok": False, "stage": "cli", "error": "empty or unexpected output", "payload": "", "raw": raw}
+
+    return {"ok": True, "stage": "cli", "error": None, "payload": raw, "raw": raw, "ms": ms}
+
+
 def fetch_full_configuration(
     host: str,
     *,

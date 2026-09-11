@@ -29,6 +29,7 @@ from netconsole_worker.junos_netconf import (
     fetch_full_configuration as nc_fetch_full_configuration,
     fetch_interface_configuration as nc_fetch_interface_configuration,
     fetch_system_uptime as nc_fetch_system_uptime,
+    fetch_system_uptime_cli as nc_fetch_system_uptime_cli,
     rollback_configuration as nc_rollback_configuration,
 )
 from netconsole_worker.models import DeviceInfo
@@ -56,7 +57,7 @@ from netconsole_worker.parsers.show_interfaces import (
 )
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
 from netconsole_worker.parsers.syslog_rpc import parse_log_payload
-from netconsole_worker.parsers.device_identity_rpc import parse_system_uptime
+from netconsole_worker.parsers.device_identity_rpc import parse_system_uptime, parse_system_uptime_cli
 from netconsole_worker.parsers.show_lldp_neighbors import (
     parse_junos_lldp_neighbors_xml,
 )
@@ -880,6 +881,12 @@ class JuniperBackend(DeviceBackend):
         # RESTCONF uptime was unreliable (returning wrong values), so NETCONF
         # is the preferred path.  A 20s timeout gives the device enough
         # time to respond without blocking the managed-check loop.
+        #
+        # Fallback: if NETCONF fails (e.g. port 830 is OpenSSH instead of
+        # Junos NETCONF subsystem on cRPD lab devices), try CLI via sshpass+ssh.
+        # CLI fallback adds one auth.log line per call at 5-min intervals — still
+        # acceptable for lab use.  This also avoids the paramiko/OpenSSH-10 key
+        # exchange incompatibility (gotcha #4).
         if netconf_open and self.config.junos_netconf_ssh:
             uptime = nc_fetch_system_uptime(
                 device.ip,
@@ -896,6 +903,24 @@ class JuniperBackend(DeviceBackend):
                     ).items()
                     if v
                 })
+            else:
+                # NETCONF subsystem unavailable (e.g. cRPD port 830 = plain SSH).
+                # Fall back to CLI `show system uptime` on port 22.
+                uptime_cli = nc_fetch_system_uptime_cli(
+                    device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    port=22,
+                    timeout=15.0,
+                )
+                if uptime_cli["ok"]:
+                    parsed.update({
+                        k: v
+                        for k, v in parse_system_uptime_cli(
+                            uptime_cli["raw"]
+                        ).items()
+                        if v
+                    })
 
         return {
             "checks": {

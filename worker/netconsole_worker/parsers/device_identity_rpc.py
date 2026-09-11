@@ -156,6 +156,79 @@ def parse_system_uptime(payload: Any) -> dict[str, str]:
     return parsed
 
 
+def parse_system_uptime_cli(raw: str) -> dict[str, str]:
+    """Parse `show system uptime` plain-text output into seconds + display text.
+
+    Expected format (one of):
+      System booted: 2026-09-10 14:41:30 +07 (1d 05:49 ago)
+      System booted: 2026-09-10 14:41:30 +07 (5 days, 5:49:41)
+    """
+    import datetime, re
+
+    parsed: dict[str, str] = {}
+
+    # Match "System booted: YYYY-MM-DD HH:MM:SS"
+    m = re.search(r"System booted:\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})", raw)
+    if not m:
+        return parsed
+
+    try:
+        booted = datetime.datetime(
+            int(m.group(1)), int(m.group(2)), int(m.group(3)),
+            int(m.group(4)), int(m.group(5)), int(m.group(6)),
+        )
+    except ValueError:
+        return parsed
+
+    # Match "Current time: YYYY-MM-DD HH:MM:SS"
+    now_m = re.search(
+        r"Current time:\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})", raw
+    )
+    if now_m:
+        try:
+            now = datetime.datetime(
+                int(now_m.group(1)), int(now_m.group(2)), int(now_m.group(3)),
+                int(now_m.group(4)), int(now_m.group(5)), int(now_m.group(6)),
+            )
+        except ValueError:
+            now = None
+    else:
+        now = None
+
+    if now:
+        delta = now - booted
+        total_seconds = int(delta.total_seconds())
+    else:
+        # No current-time in output; use wall clock
+        total_seconds = int((datetime.datetime.now() - booted).total_seconds())
+
+    if total_seconds > 0:
+        parsed["uptimeSeconds"] = str(total_seconds)
+
+    # Extract the human label from "(X days, HH:MM:SS)" or "(Xd HH:MM:SS ago)"
+    label_m = re.search(r"\((\d+)\s*days?[,\s]+(\d+):(\d{2}):(\d{2})\)", raw)
+    if not label_m:
+        label_m = re.search(r"\((\d+d)\s+(\d+):(\d{2})\s*,?\s*(\d+):(\d{2})\)", raw)
+    if not label_m:
+        # Simple "Xd HH:MM" format
+        label_m = re.search(r"\((\d+)d\s+(\d+):(\d{2}),?\s*(\d+):(\d{2})\)", raw)
+    if label_m:
+        days = int(label_m.group(1))
+        hours = int(label_m.group(2))
+        mins = int(label_m.group(3))
+        secs = int(label_m.group(4)) if len(label_m.groups()) >= 4 else 0
+        parsed["uptime"] = f"{days}d {hours:02d}:{mins:02d}:{secs:02d}"
+    else:
+        # Fallback: compute from booted time
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        mins = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        parsed["uptime"] = f"{days}d {hours:02d}:{mins:02d}:{secs:02d}"
+
+    return parsed
+
+
 def _is_placeholder_serial(serial: str) -> bool:
     return serial.upper() in {"BUILTIN", "N/A", "UNKNOWN", ""}
 
