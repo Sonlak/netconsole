@@ -108,6 +108,39 @@ export function deviceRole(device: Device): DeviceRole {
   return 'access';
 }
 
+/** Normalize the free-form `Device.vendor` string to a vendor family.
+
+Mirrors the worker-side `detect_vendor()` in `worker/netconsole_worker/vendor.py`.
+The Prisma column is a plain String, so the seed uses title-case ("Juniper",
+"Cisco", "Arista") but historic / operator-typed rows can drift to
+"aristaEOS", "Cisco-IOS-XE", "Junos", etc. We collapse those here so the
+bulk-deploy filter stays usable. Unknown vendors map to `'unknown'`.
+*/
+export type DeviceVendorFamily = 'juniper' | 'cisco' | 'arista' | 'unknown';
+
+export function deviceVendorFamily(device: Pick<Device, 'vendor' | 'model'>): DeviceVendorFamily {
+  const v = (device.vendor || '').trim().toLowerCase();
+  const m = (device.model || '').trim().toLowerCase();
+  if (v === 'juniper' || v === 'junos' || m.includes('mx') || m.includes('ex') || m.includes('qfx') || m.includes('srx') || m.includes('junos')) {
+    return 'juniper';
+  }
+  if (v === 'cisco' || v === 'ios-xe' || v === 'iosxe' || v === 'catalyst' || v === 'nexus' || v === 'nxos' || v === 'cisco-nx-os'
+    || m.includes('catalyst') || m.includes('nexus') || m.includes('csr') || m.includes('asr') || m.includes('isr')) {
+    return 'cisco';
+  }
+  if (v === 'arista' || v === 'eos' || v === 'aristaeos' || m.includes('arista') || m.includes('dcs-') || m.includes('ceos')) {
+    return 'arista';
+  }
+  return 'unknown';
+}
+
+export const DEVICE_VENDOR_LABELS: Record<DeviceVendorFamily, string> = {
+  juniper: 'Juniper (NETCONF/RESTCONF)',
+  cisco: 'Cisco IOS-XE / NX-OS (NETCONF/SSH)',
+  arista: 'Arista EOS (eAPI)',
+  unknown: 'Unknown vendor',
+};
+
 export const BANK_DEVICES: Device[] = [];
 
 export function filterBySite(devices: Device[], site: SiteFilter): Device[] {

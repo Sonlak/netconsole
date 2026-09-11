@@ -22,6 +22,7 @@ import {
   Space,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from 'antd';
@@ -59,7 +60,7 @@ import { StatusDot } from '@/components/common/StatusDot';
 import { StaleDataBanner } from '@/components/common/StaleDataBanner';
 import { Timestamp } from '@/components/display/Timestamp';
 import ManagedChecksTags from '@/components/ManagedChecksTags';
-import { SITES, deviceFloor, deviceRole, deviceSite, floorLabel, floorNumbers, floorsMatch, isKnownSite } from '@/data/bank';
+import { SITES, deviceFloor, deviceRole, deviceSite, deviceVendorFamily, DEVICE_VENDOR_LABELS, floorLabel, floorNumbers, floorsMatch, isKnownSite, type DeviceVendorFamily } from '@/data/bank';
 import { useDevices } from '@/hooks/useDevices';
 import { useSiteFilter } from '@/hooks/useSiteFilter';
 import { toError } from '@/lib/errors';
@@ -630,6 +631,7 @@ function BulkDeployPanel() {
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
 
   type BulkMode = 'template' | 'draft';
+  type BulkVendorFilter = 'all' | DeviceVendorFamily;
 
   const [mode, setMode] = useState<BulkMode>('template');
   const [role, setRole] = useState<Exclude<ConfigRole, 'custom'>>('access');
@@ -637,6 +639,13 @@ function BulkDeployPanel() {
   const [floorFilter, setFloorFilter] = useState('');
   const [search, setSearch] = useState('');
   const [managedOnly, setManagedOnly] = useState(true);
+  // Vendor filter — collapses Device.vendor's free-form string to one of
+  // juniper / cisco / arista / unknown. The worker dispatches on the
+  // same families in `vendor.py::select_backend`, so the UI label here
+  // matches the runtime that will actually push the config.
+  // `all` = no filter (default — preserves pre-filter behaviour for
+  // existing operators who mix vendors in one bulk).
+  const [vendorFilter, setVendorFilter] = useState<BulkVendorFilter>('all');
   const [selected, setSelected] = useState<string[]>([]);
   const [previewDeviceId, setPreviewDeviceId] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState('');
@@ -646,29 +655,39 @@ function BulkDeployPanel() {
   const [trackedJobs, setTrackedJobs] = useState<BulkDeployQueuedJob[] | null>(null);
   const [trackerOpen, setTrackerOpen] = useState(false);
 
-  // Devices in scope for the chosen role (+ site + floor + search + managed-only).
+  // Devices in scope for the chosen role (+ site + floor + search + managed-only + vendor).
   // In draft mode every role is in scope — the user is writing their own
-  // config, so role-based filtering doesn't apply.
+  // config, so role-based filtering doesn't apply. Vendor filter is
+  // applied in both modes: pushing the same Junos `set` lines to an EOS
+  // box would silently fail on the device, so we hide cross-vendor
+  // candidates up front.
   const candidates = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return devices
       .filter((d) => mode === 'draft' || deviceRole(d) === role)
       .filter((d) => site === 'all' || deviceSite(d) === site)
       .filter((d) => !floorFilter || floorsMatch(d, floorFilter))
+      .filter((d) => vendorFilter === 'all' || deviceVendorFamily(d) === vendorFilter)
       .filter((d) => !needle || `${d.name} ${d.ip}`.toLowerCase().includes(needle))
       .filter((d) => !managedOnly || d.status === 'MANAGED');
-  }, [devices, role, site, floorFilter, search, managedOnly, mode]);
+  }, [devices, role, site, floorFilter, search, managedOnly, mode, vendorFilter]);
 
   // Floor options scoped to the chosen role so the dropdown doesn't offer
   // empty buckets ("ACCESS at F12" when no access switch lives on F12).
+  // Vendor filter applied too — same rationale as `candidates`.
   const floorOptions = useMemo(() => {
     const inScope =
       mode === 'draft'
-        ? devices.filter((d) => site === 'all' || deviceSite(d) === site)
-        : devices.filter((d) => deviceRole(d) === role && (site === 'all' || deviceSite(d) === site));
+        ? devices.filter((d) => (site === 'all' || deviceSite(d) === site) && (vendorFilter === 'all' || deviceVendorFamily(d) === vendorFilter))
+        : devices.filter(
+            (d) =>
+              deviceRole(d) === role &&
+              (site === 'all' || deviceSite(d) === site) &&
+              (vendorFilter === 'all' || deviceVendorFamily(d) === vendorFilter),
+          );
     const set = new Set(inScope.map((d) => deviceFloor(d)).filter(Boolean));
     return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  }, [devices, role, site, mode]);
+  }, [devices, role, site, mode, vendorFilter]);
 
   // Stats per role for the segmented header.
   const roleCounts = useMemo(() => {
@@ -684,6 +703,27 @@ function BulkDeployPanel() {
     }
     return out;
   }, [devices]);
+
+  // Stats per vendor family. Mirrors the worker's select_backend dispatch
+  // (juniper → JuniperBackend, cisco → IOSxeBackend, arista → EOSBackend,
+  // unknown → JuniperBackend fallback). Counts are scoped to the same
+  // site/role so they update as filters narrow. Used to label the
+  // dropdown options so operators can tell at a glance "this set is
+  // 12 Juniper + 3 Arista" before picking.
+  const vendorCounts = useMemo(() => {
+    const out: Record<DeviceVendorFamily, number> = {
+      juniper: 0,
+      cisco: 0,
+      arista: 0,
+      unknown: 0,
+    };
+    for (const d of devices) {
+      if (mode !== 'draft' && deviceRole(d) !== role) continue;
+      if (site !== 'all' && deviceSite(d) !== site) continue;
+      out[deviceVendorFamily(d)] += 1;
+    }
+    return out;
+  }, [devices, role, site, mode]);
 
   // Drop selections that fell out of the candidate set (e.g. floor changed).
   useEffect(() => {
@@ -759,6 +799,25 @@ function BulkDeployPanel() {
   const draftValid = mode === 'draft' ? draft.trim().length > 0 : true;
   const canDeploy = selectedDevices.length > 0 && managedSelected > 0 && draftValid;
 
+  // Vendor guardrail. The worker dispatches on device.vendor at job time
+  // via `select_backend`. If the selected set contains more than one
+  // vendor family, the backend will still accept the bulk request (each
+  // device gets its own job), but the same `set`/CLI text will be sent
+  // to each device. That works fine in template mode (templates are
+  // vendor-agnostic — backend renders per-device hostname/IP only) but
+  // in draft mode it would push literal text to all of them. We warn
+  // loudly when the user is in draft mode with a mixed-vendor set so
+  // they don't accidentally push Junos `set` lines to an EOS box.
+  const selectedVendorFamilies = useMemo(() => {
+    const set = new Set<DeviceVendorFamily>();
+    for (const d of selectedDevices) {
+      set.add(deviceVendorFamily(d));
+    }
+    return set;
+  }, [selectedDevices]);
+  const mixedVendor = selectedVendorFamilies.size > 1;
+  const draftMixedVendorWarning = mode === 'draft' && mixedVendor;
+
   const deployDescription = () => {
     if (mode === 'template') {
       return (
@@ -791,6 +850,25 @@ function BulkDeployPanel() {
       content: (
         <div>
           {deployDescription()}
+          {draftMixedVendorWarning ? (
+            <Alert
+              showIcon
+              type="error"
+              style={{ marginBottom: 8 }}
+              message="Selected devices span multiple vendors"
+              description={
+                <span>
+                  The literal draft below will be pushed verbatim to every selected device.
+                  The vendor family of each selected device:
+                  {' '}
+                  <strong>{Array.from(selectedVendorFamilies).map((v) => DEVICE_VENDOR_LABELS[v]).join(', ')}</strong>.
+                  A single `set`-style / IOS-CLI / EOS block cannot fit all of these.
+                  Apply the <strong>Vendor</strong> filter on the left to narrow the selection
+                  to one vendor family, or switch to <strong>Template</strong> mode.
+                </span>
+              }
+            />
+          ) : null}
           {unmanagedSelected > 0 ? (
             <Alert
               showIcon
@@ -898,6 +976,25 @@ function BulkDeployPanel() {
             onChange={setFloorFilter}
             options={[{ value: '', label: 'All floors' }, ...floorOptions.map((value) => ({ value, label: value }))]}
           />
+          <Tooltip
+            title="Filter by device vendor. Worker dispatches to the matching backend (Juniper→RESTCONF/NETCONF, Cisco→NETCONF/SSH, Arista→eAPI)."
+            placement="topLeft"
+          >
+            <Select
+              value={vendorFilter}
+              style={{ width: 220 }}
+              onChange={(value) => setVendorFilter(value as BulkVendorFilter)}
+              options={[
+                { value: 'all', label: `All vendors (${devices.length})` },
+                { value: 'juniper', label: `Juniper (${vendorCounts.juniper})` },
+                { value: 'cisco', label: `Cisco (${vendorCounts.cisco})` },
+                { value: 'arista', label: `Arista (${vendorCounts.arista})` },
+                ...(vendorCounts.unknown > 0
+                  ? [{ value: 'unknown', label: `Unknown (${vendorCounts.unknown})` }]
+                  : []),
+              ]}
+            />
+          </Tooltip>
           <Input
             prefix={<FilterOutlined />}
             placeholder="Search name or IP"
@@ -919,6 +1016,12 @@ function BulkDeployPanel() {
           ) : (
             <>across all roles</>
           )}
+          {vendorFilter !== 'all' ? (
+            <>
+              {' '}
+              · vendor: <Tag color="purple" style={{ marginInline: 0 }}>{DEVICE_VENDOR_LABELS[vendorFilter]}</Tag>
+            </>
+          ) : null}
           {managedOnly ? ' (managed only)' : ''}. Selected {selected.length}.
         </Typography.Paragraph>
       </Card>
