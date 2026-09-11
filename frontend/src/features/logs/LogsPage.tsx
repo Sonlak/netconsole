@@ -59,14 +59,18 @@ const SEVERITY_OPTIONS = LOG_SEVERITY_ORDER.map((value) => ({
 
 function formatTimestamp(value: string): string {
   try {
-    return new Date(value).toLocaleString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
+    // Parse the ISO string as UTC and extract components directly.
+    // DB stores UTC instants; show exactly what is stored — no browser-tz conversion.
+    const date = new Date(value.endsWith('Z') ? value : value + 'Z');
+    if (Number.isNaN(date.getTime())) return value;
+    const y = date.getUTCFullYear();
+    const mo = date.getUTCMonth() + 1;
+    const d = date.getUTCDate();
+    const hh = date.getUTCHours();
+    const mi = date.getUTCMinutes();
+    const ss = date.getUTCSeconds();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${y}-${pad(mo)}-${pad(d)} ${pad(hh)}:${pad(mi)}:${pad(ss)}`;
   } catch {
     return value;
   }
