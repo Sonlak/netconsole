@@ -1,4 +1,4 @@
-"""Parser for `show lldp neighbors` CLI output across Juniper / IOS-XE / EOS.
+"""Parser for `show lldp neighbors` CLI output and NETCONF XML across Juniper / IOS-XE / EOS.
 
 LLDP is the ground truth for physical link topology — it tells us
 exactly which port on the local device connects to which port on the
@@ -57,6 +57,45 @@ def parse_junos_lldp_neighbors(output: str) -> list[dict[str, str]]:
             "remoteDeviceId": m.group("device_id"),
             "remotePort": m.group("remote_port"),
             "chassisId": m.group("chassis"),
+        })
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Juniper: NETCONF XML "get-lldp-interface-information"
+#
+#   <lldp-neighbor-information>
+#     <lldp-local-port>ge-0/0/1</lldp-local-port>
+#     <lldp-remote-system-name>LAB-F1-DS01</lldp-remote-system-name>
+#     <lldp-remote-port-description>ge-0/0/1</lldp-remote-port-description>
+#     <lldp-chassis-id>00:00:5e:00:53:01</lldp-chassis-id>
+#   </lldp-neighbor-information>
+# ---------------------------------------------------------------------------
+
+_LLDP_NEIGHBOR_RE = re.compile(
+    r"<lldp-neighbor-information>(.*?)</lldp-neighbor-information>",
+    re.DOTALL | re.IGNORECASE,
+)
+_LLDP_FIELD_RE = re.compile(
+    r"<(?P<key>lldp-local-port|lldp-remote-system-name|lldp-remote-port-description|lldp-chassis-id)>(?P<val>[^<]*)</(?P=key)>",
+    re.IGNORECASE,
+)
+
+
+def parse_junos_lldp_neighbors_xml(raw: str) -> list[dict[str, str]]:
+    """Parse Junos NETCONF `get-lldp-interface-information` XML output."""
+    entries: list[dict[str, str]] = []
+    for block in _LLDP_NEIGHBOR_RE.findall(raw):
+        fields: dict[str, str] = {}
+        for m in _LLDP_FIELD_RE.findall(block):
+            fields[m[0].lower()] = m[1].strip()
+        if not fields:
+            continue
+        entries.append({
+            "localPort": fields.get("lldp-local-port", ""),
+            "remoteDeviceId": fields.get("lldp-remote-system-name", ""),
+            "remotePort": fields.get("lldp-remote-port-description", ""),
+            "chassisId": fields.get("lldp-chassis-id", ""),
         })
     return entries
 

@@ -55,6 +55,9 @@ from netconsole_worker.parsers.show_interfaces import (
 )
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table
 from netconsole_worker.parsers.syslog_rpc import parse_log_payload
+from netconsole_worker.parsers.show_lldp_neighbors import (
+    parse_junos_lldp_neighbors_xml,
+)
 from netconsole_worker.parsers.vlan_rpc import (
     apply_vlan_membership,
     parse_vlan_information_rpc,
@@ -885,18 +888,55 @@ class JuniperBackend(DeviceBackend):
         }
 
     def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
-        """Collect LLDP neighbours via SSH CLI `show lldp neighbors`.
+        """Collect LLDP neighbours via NETCONF-over-SSH (port 830).
 
         LLDP tells us which port on this device connects to which port on the
         remote device — the ground-truth link map for the Floor/Fabric topology.
-        Falls back gracefully when LLDP is not enabled on the device.
+        Falls back to CLI SSH (port 22) when NETCONF SSH is disabled.
+        NETCONF-over-SSH (port 830) does NOT write to Junos auth.log, unlike
+        plain SSH CLI connections to port 22.
         """
+        # --- Try NETCONF-over-SSH (port 830, no auth.log noise) ---
+        if self.config.junos_netconf_ssh:
+            from netconsole_worker.junos_netconf import _run_nc_rpc
+
+            rpc = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<rpc>"
+                "<get-lldp-interface-information "
+                'xmlns="http://xml.juniper.net/junos/release/junos-lldp"/>'
+                "</rpc>"
+            )
+            ok, raw, ms = _run_nc_rpc(
+                device.ip,
+                self.config.junos_netconf_ssh_port,
+                self.config.ssh_user,
+                self.config.ssh_password,
+                rpc,
+                timeout=20.0,
+            )
+            if ok:
+                neighbors = parse_junos_lldp_neighbors_xml(raw)
+                return {
+                    "implemented": True,
+                    "source": "netconf-ssh",
+                    "command": "get-lldp-interface-information",
+                    "neighbors": neighbors,
+                    "message": (
+                        f"LLDP NETCONF OK ({len(neighbors)} neighbours)"
+                        if neighbors
+                        else "LLDP NETCONF OK (no neighbours)"
+                    ),
+                    "raw": raw,
+                }
+
+        # --- Fallback: CLI SSH (port 22, writes to auth.log) ---
         if not self.config.ssh_enabled:
             return {
                 "implemented": False,
                 "source": None,
                 "neighbors": [],
-                "message": "SSH not enabled (LAB_SSH=false)",
+                "message": "SSH not enabled (LAB_SSH=false) and NETCONF SSH not enabled",
             }
 
         ssh_result = run_ssh_command(
@@ -915,7 +955,9 @@ class JuniperBackend(DeviceBackend):
                 "message": f"LLDP SSH failed: {ssh_result['error']}",
             }
 
-        from netconsole_worker.parsers.show_lldp_neighbors import parse_junos_lldp_neighbors
+        from netconsole_worker.parsers.show_lldp_neighbors import (
+            parse_junos_lldp_neighbors,
+        )
 
         neighbors = parse_junos_lldp_neighbors(ssh_result["output"] or "")
         return {
@@ -923,7 +965,7 @@ class JuniperBackend(DeviceBackend):
             "source": "ssh-cli",
             "command": "show lldp neighbors",
             "neighbors": neighbors,
-            "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
+            "message": f"LLDP CLI OK ({len(neighbors)} neighbours)" if neighbors else "LLDP CLI OK (no neighbours)",
             "raw": ssh_result["output"],
         }
 
