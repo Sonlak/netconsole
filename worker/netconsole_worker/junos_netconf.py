@@ -197,6 +197,22 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
         and "<error-message" not in raw_lower
     ):
         return True, ""
+    # <get-system-uptime-information> and other read-only RPCs don't carry
+    # <ok/> either — they ship data payloads. Treat any reply that has a known
+    # data element and no error markers as success.
+    if (
+        (
+            "<system-uptime-information" in raw_lower
+            or "<system-information" in raw_lower
+            or "<software-information" in raw_lower
+            or "<chassis-inventory" in raw_lower
+            or "<interface-information" in raw_lower
+            or "<lldp-neighbors-information" in raw_lower
+        )
+        and "<rpc-error" not in raw_lower
+        and "<error-message" not in raw_lower
+    ):
+        return True, ""
     return False, "Unknown NETCONF error"
 
 
