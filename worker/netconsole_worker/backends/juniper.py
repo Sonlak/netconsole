@@ -828,7 +828,15 @@ class JuniperBackend(DeviceBackend):
         # configuration | display set`. The old implementation pushed
         # the full set-format config on every probe, which flooded
         # auth.log and burned SSH pool slots.
-        ssh_open = probe_ssh(device.ip, self.config.ssh_port)
+        # Probe API ports only (830 = NETCONF SSH, 8443 = RESTCONF).
+        # Port 22 (plain SSH) is intentionally excluded: a TCP connect to
+        # port 22 still triggers Junos sshd, which writes to auth.log even
+        # when the connection is dropped immediately (status 255). Since the
+        # "fully managed" gate is now `ping + rest` (isFullyManaged), the
+        # ssh: True/False flag is informational only — no operational logic
+        # depends on it, so skipping port 22 eliminates the auth.log noise
+        # without any functional change.
+        ssh_open = False
         netconf_open = (
             probe_rest_or_netconf(
                 device.ip, self.config.junos_netconf_ssh_port, timeout=1.5
