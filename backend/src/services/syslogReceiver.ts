@@ -127,7 +127,6 @@ async function flushPacket(
   const device = await resolveDeviceFromPacket(probe, senderIp);
 
   const hostname = device?.name ?? probe.hostname ?? DEFAULT_OPTS.hostnameFallback;
-  const jobId = await claimSyntheticJobForPacket(device?.id ?? null);
   const entries: LogEntry[] = parsed.map((entry) => ({
     timestamp: entry.timestamp.toISOString(),
     severity: entry.severity,
@@ -139,7 +138,16 @@ async function flushPacket(
     message: entry.message,
   }));
 
+  // Only create a synthetic GET_LOGS job if at least one entry will survive
+  // the filters in persistLogsForJob.  Otherwise we pollute the job list with
+  // phantom SUCCESS jobs that have no associated DeviceLog rows.
+  const jobId = await claimSyntheticJobForPacket(device?.id ?? null);
   const persisted = await persistLogsForJob(jobId, entries, hostname);
+  // Roll back the synthetic job if nothing was actually persisted so the job
+  // list stays clean (no phantom GET_LOGS entries with zero DeviceLog rows).
+  if (persisted === 0) {
+    await prisma.job.delete({ where: { id: jobId } }).catch(() => {/* already gone is fine */});
+  }
   if (persisted > 0) {
     // Fire alert evaluation in the background; never block the socket.
     void emitAlertsForLogs(device?.id ?? null, entries);
