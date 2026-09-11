@@ -64,7 +64,9 @@ function parseTimestamp(value: string | undefined): Date | null {
     return Number.isNaN(date.getTime()) ? null : date;
   }
 
-    // "Sep  3 01:23:45" — append the current year; if "future", roll back one year.
+    // "Sep  3 01:23:45" — Junos sends local time (not UTC).
+  // Build a local-interpreted Date so it stores & displays correctly
+  // without a 7-hour offset on a UTC+7 browser.
   const m = SHORT_TS_RE.exec(text);
   if (m) {
     const [, monthStr, dayStr, timeStr] = m;
@@ -73,12 +75,14 @@ function parseTimestamp(value: string | undefined): Date | null {
     const day = Number(dayStr);
     const [hh, mm, ss] = timeStr.split(':').map(Number);
     const now = new Date();
-    let year = now.getUTCFullYear();
-    const candidate = new Date(Date.UTC(year, month, day, hh, mm, ss));
+    let year = now.getFullYear();
+    // Use the local-time constructor so the Date represents the wall-clock
+    // time Junos sent, not a UTC-shifted version of it.
+    const candidate = new Date(year, month, day, hh, mm, ss);
     // If the candidate is more than 7 days in the future, it must belong to last year.
     if (candidate.getTime() - now.getTime() > 7 * 86400 * 1000) {
       year -= 1;
-      return new Date(Date.UTC(year, month, day, hh, mm, ss));
+      return new Date(year, month, day, hh, mm, ss);
     }
     return candidate;
   }
