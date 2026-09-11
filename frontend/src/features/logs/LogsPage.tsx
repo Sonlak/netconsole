@@ -59,16 +59,14 @@ const SEVERITY_OPTIONS = LOG_SEVERITY_ORDER.map((value) => ({
 
 function formatTimestamp(value: string): string {
   try {
-    return new Date(value).toLocaleString('en-GB', {
+    return new Date(value).toLocaleString(undefined, {
       year: 'numeric',
       month: 'short',
       day: '2-digit',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
-      hour12: false,
-      timeZone: 'Asia/Ho_Chi_Minh',
-    }).replace(',', '');
+    });
   } catch {
     return value;
   }
