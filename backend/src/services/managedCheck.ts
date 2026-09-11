@@ -158,7 +158,7 @@ export async function startManagedCheckAll() {
 }
 
 export function isFullyManaged(checks: ManagedChecks): boolean {
-  // Gate is now `ping + ssh + rest` (TCP-reachable ports). The previous
+  // Gate is now `ping + rest` (TCP-reachable API ports). The previous
   // implementation also required `showVersion` + `showRun` to be true,
   // which meant the probe had to actually SSH login and pull
   // `show running-config` on every check — that burned 2 SSH sessions
@@ -166,7 +166,12 @@ export function isFullyManaged(checks: ManagedChecks): boolean {
   // TCP connect (see worker/netconsole_worker/probe.py), so the gate
   // is correspondingly lighter. showVersion/showRun stay in the shape
   // for back-compat but are always false in the worker output.
-  return Boolean(checks.ping && checks.ssh && checks.rest);
+  //
+  // The `ssh` field (plain SSH port 22) is no longer probed for Juniper
+  // (auth.log noise). The relevant API ports (830=NETCONF-SSH, 8443=RESTCONF,
+  // 443=eAPI) are already covered by the `rest` field, so the gate
+  // becomes `ping && rest`.
+  return Boolean(checks.ping && checks.rest);
 }
 
 export async function applyManagedCheckResult(job: Job) {
