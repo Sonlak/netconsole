@@ -371,6 +371,14 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     // Capture status snapshot for ws.onclose (runs outside React)
     let wasConnected = false;
 
+    // Open terminal immediately — container is rendered in 'connecting' state
+    // This ensures xterm.js is ready before SSH data arrives
+    if (containerRef.current) {
+      term.open(containerRef.current);
+      fit.fit();
+      term.write('Connecting to ' + deviceIp + '...\r\n');
+    }
+
     ws.onopen = () => {
       console.log('[terminal] WS open');
       connectingRef.current = false;
@@ -379,24 +387,12 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
-      console.log('[terminal] WS msg:', msg.type, msg.type === 'data' ? 'len=' + (msg.data?.length || 0) : '');
       switch (msg.type) {
         case 'ready':
           wasConnected = true;
           connectingRef.current = false;
-          console.log('[terminal] received ready, opening xterm...');
           setStatus('connected');
-          // State update is async — defer terminal open until React re-renders
-          setTimeout(() => {
-            console.log('[terminal] xterm.open, container:', containerRef.current?.clientHeight, 'containerHTML:', containerRef.current?.innerHTML?.slice(0, 50));
-            if (containerRef.current) {
-              term.open(containerRef.current);
-              fit.fit();
-              console.log('[terminal] xterm opened, rows:', term.rows, 'cols:', term.cols);
-            } else {
-              console.error('[terminal] container not found!');
-            }
-          }, 0);
+          term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
           break;
         case 'data':
           term.write(msg.data);
@@ -404,7 +400,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         case 'error':
           setErrorMsg(msg.message);
           setStatus('error');
-          term.writeln(`\r\n\x1b[31m[ERROR] ${msg.message}\x1b[0m\r\n`);
+          term.writeln('\r\n\x1b[31m[ERROR] ' + msg.message + '\x1b[0m\r\n');
           break;
         case 'closed':
           term.writeln('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n');
@@ -471,7 +467,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   }, []);
 
   // ── Idle / error state — prompt card
-  if (status === 'idle' || status === 'connecting' || status === 'error') {
+  if (status === 'idle' || status === 'error') {
     return (
       <Card style={{ maxWidth: 520, margin: '24px auto' }}>
         <Typography.Title level={5}>SSH Terminal — {deviceName}</Typography.Title>
@@ -499,35 +495,21 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
             Sessions are logged for audit compliance.
           </Typography.Text>
 
-          <Button
-            type="primary"
-            onClick={() => void doConnect()}
-            loading={status === 'connecting'}
-            block
-          >
-            {status === 'connecting' ? 'Connecting…' : 'Connect'}
+          <Button type="primary" onClick={() => void doConnect()} block>
+            Connect
           </Button>
-
-          {status === 'idle' && (
-            <Button
-              onClick={() => void doConnect()}
-              block
-            >
-              Retry
-            </Button>
-          )}
         </Space>
       </Card>
     );
   }
 
-  // ── Connected — show terminal
+  // ── Connecting or connected — always show terminal
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
       <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040', flexShrink: 0 }}>
         <Space>
-          <Typography.Text style={{ color: '#52c41a', fontSize: 12 }}>
-            Connected to {deviceName} ({deviceIp})
+          <Typography.Text style={{ color: status === 'connected' ? '#52c41a' : '#faad14', fontSize: 12 }}>
+            {status === 'connected' ? 'Connected' : 'Connecting…'} to {deviceName} ({deviceIp})
           </Typography.Text>
           <Button
             size="small"

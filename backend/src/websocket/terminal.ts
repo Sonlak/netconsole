@@ -124,7 +124,7 @@ export function startTerminalWebSocket(httpServer: Server) {
 
       switch (msg.type) {
         case 'connect': {
-          console.log(`[terminal] received connect msg`);
+          console.log(`[terminal] received connect msg, deviceIp=${msg.deviceIp}`);
           if (!msg.deviceIp) {
             send(ws, { type: 'error', message: 'Missing deviceIp' });
             return;
@@ -175,11 +175,8 @@ export function startTerminalWebSocket(httpServer: Server) {
 
           ssh.on('ready', () => {
             console.log(`[terminal] Session ${session.id}: SSH connected, opening shell`);
-            // Small delay to ensure WebSocket is stable before sending ready
-            setTimeout(() => {
-              console.log(`[terminal] Session ${session.id}: SENDING READY to frontend`);
-              send(ws, { type: 'ready' });
-            }, 50);
+            send(ws, { type: 'ready' });
+            console.log(`[terminal] Session ${session.id}: READY sent to frontend`);
 
             // Update session with device name from SSH
             ssh.exec('show system uptime | match hostname', (err, stream) => {
