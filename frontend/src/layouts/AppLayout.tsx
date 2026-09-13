@@ -3,7 +3,6 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   ApiOutlined,
   ApartmentOutlined,
-  AlertOutlined,
   CloudServerOutlined,
   ClusterOutlined,
   DashboardOutlined,
@@ -43,7 +42,6 @@ const NAV: NavDef[] = [
   { key: '/mac-addresses', label: 'MAC Address', hint: 'Switching table', icon: <TableOutlined /> },
   { key: '/arp-addresses', label: 'ARP', hint: 'Neighbor table', icon: <ClusterOutlined /> },
   { key: '/logs', label: 'Logs', hint: 'Syslog · severity · facility', icon: <FileSearchOutlined /> },
-  { key: '/logs/alerts', label: 'Alerts', hint: 'Rules · triggered alerts', icon: <AlertOutlined /> },
   { key: '/interfaces', label: 'Ports', hint: 'Device ports · shut / VLAN', icon: <ApiOutlined /> },
   { key: '/generate-config', label: 'Config Studio', hint: 'Draft · commit · rollback', icon: <FileTextOutlined /> },
   { key: '/dhcp', label: 'DHCP', hint: 'Kea DC · relay', icon: <WifiOutlined /> },
@@ -53,7 +51,6 @@ const NAV: NavDef[] = [
 
 const PAGE_META: Record<string, { title: string; subtitle: string }> = {
   '/': { title: 'Dashboard', subtitle: 'Network ops · NKKN / NTMK' },
-  '/logs/alerts': { title: 'Alerts', subtitle: 'Rules · triggered alerts · acknowledge' },
   '/devices': { title: 'Devices', subtitle: 'Core · Dist · Access' },
   '/jobs': { title: 'Jobs', subtitle: 'Recent activity · last 1000' },
   '/discovery': { title: 'Discovery', subtitle: 'Scan mgmt · sync inventory' },
@@ -436,7 +433,7 @@ export default function AppLayout() {
       key: 'grp-network',
       type: 'group',
       label: 'Network',
-      children: NAV.slice(4, 9).map((item) => ({
+      children: NAV.slice(4, 10).map((item) => ({
         key: item.key,
         icon: item.icon,
         label: item.label,
@@ -446,7 +443,7 @@ export default function AppLayout() {
       key: 'grp-system',
       type: 'group',
       label: 'System',
-      children: NAV.slice(9).map((item) => ({
+      children: NAV.slice(10).map((item) => ({
         key: item.key,
         icon: item.icon,
         label: item.label,
