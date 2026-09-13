@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeftOutlined,
@@ -23,6 +23,9 @@ import {
   message,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import {
   fetchDeviceArp,
   fetchDeviceById,
@@ -47,6 +50,7 @@ import { Timestamp } from '@/components/display/Timestamp';
 import ManagedChecksTags from '@/components/ManagedChecksTags';
 import { PortsPanel } from '@/features/ports/PortsPanel';
 import { useJobs } from '@/hooks/useJobs';
+import { useAuth } from '@/hooks/useAuth';
 import { useUrlState } from '@/hooks/useUrlState';
 import { isNotFound, toError } from '@/lib/errors';
 import { formatPing, formatUptime, prettyJson, redactForDisplay, summarizeJson } from '@/lib/format';
@@ -55,7 +59,7 @@ import { isFullyManaged, type Device } from '@/types/device';
 import { deviceFloor, deviceSite } from '@/data/bank';
 import { JOB_TYPE_LABELS, type Job, type OperationResponse } from '@/types/job';
 
-const TABS = ['overview', 'ports', 'config', 'arp', 'mac', 'activity'] as const;
+const TABS = ['overview', 'ports', 'config', 'arp', 'mac', 'terminal', 'activity'] as const;
 type TabKey = (typeof TABS)[number];
 
 function parseTab(value?: string): TabKey {
@@ -307,6 +311,242 @@ function ActivityTab({ deviceId }: { deviceId: string }) {
           />
         )}
       </DataTableShell>
+    </div>
+  );
+}
+
+// ─── Terminal Tab ─────────────────────────────────────────────────────────────────
+
+interface TerminalTabProps {
+  deviceIp: string;
+  deviceName: string;
+}
+
+function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
+  const { token } = useAuth();
+  const containerRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+
+  // Auto-fit on resize
+  useEffect(() => {
+    if (status !== 'connected' || !containerRef.current || !fitAddonRef.current) return;
+    const ro = new ResizeObserver(() => {
+      try {
+        fitAddonRef.current?.fit();
+        const dims = fitAddonRef.current?.proposeDimensions();
+        if (dims) terminalRef.current?.resize(dims.cols, dims.rows);
+      } catch { /* ignore */ }
+    });
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [status]);
+
+  const connect = useCallback(() => {
+    if (!token || !username || !password) return;
+
+    // Destroy previous terminal if any
+    if (terminalRef.current) {
+      terminalRef.current.dispose();
+      terminalRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    setStatus('connecting');
+    setErrorMsg(null);
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
+      fontSize: 13,
+      scrollback: 10000,
+      theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    terminalRef.current = term;
+    fitAddonRef.current = fit;
+
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/terminal?token=${token}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'connect', deviceIp, username, password }));
+    };
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      switch (msg.type) {
+        case 'ready':
+          setStatus('connected');
+          // Open terminal in DOM after connecting
+          if (containerRef.current) {
+            term.open(containerRef.current);
+            fit.fit();
+          }
+          break;
+        case 'data':
+          term.write(msg.data);
+          break;
+        case 'error':
+          setErrorMsg(msg.message);
+          setStatus('error');
+          term.writeln(`\r\n\x1b[31mError: ${msg.message}\x1b[0m\r\n`);
+          break;
+        case 'closed':
+          term.writeln('\r\n\x1b[33mConnection closed.\x1b[0m\r\n');
+          setStatus('idle');
+          break;
+      }
+    };
+
+    ws.onclose = () => {
+      if (status !== 'connected') {
+        setErrorMsg('Could not connect to terminal server. Please check your credentials.');
+        setStatus('error');
+      }
+    };
+
+    ws.onerror = () => {
+      setErrorMsg('WebSocket error. Please try again.');
+      setStatus('error');
+    };
+
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', data }));
+      }
+    });
+
+    term.onResize(({ cols, rows }) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+      }
+    });
+
+    // Store username/password in memory only — never persisted
+    void password; // referenced above in ws.onopen closure, intentionally not stored after
+  }, [token, username, password, deviceIp, status]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      terminalRef.current?.dispose();
+    };
+  }, []);
+
+  if (status === 'idle' || status === 'connecting' || status === 'error') {
+    return (
+      <Card style={{ maxWidth: 440, margin: '24px auto' }}>
+        <Typography.Title level={5}>SSH Terminal — {deviceName}</Typography.Title>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 20 }}>
+          Management IP: <MonoValue value={deviceIp} copyable />
+        </Typography.Paragraph>
+
+        {status === 'error' && errorMsg && (
+          <Alert
+            type="error"
+            message="Connection failed"
+            description={
+              <span>
+                {errorMsg}{' '}
+                <strong>Please verify the username and password are correct.</strong> If the problem persists,
+                check that the device is reachable and SSH is enabled.
+              </span>
+            }
+            style={{ marginBottom: 16 }}
+            showIcon
+          />
+        )}
+
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <div>
+            <Typography.Text strong>Username</Typography.Text>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="SSH username"
+              style={{
+                width: '100%', marginTop: 4, padding: '6px 12px',
+                border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 14,
+              }}
+              onKeyDown={(e) => { if (e.key === 'Enter') connect(); }}
+              autoFocus
+            />
+          </div>
+
+          <div>
+            <Typography.Text strong>Password</Typography.Text>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="SSH password"
+              style={{
+                width: '100%', marginTop: 4, padding: '6px 12px',
+                border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 14,
+              }}
+              onKeyDown={(e) => { if (e.key === 'Enter') connect(); }}
+            />
+          </div>
+
+          <Button
+            type="primary"
+            onClick={connect}
+            loading={status === 'connecting'}
+            disabled={!username || !password}
+            block
+          >
+            {status === 'connecting' ? 'Connecting…' : 'Connect'}
+          </Button>
+
+          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+            Password is never stored. Sessions are logged for audit compliance.
+          </Typography.Text>
+        </Space>
+      </Card>
+    );
+  }
+
+  // Connected — show terminal
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
+      <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040' }}>
+        <Space>
+          <Typography.Text style={{ color: '#52c41a', fontSize: 12 }}>
+            Connected to {deviceName} ({deviceIp})
+          </Typography.Text>
+          <Button
+            size="small"
+            danger
+            onClick={() => {
+              wsRef.current?.close();
+              terminalRef.current?.dispose();
+              terminalRef.current = null;
+              setStatus('idle');
+              setUsername('');
+              setPassword('');
+            }}
+          >
+            Disconnect
+          </Button>
+        </Space>
+      </div>
+      <div
+        ref={containerRef}
+        style={{ flex: 1, padding: 8, background: '#1e1e1e', overflow: 'hidden' }}
+      />
     </div>
   );
 }
@@ -575,6 +815,7 @@ export default function DeviceDetailPage() {
           { key: 'config', label: 'Config', children: <ConfigTab deviceId={id} /> },
           { key: 'arp', label: 'ARP', children: <DeviceNetworkTable deviceId={id} kind="arp" /> },
           { key: 'mac', label: 'MAC', children: <DeviceNetworkTable deviceId={id} kind="mac" /> },
+          { key: 'terminal', label: 'Terminal', children: <TerminalTab deviceIp={device.ip} deviceName={device.name} /> },
           { key: 'activity', label: 'Activity', children: <ActivityTab deviceId={id} /> },
         ]}
       />
