@@ -1,4 +1,3 @@
-import { StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { unstableSetRender } from 'antd';
 import { BrowserRouter } from 'react-router-dom';
@@ -36,13 +35,11 @@ unstableSetRender((node, container) => {
 });
 
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ThemeProvider>
-      <SiteProvider>
-        <BrowserRouter>
-          <App />
-        </BrowserRouter>
-      </SiteProvider>
-    </ThemeProvider>
-  </StrictMode>,
+  <ThemeProvider>
+    <SiteProvider>
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
+    </SiteProvider>
+  </ThemeProvider>,
 );
