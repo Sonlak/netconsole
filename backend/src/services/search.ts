@@ -344,6 +344,20 @@ async function searchDhcp(q: string, limit: number): Promise<{ items: SearchResu
 
 const DEFAULT_LIMIT = 3;
 
+/** Wrap a promise with a deadline. Resolves to `null` on timeout. */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<{ v: T } | null> {
+  let timer: ReturnType<typeof setTimeout>;
+  const race = Promise.race([p, new Promise<null>((_, reject) => { timer = setTimeout(() => reject(null), ms); })]);
+  try {
+    const v = await race;
+    clearTimeout(timer!);
+    return { v: v as T };
+  } catch {
+    clearTimeout(timer!);
+    return null;
+  }
+}
+
 export async function searchAll(
   q: string,
   options?: { limitPerGroup?: number }
@@ -352,43 +366,43 @@ export async function searchAll(
 
   const limit = Math.min(Math.max(options?.limitPerGroup ?? DEFAULT_LIMIT, 1), 10);
   const trimmed = q.trim();
-  const tAll = Date.now();
-  const mkTimer = () => Date.now();
 
+  // Per-group deadline: return partial results as they arrive.
+  // Fast groups (Devices, DHCP) show within ~50 ms; slow groups (ARP/MAC
+  // Job.result ILIKE) are allowed up to 8 s before we give up.
+  const FAST_MS = 3000;
   const tasks: Array<{
     kind: SearchResultGroup['kind'];
     label: string;
     url: string;
     p: Promise<{ items: SearchResultItem[]; total: number }>;
-    tStart: number;
   }> = [
-    { kind: 'device', label: 'Devices', url: '/devices', p: searchDevices(trimmed, limit), tStart: mkTimer() },
-    { kind: 'arp', label: 'ARP', url: '/arp-addresses', p: searchArp(trimmed, limit), tStart: mkTimer() },
-    { kind: 'mac', label: 'MAC', url: '/mac-addresses', p: searchMac(trimmed, limit), tStart: mkTimer() },
-    { kind: 'log', label: 'Logs', url: '/logs', p: searchLogs(trimmed, limit), tStart: mkTimer() },
-    { kind: 'job', label: 'Jobs', url: '/jobs', p: searchJobs(trimmed, limit), tStart: mkTimer() },
-    { kind: 'audit', label: 'Audit', url: '/logs', p: searchAudit(trimmed, limit), tStart: mkTimer() },
-    { kind: 'dhcp', label: 'DHCP Leases', url: '/dhcp', p: searchDhcp(trimmed, limit), tStart: mkTimer() },
+    { kind: 'device', label: 'Devices', url: '/devices', p: searchDevices(trimmed, limit) },
+    { kind: 'dhcp', label: 'DHCP Leases', url: '/dhcp', p: searchDhcp(trimmed, limit) },
+    { kind: 'job', label: 'Jobs', url: '/jobs', p: searchJobs(trimmed, limit) },
+    { kind: 'log', label: 'Logs', url: '/logs', p: searchLogs(trimmed, limit) },
+    { kind: 'audit', label: 'Audit', url: '/logs', p: searchAudit(trimmed, limit) },
+    { kind: 'arp', label: 'ARP', url: '/arp-addresses', p: searchArp(trimmed, limit) },
+    { kind: 'mac', label: 'MAC', url: '/mac-addresses', p: searchMac(trimmed, limit) },
   ];
 
-  const settled = await Promise.allSettled(tasks.map((t) => t.p));
+  const timed = tasks.map((t) => withTimeout(t.p, FAST_MS));
+  const settled = await Promise.all(timed);
 
   const groups: SearchResultGroup[] = [];
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
     const result = settled[i];
-    const ms = Date.now() - task.tStart;
-    if (result.status !== 'fulfilled') {
-      console.warn(`[search] ${task.label}=${ms}ms status=rejected reason=${String(result.reason)}`);
+    if (result === null) {
+      console.warn(`[search] ${task.label} timed out after ${FAST_MS}ms q=${trimmed}`);
       continue;
     }
-    const { items, total } = result.value;
-    console.log(`[search] ${task.label}=${ms}ms hits=${total}`);
+    const { items, total } = result.v;
     if (total === 0) continue;
     groups.push({ kind: task.kind, label: task.label, items, total, url: task.url });
   }
 
-  console.log(`[search] total=${Date.now() - tAll}ms groups=${groups.length} q=${trimmed}`);
+  console.log(`[search] groups=${groups.length} q=${trimmed}`);
   return groups;
 }
 
