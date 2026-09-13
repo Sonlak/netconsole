@@ -371,10 +371,14 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     // Open terminal immediately — container is rendered in 'connecting' state
     // This ensures xterm.js is ready before SSH data arrives
+    console.log('[terminal] containerRef.current:', containerRef.current ? 'EXISTS h=' + containerRef.current.clientHeight : 'NULL');
     if (containerRef.current) {
       term.open(containerRef.current);
       fit.fit();
+      console.log('[terminal] xterm opened, rows:', term.rows, 'cols:', term.cols);
       term.write('Connecting to ' + deviceIp + '...\r\n');
+    } else {
+      console.error('[terminal] containerRef is NULL — React not rendered yet!');
     }
 
     ws.onopen = () => {
