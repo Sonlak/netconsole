@@ -173,7 +173,7 @@ export function startTerminalWebSocket(httpServer: Server) {
           });
 
           ssh.on('ready', () => {
-            console.log(`[terminal] Session ${session.id}: SSH connected`);
+            console.log(`[terminal] Session ${session.id}: SSH connected, opening shell`);
             send(ws, { type: 'ready' });
 
             // Update session with device name from SSH
@@ -197,9 +197,12 @@ export function startTerminalWebSocket(httpServer: Server) {
                 close(ws);
                 return;
               }
+              console.log(`[terminal] Session ${session.id}: shell opened`);
 
               stream.on('data', (data: Buffer) => {
-                send(ws, { type: 'data', data: data.toString() });
+                const text = data.toString();
+                console.log(`[terminal] Session ${session.id}: shell data len=${text.length} preview=${JSON.stringify(text.substring(0, 80))}`);
+                send(ws, { type: 'data', data: text });
               });
 
               stream.stderr.on('data', (data: Buffer) => {

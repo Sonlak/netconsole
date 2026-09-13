@@ -378,10 +378,13 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         case 'ready':
           wasConnected = true;
           setStatus('connected');
-          if (containerRef.current) {
-            term.open(containerRef.current);
-            fit.fit();
-          }
+          // State update is async — defer terminal open until React re-renders
+          setTimeout(() => {
+            if (containerRef.current) {
+              term.open(containerRef.current);
+              fit.fit();
+            }
+          }, 0);
           break;
         case 'data':
           term.write(msg.data);
