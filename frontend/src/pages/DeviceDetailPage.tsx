@@ -328,8 +328,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  // Track if the connection is in-flight (set to true after ws.onopen, cleared on ws.onclose)
-  const connectingRef = useRef(false);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -377,44 +375,48 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     ws.onopen = () => {
       console.log('[terminal] WS open');
-      connectingRef.current = true;
       ws.send(JSON.stringify({ type: 'connect', deviceIp }));
       console.log('[terminal] connect msg sent');
     };
 
     ws.onmessage = (event) => {
-      console.log('[terminal] WS msg:', event.data);
-      const msg = JSON.parse(event.data);
-      switch (msg.type) {
-        case 'ready':
-          console.log('[terminal] received ready!');
-          connectingRef.current = false;
-          setStatus('connected');
-          term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
-          break;
-        case 'data':
-          term.write(msg.data);
-          break;
-        case 'error':
-          setErrorMsg(msg.message);
-          setStatus('error');
-          term.writeln('\r\n\x1b[31m[ERROR] ' + msg.message + '\x1b[0m\r\n');
-          break;
-        case 'closed':
-          term.writeln('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n');
-          setStatus('idle');
-          break;
+      try {
+        const msg = JSON.parse(event.data);
+        console.log('[terminal] WS msg:', msg.type, msg.type === 'data' ? 'len=' + msg.data?.length : '');
+        switch (msg.type) {
+          case 'ready':
+            console.log('[terminal] received ready!');
+            setStatus('connected');
+            term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
+            break;
+          case 'data':
+            term.write(msg.data);
+            break;
+          case 'error':
+            setErrorMsg(msg.message);
+            setStatus('error');
+            term.writeln('\r\n\x1b[31m[ERROR] ' + msg.message + '\x1b[0m\r\n');
+            break;
+          case 'closed':
+            term.writeln('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n');
+            setStatus('idle');
+            break;
+          default:
+            console.log('[terminal] unknown msg type:', msg.type);
+        }
+      } catch (e) {
+        console.error('[terminal] msg parse error:', e, 'data:', event.data?.slice(0, 100));
       }
     };
 
     ws.onclose = () => {
-      console.log('[terminal] WS closed, connectingRef=', connectingRef.current);
-      if (connectingRef.current) {
-        // Closed before onopen fired — StrictMode cleanup or network issue
-        setErrorMsg('Could not connect. Check that the device is reachable and SSH is enabled.');
+      console.log('[terminal] WS closed, readyState=', ws.readyState, 'OPEN=', WebSocket.OPEN);
+      // If readyState is CLOSING/CLOSED, we closed it intentionally (cleanup) — suppress error
+      // Otherwise it was a network failure
+      if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) {
+        setErrorMsg('Connection lost. Check your network.');
         setStatus('error');
       }
-      connectingRef.current = false;
     };
 
     ws.onerror = () => {
@@ -454,11 +456,10 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     return () => ro.disconnect();
   }, [status]);
 
-  // Cleanup on unmount — always close WS and dispose terminal
+  // Cleanup on unmount — close WS and dispose terminal
   useEffect(() => {
     return () => {
       if (wsRef.current) {
-        wsRef.current.onclose = null; // Prevent recursive cleanup
         wsRef.current.close();
       }
       terminalRef.current?.dispose();
