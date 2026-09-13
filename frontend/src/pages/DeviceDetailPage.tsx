@@ -504,7 +504,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   // ── Connected — show terminal
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
-      <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040' }}>
+      <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040', flexShrink: 0 }}>
         <Space>
           <Typography.Text style={{ color: '#52c41a', fontSize: 12 }}>
             Connected to {deviceName} ({deviceIp})
@@ -525,7 +525,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, padding: 8, background: '#1e1e1e', overflow: 'hidden' }}
+        style={{ flex: 1, padding: 8, background: '#1e1e1e', overflow: 'hidden', minHeight: 0 }}
       />
     </div>
   );
