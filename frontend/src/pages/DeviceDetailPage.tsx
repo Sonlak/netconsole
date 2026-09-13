@@ -334,7 +334,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
   // ── Core SSH connect (stable ref so ws callbacks don't staleness)
   const doConnect = useCallback(() => {
-    console.log('[terminal] doConnect called, token=', !!token);
     if (!token) return;
 
     // Assign a unique ID for this connection attempt — stale close events will have old IDs
@@ -351,7 +350,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     }
 
     setStatus('connecting');
-    console.log('[terminal] setStatus(connecting) called, containerRef=', containerRef.current ? 'EXISTS' : 'NULL');
 
     const term = new Terminal({
       cursorBlink: true,
@@ -369,23 +367,18 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    // Open terminal immediately — container is rendered in 'connecting' state
-    // This ensures xterm.js is ready before SSH data arrives
-    console.log('[terminal] containerRef.current:', containerRef.current ? 'EXISTS h=' + containerRef.current.clientHeight + ' children=' + containerRef.current.children.length : 'NULL');
+    // Open terminal immediately — container is always rendered
     if (containerRef.current) {
       term.open(containerRef.current);
       fit.fit();
-      console.log('[terminal] xterm opened, rows:', term.rows, 'cols:', term.cols);
       term.write('Connecting to ' + deviceIp + '...\r\n');
     } else {
-      console.error('[terminal] containerRef is NULL — React not rendered yet! Setting up mutation observer');
-      // Container not ready yet — observe the tab pane for when it appears
+      // Fallback: observe tab pane for when container appears
       const tabPane = document.querySelector('.ant-tabs-tabpane-active');
       if (tabPane) {
         const mo = new MutationObserver(() => {
           if (containerRef.current) {
             mo.disconnect();
-            console.log('[terminal] container appeared, opening xterm');
             term.open(containerRef.current);
             fit.fit();
             term.write('Connecting to ' + deviceIp + '...\r\n');
@@ -396,22 +389,17 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     }
 
     ws.onopen = () => {
-      console.log('[terminal] WS open');
       ws.send(JSON.stringify({ type: 'connect', deviceIp }));
-      console.log('[terminal] connect msg sent');
     };
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        console.log('[terminal] WS msg:', msg.type, msg.type === 'data' ? 'len=' + msg.data?.length : '');
         switch (msg.type) {
-          case 'ready': {
-            console.log('[terminal] received ready! setting status=connected');
+          case 'ready':
             setStatus('connected');
             term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
             break;
-          }
           case 'data':
             term.write(msg.data);
             break;
@@ -423,21 +411,15 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
             term.writeln('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n');
             setStatus('idle');
             break;
-          default:
-            console.log('[terminal] unknown msg type:', msg.type);
         }
-      } catch (e) {
-        console.error('[terminal] msg parse error:', e, 'data:', event.data?.slice(0, 100));
+      } catch {
+        // ignore parse errors
       }
     };
 
     ws.onclose = () => {
       // Only handle close if this is the current connection (not a stale StrictMode close)
-      if (wsIdRef.current !== thisWsId) {
-        console.log('[terminal] WS closed (stale, ignoring)');
-        return;
-      }
-      console.log('[terminal] WS closed');
+      if (wsIdRef.current !== thisWsId) return;
       if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) {
         setStatus('error');
       }
