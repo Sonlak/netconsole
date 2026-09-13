@@ -92,7 +92,7 @@ model Job {
   /// ASC when polling PENDING.
   priority  Int       @default(0)
   payload   Json?
-  result    JsonB?
+  result    Json?
   error     String?
   // User who POSTed this job via /api/jobs. Workers (which also call POST
   // for DISCOVERY_PROBE/queueGen) must carry a userId in their JWT; we
