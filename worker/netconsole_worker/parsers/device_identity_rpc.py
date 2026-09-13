@@ -171,7 +171,8 @@ def parse_system_uptime_cli(raw: str) -> dict[str, str]:
       System booted: 2026-09-10 14:41:30 +07 (1d 05:49 ago)
       System booted: 2026-09-10 14:41:30 +07 (5 days, 5:49:41)
     """
-    import datetime, re
+    import datetime
+    import re
 
     parsed: dict[str, str] = {}
 
