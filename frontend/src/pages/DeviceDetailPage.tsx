@@ -331,7 +331,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   // Unique ID per mount — used to detect stale WebSocket close events
   const wsIdRef = useRef(0);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // ── Core SSH connect (stable ref so ws callbacks don't staleness)
   const doConnect = useCallback(() => {
@@ -353,7 +352,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     setStatus('connecting');
     console.log('[terminal] setStatus(connecting) called, containerRef=', containerRef.current ? 'EXISTS' : 'NULL');
-    setErrorMsg(null);
 
     const term = new Terminal({
       cursorBlink: true,
@@ -418,7 +416,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
             term.write(msg.data);
             break;
           case 'error':
-            setErrorMsg(msg.message);
             setStatus('error');
             term.writeln('\r\n\x1b[31m[ERROR] ' + msg.message + '\x1b[0m\r\n');
             break;
@@ -442,13 +439,11 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       }
       console.log('[terminal] WS closed');
       if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) {
-        setErrorMsg('Connection lost. Check your network.');
         setStatus('error');
       }
     };
 
     ws.onerror = () => {
-      setErrorMsg('WebSocket error. Please try again.');
       setStatus('error');
     };
 
@@ -496,50 +491,14 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     };
   }, []);
 
-  // ── Idle / error state — prompt card
-  if (status === 'idle' || status === 'error') {
-    return (
-      <Card style={{ maxWidth: 520, margin: '24px auto' }}>
-        <Typography.Title level={5}>SSH Terminal — {deviceName}</Typography.Title>
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-          Management IP: <MonoValue value={deviceIp} copyable />
-        </Typography.Paragraph>
-
-        {status === 'error' && errorMsg && (
-          <Alert
-            type="error"
-            message="Connection failed"
-            description={
-              <>
-                {errorMsg}{' '}
-                Check that the device is reachable from the server and SSH is enabled.
-              </>
-            }
-            style={{ marginBottom: 16 }}
-            showIcon
-          />
-        )}
-
-        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Sessions are logged for audit compliance.
-          </Typography.Text>
-
-          <Button type="primary" onClick={() => void doConnect()} block>
-            Connect
-          </Button>
-        </Space>
-      </Card>
-    );
-  }
-
-  // ── Connecting or connected — always show terminal
+  // ── Always render the terminal div — terminal visibility is controlled by the WebSocket data flow
+  // Status is only used for the status bar color and disconnect behavior
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
       <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040', flexShrink: 0 }}>
         <Space>
-          <Typography.Text style={{ color: status === 'connected' ? '#52c41a' : '#faad14', fontSize: 12 }}>
-            {status === 'connected' ? 'Connected' : 'Connecting…'} to {deviceName} ({deviceIp})
+          <Typography.Text style={{ color: status === 'connected' ? '#52c41a' : status === 'connecting' ? '#faad14' : '#ff4d4f', fontSize: 12 }}>
+            {status === 'connected' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected'} to {deviceName} ({deviceIp})
           </Typography.Text>
           <Button
             size="small"
