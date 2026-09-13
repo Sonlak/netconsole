@@ -328,8 +328,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  // Track if we've intentionally started a connection — prevents StrictMode double-invoke
-  // from closing the WS before ws.onopen fires
+  // Track if the connection is in-flight (set to true after ws.onopen, cleared on ws.onclose)
   const connectingRef = useRef(false);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -338,19 +337,19 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const doConnect = useCallback(() => {
     if (!token) return;
 
-    // Destroy previous terminal if any
+    // Clean up existing connections
     if (terminalRef.current) {
       terminalRef.current.dispose();
       terminalRef.current = null;
     }
     if (wsRef.current) {
+      wsRef.current.onclose = null; // Prevent cleanup from running
       wsRef.current.close();
       wsRef.current = null;
     }
 
     setStatus('connecting');
     setErrorMsg(null);
-    connectingRef.current = true;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -368,9 +367,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    // Capture status snapshot for ws.onclose (runs outside React)
-    let wasConnected = false;
-
     // Open terminal immediately — container is rendered in 'connecting' state
     // This ensures xterm.js is ready before SSH data arrives
     if (containerRef.current) {
@@ -381,15 +377,17 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     ws.onopen = () => {
       console.log('[terminal] WS open');
-      connectingRef.current = false;
+      connectingRef.current = true;
       ws.send(JSON.stringify({ type: 'connect', deviceIp }));
+      console.log('[terminal] connect msg sent');
     };
 
     ws.onmessage = (event) => {
+      console.log('[terminal] WS msg:', event.data);
       const msg = JSON.parse(event.data);
       switch (msg.type) {
         case 'ready':
-          wasConnected = true;
+          console.log('[terminal] received ready!');
           connectingRef.current = false;
           setStatus('connected');
           term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
@@ -410,11 +408,13 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     };
 
     ws.onclose = () => {
-      connectingRef.current = false;
-      if (!wasConnected) {
+      console.log('[terminal] WS closed, connectingRef=', connectingRef.current);
+      if (connectingRef.current) {
+        // Closed before onopen fired — StrictMode cleanup or network issue
         setErrorMsg('Could not connect. Check that the device is reachable and SSH is enabled.');
         setStatus('error');
       }
+      connectingRef.current = false;
     };
 
     ws.onerror = () => {
@@ -454,12 +454,11 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     return () => ro.disconnect();
   }, [status]);
 
-  // Cleanup on unmount — only close WS if we intentionally started connecting
+  // Cleanup on unmount — always close WS and dispose terminal
   useEffect(() => {
     return () => {
-      // Only close if we're in a pending connect state (not yet open)
-      // If ws.onopen already fired, the backend cleanup handles SSH teardown
-      if (connectingRef.current && wsRef.current) {
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // Prevent recursive cleanup
         wsRef.current.close();
       }
       terminalRef.current?.dispose();
