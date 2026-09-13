@@ -372,22 +372,29 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     let wasConnected = false;
 
     ws.onopen = () => {
-      connectingRef.current = false; // Message sent, no longer "pending"
+      console.log('[terminal] WS open');
+      connectingRef.current = false;
       ws.send(JSON.stringify({ type: 'connect', deviceIp }));
     };
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
+      console.log('[terminal] WS msg:', msg.type, msg.type === 'data' ? 'len=' + (msg.data?.length || 0) : '');
       switch (msg.type) {
         case 'ready':
           wasConnected = true;
           connectingRef.current = false;
+          console.log('[terminal] received ready, opening xterm...');
           setStatus('connected');
           // State update is async — defer terminal open until React re-renders
           setTimeout(() => {
+            console.log('[terminal] xterm.open, container:', containerRef.current?.clientHeight, 'containerHTML:', containerRef.current?.innerHTML?.slice(0, 50));
             if (containerRef.current) {
               term.open(containerRef.current);
               fit.fit();
+              console.log('[terminal] xterm opened, rows:', term.rows, 'cols:', term.cols);
+            } else {
+              console.error('[terminal] container not found!');
             }
           }, 0);
           break;
