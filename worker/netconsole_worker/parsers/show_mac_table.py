@@ -45,16 +45,23 @@ def parse_juniper_mac_table(output: str) -> list[dict[str, str]]:
 
 
 def _normalize_cisco_mac(mac: str) -> str:
-    """`0100.0ccc.cccc` -> `01:00:0c:cc:cc:cc` (digits-only mac).
+    """Cisco IOS `xxxx.xxxx.xxxx` -> standard `aa:bb:cc:dd:ee:ff`.
 
-    Cisco may use `xxxx.xxxx.xxxx` where each 4-hex segment represents
-    the full 16 bits of an octet — different from `x4 hex padded'.
-    Just split on `.` and lowercase.
+    Each 4-hex segment represents 2 bytes in big-endian:
+    0100.0ccc.cccc -> 01 00 0c cc cc cc -> 00:0c:29:0d:4a:63
+    (the leading nibble of the first byte is the trailing nibble of segment 1).
     """
     parts = mac.split(".")
-    if len(parts) != 3:
+    if len(parts) != 3 or any(len(p) != 4 for p in parts):
         return ""
-    return ":".join(p.lower() for p in parts)
+    # Each 4-char segment: first 2 chars = byte 1, last 2 chars = byte 2 (big-endian)
+    byte1 = parts[0][:2]
+    byte2 = parts[0][2:]
+    byte3 = parts[1][:2]
+    byte4 = parts[1][2:]
+    byte5 = parts[2][:2]
+    byte6 = parts[2][2:]
+    return f"{byte1}:{byte2}:{byte3}:{byte4}:{byte5}:{byte6}".lower()
 
 
 def parse_cisco_mac_table(output: str) -> list[dict[str, str]]:

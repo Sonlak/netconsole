@@ -40,7 +40,11 @@ type ArpJobResult = {
 };
 
 function normalizeMac(mac: string): string {
-  return mac.toLowerCase().replace(/[^0-9a-f]/g, '');
+  // Accept any MAC format (0100.0ccc.cccc / 01:00:0c:cc:cc:cc / 01000ccccccc)
+  // and normalize to the canonical aa:bb:cc:dd:ee:ff used everywhere in this service.
+  const hex = mac.toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (hex.length !== 12) return mac;
+  return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`;
 }
 
 /**
