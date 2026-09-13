@@ -159,12 +159,18 @@ export function startTerminalWebSocket(httpServer: Server) {
             host: msg.deviceIp,
             username: sshUser,
             password: sshPass,
+            tryKeyboard: true,
             readyTimeout: 20000,
             keepaliveInterval: 10000,
           };
 
           const ssh = new SSH2Client();
           ws._ssh = ssh;
+
+          // Handle keyboard-interactive auth (used by Juniper/cRPD for password prompts)
+          ssh.on('keyboard-interactive', (name, instr, lang, prompts, finish) => {
+            finish([sshPass]);
+          });
 
           ssh.on('ready', () => {
             console.log(`[terminal] Session ${session.id}: SSH connected`);
