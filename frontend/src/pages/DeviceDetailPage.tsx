@@ -330,25 +330,10 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
 
-  // Auto-fit on resize
-  useEffect(() => {
-    if (status !== 'connected' || !containerRef.current || !fitAddonRef.current) return;
-    const ro = new ResizeObserver(() => {
-      try {
-        fitAddonRef.current?.fit();
-        const dims = fitAddonRef.current?.proposeDimensions();
-        if (dims) terminalRef.current?.resize(dims.cols, dims.rows);
-      } catch { /* ignore */ }
-    });
-    ro.observe(containerRef.current);
-    return () => ro.disconnect();
-  }, [status]);
-
-  const connect = useCallback(() => {
-    if (!token || !username || !password) return;
+  // ── Core SSH connect (stable ref so ws callbacks don't staleness)
+  const doConnect = useCallback(() => {
+    if (!token) return;
 
     // Destroy previous terminal if any
     if (terminalRef.current) {
@@ -379,16 +364,20 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
+    // Capture status snapshot for ws.onclose (runs outside React)
+    let wasConnected = false;
+
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'connect', deviceIp, username, password }));
+      // Backend resolves credentials from env vars — no user/pass sent
+      ws.send(JSON.stringify({ type: 'connect', deviceIp }));
     };
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
       switch (msg.type) {
         case 'ready':
+          wasConnected = true;
           setStatus('connected');
-          // Open terminal in DOM after connecting
           if (containerRef.current) {
             term.open(containerRef.current);
             fit.fit();
@@ -400,18 +389,18 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         case 'error':
           setErrorMsg(msg.message);
           setStatus('error');
-          term.writeln(`\r\n\x1b[31mError: ${msg.message}\x1b[0m\r\n`);
+          term.writeln(`\r\n\x1b[31m[ERROR] ${msg.message}\x1b[0m\r\n`);
           break;
         case 'closed':
-          term.writeln('\r\n\x1b[33mConnection closed.\x1b[0m\r\n');
+          term.writeln('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n');
           setStatus('idle');
           break;
       }
     };
 
     ws.onclose = () => {
-      if (status !== 'connected') {
-        setErrorMsg('Could not connect to terminal server. Please check your credentials.');
+      if (!wasConnected) {
+        setErrorMsg('Could not connect. Check that the device is reachable and SSH is enabled.');
         setStatus('error');
       }
     };
@@ -432,10 +421,26 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         ws.send(JSON.stringify({ type: 'resize', cols, rows }));
       }
     });
+  }, [token, deviceIp]);
 
-    // Store username/password in memory only — never persisted
-    void password; // referenced above in ws.onopen closure, intentionally not stored after
-  }, [token, username, password, deviceIp, status]);
+  // Auto-connect when tab mounts
+  useEffect(() => {
+    void doConnect();
+  }, [doConnect]);
+
+  // Auto-fit on resize when connected
+  useEffect(() => {
+    if (status !== 'connected' || !containerRef.current || !fitAddonRef.current) return;
+    const ro = new ResizeObserver(() => {
+      try {
+        fitAddonRef.current?.fit();
+        const dims = fitAddonRef.current?.proposeDimensions();
+        if (dims) terminalRef.current?.resize(dims.cols, dims.rows);
+      } catch { /* ignore */ }
+    });
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [status]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -445,11 +450,12 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     };
   }, []);
 
+  // ── Idle / error state — prompt card
   if (status === 'idle' || status === 'connecting' || status === 'error') {
     return (
-      <Card style={{ maxWidth: 440, margin: '24px auto' }}>
+      <Card style={{ maxWidth: 520, margin: '24px auto' }}>
         <Typography.Title level={5}>SSH Terminal — {deviceName}</Typography.Title>
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 20 }}>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
           Management IP: <MonoValue value={deviceIp} copyable />
         </Typography.Paragraph>
 
@@ -458,11 +464,10 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
             type="error"
             message="Connection failed"
             description={
-              <span>
+              <>
                 {errorMsg}{' '}
-                <strong>Please verify the username and password are correct.</strong> If the problem persists,
-                check that the device is reachable and SSH is enabled.
-              </span>
+                Check that the device is reachable from the server and SSH is enabled.
+              </>
             }
             style={{ marginBottom: 16 }}
             showIcon
@@ -470,56 +475,33 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         )}
 
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <div>
-            <Typography.Text strong>Username</Typography.Text>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="SSH username"
-              style={{
-                width: '100%', marginTop: 4, padding: '6px 12px',
-                border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 14,
-              }}
-              onKeyDown={(e) => { if (e.key === 'Enter') connect(); }}
-              autoFocus
-            />
-          </div>
-
-          <div>
-            <Typography.Text strong>Password</Typography.Text>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="SSH password"
-              style={{
-                width: '100%', marginTop: 4, padding: '6px 12px',
-                border: '1px solid #d9d9d9', borderRadius: 6, fontSize: 14,
-              }}
-              onKeyDown={(e) => { if (e.key === 'Enter') connect(); }}
-            />
-          </div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            Sessions are logged for audit compliance.
+          </Typography.Text>
 
           <Button
             type="primary"
-            onClick={connect}
+            onClick={() => void doConnect()}
             loading={status === 'connecting'}
-            disabled={!username || !password}
             block
           >
             {status === 'connecting' ? 'Connecting…' : 'Connect'}
           </Button>
 
-          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-            Password is never stored. Sessions are logged for audit compliance.
-          </Typography.Text>
+          {status === 'idle' && (
+            <Button
+              onClick={() => void doConnect()}
+              block
+            >
+              Retry
+            </Button>
+          )}
         </Space>
       </Card>
     );
   }
 
-  // Connected — show terminal
+  // ── Connected — show terminal
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
       <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040' }}>
@@ -535,8 +517,6 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
               terminalRef.current?.dispose();
               terminalRef.current = null;
               setStatus('idle');
-              setUsername('');
-              setPassword('');
             }}
           >
             Disconnect

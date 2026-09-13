@@ -4,9 +4,12 @@
  * Provides a web-based SSH terminal to network devices.
  * Sessions are logged for compliance.
  *
+ * Credentials are resolved server-side from environment variables
+ * (LAB_SSH_USER / LAB_SSH_PASSWORD), matching the worker config.
+ *
  * Protocol:
  *   Client -> Server:
- *     { type: 'connect', deviceIp: string, username: string, password: string }
+ *     { type: 'connect', deviceIp: string }    // auto-auth via env vars
  *     { type: 'input', data: string }          // keystrokes
  *     { type: 'resize', cols: number, rows: number }
  *     { type: 'disconnect' }
@@ -21,7 +24,6 @@
 import { WebSocket, WebSocketServer } from 'ws';
 import { Server } from 'http';
 import { Client as SSH2Client, ConnectConfig } from 'ssh2';
-import { authMiddleware } from '../middleware/auth.js';
 import { prisma } from '../lib/prisma.js';
 import type { Request } from 'express';
 
@@ -30,22 +32,26 @@ const TIMEOUT_MS = 60000; // 1 minute idle timeout
 interface ClientMessage {
   type: 'connect' | 'input' | 'resize' | 'disconnect';
   deviceIp?: string;
-  username?: string;
-  password?: string;
   data?: string;
   cols?: number;
   rows?: number;
 }
 
+// Extended WebSocket with our custom properties
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
   username?: string;
   role?: string;
   sessionId?: string;
-  sshClient?: SSH2Client;
   deviceIp?: string;
   idleTimer?: NodeJS.Timeout;
+  _ssh?: SSH2Client;
+  _stream?: unknown;
 }
+
+// Send helper — casts to any to satisfy TS strict mode on ws types
+const send = (ws: AuthenticatedWebSocket, msg: object) => ws.send(JSON.stringify(msg));
+const close = (ws: AuthenticatedWebSocket) => ws.close();
 
 export function startTerminalWebSocket(httpServer: Server) {
   const wss = new WebSocketServer({ noServer: true });
@@ -92,16 +98,16 @@ export function startTerminalWebSocket(httpServer: Server) {
 
     const cleanup = () => {
       if (ws.idleTimer) clearTimeout(ws.idleTimer);
-      if (ws.sshClient) {
-        try { ws.sshClient.end(); } catch { /* ignore */ }
+      if (ws._ssh) {
+        try { (ws._ssh as SSH2Client).end(); } catch { /* ignore */ }
       }
     };
 
     const resetIdleTimer = () => {
       if (ws.idleTimer) clearTimeout(ws.idleTimer);
       ws.idleTimer = setTimeout(() => {
-        ws.send(JSON.stringify({ type: 'error', message: 'Session timed out' }));
-        ws.close();
+        send(ws, { type: 'error', message: 'Session timed out' });
+        close(ws);
       }, TIMEOUT_MS);
     };
 
@@ -110,7 +116,7 @@ export function startTerminalWebSocket(httpServer: Server) {
       try {
         msg = JSON.parse(raw.toString());
       } catch {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+        send(ws, { type: 'error', message: 'Invalid JSON' });
         return;
       }
 
@@ -118,16 +124,28 @@ export function startTerminalWebSocket(httpServer: Server) {
 
       switch (msg.type) {
         case 'connect': {
-          if (!msg.deviceIp || !msg.username || !msg.password) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Missing deviceIp, username, or password' }));
+          if (!msg.deviceIp) {
+            send(ws, { type: 'error', message: 'Missing deviceIp' });
             return;
           }
+
+          // Resolve credentials from environment (same as worker uses)
+          const sshUser = process.env.LAB_SSH_USER || 'admin';
+          const sshPass = process.env.LAB_SSH_PASSWORD || 'Admin@123';
+
+          // Look up device in DB to get deviceId and deviceName for the session record
+          const device = await prisma.device.findUnique({
+            where: { ip: msg.deviceIp },
+            select: { id: true, name: true },
+          }).catch(() => null);
 
           // Create session record
           const session = await prisma.terminalSession.create({
             data: {
               userId: ws.userId!,
+              deviceId: device?.id ?? null,
               deviceIp: msg.deviceIp,
+              deviceName: device?.name ?? null,
               startTime: new Date(),
             },
           });
@@ -135,22 +153,22 @@ export function startTerminalWebSocket(httpServer: Server) {
           ws.sessionId = session.id;
           ws.deviceIp = msg.deviceIp;
 
-          console.log(`[terminal] Session ${session.id}: connecting to ${msg.deviceIp}`);
+          console.log(`[terminal] Session ${session.id}: connecting to ${msg.deviceIp} as ${sshUser}`);
 
           const sshConfig: ConnectConfig = {
             host: msg.deviceIp,
-            username: msg.username,
-            password: msg.password,
+            username: sshUser,
+            password: sshPass,
             readyTimeout: 20000,
             keepaliveInterval: 10000,
           };
 
           const ssh = new SSH2Client();
-          ws.sshClient = ssh;
+          ws._ssh = ssh;
 
           ssh.on('ready', () => {
             console.log(`[terminal] Session ${session.id}: SSH connected`);
-            ws.send(JSON.stringify({ type: 'ready' }));
+            send(ws, { type: 'ready' });
 
             // Update session with device name from SSH
             ssh.exec('show system uptime | match hostname', (err, stream) => {
@@ -169,32 +187,31 @@ export function startTerminalWebSocket(httpServer: Server) {
             ssh.shell({ term: 'xterm-256color', cols: 80, rows: 24 }, (err, stream) => {
               if (err) {
                 console.error(`[terminal] Session ${session.id}: shell error:`, err.message);
-                ws.send(JSON.stringify({ type: 'error', message: `Shell error: ${err.message}` }));
-                ws.close();
+                send(ws, { type: 'error', message: `Shell error: ${err.message}` });
+                close(ws);
                 return;
               }
 
               stream.on('data', (data: Buffer) => {
-                ws.send(JSON.stringify({ type: 'data', data: data.toString() }));
+                send(ws, { type: 'data', data: data.toString() });
               });
 
               stream.stderr.on('data', (data: Buffer) => {
-                ws.send(JSON.stringify({ type: 'data', data: data.toString() }));
+                send(ws, { type: 'data', data: data.toString() });
               });
 
               stream.on('close', () => {
                 console.log(`[terminal] Session ${session.id}: stream closed`);
-                ws.close();
+                close(ws);
               });
 
-              // Store stream reference for input/resize
-              (ws as any)._stream = stream;
+              ws._stream = stream;
             });
           });
 
           ssh.on('error', async (err) => {
             console.error(`[terminal] Session ${session.id}: SSH error:`, err.message);
-            ws.send(JSON.stringify({ type: 'error', message: err.message }));
+            send(ws, { type: 'error', message: err.message });
 
             // Update session with error
             if (currentSessionId) {
@@ -207,7 +224,7 @@ export function startTerminalWebSocket(httpServer: Server) {
 
           ssh.on('close', () => {
             console.log(`[terminal] Session ${session.id}: SSH closed`);
-            ws.send(JSON.stringify({ type: 'closed' }));
+            send(ws, { type: 'closed' });
           });
 
           ssh.connect(sshConfig);
@@ -215,17 +232,17 @@ export function startTerminalWebSocket(httpServer: Server) {
         }
 
         case 'input': {
-          if (!(ws as any)._stream) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Not connected' }));
+          if (!ws._stream) {
+            send(ws, { type: 'error', message: 'Not connected' });
             return;
           }
-          (ws as any)._stream.write(msg.data || '');
+          (ws._stream as NodeJS.WritableStream & { write: (d: string) => void }).write(msg.data || '');
           break;
         }
 
         case 'resize': {
-          if (!(ws as any)._stream) return;
-          const stream = (ws as any)._stream;
+          if (!ws._stream) return;
+          const stream = ws._stream as { setWindow?: (r: number, c: number, w: number, h: number) => void };
           if (stream.setWindow) {
             stream.setWindow(msg.rows || 24, msg.cols || 80, 0, 0);
           }
@@ -234,12 +251,12 @@ export function startTerminalWebSocket(httpServer: Server) {
 
         case 'disconnect': {
           cleanup();
-          ws.close();
+          close(ws);
           break;
         }
 
         default:
-          ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
+          send(ws, { type: 'error', message: 'Unknown message type' });
       }
     });
 
