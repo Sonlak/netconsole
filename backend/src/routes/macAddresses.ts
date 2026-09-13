@@ -79,7 +79,10 @@ macAddressesRouter.post('/collect/:deviceId', async (req, res) => {
     const iface = cols.slice(3).join(' ');
     // Validate MAC format (xxxx.xxxx.xxxx)
     if (!/^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$/.test(mac)) continue;
-    entries.push({ mac: mac.toLowerCase(), vlan, type: type.toLowerCase(), interface: iface || '-' });
+    // Convert Cisco xxxx.xxxx.xxxx -> IEEE aa:bb:cc:dd:ee:ff
+    const normalized = mac.toLowerCase().replace(/[^0-9a-f]/g, '');
+    const macNorm = `${normalized.slice(0, 2)}:${normalized.slice(2, 4)}:${normalized.slice(4, 6)}:${normalized.slice(6, 8)}:${normalized.slice(8, 10)}:${normalized.slice(10, 12)}`;
+    entries.push({ mac: macNorm, vlan, type: type.toLowerCase(), interface: iface || '-' });
   }
   res.json({ entries, source: 'ssh-cli', raw });
 });
