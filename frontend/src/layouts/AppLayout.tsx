@@ -217,7 +217,7 @@ function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRe
           style={{
             position: 'absolute',
             top: '100%',
-            left: 0,
+            right: 0,
             zIndex: 1000,
             width: 520,
             background: token.colorBgElevated,
