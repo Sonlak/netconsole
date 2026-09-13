@@ -6,13 +6,11 @@
  * directly to the relevant page with the filter pre-applied.
  *
  * Design decisions:
- * - Runs Devices and Jobs in parallel — both are small tables with B-tree
- *   indexes and return in < 1 s even on a large dataset.
- * - Skips heavy sequential scans (ARP/MAC/Logs/Audit/DHCP) entirely from the
- *   global search. These tables require full-table JSON ILIKE scans that take
- *   10+ seconds on the 200 k-row Job table and make the search feel unusable.
- *   Users who need ARP/MAC/Logs data should search directly on those pages.
+ * - Runs searches in parallel where possible: Devices + Jobs + ARP/MAC all fire
+ *   at once via Promise.allSettled. Each has its own fast query path.
  * - IP prefix queries use `startsWith` so Prisma can use the B-tree index.
+ * - ARP/MAC use raw SQL with PostgreSQL JSONB operators (jsonb_array_elements)
+ *   to search inside Job.result without a full-table ILIKE scan.
  * - Empty query returns empty results (no "show all" behavior).
  */
 
@@ -45,8 +43,6 @@ function looksLikeIp(q: string): boolean {
 // ── searchers ────────────────────────────────────────────────────────────────
 
 async function searchDevices(q: string, limit: number) {
-  // Use startsWith for IP prefix queries so Prisma can use the B-tree index.
-  // "10.10.20" matches "10.10.20.101", "10.10.20.111".
   const isIpQuery = looksLikeIp(q);
   const baseConditions = [
     { name: { contains: q, mode: 'insensitive' as const } },
@@ -121,6 +117,95 @@ async function searchJobs(q: string, limit: number) {
   };
 }
 
+type ArpSearchRow = { ip: string; mac: string; deviceName: string };
+
+/**
+ * Search ARP entries inside Job.result JSON.
+ *
+ * Uses `jsonb_array_elements(result->'entries')` so PostgreSQL unnests the
+ * JSON array and filters on the IP/MAC string inside — no full-table ILIKE
+ * on the result column. The WHERE on type+status restricts rows to the
+ * ~15k GET_ARP SUCCESS jobs.
+ */
+async function searchArp(q: string, limit: number): Promise<{ items: SearchResultItem[]; total: number }> {
+  // Escape special LIKE chars in q, then build ILIKE pattern
+  const escaped = q.replace(/[%_\\]/g, '\\$&');
+  const likePattern = `%${escaped}%`;
+
+  // jsonb_array_elements returns one row per ARP entry.
+  // Filter IP or MAC field, join with device name, dedupe by IP.
+  const rows = await prisma.$queryRaw<
+    Array<{ ip: string; mac: string; deviceName: string }>
+  >`
+    SELECT DISTINCT ON (entry->>'ip')
+           entry->>'ip'    AS ip,
+           entry->>'mac'   AS mac,
+           d.name          AS "deviceName"
+    FROM "Job" j
+    JOIN "Device" d ON d.id = j."deviceId"
+    CROSS JOIN LATERAL jsonb_array_elements(j.result->'entries') AS entry
+    WHERE j.type    = 'GET_ARP'
+      AND j.status  = 'SUCCESS'
+      AND (
+           entry->>'ip' ILIKE ${likePattern}
+        OR entry->>'mac' ILIKE ${likePattern}
+        OR entry->>'hostname' ILIKE ${likePattern}
+      )
+    ORDER BY entry->>'ip', j."updatedAt" DESC
+    LIMIT ${limit}
+  `;
+
+  return {
+    items: rows.map(
+      (r): SearchResultItem => ({
+        primary: r.ip,
+        secondary: r.mac ? `${r.mac} - ${r.deviceName}` : r.deviceName,
+        href: `/arp-addresses?q=${encodeURIComponent(q)}`,
+      })
+    ),
+    total: rows.length,
+  };
+}
+
+type MacSearchRow = { mac: string; vlan: string; interface: string; deviceName: string };
+
+/**
+ * Search MAC entries inside Job.result JSON (same JSONB approach as ARP).
+ */
+async function searchMac(q: string, limit: number): Promise<{ items: SearchResultItem[]; total: number }> {
+  const escaped = q.replace(/[%_\\]/g, '\\$&');
+  const likePattern = `%${escaped}%`;
+
+  const rows = await prisma.$queryRaw<
+    Array<{ mac: string; vlan: string; interface: string; deviceName: string }>
+  >`
+    SELECT DISTINCT ON (entry->>'mac')
+           entry->>'mac'        AS mac,
+           COALESCE(entry->>'vlan', '-')  AS vlan,
+           COALESCE(entry->>'interface', '-') AS interface,
+           d.name               AS "deviceName"
+    FROM "Job" j
+    JOIN "Device" d ON d.id = j."deviceId"
+    CROSS JOIN LATERAL jsonb_array_elements(j.result->'entries') AS entry
+    WHERE j.type    = 'GET_MAC'
+      AND j.status  = 'SUCCESS'
+      AND entry->>'mac' ILIKE ${likePattern}
+    ORDER BY entry->>'mac', j."updatedAt" DESC
+    LIMIT ${limit}
+  `;
+
+  return {
+    items: rows.map(
+      (r): SearchResultItem => ({
+        primary: r.mac,
+        secondary: `${r.interface} / VLAN ${r.vlan} - ${r.deviceName}`,
+        href: `/mac-addresses?q=${encodeURIComponent(q)}`,
+      })
+    ),
+    total: rows.length,
+  };
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 const DEFAULT_LIMIT = 3;
@@ -134,12 +219,12 @@ export async function searchAll(
   const limit = Math.min(Math.max(options?.limitPerGroup ?? DEFAULT_LIMIT, 1), 10);
   const trimmed = q.trim();
 
-  // Run Devices and Jobs in parallel — both are small tables with indexes.
-  // Skips heavy sequential scans (ARP/MAC/Logs/Audit/DHCP) that require
-  // full-table JSON ILIKE on the 200 k-row Job table (10+ seconds).
-  const [devicesResult, jobsResult] = await Promise.allSettled([
+  // All searches run in parallel — each has its own efficient query path.
+  const [devicesResult, jobsResult, arpResult, macResult] = await Promise.allSettled([
     searchDevices(trimmed, limit),
     searchJobs(trimmed, limit),
+    searchArp(trimmed, limit),
+    searchMac(trimmed, limit),
   ]);
 
   const groups: SearchResultGroup[] = [];
@@ -154,6 +239,12 @@ export async function searchAll(
 
   const j = jobsResult.status === 'fulfilled' ? jobsResult.value : { items: [], total: 0 };
   add('job', 'Jobs', '/jobs', j.items, j.total);
+
+  const a = arpResult.status === 'fulfilled' ? arpResult.value : { items: [], total: 0 };
+  add('arp', 'ARP', '/arp-addresses', a.items, a.total);
+
+  const m = macResult.status === 'fulfilled' ? macResult.value : { items: [], total: 0 };
+  add('mac', 'MAC', '/mac-addresses', m.items, m.total);
 
   console.log(`[search] groups=${groups.length} q=${trimmed}`);
   return groups;
