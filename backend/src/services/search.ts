@@ -272,54 +272,69 @@ async function searchAudit(q: string, limit: number) {
   };
 }
 
-async function searchDhcp(q: string, limit: number) {
+// ── DHCP helpers ──────────────────────────────────────────────────────────────
+
+/** True when `q` looks like an IP address or MAC address. */
+function isDhcpWorthy(q: string): boolean {
+  // IP: contains only digits+dots and has at least one dot
+  if (/^\d[\d.]*$/.test(q) && q.includes('.')) return true;
+  // MAC: hex chars + separators (colon, dash, dot)
+  const hexOnly = q.replace(/[^0-9a-f]/gi, '');
+  if (hexOnly.length >= 6) return true;
+  return false;
+}
+
+async function dhcpSearchByIp(q: string, limit: number): Promise<SearchResultItem[]> {
+  // Kea's lease4-search is indexed — O(1) for exact IP match.
+  const result = await keaCommand('lease4-search', { 'ip-address': q });
+  const leases = ((result.arguments as Record<string, unknown>)?.leases as Array<{
+    ip?: string; hwaddr?: string; hostname?: string; 'subnet-id'?: number;
+  }>) ?? [];
+
+  return leases.slice(0, limit).map((l) => ({
+    primary: l.ip ?? q,
+    secondary: `${(l.hwaddr ?? '').toLowerCase()} - ${l.hostname || '-'} - pool ${l['subnet-id'] ?? 0}`,
+    href: `/dhcp?pool=${l['subnet-id'] ?? 0}`,
+  }));
+}
+
+async function dhcpSearchByMac(q: string, limit: number): Promise<SearchResultItem[]> {
+  // Normalize input MAC to colon-separated lowercase, then query Kea.
+  const normalizedMac = q.replace(/[^0-9a-f]/gi, '').toLowerCase();
+  const formattedMac = normalizedMac
+    .match(/.{1,2}/g)
+    ?.join(':') ?? normalizedMac;
+
+  const result = await keaCommand('lease4-search', { 'hw-address': formattedMac });
+  const leases = ((result.arguments as Record<string, unknown>)?.leases as Array<{
+    ip?: string; hwaddr?: string; hostname?: string; 'subnet-id'?: number;
+  }>) ?? [];
+
+  return leases.slice(0, limit).map((l) => ({
+    primary: l.ip ?? '-',
+    secondary: `${(l.hwaddr ?? '').toLowerCase()} - ${l.hostname || '-'} - pool ${l['subnet-id'] ?? 0}`,
+    href: `/dhcp?pool=${l['subnet-id'] ?? 0}`,
+  }));
+}
+
+async function searchDhcp(q: string, limit: number): Promise<{ items: SearchResultItem[]; total: number }> {
   try {
-    const dashResult = await keaCommand('query4', { query: 'subnet4-get-all' });
-    const subnets = ((dashResult.arguments as Record<string, unknown>)?.subnets as Array<{ id: number }>) ?? [];
-    if (subnets.length === 0) return { items: [], total: 0 };
-
-    const allLeaseResults = await Promise.allSettled(
-      subnets.map((s) =>
-        keaCommand('query4', { query: 'lease4-get-all', subnetId: s.id })
-      )
-    );
-
-    const matched: Array<{ ip: string; mac: string; hostname: string; subnetId: number }> = [];
-    for (const r of allLeaseResults) {
-      if (r.status !== 'fulfilled') continue;
-      const leases = ((r.value.arguments as Record<string, unknown>)?.leases as Array<{
-        ip?: string;
-        hwaddr?: string;
-        hostname?: string;
-        subnetId?: number;
-      }>) ?? [];
-      for (const lease of leases) {
-        const ip = lease.ip ?? '';
-        const mac = (lease.hwaddr ?? '').toLowerCase();
-        const hostname = lease.hostname ?? '';
-        if (matches(ip, q) || matches(mac, q) || matches(hostname, q)) {
-          matched.push({
-            ip,
-            mac,
-            hostname,
-            subnetId: lease.subnetId ?? 0,
-          });
-          if (matched.length >= limit) break;
-        }
-      }
-      if (matched.length >= limit) break;
+    if (!isDhcpWorthy(q)) {
+      // Text query (hostname, device name…) — skip DHCP entirely.
+      // Scanning all leases for a hostname is O(n) and can take 3-5 s.
+      return { items: [], total: 0 };
     }
 
-    return {
-      items: matched.map(
-        (m): SearchResultItem => ({
-          primary: m.ip,
-          secondary: `${m.mac} - ${m.hostname || '-'} - pool ${m.subnetId}`,
-          href: `/dhcp?pool=${m.subnetId}`,
-        })
-      ),
-      total: matched.length,
-    };
+    // IP or MAC: use Kea's indexed lease4-search — sub-100 ms.
+    const isMacQuery = /^[0-9a-f]{6,}[':.\-]?/i.test(q);
+
+    if (isMacQuery) {
+      const items = await dhcpSearchByMac(q, limit);
+      return { items, total: items.length };
+    }
+
+    const items = await dhcpSearchByIp(q, limit);
+    return { items, total: items.length };
   } catch {
     return { items: [], total: 0 };
   }

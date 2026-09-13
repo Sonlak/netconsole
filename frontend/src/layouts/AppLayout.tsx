@@ -214,13 +214,13 @@ export default function AppLayout() {
             <Input
               readOnly
               prefix={<SearchOutlined />}
-              placeholder="Jump to page"
+              placeholder="Search…"
               suffix={
                 <Typography.Text type="secondary" style={{ fontSize: 11 }}>
                   ⌘K
                 </Typography.Text>
               }
-              style={{ width: 180, cursor: 'pointer' }}
+              style={{ width: 140, cursor: 'pointer' }}
               onClick={() => setCommandOpen(true)}
               className="nc-app-search"
             />
