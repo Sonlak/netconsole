@@ -80,6 +80,7 @@ const MIN_QUERY = 2;
 
 function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRef | null> }) {
   const navigate = useNavigate();
+  const { token } = theme.useToken();
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResultGroup[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -222,17 +223,17 @@ function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRe
             left: 0,
             zIndex: 1000,
             width: 520,
-            background: 'var(--ant-color-bg-container, #fff)',
+            background: token.colorBgElevated,
             borderRadius: 8,
-            boxShadow: '0 6px 16px 0 rgba(0,0,0,0.08), 0 3px 6px -4px rgba(0,0,0,0.12)',
-            border: '1px solid var(--ant-color-border-secondary, #f0f0f0)',
+            boxShadow: token.boxShadow,
+            border: `1px solid ${token.colorBorderSecondary}`,
             marginTop: 4,
             maxHeight: 480,
             overflowY: 'auto',
           }}
         >
           {/* Input area */}
-          <div style={{ padding: '8px 12px 6px', borderBottom: '1px solid var(--ant-color-border-secondary, #f0f0f0)' }}>
+          <div style={{ padding: '8px 12px 6px', borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
             {error && (
               <Typography.Text type="danger" style={{ fontSize: 12, display: 'block' }}>
                 {error}
@@ -305,7 +306,7 @@ function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRe
                         style={{
                           padding: '5px 14px',
                           cursor: 'pointer',
-                          background: isFocused ? 'var(--ant-color-bg-spotlight, #f5f5f5)' : 'transparent',
+                          background: isFocused ? token.colorBgSpotlight : 'transparent',
                           display: 'flex',
                           alignItems: 'center',
                           gap: 8,
@@ -349,7 +350,7 @@ function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRe
           {(results || loading || error) && (
             <div style={{
               padding: '6px 14px',
-              borderTop: '1px solid var(--ant-color-border-secondary, #f0f0f0)',
+              borderTop: `1px solid ${token.colorBorderSecondary}`,
               display: 'flex',
               justifyContent: 'space-between',
               alignItems: 'center',
@@ -357,7 +358,7 @@ function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRe
               <Flex gap={12}>
                 {[['↑↓', 'Navigate'], ['↵', 'Open'], ['Esc', 'Close']].map(([key, label]) => (
                   <Typography.Text key={key} type="secondary" style={{ fontSize: 11 }}>
-                    <kbd style={{ background: '#f5f5f5', border: '1px solid #d9d9d9', borderRadius: 4, padding: '1px 5px', fontSize: 11 }}>{key}</kbd>
+                    <kbd style={{ background: token.colorBgContainer, border: `1px solid ${token.colorBorder}`, borderRadius: 4, padding: '1px 5px', fontSize: 11 }}>{key}</kbd>
                     {' '}{label}
                   </Typography.Text>
                 ))}
