@@ -26,6 +26,8 @@ import { logsRouter } from './routes/logs.js';
 import { authRouter } from './routes/auth.js';
 import { auditLogRouter } from './routes/auditLog.js';
 import { searchRouter } from './routes/search.js';
+import { terminalRouter } from './routes/terminal.js';
+import { startTerminalWebSocket } from './websocket/terminal.js';
 import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
 import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
@@ -105,6 +107,10 @@ const httpServer = app.listen(port, () => {
   scheduleJobWatchdog(30);
   console.log('Job watchdog enabled (reclaim stale RUNNING every 30s)');
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
+
+  // Start WebSocket terminal server
+  startTerminalWebSocket(httpServer);
+  console.log('WebSocket terminal server enabled at /ws/terminal');
 });
 
 // CORS - phải đặt trước routes
@@ -140,6 +146,7 @@ app.get('/api/health', (_req, res) => {
       'logs',
       'auth',
       'audit-log',
+      'terminal',
     ],
     pingIntervalSeconds,
     macCollectIntervalSeconds,
@@ -173,6 +180,7 @@ app.use('/api/logs', authMiddleware, strictRateLimit, logsRouter);
 app.use('/api/jobs', authMiddleware, moderateRateLimit, jobsRouter);
 app.use('/api/audit-log', authMiddleware, strictRateLimit, auditLogRouter);
 app.use('/api/search', authMiddleware, strictRateLimit, searchRouter);
+app.use('/api/terminal', authMiddleware, strictRateLimit, terminalRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {

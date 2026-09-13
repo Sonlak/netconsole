@@ -296,6 +296,9 @@ model User {
   // `onDelete: SetNull` so historical jobs survive user deletion (audit
   // trail is more important than referential tidiness here).
   jobs Job[]
+
+  // Back-relation for terminal sessions
+  terminalSessions TerminalSession[]
 }
 
 // Append-only audit trail. Every mutating API request is logged here by the
@@ -346,4 +349,36 @@ model RefreshToken {
 
   @@index([userId, createdAt])
   @@index([expiresAt])
+}
+
+// Web SSH terminal sessions - compliance logging
+model TerminalSession {
+  id          String            @id @default(uuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId    String?
+  deviceIp    String?           // denormalised: stays readable after device deletion
+  deviceName  String?
+  hostname    String?           // device's reported hostname at session start
+  startTime   DateTime          @default(now())
+  endTime     DateTime?
+  error       String?           // connection error message if failed
+  commands    TerminalCommand[]
+
+  @@index([userId, startTime])
+  @@index([deviceId, startTime])
+  @@index([startTime])
+}
+
+// Individual command + output within a terminal session
+model TerminalCommand {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   TerminalSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  command   String         // raw input (passwords stripped server-side)
+  output    String?        // stdout/stderr; null for password echo
+  duration  Int?           // milliseconds to complete
+  timestamp DateTime       @default(now())
+
+  @@index([sessionId])
 }
