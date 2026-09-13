@@ -328,6 +328,8 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Unique ID per mount — used to detect stale WebSocket close events
+  const wsIdRef = useRef(0);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -335,13 +337,15 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const doConnect = useCallback(() => {
     if (!token) return;
 
+    // Assign a unique ID for this connection attempt — stale close events will have old IDs
+    const thisWsId = ++wsIdRef.current;
+
     // Clean up existing connections
     if (terminalRef.current) {
       terminalRef.current.dispose();
       terminalRef.current = null;
     }
     if (wsRef.current) {
-      wsRef.current.onclose = null; // Prevent cleanup from running
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -384,11 +388,12 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
         const msg = JSON.parse(event.data);
         console.log('[terminal] WS msg:', msg.type, msg.type === 'data' ? 'len=' + msg.data?.length : '');
         switch (msg.type) {
-          case 'ready':
-            console.log('[terminal] received ready!');
+          case 'ready': {
+            console.log('[terminal] received ready! setting status=connected');
             setStatus('connected');
             term.write('\r\n\x1b[32mConnected.\x1b[0m\r\n');
             break;
+          }
           case 'data':
             term.write(msg.data);
             break;
@@ -410,9 +415,12 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     };
 
     ws.onclose = () => {
-      console.log('[terminal] WS closed, readyState=', ws.readyState, 'OPEN=', WebSocket.OPEN);
-      // If readyState is CLOSING/CLOSED, we closed it intentionally (cleanup) — suppress error
-      // Otherwise it was a network failure
+      // Only handle close if this is the current connection (not a stale StrictMode close)
+      if (wsIdRef.current !== thisWsId) {
+        console.log('[terminal] WS closed (stale, ignoring)');
+        return;
+      }
+      console.log('[terminal] WS closed');
       if (ws.readyState !== WebSocket.CLOSING && ws.readyState !== WebSocket.CLOSED) {
         setErrorMsg('Connection lost. Check your network.');
         setStatus('error');
@@ -459,6 +467,8 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   // Cleanup on unmount — close WS and dispose terminal
   useEffect(() => {
     return () => {
+      // Increment the ID so stale WS close events are ignored
+      ++wsIdRef.current;
       if (wsRef.current) {
         wsRef.current.close();
       }
