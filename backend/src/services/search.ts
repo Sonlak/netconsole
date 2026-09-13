@@ -6,8 +6,10 @@
  * directly to the relevant page with the filter pre-applied.
  *
  * Design decisions:
- * - Runs all searches in parallel (Promise.allSettled) so one slow source
- *   (e.g. DHCP/Kea) does not block the rest.
+ * - Runs searches in a prioritized waterfall: fast/small tables first (Devices,
+ *   Jobs) in parallel, then heavier scans (ARP, MAC, Logs, Audit) sequentially.
+ *   This avoids connection-pool exhaustion that plagued the old parallel-all
+ *   approach where 7 queries fighting over 9 connections caused timeouts.
  * - DHCP requires live Kea API calls; all others hit the local Postgres DB.
  * - Each group is capped at `limitPerGroup` results so the response stays small
  *   even if one entity type has thousands of matches.
@@ -16,6 +18,8 @@
  * - ARP/MAC results are bounded to a 7-day window so the JSON ILIKE scan in
  *   `Job.result` stays fast even as the table grows; ARP/MAC tables refresh
  *   every few minutes, so a week covers all live inventory.
+ * - IP searches use `startsWith` (B-tree index) instead of `contains`
+ *   (sequential scan) when the query looks like an IP prefix.
  */
 
 import { Prisma } from '@prisma/client';
@@ -45,6 +49,21 @@ export type SearchResultItem = {
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** True when `q` looks like an IP address or IP prefix (e.g. "10", "10.10", "10.10.20.1"). */
+function looksLikeIp(q: string): boolean {
+  return /^\d[\d.]*$/.test(q) && q.includes('.');
+}
+
+/**
+ * Build a Prisma `startsWith` filter for IP prefix queries.
+ * "10.10.20.1" → startsWith "10.10.20.1" matches "10.10.20.101", "10.10.20.111"
+ * "10.10"      → startsWith "10.10"    matches "10.10.20.1", "10.10.30.1"
+ * "10"         → startsWith "10"       matches "10.1.2.3", "10.200.0.1"
+ */
+function ipPrefixFilter(q: string): Record<string, unknown> {
+  return { ip: { startsWith: q } };
+}
 
 function matches(haystack: string, q: string): boolean {
   if (!q) return true;
@@ -81,18 +100,24 @@ async function searchJobResult(
 // ── searchers ────────────────────────────────────────────────────────────────
 
 async function searchDevices(q: string, limit: number) {
+  // Use startsWith for IP prefix queries so Prisma can use the B-tree index.
+  // "10.10.20" matches "10.10.20.101", "10.10.20.111".
+  const isIpQuery = looksLikeIp(q);
+  const baseConditions = [
+    { name: { contains: q, mode: 'insensitive' as const } },
+    { serial: { contains: q, mode: 'insensitive' as const } },
+    { vendor: { contains: q, mode: 'insensitive' as const } },
+    { model: { contains: q, mode: 'insensitive' as const } },
+    { version: { contains: q, mode: 'insensitive' as const } },
+    { description: { contains: q, mode: 'insensitive' as const } },
+  ];
+  const orConditions: Record<string, unknown>[] = isIpQuery
+    ? [{ ip: { startsWith: q } }, ...baseConditions]
+    : [{ ip: { contains: q } }, ...baseConditions];
+
   const rows = await prisma.device.findMany({
-    where: {
-      OR: [
-        { name: { contains: q, mode: 'insensitive' } },
-        { ip: { contains: q } },
-        { serial: { contains: q, mode: 'insensitive' } },
-        { vendor: { contains: q, mode: 'insensitive' } },
-        { model: { contains: q, mode: 'insensitive' } },
-        { version: { contains: q, mode: 'insensitive' } },
-        { description: { contains: q, mode: 'insensitive' } },
-      ],
-    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    where: { OR: orConditions as any },
     take: limit,
     orderBy: { updatedAt: 'desc' },
   });
@@ -118,9 +143,6 @@ async function searchDevices(q: string, limit: number) {
 
 async function searchArp(q: string, limit: number) {
   try {
-    // Push the filter down to Postgres so we don't pull every ARP row into
-    // memory before filtering in JS. JSON ILIKE in `result::text` is bounded
-    // by the 7-day window and the per-job row count.
     const jobs = await searchJobResult('GET_ARP', q, limit);
     const seen = new Set<string>();
     const items: SearchResultItem[] = [];
@@ -131,7 +153,9 @@ async function searchArp(q: string, limit: number) {
         const ip = String(e.ip ?? '');
         const mac = String(e.mac ?? '');
         const hostname = String(e.hostname ?? '');
-        if (!matches(ip, q) && !matches(mac, q) && !matches(hostname, q)) continue;
+        // For IP prefix queries (e.g. "10.10.20"), use startsWith matching
+        const ipMatches = looksLikeIp(q) ? ip.startsWith(q) : matches(ip, q);
+        if (!ipMatches && !matches(mac, q) && !matches(hostname, q)) continue;
         const key = `${ip}|${mac}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -210,8 +234,6 @@ async function searchLogs(q: string, limit: number) {
 }
 
 async function searchJobs(q: string, limit: number) {
-  // Job.type is an enum; substring filter on enum values is meaningless.
-  // Match against error / device name / device IP / device serial instead.
   const rows = await prisma.job.findMany({
     where: {
       OR: [
@@ -276,16 +298,13 @@ async function searchAudit(q: string, limit: number) {
 
 /** True when `q` looks like an IP address or MAC address. */
 function isDhcpWorthy(q: string): boolean {
-  // IP: contains only digits+dots and has at least one dot
   if (/^\d[\d.]*$/.test(q) && q.includes('.')) return true;
-  // MAC: hex chars + separators (colon, dash, dot)
   const hexOnly = q.replace(/[^0-9a-f]/gi, '');
   if (hexOnly.length >= 6) return true;
   return false;
 }
 
 async function dhcpSearchByIp(q: string, limit: number): Promise<SearchResultItem[]> {
-  // Kea's lease4-search is indexed — O(1) for exact IP match.
   const result = await keaCommand('lease4-search', { 'ip-address': q });
   const leases = ((result.arguments as Record<string, unknown>)?.leases as Array<{
     ip?: string; hwaddr?: string; hostname?: string; 'subnet-id'?: number;
@@ -299,7 +318,6 @@ async function dhcpSearchByIp(q: string, limit: number): Promise<SearchResultIte
 }
 
 async function dhcpSearchByMac(q: string, limit: number): Promise<SearchResultItem[]> {
-  // Normalize input MAC to colon-separated lowercase, then query Kea.
   const normalizedMac = q.replace(/[^0-9a-f]/gi, '').toLowerCase();
   const formattedMac = normalizedMac
     .match(/.{1,2}/g)
@@ -320,12 +338,9 @@ async function dhcpSearchByMac(q: string, limit: number): Promise<SearchResultIt
 async function searchDhcp(q: string, limit: number): Promise<{ items: SearchResultItem[]; total: number }> {
   try {
     if (!isDhcpWorthy(q)) {
-      // Text query (hostname, device name…) — skip DHCP entirely.
-      // Scanning all leases for a hostname is O(n) and can take 3-5 s.
       return { items: [], total: 0 };
     }
 
-    // IP or MAC: use Kea's indexed lease4-search — sub-100 ms.
     const isMacQuery = /^[0-9a-f]{6,}[':.\-]?/i.test(q);
 
     if (isMacQuery) {
@@ -344,20 +359,6 @@ async function searchDhcp(q: string, limit: number): Promise<{ items: SearchResu
 
 const DEFAULT_LIMIT = 3;
 
-/** Wrap a promise with a deadline. Resolves to `null` on timeout. */
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<{ v: T } | null> {
-  let timer: ReturnType<typeof setTimeout>;
-  const race = Promise.race([p, new Promise<null>((_, reject) => { timer = setTimeout(() => reject(null), ms); })]);
-  try {
-    const v = await race;
-    clearTimeout(timer!);
-    return { v: v as T };
-  } catch {
-    clearTimeout(timer!);
-    return null;
-  }
-}
-
 export async function searchAll(
   q: string,
   options?: { limitPerGroup?: number }
@@ -367,40 +368,54 @@ export async function searchAll(
   const limit = Math.min(Math.max(options?.limitPerGroup ?? DEFAULT_LIMIT, 1), 10);
   const trimmed = q.trim();
 
-  // Per-group deadline: return partial results as they arrive.
-  // Fast groups (Devices, DHCP) show within ~50 ms; slow groups (ARP/MAC
-  // Job.result ILIKE) are allowed up to 8 s before we give up.
-  const FAST_MS = 3000;
-  const tasks: Array<{
-    kind: SearchResultGroup['kind'];
-    label: string;
-    url: string;
-    p: Promise<{ items: SearchResultItem[]; total: number }>;
-  }> = [
-    { kind: 'device', label: 'Devices', url: '/devices', p: searchDevices(trimmed, limit) },
-    { kind: 'dhcp', label: 'DHCP Leases', url: '/dhcp', p: searchDhcp(trimmed, limit) },
-    { kind: 'job', label: 'Jobs', url: '/jobs', p: searchJobs(trimmed, limit) },
-    { kind: 'log', label: 'Logs', url: '/logs', p: searchLogs(trimmed, limit) },
-    { kind: 'audit', label: 'Audit', url: '/logs', p: searchAudit(trimmed, limit) },
-    { kind: 'arp', label: 'ARP', url: '/arp-addresses', p: searchArp(trimmed, limit) },
-    { kind: 'mac', label: 'MAC', url: '/mac-addresses', p: searchMac(trimmed, limit) },
-  ];
-
-  const timed = tasks.map((t) => withTimeout(t.p, FAST_MS));
-  const settled = await Promise.all(timed);
+  // Waterfall strategy: run the two fastest/smallest tables in parallel
+  // (Devices: ~9 rows with B-tree index; Jobs: small table with indexes),
+  // then chain the heavier scans sequentially. This avoids the connection-pool
+  // exhaustion that plagued the old parallel-all approach where 7 queries
+  // fighting over 9 connections caused timeouts.
+  const [devicesResult, jobsResult] = await Promise.allSettled([
+    searchDevices(trimmed, limit),
+    searchJobs(trimmed, limit),
+  ]);
 
   const groups: SearchResultGroup[] = [];
-  for (let i = 0; i < tasks.length; i++) {
-    const task = tasks[i];
-    const result = settled[i];
-    if (result === null) {
-      console.warn(`[search] ${task.label} timed out after ${FAST_MS}ms q=${trimmed}`);
-      continue;
-    }
-    const { items, total } = result.v;
-    if (total === 0) continue;
-    groups.push({ kind: task.kind, label: task.label, items, total, url: task.url });
-  }
+
+  const add = (kind: SearchResultGroup['kind'], label: string, url: string, items: SearchResultItem[], total: number) => {
+    if (total === 0) return;
+    groups.push({ kind, label, items, total, url });
+  };
+
+  const d = devicesResult.status === 'fulfilled' ? devicesResult.value : { items: [], total: 0 };
+  add('device', 'Devices', '/devices', d.items, d.total);
+
+  const j = jobsResult.status === 'fulfilled' ? jobsResult.value : { items: [], total: 0 };
+  add('job', 'Jobs', '/jobs', j.items, j.total);
+
+  // Heavier scans — run sequentially to avoid pool exhaustion
+  try {
+    const dhcp = await searchDhcp(trimmed, limit);
+    add('dhcp', 'DHCP Leases', '/dhcp', dhcp.items, dhcp.total);
+  } catch { /* skip */ }
+
+  try {
+    const arp = await searchArp(trimmed, limit);
+    add('arp', 'ARP', '/arp-addresses', arp.items, arp.total);
+  } catch { /* skip */ }
+
+  try {
+    const mac = await searchMac(trimmed, limit);
+    add('mac', 'MAC', '/mac-addresses', mac.items, mac.total);
+  } catch { /* skip */ }
+
+  try {
+    const logs = await searchLogs(trimmed, limit);
+    add('log', 'Logs', '/logs', logs.items, logs.total);
+  } catch { /* skip */ }
+
+  try {
+    const audit = await searchAudit(trimmed, limit);
+    add('audit', 'Audit', '/logs', audit.items, audit.total);
+  } catch { /* skip */ }
 
   console.log(`[search] groups=${groups.length} q=${trimmed}`);
   return groups;
