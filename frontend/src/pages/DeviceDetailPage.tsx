@@ -328,6 +328,9 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Track if we've intentionally started a connection — prevents StrictMode double-invoke
+  // from closing the WS before ws.onopen fires
+  const connectingRef = useRef(false);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -347,6 +350,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     setStatus('connecting');
     setErrorMsg(null);
+    connectingRef.current = true;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -368,7 +372,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     let wasConnected = false;
 
     ws.onopen = () => {
-      // Backend resolves credentials from env vars — no user/pass sent
+      connectingRef.current = false; // Message sent, no longer "pending"
       ws.send(JSON.stringify({ type: 'connect', deviceIp }));
     };
 
@@ -377,6 +381,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       switch (msg.type) {
         case 'ready':
           wasConnected = true;
+          connectingRef.current = false;
           setStatus('connected');
           // State update is async — defer terminal open until React re-renders
           setTimeout(() => {
@@ -402,6 +407,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     };
 
     ws.onclose = () => {
+      connectingRef.current = false;
       if (!wasConnected) {
         setErrorMsg('Could not connect. Check that the device is reachable and SSH is enabled.');
         setStatus('error');
@@ -445,10 +451,14 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     return () => ro.disconnect();
   }, [status]);
 
-  // Cleanup on unmount
+  // Cleanup on unmount — only close WS if we intentionally started connecting
   useEffect(() => {
     return () => {
-      wsRef.current?.close();
+      // Only close if we're in a pending connect state (not yet open)
+      // If ws.onopen already fired, the backend cleanup handles SSH teardown
+      if (connectingRef.current && wsRef.current) {
+        wsRef.current.close();
+      }
       terminalRef.current?.dispose();
     };
   }, []);
