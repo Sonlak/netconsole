@@ -335,6 +335,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
   // ── Core SSH connect (stable ref so ws callbacks don't staleness)
   const doConnect = useCallback(() => {
+    console.log('[terminal] doConnect called, token=', !!token);
     if (!token) return;
 
     // Assign a unique ID for this connection attempt — stale close events will have old IDs
@@ -351,6 +352,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
     }
 
     setStatus('connecting');
+    console.log('[terminal] setStatus(connecting) called, containerRef=', containerRef.current ? 'EXISTS' : 'NULL');
     setErrorMsg(null);
 
     const term = new Terminal({
@@ -371,14 +373,28 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
 
     // Open terminal immediately — container is rendered in 'connecting' state
     // This ensures xterm.js is ready before SSH data arrives
-    console.log('[terminal] containerRef.current:', containerRef.current ? 'EXISTS h=' + containerRef.current.clientHeight : 'NULL');
+    console.log('[terminal] containerRef.current:', containerRef.current ? 'EXISTS h=' + containerRef.current.clientHeight + ' children=' + containerRef.current.children.length : 'NULL');
     if (containerRef.current) {
       term.open(containerRef.current);
       fit.fit();
       console.log('[terminal] xterm opened, rows:', term.rows, 'cols:', term.cols);
       term.write('Connecting to ' + deviceIp + '...\r\n');
     } else {
-      console.error('[terminal] containerRef is NULL — React not rendered yet!');
+      console.error('[terminal] containerRef is NULL — React not rendered yet! Setting up mutation observer');
+      // Container not ready yet — observe the tab pane for when it appears
+      const tabPane = document.querySelector('.ant-tabs-tabpane-active');
+      if (tabPane) {
+        const mo = new MutationObserver(() => {
+          if (containerRef.current) {
+            mo.disconnect();
+            console.log('[terminal] container appeared, opening xterm');
+            term.open(containerRef.current);
+            fit.fit();
+            term.write('Connecting to ' + deviceIp + '...\r\n');
+          }
+        });
+        mo.observe(tabPane, { childList: true, subtree: true });
+      }
     }
 
     ws.onopen = () => {
