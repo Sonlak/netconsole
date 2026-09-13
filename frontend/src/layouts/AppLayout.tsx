@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import {
   ApiOutlined,
@@ -22,7 +22,7 @@ import {
   UserOutlined,
   WifiOutlined,
 } from '@ant-design/icons';
-import { App as AntApp, Avatar, type InputRef, Breadcrumb, Button, Dropdown, Flex, Input, Layout, Menu, Modal, Select, Skeleton, Space, Tag, Tooltip, Typography, theme } from 'antd';
+import { App as AntApp, Avatar, Breadcrumb, Button, Dropdown, Flex, Input, type InputRef, Layout, Menu, Select, Skeleton, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type { MenuProps } from 'antd';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { useSite, SITE_OPTIONS } from '@/components/site-provider';
@@ -74,6 +74,309 @@ function pageMeta(pathname: string) {
   return PAGE_META[pathname] ?? PAGE_META['/'];
 }
 
+// ─── Inline Search ─────────────────────────────────────────────────────────────
+
+const MIN_QUERY = 2;
+
+function InlineSearch({ forwardedRef }: { forwardedRef?: React.RefObject<InputRef | null> }) {
+  const navigate = useNavigate();
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<SearchResultGroup[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [focusedIndex, setFocusedIndex] = useState(-1);
+  const [open, setOpen] = useState(false);
+  const inputRef = useRef<InputRef>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Sync forwarded ref to the actual InputRef
+  useEffect(() => {
+    if (!forwardedRef) return;
+    (forwardedRef as React.MutableRefObject<InputRef | null>).current = inputRef.current;
+  }, [forwardedRef]);
+
+  // Debounced search
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < MIN_QUERY) {
+      setResults(null);
+      setLoading(false);
+      setLatencyMs(null);
+      setFocusedIndex(-1);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const t0 = performance.now();
+      setLoading(true);
+      setError(null);
+      globalSearch(trimmed, 3)
+        .then((groups) => {
+          if (cancelled) return;
+          setResults(groups);
+          setLatencyMs(Math.round(performance.now() - t0));
+          setFocusedIndex(groups.length > 0 ? 0 : -1);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : 'Search failed');
+          setResults(null);
+          setLatencyMs(Math.round(performance.now() - t0));
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [query]);
+
+  // Flat list for keyboard nav
+  const flatItems = useMemo((): Array<{ href: string; label: string }> => {
+    if (!results || results.length === 0) return [];
+    const out: Array<{ href: string; label: string }> = [];
+    for (const group of results) {
+      if (group.url) out.push({ href: group.url, label: `All ${group.label}` });
+      for (const item of group.items) out.push({ href: item.href, label: item.primary });
+    }
+    return out;
+  }, [results]);
+
+  const handleNavigate = useCallback((href: string) => {
+    navigate(href);
+    setQuery('');
+    setResults(null);
+    setOpen(false);
+  }, [navigate]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setFocusedIndex((i) => Math.min(i + 1, flatItems.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setFocusedIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (focusedIndex >= 0 && flatItems[focusedIndex]) {
+        handleNavigate(flatItems[focusedIndex].href);
+      }
+    } else if (e.key === 'Escape') {
+      setOpen(false);
+      setQuery('');
+      setResults(null);
+    }
+  };
+
+  // Close on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  // Scroll focused item into view
+  useEffect(() => {
+    if (focusedIndex < 0) return;
+    const el = document.querySelector(`[data-search-idx="${focusedIndex}"]`);
+    el?.scrollIntoView({ block: 'nearest' });
+  }, [focusedIndex]);
+
+  const showResults = query.trim().length >= MIN_QUERY;
+  let flatIdx = 0;
+
+  return (
+    <div ref={containerRef} style={{ position: 'relative' }}>
+      <Input
+        ref={inputRef}
+        prefix={<SearchOutlined />}
+        placeholder="Search…"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={handleKeyDown}
+        className="nc-app-search"
+        style={{ width: 280 }}
+        suffix={
+          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+            ⌘K
+          </Typography.Text>
+        }
+      />
+
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            zIndex: 1000,
+            width: 520,
+            background: 'var(--ant-color-bg-container, #fff)',
+            borderRadius: 8,
+            boxShadow: '0 6px 16px 0 rgba(0,0,0,0.08), 0 3px 6px -4px rgba(0,0,0,0.12)',
+            border: '1px solid var(--ant-color-border-secondary, #f0f0f0)',
+            marginTop: 4,
+            maxHeight: 480,
+            overflowY: 'auto',
+          }}
+        >
+          {/* Input area */}
+          <div style={{ padding: '8px 12px 6px', borderBottom: '1px solid var(--ant-color-border-secondary, #f0f0f0)' }}>
+            {error && (
+              <Typography.Text type="danger" style={{ fontSize: 12, display: 'block' }}>
+                {error}
+              </Typography.Text>
+            )}
+            {query.trim().length > 0 && query.trim().length < MIN_QUERY && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                Type {MIN_QUERY - query.trim().length} more character{MIN_QUERY - query.trim().length > 1 ? 's' : ''} to search
+              </Typography.Text>
+            )}
+          </div>
+
+          {/* Loading */}
+          {loading && showResults && (
+            <div style={{ padding: '8px 12px 12px' }}>
+              {[1, 2, 3].map((i) => (
+                <Skeleton key={i} active paragraph={{ rows: 1 }} style={{ marginBottom: 8 }} />
+              ))}
+            </div>
+          )}
+
+          {/* Empty hint */}
+          {!loading && !showResults && (
+            <div style={{ padding: '24px 16px', textAlign: 'center' }}>
+              <SearchOutlined style={{ fontSize: 24, color: '#bfbfbf', display: 'block', marginBottom: 8 }} />
+              <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                Search across devices, ARP, MAC, logs, jobs…
+              </Typography.Text>
+            </div>
+          )}
+
+          {/* Results */}
+          {!loading && showResults && results && results.length > 0 && (
+            <div>
+              {results.map((group) => (
+                <div key={group.kind}>
+                  {/* Group header */}
+                  <div
+                    data-search-idx={flatIdx++}
+                    onClick={() => group.url && handleNavigate(group.url)}
+                    onMouseEnter={() => setFocusedIndex(group.url ? flatIdx - 1 : -1)}
+                    style={{
+                      padding: '6px 14px 4px',
+                      cursor: group.url ? 'pointer' : 'default',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                    }}
+                  >
+                    <Typography.Text style={{ fontSize: 12, fontWeight: 600 }}>
+                      {group.label}
+                    </Typography.Text>
+                    {group.url && (
+                      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                        See all →
+                      </Typography.Text>
+                    )}
+                  </div>
+
+                  {/* Group items */}
+                  {group.items.slice(0, 5).map((item, idx) => {
+                    const currentIdx = flatIdx++;
+                    const isFocused = focusedIndex === currentIdx;
+                    return (
+                      <div
+                        key={idx}
+                        data-search-idx={currentIdx}
+                        onClick={() => handleNavigate(item.href)}
+                        onMouseEnter={() => setFocusedIndex(currentIdx)}
+                        style={{
+                          padding: '5px 14px',
+                          cursor: 'pointer',
+                          background: isFocused ? 'var(--ant-color-bg-spotlight, #f5f5f5)' : 'transparent',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
+                        }}
+                      >
+                        <span style={{ fontSize: 13 }}>{item.primary}</span>
+                        {item.secondary && (
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {item.secondary}
+                          </Typography.Text>
+                        )}
+                        {item.tag && (
+                          <Tag
+                            color={item.tagColor === 'success' ? 'success' : item.tagColor === 'warning' ? 'warning' : item.tagColor === 'error' ? 'error' : item.tagColor === 'processing' ? 'processing' : 'default'}
+                            style={{ flexShrink: 0, margin: 0, fontSize: 11 }}
+                          >
+                            {item.tag}
+                          </Tag>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* No results */}
+          {!loading && showResults && results && results.length === 0 && !error && (
+            <div style={{ padding: '24px 16px', textAlign: 'center' }}>
+              <SearchOutlined style={{ fontSize: 28, color: '#bfbfbf', display: 'block', marginBottom: 8 }} />
+              <Typography.Text type="secondary">No results for &ldquo;{query}&rdquo;</Typography.Text>
+              <br />
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                Try a device name, IP address, MAC, or hostname
+              </Typography.Text>
+            </div>
+          )}
+
+          {/* Footer */}
+          {(results || loading || error) && (
+            <div style={{
+              padding: '6px 14px',
+              borderTop: '1px solid var(--ant-color-border-secondary, #f0f0f0)',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}>
+              <Flex gap={12}>
+                {[['↑↓', 'Navigate'], ['↵', 'Open'], ['Esc', 'Close']].map(([key, label]) => (
+                  <Typography.Text key={key} type="secondary" style={{ fontSize: 11 }}>
+                    <kbd style={{ background: '#f5f5f5', border: '1px solid #d9d9d9', borderRadius: 4, padding: '1px 5px', fontSize: 11 }}>{key}</kbd>
+                    {' '}{label}
+                  </Typography.Text>
+                ))}
+              </Flex>
+              {latencyMs !== null && (
+                <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                  {latencyMs} ms
+                </Typography.Text>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App Layout ──────────────────────────────────────────────────────────────
+
 export default function AppLayout() {
   const { user, logout } = useAuth();
   const location = useLocation();
@@ -97,7 +400,7 @@ export default function AppLayout() {
   }, [notification, message]);
 
   const [collapsed, setCollapsed] = useState(false);
-  const [commandOpen, setCommandOpen] = useState(false);
+  const searchInputRef = useRef<InputRef>(null);
   const current = pageMeta(location.pathname);
   const isDark = colorMode === 'dark';
 
@@ -105,7 +408,7 @@ export default function AppLayout() {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        setCommandOpen(true);
+        searchInputRef.current?.focus();
       }
     };
     window.addEventListener('keydown', onKey);
@@ -211,19 +514,7 @@ export default function AppLayout() {
               options={SITE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
               onChange={setSite}
             />
-            <Input
-              readOnly
-              prefix={<SearchOutlined />}
-              placeholder="Search…"
-              suffix={
-                <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-                  ⌘K
-                </Typography.Text>
-              }
-              style={{ width: 140, cursor: 'pointer' }}
-              onClick={() => setCommandOpen(true)}
-              className="nc-app-search"
-            />
+            <InlineSearch forwardedRef={searchInputRef} />
             <Tooltip title={isDark ? 'Light theme' : 'Dark theme'}>
               <Button type="text" aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'} icon={isDark ? <SunOutlined /> : <MoonOutlined />} onClick={toggle} />
             </Tooltip>
@@ -280,357 +571,7 @@ export default function AppLayout() {
         <div className="nc-app-footer-version">NetConsole 1.2.0</div>
         <div className="nc-app-footer-copy">© 2026 SonLak.</div>
       </footer>
-      <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} />
       </Layout>
     </AntApp>
-  );
-}
-
-function CommandPalette({
-  open,
-  onClose,
-}: {
-  open: boolean;
-  onClose: () => void;
-}) {
-  const navigate = useNavigate();
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<SearchResultGroup[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
-  const [focusedIndex, setFocusedIndex] = useState(-1);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  // Reset state when modal opens
-  useEffect(() => {
-    if (open) {
-      setQuery('');
-      setResults(null);
-      setLoading(false);
-      setError(null);
-      setLatencyMs(null);
-      setFocusedIndex(-1);
-    }
-  }, [open]);
-
-  // Debounced fetch — fires 250ms after last keystroke
-  useEffect(() => {
-    const trimmed = query.trim();
-    if (trimmed.length < 2) {
-      setResults(null);
-      setLoading(false);
-      setLatencyMs(null);
-      setFocusedIndex(-1);
-      return;
-    }
-
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      const t0 = performance.now();
-      setLoading(true);
-      setError(null);
-
-      globalSearch(trimmed, 3)
-        .then((groups) => {
-          if (cancelled) return;
-          setResults(groups);
-          setLatencyMs(Math.round(performance.now() - t0));
-          setFocusedIndex(groups.length > 0 ? 0 : -1);
-        })
-        .catch((err) => {
-          if (cancelled) return;
-          setError(err instanceof Error ? err.message : 'Search failed');
-          setResults(null);
-          setLatencyMs(Math.round(performance.now() - t0));
-        })
-        .finally(() => {
-          if (!cancelled) setLoading(false);
-        });
-    }, 250);
-
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [query]);
-
-  // Build flat list of all navigable items for keyboard nav
-  const flatItems = useMemo((): Array<{ href: string; label: string }> => {
-    if (!results || results.length === 0) {
-      // Static NAV removed — keyboard nav only navigates real results
-      return [];
-    }
-    // Search results: "open all" headers + individual rows
-    const out: Array<{ href: string; label: string }> = [];
-    for (const group of results) {
-      // Group header row
-      if (group.url) {
-        out.push({ href: group.url, label: `All ${group.label}` });
-      }
-      // Individual rows
-      for (const item of group.items) {
-        out.push({ href: item.href, label: item.primary });
-      }
-    }
-    return out;
-  }, [results]);
-
-  const handleNavigate = (href: string) => {
-    navigate(href);
-    onClose();
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setFocusedIndex((i) => Math.min(i + 1, flatItems.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setFocusedIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (focusedIndex >= 0 && flatItems[focusedIndex]) {
-        handleNavigate(flatItems[focusedIndex].href);
-      }
-    }
-  };
-
-  // Scroll focused item into view
-  useEffect(() => {
-    if (focusedIndex < 0) return;
-    const el = document.querySelector(`[data-search-idx="${focusedIndex}"]`);
-    el?.scrollIntoView({ block: 'nearest' });
-  }, [focusedIndex]);
-
-  const MIN_QUERY = 2;
-  const showNav = !loading && (query.trim().length < MIN_QUERY || (!results && !error));
-  const showResults = query.trim().length >= MIN_QUERY;
-  let flatIdx = 0;
-
-  return (
-    <Modal
-      open={open}
-      onCancel={onClose}
-      footer={null}
-      title={
-        <Flex align="center" gap={8}>
-          <SearchOutlined />
-          <span>Search</span>
-        </Flex>
-      }
-      destroyOnClose
-      styles={{ body: { padding: 0, maxHeight: 480, overflowY: 'auto' } }}
-      width={520}
-    >
-      <div style={{ padding: '12px 16px 8px' }}>
-        <Input
-          ref={inputRef as React.Ref<InputRef>}
-          autoFocus
-          prefix={<SearchOutlined />}
-          placeholder="Device name, IP, MAC, hostname, log message…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={handleKeyDown}
-          status={error ? 'error' : undefined}
-        />
-        {error && (
-          <Typography.Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
-            {error}
-          </Typography.Text>
-        )}
-        {query.trim().length > 0 && query.trim().length < MIN_QUERY && (
-          <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
-            Type {MIN_QUERY - query.trim().length} more character{MIN_QUERY - query.trim().length > 1 ? 's' : ''} to search
-          </Typography.Text>
-        )}
-      </div>
-
-      {/* Loading skeleton */}
-      {loading && showResults && (
-        <div style={{ padding: '8px 16px 16px' }}>
-          {[1, 2, 3].map((i) => (
-            <Skeleton key={i} active paragraph={{ rows: 1 }} style={{ marginBottom: 8 }} />
-          ))}
-        </div>
-      )}
-
-      {/* Static NAV fallback removed — show hint to type more characters */}
-      {!loading && showNav && (
-        <div style={{
-          padding: '32px 16px',
-          textAlign: 'center',
-          color: 'var(--ant-color-text-secondary, #8c8c8c)',
-        }}>
-          <SearchOutlined style={{ fontSize: 28, color: '#bfbfbf', display: 'block', marginBottom: 8 }} />
-          <Typography.Text type="secondary" style={{ display: 'block' }}>
-            {query.trim().length === 0
-              ? 'Start typing to search across devices, ARP, MAC, logs, jobs…'
-              : `Type ${MIN_QUERY - query.trim().length} more character${MIN_QUERY - query.trim().length > 1 ? 's' : ''} to search`}
-          </Typography.Text>
-        </div>
-      )}
-
-      {/* Search results */}
-      {!loading && showResults && results && results.length > 0 && (
-        <div>
-          {results.map((group) => {
-            const groupStartIdx = flatIdx;
-
-            return (
-              <div key={group.kind}>
-                {/* Group header */}
-                <div
-                  data-search-idx={flatIdx++}
-                  onClick={() => group.url && handleNavigate(group.url)}
-                  style={{
-                    padding: '6px 16px 4px',
-                    cursor: group.url ? 'pointer' : 'default',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    background: focusedIndex === groupStartIdx
-                      ? '#f0f5ff'
-                      : 'transparent',
-                    borderRadius: 6,
-                    margin: '0 4px',
-                  }}
-                  onMouseEnter={() => setFocusedIndex(groupStartIdx)}
-                >
-                  <Typography.Text strong style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--ant-color-text-secondary, #8c8c8c)' }}>
-                    {group.label}
-                  </Typography.Text>
-                  <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-                    {group.total > group.items.length ? `${group.items.length}/${group.total}` : group.total}
-                    {' '}
-                    <a
-                      onClick={(e) => { e.stopPropagation(); if (group.url) handleNavigate(group.url); }}
-                      style={{ fontSize: 11 }}
-                    >
-                      Open all
-                    </a>
-                  </Typography.Text>
-                </div>
-
-                {/* Group rows */}
-                {group.items.map((item) => {
-                  const idx = flatIdx++;
-                  const isFocused = focusedIndex === idx;
-
-                  return (
-                    <div
-                      key={idx}
-                      data-search-idx={idx}
-                      onClick={() => handleNavigate(item.href)}
-                      onMouseEnter={() => setFocusedIndex(idx)}
-                      style={{
-                        padding: '7px 16px',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'flex-start',
-                        justifyContent: 'space-between',
-                        gap: 12,
-                        background: isFocused ? '#e6f4ff' : 'transparent',
-                        borderRadius: 6,
-                        margin: '0 4px',
-                      }}
-                    >
-                      <div style={{ minWidth: 0, flex: 1 }}>
-                        <Typography.Text
-                          style={{
-                            display: 'block',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                            fontFamily: 'var(--ant-font-family, monospace)',
-                            fontSize: 13,
-                          }}
-                        >
-                          {item.primary}
-                        </Typography.Text>
-                        <Typography.Text
-                          type="secondary"
-                          style={{
-                            display: 'block',
-                            fontSize: 11,
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                          }}
-                        >
-                          {item.secondary}
-                        </Typography.Text>
-                      </div>
-                      {item.tag && (
-                        <Tag
-                          color={
-                            item.tagColor === 'success' ? 'success'
-                            : item.tagColor === 'error'   ? 'error'
-                            : item.tagColor === 'warning' ? 'warning'
-                            : item.tagColor === 'processing' ? 'processing'
-                            : 'default'
-                          }
-                          style={{ flexShrink: 0, margin: 0, fontSize: 11 }}
-                        >
-                          {item.tag}
-                        </Tag>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Empty results */}
-      {!loading && showResults && results && results.length === 0 && !error && (
-        <div style={{ padding: '24px 16px', textAlign: 'center' }}>
-          <SearchOutlined style={{ fontSize: 32, color: '#bfbfbf', display: 'block', marginBottom: 8 }} />
-          <Typography.Text type="secondary">No results for &ldquo;{query}&rdquo;</Typography.Text>
-          <br />
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Try a device name, IP address, MAC, or hostname
-          </Typography.Text>
-        </div>
-      )}
-
-      {/* Keyboard hint footer */}
-      <div style={{
-        padding: '8px 16px',
-        borderTop: '1px solid var(--ant.colorBorderSecondary, #f0f0f0)',
-        display: 'flex',
-        gap: 16,
-        flexWrap: 'wrap',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-      }}>
-        <Flex gap={16} wrap="wrap">
-          {[
-            ['↑↓', 'Navigate'],
-            ['↵', 'Open'],
-            ['Esc', 'Close'],
-          ].map(([key, label]) => (
-            <Typography.Text key={key} type="secondary" style={{ fontSize: 11 }}>
-              <kbd style={{
-                background: '#f5f5f5',
-                border: '1px solid #d9d9d9',
-                borderRadius: 4,
-                padding: '1px 5px',
-                fontFamily: 'inherit',
-                fontSize: 11,
-              }}>{key}</kbd>
-              {' '}{label}
-            </Typography.Text>
-          ))}
-        </Flex>
-        {latencyMs !== null && (
-          <Typography.Text type="secondary" style={{ fontSize: 11 }}>
-            {latencyMs} ms
-          </Typography.Text>
-        )}
-      </div>
-    </Modal>
   );
 }
