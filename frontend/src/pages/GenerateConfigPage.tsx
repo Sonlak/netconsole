@@ -24,9 +24,12 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Upload,
   message,
   notification,
 } from 'antd';
+import { UploadOutlined, PlusOutlined, EditOutlined, DeleteOutlined, CloudUploadOutlined } from '@ant-design/icons';
+import type { UploadFile, UploadProps } from 'antd/es/upload/interface';
 import {
   BulkDeployProgressModal,
   type BulkDeployQueuedJob,
@@ -39,14 +42,19 @@ import {
   commitGenerateConfig,
   fetchConfigTemplates,
   fetchGenerateConfig,
+  fetchUserTemplates,
   previewBulkConfig,
   renderConfigTemplate,
   rollbackGenerateConfig,
   saveGenerateConfig,
+  createUserTemplate,
+  deleteUserTemplate,
+  updateUserTemplate,
   type BulkCommitResult,
   type ConfigRole,
   type ConfigTemplateMeta,
   type DeviceSavedConfig,
+  type UserTemplate,
 } from '@/api/generateConfig';
 import {
   JobWaitTimeoutError,
@@ -105,6 +113,11 @@ export default function GenerateConfigPage() {
             label: 'Bulk deploy',
             children: <BulkDeployPanel />,
           },
+          {
+            key: 'templates',
+            label: 'Templates',
+            children: <TemplateTab />,
+          },
         ]}
       />
     </div>
@@ -114,12 +127,12 @@ export default function GenerateConfigPage() {
 function SingleDevicePanel() {
   const { site, setSite, get, patch } = useSiteFilter();
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
-  const [templates, setTemplates] = useState<ConfigTemplateMeta[]>([]);
+  const [userTemplates, setUserTemplates] = useState<UserTemplate[]>([]);
   const [templatesError, setTemplatesError] = useState<Error | null>(null);
   const [templatesLoading, setTemplatesLoading] = useState(true);
   const [floor, setFloor] = useState(get('floor') || '');
   const [deviceId, setDeviceId] = useState(get('device') || '');
-  const [role, setRole] = useState<Exclude<ConfigRole, 'custom'>>('core');
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [running, setRunning] = useState('');
   const [runningJobId, setRunningJobId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
@@ -142,8 +155,8 @@ function SingleDevicePanel() {
   const loadTemplates = useCallback(async () => {
     setTemplatesLoading(true);
     try {
-      const list = await fetchConfigTemplates();
-      setTemplates(Array.isArray(list) ? list : []);
+      const list = await fetchUserTemplates();
+      setUserTemplates(Array.isArray(list) ? list : []);
       setTemplatesError(null);
     } catch (cause) {
       setTemplatesError(toError(cause, 'Could not load templates'));
@@ -190,7 +203,6 @@ function SingleDevicePanel() {
     setStateError(null);
     try {
       const state = await fetchGenerateConfig(id);
-      setRole(state.suggestedRole === 'dist' || state.suggestedRole === 'access' ? state.suggestedRole : 'core');
       if (!options?.keepRunning) {
         setRunning(state.running?.config || '');
         setCollectedAt(state.running?.collectedAt ?? null);
@@ -281,21 +293,18 @@ function SingleDevicePanel() {
     }
   };
 
-  const applyTemplate = async (nextRole: Exclude<ConfigRole, 'custom'>) => {
+  const applyTemplate = async (templateId: string) => {
     if (!deviceId || !selectedDevice) return;
-    const run = async () => {
-      try {
-        const rendered = await renderConfigTemplate(nextRole, deviceId);
-        setRole(nextRole);
-        setDraft(rendered.content);
-        setRenderError(null);
-        message.success(`Loaded ${nextRole} template`);
-      } catch (cause) {
-        setRenderError(toError(cause, 'Could not render template'));
-        message.error(cause instanceof Error ? cause.message : 'Could not render template');
-      }
+    const template = userTemplates.find((t) => t.id === templateId);
+    if (!template) return;
+
+    const run = () => {
+      setSelectedTemplateId(templateId);
+      setDraft(template.content);
+      setRenderError(null);
+      message.success(`Loaded template: ${template.name}`);
     };
-    confirmIfDirty(() => void run());
+    confirmIfDirty(run);
   };
 
   const onSave = async () => {
@@ -608,28 +617,49 @@ function SingleDevicePanel() {
               }
             >
               <Space wrap style={{ marginBottom: 8 }}>
-                {templates.map((item) => (
-                  <Button
-                    key={item.id}
-                    type={role === item.id ? 'primary' : 'default'}
-                    disabled={!deviceId}
-                    onClick={() => void applyTemplate(item.id)}
-                  >
-                    {item.label}
-                  </Button>
-                ))}
+                <Select
+                  placeholder="Select a template"
+                  style={{ minWidth: 200 }}
+                  allowClear
+                  value={selectedTemplateId}
+                  onChange={(value) => {
+                    if (value) {
+                      void applyTemplate(value);
+                    } else {
+                      setSelectedTemplateId(null);
+                    }
+                  }}
+                  options={[
+                    { value: '', label: '— Select template —', disabled: true },
+                    ...userTemplates.map((t) => ({
+                      value: t.id,
+                      label: `${t.name} (${t.vendor})`,
+                    })),
+                  ]}
+                />
+                {userTemplates.length === 0 && (
+                  <Typography.Text type="secondary">
+                    No templates yet.{' '}
+                    <Link to="/generate-config?tab=templates">Create one in Templates tab</Link>
+                  </Typography.Text>
+                )}
               </Space>
               <Typography.Paragraph type="secondary">
-                Template: {templates.find((item) => item.id === role)?.label || role}
+                {selectedTemplateId
+                  ? `Template: ${userTemplates.find((t) => t.id === selectedTemplateId)?.name || '—'}`
+                  : 'Select a template above or write your own config below'}
                 {saved ? ` · last saved role ${saved.role}` : ''}
               </Typography.Paragraph>
               <Input.TextArea
                 className="nc-code-area"
                 value={draft}
-                onChange={(event) => setDraft(event.target.value)}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  setSelectedTemplateId(null); // Clear template selection when manually editing
+                }}
                 autoSize={{ minRows: 18, maxRows: 24 }}
                 disabled={!deviceId || loadingState}
-                placeholder="Load a Core / Dist / Access template from the API"
+                placeholder="Select a template above or write your own config here"
               />
             </Card>
           </div>
@@ -1287,5 +1317,331 @@ function BulkDeviceRow({
         {previewing ? 'Re-render' : 'Preview'}
       </Button>
     </li>
+  );
+}
+
+// ============================================================================
+// Template Management Tab
+// ============================================================================
+
+function TemplateTab() {
+  const [templates, setTemplates] = useState<UserTemplate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editingTemplate, setEditingTemplate] = useState<UserTemplate | null>(null);
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [previewContent, setPreviewContent] = useState('');
+  const [previewVendor, setPreviewVendor] = useState<string>('UNKNOWN');
+
+  // Form state for create/edit
+  const [formName, setFormName] = useState('');
+  const [formDescription, setFormDescription] = useState('');
+  const [formContent, setFormContent] = useState('');
+  const [formFileContent, setFormFileContent] = useState<string | null>(null);
+  const [formFilename, setFormFilename] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState<string | null>(null);
+
+  const loadTemplates = useCallback(async () => {
+    setLoading(true);
+    try {
+      const list = await fetchUserTemplates();
+      setTemplates(Array.isArray(list) ? list : []);
+      setError(null);
+    } catch (cause) {
+      setError(toError(cause, 'Could not load templates'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadTemplates();
+  }, [loadTemplates]);
+
+  const handleUpload: UploadProps['customRequest'] = async (options) => {
+    const { file, onSuccess, onError } = options;
+    const txtFile = file as File;
+
+    try {
+      const text = await txtFile.text();
+      setFormFileContent(text);
+      setFormFilename(txtFile.name);
+      
+      // Auto-detect vendor and render preview
+      const { previewRenderConfig } = await import('@/api/generateConfig');
+      const result = await previewRenderConfig(text);
+      setFormContent(result.rendered);
+      setPreviewContent(result.rendered);
+      setPreviewVendor(result.vendor);
+      setPreviewModalOpen(true);
+      
+      onSuccess?.({});
+    } catch (err) {
+      onError?.(err as Error);
+    }
+  };
+
+  const openCreateModal = () => {
+    setEditingTemplate(null);
+    setFormName('');
+    setFormDescription('');
+    setFormContent('');
+    setFormFileContent(null);
+    setFormFilename(null);
+    setEditModalOpen(true);
+  };
+
+  const openEditModal = (template: UserTemplate) => {
+    setEditingTemplate(template);
+    setFormName(template.name);
+    setFormDescription(template.description || '');
+    setFormContent(template.content);
+    setFormFileContent(null);
+    setFormFilename(null);
+    setEditModalOpen(true);
+  };
+
+  const handleSave = async () => {
+    if (!formName.trim()) {
+      message.error('Template name is required');
+      return;
+    }
+    if (!formContent.trim()) {
+      message.error('Template content is required');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      if (editingTemplate) {
+        await updateUserTemplate(editingTemplate.id, {
+          name: formName.trim(),
+          description: formDescription.trim() || undefined,
+          content: formContent,
+        });
+        message.success('Template updated');
+      } else {
+        await createUserTemplate({
+          name: formName.trim(),
+          description: formDescription.trim() || undefined,
+          content: formContent,
+          fileContent: formFileContent || undefined,
+          originalFilename: formFilename || undefined,
+        });
+        message.success('Template created');
+      }
+      setEditModalOpen(false);
+      void loadTemplates();
+    } catch (cause) {
+      message.error(cause instanceof Error ? cause.message : 'Failed to save template');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = (template: UserTemplate) => {
+    Modal.confirm({
+      title: `Delete template "${template.name}"?`,
+      content: 'This action cannot be undone.',
+      okText: 'Delete',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setDeleting(template.id);
+        try {
+          await deleteUserTemplate(template.id);
+          message.success('Template deleted');
+          void loadTemplates();
+        } catch (cause) {
+          message.error(cause instanceof Error ? cause.message : 'Failed to delete template');
+        } finally {
+          setDeleting(null);
+        }
+      },
+    });
+  };
+
+  const VENDOR_COLORS: Record<string, string> = {
+    JUNIPER: 'blue',
+    CISCO: 'green',
+    ARISTA: 'purple',
+    UNKNOWN: 'default',
+  };
+
+  if (loading && templates.length === 0) return <PageSkeleton />;
+  if (error && templates.length === 0) {
+    return <ErrorState title="Could not load templates" error={error} onRetry={() => void loadTemplates()} />;
+  }
+
+  return (
+    <>
+      <StaleDataBanner error={error} onRetry={() => void loadTemplates()} />
+
+      <Card
+        bordered={false}
+        style={{ marginBottom: 12 }}
+        title="Upload new template"
+        extra={
+          <Upload
+            accept=".txt,.conf,.cfg"
+            showUploadList={false}
+            customRequest={handleUpload}
+          >
+            <Button icon={<UploadOutlined />}>Upload .txt file</Button>
+          </Upload>
+        }
+      >
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+          Upload a configuration file (.txt, .conf, .cfg). The system will automatically
+          detect the vendor (Juniper/Cisco/Arista) and standardize the config format.
+        </Typography.Paragraph>
+        <Space style={{ marginTop: 8 }}>
+          <Button icon={<PlusOutlined />} onClick={openCreateModal}>
+            Create template manually
+          </Button>
+        </Space>
+      </Card>
+
+      <Card bordered={false} title={`${templates.length} template(s)`}>
+        {templates.length === 0 ? (
+          <Empty description="No templates yet. Upload a config file or create one manually." />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {templates.map((t) => (
+              <Card
+                key={t.id}
+                size="small"
+                title={
+                  <Space>
+                    <span>{t.name}</span>
+                    <Tag color={VENDOR_COLORS[t.vendor] || 'default'}>{t.vendor}</Tag>
+                  </Space>
+                }
+                extra={
+                  <Space>
+                    <Tooltip title="Edit">
+                      <Button
+                        size="small"
+                        icon={<EditOutlined />}
+                        onClick={() => openEditModal(t)}
+                      />
+                    </Tooltip>
+                    <Tooltip title="Delete">
+                      <Button
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        loading={deleting === t.id}
+                        onClick={() => handleDelete(t)}
+                      />
+                    </Tooltip>
+                  </Space>
+                }
+              >
+                {t.description && (
+                  <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+                    {t.description}
+                  </Typography.Paragraph>
+                )}
+                <Input.TextArea
+                  className="nc-code-area"
+                  value={t.content}
+                  readOnly
+                  autoSize={{ minRows: 3, maxRows: 10 }}
+                  style={{ fontSize: 12 }}
+                />
+                <Typography.Paragraph type="secondary" style={{ marginTop: 4, marginBottom: 0 }}>
+                  {t.content.split('\n').length} lines ·{' '}
+                  <Timestamp value={t.createdAt} /> · updated <Timestamp value={t.updatedAt} />
+                </Typography.Paragraph>
+              </Card>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* Create/Edit Modal */}
+      <Modal
+        open={editModalOpen}
+        title={editingTemplate ? 'Edit template' : 'Create new template'}
+        onCancel={() => setEditModalOpen(false)}
+        onOk={handleSave}
+        okText={editingTemplate ? 'Save' : 'Create'}
+        confirmLoading={saving}
+        width={800}
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Input
+            placeholder="Template name"
+            value={formName}
+            onChange={(e) => setFormName(e.target.value)}
+          />
+          <Input.TextArea
+            placeholder="Description (optional)"
+            value={formDescription}
+            onChange={(e) => setFormDescription(e.target.value)}
+            rows={2}
+          />
+          {formFilename && (
+            <Alert
+              type="info"
+              message={`Uploaded from: ${formFilename}`}
+              showIcon
+            />
+          )}
+          <div>
+            <Typography.Text type="secondary" style={{ marginBottom: 4, display: 'block' }}>
+              Configuration content:
+            </Typography.Text>
+            <Input.TextArea
+              className="nc-code-area"
+              placeholder="Paste or write your configuration here..."
+              value={formContent}
+              onChange={(e) => setFormContent(e.target.value)}
+              rows={16}
+            />
+          </div>
+        </Space>
+      </Modal>
+
+      {/* Preview Modal */}
+      <Modal
+        open={previewModalOpen}
+        title="Config Preview"
+        onCancel={() => setPreviewModalOpen(false)}
+        footer={
+          <Space>
+            <Button onClick={() => setPreviewModalOpen(false)}>Cancel</Button>
+            <Button
+              type="primary"
+              icon={<CloudUploadOutlined />}
+              onClick={() => {
+                setPreviewModalOpen(false);
+                openCreateModal();
+              }}
+            >
+              Use this config
+            </Button>
+          </Space>
+        }
+        width={800}
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            message={`Detected vendor: ${previewVendor}`}
+            showIcon
+          />
+          <Input.TextArea
+            className="nc-code-area"
+            value={previewContent}
+            readOnly
+            rows={20}
+          />
+        </Space>
+      </Modal>
+    </>
   );
 }

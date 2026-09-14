@@ -269,6 +269,24 @@ model DeviceSavedConfig {
   updatedAt         DateTime  @updatedAt
 }
 
+// Vendor families for config templates
+enum VendorFamily {
+  JUNIPER
+  CISCO
+  ARISTA
+  UNKNOWN
+}
+
+model ConfigTemplate {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  description String?
+  content     String
+  vendor      VendorFamily @default(UNKNOWN)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+}
+
 enum UserRole {
   ADMIN
   OPERATOR

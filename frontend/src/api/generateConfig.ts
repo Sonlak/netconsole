@@ -6,6 +6,24 @@ export type ConfigTemplateMeta = {
   description: string;
 };
 
+// New: User-defined templates stored in database
+export type UserTemplate = {
+  id: string;
+  name: string;
+  description: string | null;
+  content: string;
+  vendor: 'JUNIPER' | 'CISCO' | 'ARISTA' | 'UNKNOWN';
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RenderPreview = {
+  vendor: 'JUNIPER' | 'CISCO' | 'ARISTA' | 'UNKNOWN';
+  rendered: string;
+  rawLength: number;
+  renderedLength: number;
+};
+
 export type DeviceSavedConfig = {
   id: string;
   deviceId: string;
@@ -136,4 +154,75 @@ export async function previewBulkConfig(
   deviceId: string,
 ): Promise<{ content: string; role: string; deviceName: string }> {
   return renderConfigTemplate(role, deviceId);
+}
+
+// ============================================================================
+// User-defined templates (stored in database)
+// ============================================================================
+
+const TEMPLATES_API = '/api/templates';
+
+/**
+ * Fetch all user-defined templates
+ */
+export async function fetchUserTemplates(): Promise<UserTemplate[]> {
+  const response = await authFetch(TEMPLATES_API);
+  return handleResponse(response);
+}
+
+/**
+ * Fetch a single template by ID
+ */
+export async function fetchUserTemplate(id: string): Promise<UserTemplate> {
+  const response = await authFetch(`${TEMPLATES_API}/${id}`);
+  return handleResponse(response);
+}
+
+/**
+ * Create a new template
+ */
+export async function createUserTemplate(input: {
+  name: string;
+  description?: string;
+  content?: string;
+  fileContent?: string;
+  originalFilename?: string;
+}): Promise<UserTemplate> {
+  return authJsonFetch(TEMPLATES_API, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Update an existing template
+ */
+export async function updateUserTemplate(
+  id: string,
+  input: { name?: string; description?: string; content?: string },
+): Promise<UserTemplate> {
+  return authJsonFetch(`${TEMPLATES_API}/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Delete a template
+ */
+export async function deleteUserTemplate(id: string): Promise<void> {
+  const response = await authFetch(`${TEMPLATES_API}/${id}`, { method: 'DELETE' });
+  if (!response.ok && response.status !== 204) {
+    throw new Error(`Failed to delete template: ${response.status}`);
+  }
+}
+
+/**
+ * Preview render of raw config content without saving
+ */
+export async function previewRenderConfig(content: string): Promise<RenderPreview> {
+  return authJsonFetch(`${TEMPLATES_API}/render`, {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  });
 }
