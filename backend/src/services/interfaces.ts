@@ -207,7 +207,7 @@ export type QueueInterfaceActionResult =
 export async function queueInterfaceAction(
   deviceId: string,
   payload: InterfaceActionPayload,
-  createdById?: string,
+  createdById: string | null | undefined = undefined,
 ): Promise<QueueInterfaceActionResult> {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
   if (!device) {
@@ -242,6 +242,7 @@ export async function queueInterfaceAction(
  */
 export async function collectInterfacesForDevice(
   deviceId: string,
+  createdById: string | null | undefined = undefined,
 ): Promise<{ job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null }; queued: boolean }> {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
   if (!device) {
@@ -260,6 +261,7 @@ export async function collectInterfacesForDevice(
           type: JobType.GET_INTERFACES,
           status: JobStatus.SUCCESS,
           priority: 100,
+          ...(createdById ? { createdById } : {}),
           result: {
             implemented: true,
             source: 'junos-rest',
@@ -287,6 +289,7 @@ export async function collectInterfacesForDevice(
           type: JobType.GET_INTERFACES,
           status: JobStatus.SUCCESS,
           priority: 100,
+          ...(createdById ? { createdById } : {}),
           result: {
             implemented: true,
             source: 'iosxe-rest',
@@ -321,6 +324,7 @@ export async function collectInterfacesForDevice(
       type: JobType.GET_INTERFACES,
       status: JobStatus.PENDING,
       priority: 100,
+      ...(createdById ? { createdById } : {}),
     },
     select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
   });

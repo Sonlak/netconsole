@@ -61,6 +61,17 @@ import { isFullyManaged, type Device } from '@/types/device';
 import { deviceFloor, deviceSite } from '@/data/bank';
 import { JOB_TYPE_LABELS, type Job, type OperationResponse } from '@/types/job';
 
+function formatRelativeTime(isoString: string): string {
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+  if (diffSec < 60) return `${diffSec}s trước`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} phút trước`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h trước`;
+  return `${Math.floor(diffHr / 24)} ngày trước`;
+}
+
 const TABS = ['overview', 'ports', 'config', 'arp', 'mac', 'terminal', 'activity'] as const;
 type TabKey = (typeof TABS)[number];
 
@@ -123,10 +134,15 @@ function ConfigTab({ deviceId }: { deviceId: string }) {
       message.success('Collected running config');
     } catch (cause) {
       if (cause instanceof DeviceBusyError) {
-        const username = cause.lockedBy.username;
+        const { username, jobType, jobCreatedAt } = cause.lockedBy;
+        const label = JOB_TYPE_LABELS[jobType as keyof typeof JOB_TYPE_LABELS] ?? jobType;
         notification.warning({
-          message: username ? `Device đang được cấu hình bởi user "${username}"` : 'Device đang bận',
-          description: 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+          message: username
+            ? `Device đang được cấu hình bởi user "${username}"`
+            : `Device đang bận (job ${label})`,
+          description: username
+            ? 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.'
+            : `Job bắt đầu ${formatRelativeTime(jobCreatedAt)}. Vui lòng chờ hoặc vào Jobs để hủy.`,
           duration: 0,
         });
       } else if (cause instanceof JobWaitTimeoutError) {

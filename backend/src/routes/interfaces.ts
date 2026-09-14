@@ -7,6 +7,8 @@ import {
 } from '../services/interfaces.js';
 import { prisma } from '../lib/prisma.js';
 import { runIosxeSshApply } from '../services/labSsh.js';
+import { authMiddleware } from '../middleware/auth.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 export const interfacesRouter = Router();
 
@@ -55,55 +57,61 @@ interfacesRouter.get('/:deviceId', async (req, res) => {
   });
 });
 
-interfacesRouter.post('/:deviceId/collect', async (req, res) => {
-  const deviceId = String(req.params.deviceId);
-  try {
-    const result = await collectInterfacesForDevice(deviceId);
-    res.status(result.queued ? 202 : 200).json(result);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Interface collection failed';
-    const status = message === 'Device not found' ? 404 : 502;
-    res.status(status).json({ error: message });
-  }
+interfacesRouter.post('/:deviceId/collect', authMiddleware, (req, res) => {
+  void (async () => {
+    const deviceId = String(req.params.deviceId);
+    const userId = (req as AuthenticatedRequest).user?.userId ?? null;
+    try {
+      const result = await collectInterfacesForDevice(deviceId, userId ?? undefined);
+      res.status(result.queued ? 202 : 200).json(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Interface collection failed';
+      const status = message === 'Device not found' ? 404 : 502;
+      res.status(status).json({ error: message });
+    }
+  })();
 });
 
-interfacesRouter.post('/:deviceId/actions', async (req, res) => {
-  const deviceId = String(req.params.deviceId);
-  const payload = parseInterfaceActionPayload(req.body);
-  if (!payload) {
-    res.status(400).json({
-      error:
-        'Invalid body. Expected { action: shut|no-shut|show-run|set-access-vlan, interface, vlan? }',
+interfacesRouter.post('/:deviceId/actions', authMiddleware, (req, res) => {
+  void (async () => {
+    const deviceId = String(req.params.deviceId);
+    const userId = (req as AuthenticatedRequest).user?.userId ?? null;
+    const payload = parseInterfaceActionPayload(req.body);
+    if (!payload) {
+      res.status(400).json({
+        error:
+          'Invalid body. Expected { action: shut|no-shut|show-run|set-access-vlan, interface, vlan? }',
+      });
+      return;
+    }
+
+    const result = await queueInterfaceAction(deviceId, payload, userId);
+
+    if (result === null) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+
+    if (result.kind === 'busy') {
+      res.status(409).json({
+        error: 'Device busy',
+        code: 'device_locked',
+        lockedBy: {
+          jobId: result.error.blockingJob.id,
+          jobType: result.error.blockingJob.type,
+          jobStatus: result.error.blockingJob.status,
+          jobCreatedAt: result.error.blockingJob.createdAt,
+          username: result.error.blockingJob.createdByUsername,
+        },
+      });
+      return;
+    }
+
+    res.status(202).json({
+      job: result.job,
+      message: `INTERFACE_ACTION ${payload.action} queued`,
     });
-    return;
-  }
-
-  const result = await queueInterfaceAction(deviceId, payload);
-
-  if (result === null) {
-    res.status(404).json({ error: 'Device not found' });
-    return;
-  }
-
-  if (result.kind === 'busy') {
-    res.status(409).json({
-      error: 'Device busy',
-      code: 'device_locked',
-      lockedBy: {
-        jobId: result.error.blockingJob.id,
-        jobType: result.error.blockingJob.type,
-        jobStatus: result.error.blockingJob.status,
-        jobCreatedAt: result.error.blockingJob.createdAt,
-        username: result.error.blockingJob.createdByUsername,
-      },
-    });
-    return;
-  }
-
-  res.status(202).json({
-    job: result.job,
-    message: `INTERFACE_ACTION ${payload.action} queued`,
-  });
+  })();
 });
 
 /**
