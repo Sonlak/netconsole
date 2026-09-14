@@ -169,8 +169,18 @@ export function startTerminalWebSocket(httpServer: Server) {
           ws._ssh = ssh;
 
           // Handle keyboard-interactive auth (used by Juniper/cRPD for password prompts)
+          // Some devices send multiple prompts - handle them all
           ssh.on('keyboard-interactive', (name, instr, lang, prompts, finish) => {
-            finish([sshPass]);
+            console.log(`[terminal] Session ${session.id}: keyboard-interactive (name=${name}, prompts=${prompts.length})`);
+            // Answer each prompt with the password
+            const answers = prompts.map(() => sshPass);
+            finish(answers);
+          });
+
+          // Also handle password auth directly
+          ssh.on('password', (piry) => {
+            console.log(`[terminal] Session ${session.id}: password auth requested`);
+            piry(sshPass);
           });
 
           ssh.on('ready', () => {
