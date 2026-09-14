@@ -108,9 +108,18 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          # --no-deps: don't restart kea/postgres (they hold persistent state)
-          echo "Running: docker compose -p $COMPOSE_PROJECT -f $COMPOSE_FILE up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES"
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
+          # Stop + rm old containers FIRST so we can rebuild with the same tag
+          # without "container name conflict" errors from docker compose.
+          # --no-deps: don't touch kea/postgres (they hold persistent state)
+          echo "==> Stopping old containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            stop $DEPLOY_SERVICES || true
+          echo "==> Removing old containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            rm -sf $DEPLOY_SERVICES || true
+          echo "==> Building + starting fresh containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            up -d --build --no-deps $DEPLOY_SERVICES
 
       - name: Wait for backend healthy
         run: |
@@ -257,8 +266,15 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
+          echo "==> Stopping old containers..."
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-            up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
+            stop $DEPLOY_SERVICES || true
+          echo "==> Removing old containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            rm -sf $DEPLOY_SERVICES || true
+          echo "==> Building + starting fresh containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            up -d --build --no-deps $DEPLOY_SERVICES
 
       - name: Health-check restored deploy
         run: |
