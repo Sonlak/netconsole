@@ -357,7 +357,28 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       fontSize: 13,
       scrollback: 10000,
       allowProposedApi: true,
-      theme: { background: '#ffffff', foreground: '#000000' },
+      theme: {
+        background: '#0b0f14',
+        foreground: '#e4e4e7',
+        cursor: '#e4e4e7',
+        selectionBackground: '#264f78',
+        black: '#000000',
+        red: '#f87171',
+        green: '#4ade80',
+        yellow: '#fbbf24',
+        blue: '#60a5fa',
+        magenta: '#c084fc',
+        cyan: '#22d3ee',
+        white: '#d4d4d4',
+        brightBlack: '#6b7280',
+        brightRed: '#fca5a5',
+        brightGreen: '#86efac',
+        brightYellow: '#fcd34d',
+        brightBlue: '#93c5fd',
+        brightMagenta: '#d8b4fe',
+        brightCyan: '#a5f3fc',
+        brightWhite: '#fafafa',
+      },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -478,9 +499,9 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   // Status is only used for the status bar color and disconnect behavior
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
-      <div style={{ padding: '8px 12px', background: '#f5f5f5', borderBottom: '1px solid #d9d9d9', flexShrink: 0 }}>
+      <div style={{ padding: '8px 12px', background: '#111720', borderBottom: '1px solid #1e2530', flexShrink: 0 }}>
         <Space>
-          <Typography.Text style={{ color: status === 'connected' ? '#52c41a' : status === 'connecting' ? '#faad14' : '#ff4d4f', fontSize: 12 }}>
+          <Typography.Text style={{ color: status === 'connected' ? '#4ade80' : status === 'connecting' ? '#fbbf24' : '#f87171', fontSize: 12 }}>
             {status === 'connected' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected'} to {deviceName} ({deviceIp})
           </Typography.Text>
           <Button
@@ -499,7 +520,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, padding: 8, background: '#ffffff', overflow: 'hidden', minHeight: 0 }}
+        style={{ flex: 1, padding: 8, background: '#0b0f14', overflow: 'hidden', minHeight: 0 }}
       />
     </div>
   );
