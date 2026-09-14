@@ -376,14 +376,25 @@ function SingleDevicePanel() {
           await loadState(deviceId, { keepDraft: true });
         } catch (cause) {
           if (cause instanceof JobWaitTimeoutError) {
-            // Defensive -- waitForJobWithNotification returns null on
-            // timeout rather than throwing. Keeping the branch in case
-            // some future call site uses the bare waitForJob.
             message.warning(
               <span>
                 Commit still running — <Link to={`/jobs?q=${jobId ?? ''}`}>open Jobs</Link>
               </span>,
             );
+            return;
+          }
+          if (cause instanceof DeviceBusyError) {
+            const { username, jobType, jobCreatedAt } = cause.lockedBy;
+            const label = JOB_TYPE_LABELS[jobType as keyof typeof JOB_TYPE_LABELS] ?? jobType;
+            notification.warning({
+              message: username
+                ? `Device đang được cấu hình bởi user "${username}"`
+                : `Device đang bận (job ${label})`,
+              description: username
+                ? 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.'
+                : `Job bắt đầu ${formatRelativeTime(jobCreatedAt)}. Vui lòng chờ hoặc vào Jobs để hủy.`,
+              duration: 0,
+            });
             return;
           }
           const detail = cause instanceof Error ? cause.message : 'Commit failed';
@@ -441,6 +452,20 @@ function SingleDevicePanel() {
                 Rollback still running — <Link to={`/jobs?q=${jobId ?? ''}`}>open Jobs</Link>
               </span>,
             );
+            return;
+          }
+          if (cause instanceof DeviceBusyError) {
+            const { username, jobType, jobCreatedAt } = cause.lockedBy;
+            const label = JOB_TYPE_LABELS[jobType as keyof typeof JOB_TYPE_LABELS] ?? jobType;
+            notification.warning({
+              message: username
+                ? `Device đang được cấu hình bởi user "${username}"`
+                : `Device đang bận (job ${label})`,
+              description: username
+                ? 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.'
+                : `Job bắt đầu ${formatRelativeTime(jobCreatedAt)}. Vui lòng chờ hoặc vào Jobs để hủy.`,
+              duration: 0,
+            });
             return;
           }
           const detail = cause instanceof Error ? cause.message : 'Rollback failed';
