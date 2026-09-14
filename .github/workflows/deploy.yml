@@ -74,6 +74,42 @@ jobs:
           git log --oneline -5 >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
+      # Save rollback marker BEFORE we touch anything. This preserves the
+      # LAST SUCCESSFUL deploy so we can always roll back to it.
+      # - .rollback-before-deploy-sha = commit currently running on VPS (never overwritten by failures)
+      # - .last-deploy-sha            = updated after each SUCCESS (the "normal" path)
+      - name: Save rollback marker (current VPS state — before deploy)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPLOY_DIR"
+
+          # Always preserve the current running SHA — this is our anchor.
+          # Even if the next deploy fails and .last-deploy-sha gets overwritten
+          # with the bad commit, this backup survives and can still recover us.
+          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+            cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+            cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
+            echo "Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
+          else
+            echo "No existing marker — first deploy? Will use git HEAD from deployed source."
+          fi
+
+          # The auto-rollback job reads .last-deploy-sha, so we must
+          # preserve the CURRENT (pre-deploy) state there.
+          # Read it now; if it doesn't exist, read from git HEAD on VPS.
+          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+            CURRENT_SHA=$(cat "$DEPLOY_DIR/.last-deploy-sha")
+            CURRENT_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
+          else
+            # Fallback: read git HEAD from the deployed source tree
+            CURRENT_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+            CURRENT_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+          fi
+          printf '%s\n' "$CURRENT_SHA" > "$DEPLOY_DIR/.last-deploy-sha"
+          printf '%s\n' "$CURRENT_REF" > "$DEPLOY_DIR/.last-deploy-ref"
+          printf '%s\n' "push" > "$DEPLOY_DIR/.last-deploy-event"
+          echo "💾 Pre-deploy rollback marker saved: sha=$CURRENT_SHA ref=$CURRENT_REF"
+
       - name: Sync source to ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
@@ -222,20 +258,35 @@ jobs:
         id: marker
         run: |
           set -euo pipefail
-          SHA_FILE="$DEPLOY_DIR/.last-deploy-sha"
-          if [ ! -f "$SHA_FILE" ]; then
-            echo "::error::No .last-deploy-sha marker found at $DEPLOY_DIR."
-            echo "::error::This usually means the previous deploy never wrote it"
-            echo "::error::(the success path was added recently) OR the VPS was"
-            echo "::error::reprovisioned. Manual rollback via"
-            echo "::error::.github/workflows/rollback.yml is required."
-            exit 1
+          mkdir -p "$DEPLOY_DIR"
+
+          # Priority 1: pre-deploy backup (survives consecutive failures)
+          if [ -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+            PREV_SHA=$(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")
+            PREV_REF=$(cat "$DEPLOY_DIR/.rollback-before-deploy-ref")
+            echo "Using pre-deploy backup marker: sha=$PREV_SHA ref=$PREV_REF"
+
+          # Priority 2: last deploy marker (fallback for first-ever deploy scenario)
+          elif [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+            PREV_SHA=$(cat "$DEPLOY_DIR/.last-deploy-sha")
+            PREV_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
+            echo "Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
+
+          # Priority 3: git HEAD from deployed source (fresh VPS with no marker)
+          else
+            PREV_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || true)
+            if [ -n "$PREV_SHA" ]; then
+              PREV_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+              echo "No marker file found — falling back to git HEAD: sha=$PREV_SHA ref=$PREV_REF"
+            else
+              echo "::error::No rollback marker found at $DEPLOY_DIR and no git history available."
+              echo "::error::This VPS has never had a successful deploy. Manual intervention required."
+              echo "::error::Run: .github/workflows/rollback.yml with a known-good commit SHA."
+              exit 1
+            fi
           fi
-          PREV_SHA=$(cat "$SHA_FILE")
-          PREV_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
           echo "PREV_SHA=$PREV_SHA" >> "$GITHUB_OUTPUT"
           echo "PREV_REF=$PREV_REF" >> "$GITHUB_OUTPUT"
-          echo "Last known-good: sha=$PREV_SHA ref=$PREV_REF"
 
       - name: Checkout previous commit
         uses: actions/checkout@v4
@@ -260,6 +311,7 @@ jobs:
             --exclude '/logs/' \
             --exclude '/backups/' \
             --exclude '/.last-deploy-*' \
+            --exclude '/.rollback-before-deploy-*' \
             ./src/ "$DEPLOY_DIR/"
 
       - name: Rebuild and restart app services
@@ -288,7 +340,7 @@ jobs:
             sleep 2
           done
           sleep 3
-          code=$(curl -skL -o /dev/null -w "%{http_code}" --max-time 5 https://127.0.0.1:8443/ || echo "000")
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8443/ || echo "000")
           if [ "$code" != "200" ]; then
             echo "::error::Frontend still unreachable after rollback (HTTP $code)"
             docker logs --tail 30 netconsole-frontend || true
