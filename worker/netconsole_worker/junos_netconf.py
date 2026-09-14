@@ -244,17 +244,15 @@ def apply_set_configuration(
     _ = log
 
     set_text = "\n".join(commands).rstrip("\n")
-    # Junos NETCONF <load-configuration> with format="set".
-    # Reference: Junos XML Management Protocol Guide §4.7.
-    # The <configuration-set> child holds the set commands verbatim.
-    # Namespace prefix "junos" matches the device's expected namespace
-    # (http://xml.juniper.net/junos/<version>/junos).
+    # Junos NETCONF <load-configuration> with format="text".
+    # IMPORTANT: Use <configuration-text> (NOT <configuration-set>) for NETCONF SSH.
+    # <configuration-set> works for RESTCONF but is rejected by NETCONF SSH with
+    # "expecting <configuration>, <configuration/>, or <configuration-text>".
+    # Also: NO action="set" attribute when using <configuration-text>.
     load_rpc = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<rpc>"
-        '<load-configuration format="text" action="set">'
-        f"<configuration-set>{escape(set_text)}</configuration-set>"
-        "</load-configuration>"
+        f'<load-configuration format="text"><configuration-text>{escape(set_text)}</configuration-text></load-configuration>'
         "</rpc>"
     )
     commit_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><commit-configuration/></rpc>'

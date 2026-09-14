@@ -718,10 +718,9 @@ class JuniperBackend(DeviceBackend):
                 nc_user = creds["username"]
                 nc_pass = creds["password"]
                 nc_port = self.config.junos_netconf_ssh_port
-                # 15s timeout: enough for NETCONF SSH to succeed on a warm
-                # connection, but fast enough to fail quickly if the session
-                # is cold (avoiding the 20-30s Junos cRPD spike burning
-                # budget on a fallback path that rarely gets hit).
+                # 60s timeout: enough for a full load+commit on a cold NETCONF SSH
+                # session. Hardware ex9214 can take 22-45s for commit. The 15s
+                # timeout was too short and always caused fallback to SSH CLI.
                 nc_result = nc_apply_set_configuration(
                     device.ip,
                     commands,
@@ -729,7 +728,7 @@ class JuniperBackend(DeviceBackend):
                     username=nc_user,
                     password=nc_pass,
                     port=nc_port,
-                    timeout=15.0,
+                    timeout=60.0,
                 )
                 if nc_result["ok"]:
                     applied = nc_result
