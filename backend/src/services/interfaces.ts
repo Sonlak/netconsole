@@ -2,7 +2,7 @@ import { JobStatus, JobType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { reclaimStaleJobs } from './jobWatchdog.js';
-import { jobPriority } from './deviceOperations.js';
+import { jobPriority, tryCreateDeviceJob, type DeviceBusyError } from './deviceOperations.js';
 import { fetchInterfaceList } from './junosRest.js';
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
 
@@ -199,26 +199,33 @@ export function scheduleInterfacesCollection(intervalSeconds: number) {
   }, intervalMs);
 }
 
-export async function queueInterfaceAction(deviceId: string, payload: InterfaceActionPayload) {
+export type QueueInterfaceActionResult =
+  | { kind: 'created'; job: { id: string; type: JobType; status: JobStatus; createdAt: Date; deviceId: string | null; payload: InterfaceActionPayload } }
+  | { kind: 'busy'; error: DeviceBusyError }
+  | null; // device not found
+
+export async function queueInterfaceAction(
+  deviceId: string,
+  payload: InterfaceActionPayload,
+  createdById?: string,
+): Promise<QueueInterfaceActionResult> {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
   if (!device) {
     return null;
   }
 
-  return prisma.job.create({
-    data: {
-      deviceId,
-      type: JobType.INTERFACE_ACTION,
-      status: JobStatus.PENDING,
-      priority: jobPriority(JobType.INTERFACE_ACTION),
-      payload: payload as Prisma.InputJsonValue,
-    },
-    include: {
-      device: {
-        select: { id: true, name: true, ip: true, site: true, floor: true },
-      },
-    },
-  });
+  const outcome = await prisma.$transaction(async (tx) =>
+    tryCreateDeviceJob(tx, deviceId, JobType.INTERFACE_ACTION, createdById ?? null, payload as Prisma.InputJsonValue),
+  );
+
+  if (outcome.kind === 'busy') {
+    return { kind: 'busy', error: outcome.error };
+  }
+
+  return {
+    kind: 'created',
+    job: { ...outcome.job, payload },
+  };
 }
 
 /**

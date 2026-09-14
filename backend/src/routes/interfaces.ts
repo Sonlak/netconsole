@@ -78,13 +78,32 @@ interfacesRouter.post('/:deviceId/actions', async (req, res) => {
     return;
   }
 
-  const job = await queueInterfaceAction(deviceId, payload);
-  if (!job) {
+  const result = await queueInterfaceAction(deviceId, payload);
+
+  if (result === null) {
     res.status(404).json({ error: 'Device not found' });
     return;
   }
 
-  res.status(202).json({ job, message: `INTERFACE_ACTION ${payload.action} queued` });
+  if (result.kind === 'busy') {
+    res.status(409).json({
+      error: 'Device busy',
+      code: 'device_locked',
+      lockedBy: {
+        jobId: result.error.blockingJob.id,
+        jobType: result.error.blockingJob.type,
+        jobStatus: result.error.blockingJob.status,
+        jobCreatedAt: result.error.blockingJob.createdAt,
+        username: result.error.blockingJob.createdByUsername,
+      },
+    });
+    return;
+  }
+
+  res.status(202).json({
+    job: result.job,
+    message: `INTERFACE_ACTION ${payload.action} queued`,
+  });
 });
 
 /**
