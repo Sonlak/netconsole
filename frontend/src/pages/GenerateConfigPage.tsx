@@ -708,11 +708,32 @@ function BulkDeployPanel() {
   const { site, setSite } = useSiteFilter();
   const { devices, isLoading: loadingDevices, error: devicesError, refetch: refetchDevices } = useDevices();
 
+  // User templates state
+  const [userTemplates, setUserTemplates] = useState<UserTemplate[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(true);
+
+  const loadTemplates = useCallback(async () => {
+    setTemplatesLoading(true);
+    try {
+      const list = await fetchUserTemplates();
+      setUserTemplates(Array.isArray(list) ? list : []);
+    } catch {
+      // Templates loading error is non-fatal; UI shows empty state
+    } finally {
+      setTemplatesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadTemplates();
+  }, [loadTemplates]);
+
   type BulkMode = 'template' | 'draft';
   type BulkVendorFilter = 'all' | DeviceVendorFamily;
 
   const [mode, setMode] = useState<BulkMode>('template');
   const [role, setRole] = useState<Exclude<ConfigRole, 'custom'>>('access');
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [floorFilter, setFloorFilter] = useState('');
   const [search, setSearch] = useState('');
@@ -825,8 +846,15 @@ function BulkDeployPanel() {
       setPreviewLoading(true);
       try {
         if (mode === 'template') {
-          const out = await previewBulkConfig(role, deviceId);
-          setPreviewContent(out.content);
+          if (selectedTemplateId) {
+            // User template: show raw content (no per-device rendering)
+            const template = userTemplates.find((t) => t.id === selectedTemplateId);
+            setPreviewContent(template?.content || '');
+          } else {
+            // Role-based template: render per device
+            const out = await previewBulkConfig(role, deviceId);
+            setPreviewContent(out.content);
+          }
         } else {
           // Draft mode: every device receives the same literal string.
           setPreviewContent(draft);
@@ -838,7 +866,7 @@ function BulkDeployPanel() {
         setPreviewLoading(false);
       }
     },
-    [role, mode, draft],
+    [role, mode, draft, selectedTemplateId, userTemplates],
   );
 
   // When switching into draft mode, refresh the preview pane so the user
@@ -898,6 +926,16 @@ function BulkDeployPanel() {
 
   const deployDescription = () => {
     if (mode === 'template') {
+      if (selectedTemplateId) {
+        const template = userTemplates.find((t) => t.id === selectedTemplateId);
+        return (
+          <Typography.Paragraph style={{ marginBottom: 6 }}>
+            Pushes the <strong>{template?.name || 'selected'}</strong> template verbatim to every
+            selected device and queues one <code>APPLY_CONFIG</code> job each. No per-device
+            rendering — the same content lands on every device.
+          </Typography.Paragraph>
+        );
+      }
       return (
         <Typography.Paragraph style={{ marginBottom: 6 }}>
           Renders the <strong>{BULK_ROLE_LABEL[role]}</strong> template per device and queues one
@@ -916,12 +954,21 @@ function BulkDeployPanel() {
 
   const confirmDeploy = () => {
     if (!canDeploy) return;
-    const okLabel = mode === 'template'
-      ? `Deploy to ${managedSelected}`
-      : `Push draft to ${managedSelected}`;
-    const titleSuffix = mode === 'template'
-      ? `${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)?`
-      : `this literal draft to ${managedSelected} device(s)?`;
+    let okLabel: string;
+    let titleSuffix: string;
+    if (mode === 'template') {
+      if (selectedTemplateId) {
+        const template = userTemplates.find((t) => t.id === selectedTemplateId);
+        okLabel = `Deploy to ${managedSelected}`;
+        titleSuffix = `${template?.name || 'selected'} template to ${managedSelected} device(s)?`;
+      } else {
+        okLabel = `Deploy to ${managedSelected}`;
+        titleSuffix = `${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)?`;
+      }
+    } else {
+      okLabel = `Push draft to ${managedSelected}`;
+      titleSuffix = `this literal draft to ${managedSelected} device(s)?`;
+    }
     Modal.confirm({
       width: 720,
       title: mode === 'template' ? `Deploy ${titleSuffix}` : `Push ${titleSuffix}`,
@@ -976,10 +1023,19 @@ function BulkDeployPanel() {
         setDeploying(true);
         try {
           const managedIds = selectedDevices.filter((d) => d.status === 'MANAGED').map((d) => d.id);
-          const result =
-            mode === 'template'
-              ? await bulkCommitGenerateConfig(managedIds, { role })
-              : await bulkCommitGenerateConfig(managedIds, { content: draft });
+          let result: BulkCommitResult;
+          if (mode === 'template') {
+            if (selectedTemplateId) {
+              // User template: pass content directly
+              const template = userTemplates.find((t) => t.id === selectedTemplateId);
+              result = await bulkCommitGenerateConfig(managedIds, { content: template?.content || '' });
+            } else {
+              // Role-based template: use role
+              result = await bulkCommitGenerateConfig(managedIds, { role });
+            }
+          } else {
+            result = await bulkCommitGenerateConfig(managedIds, { content: draft });
+          }
           setLastResult(result);
           if (result.jobs.length > 0) {
             // Open the progress tracker so the user sees per-device updates
@@ -1022,21 +1078,53 @@ function BulkDeployPanel() {
             value={mode}
             onChange={(value) => setMode(value as BulkMode)}
             options={[
-              { value: 'template', label: 'By template (rendered per device)' },
+              { value: 'template', label: 'By template' },
               { value: 'draft', label: 'Custom draft (applied as-is)' },
             ]}
           />
         </Space>
         <Space wrap size={12} align="center" style={{ marginTop: 12 }}>
           {mode === 'template' ? (
-            <Segmented
-              value={role}
-              onChange={(value) => setRole(value as Exclude<ConfigRole, 'custom'>)}
-              options={BULK_ROLE_OPTIONS.map((r) => ({
-                value: r,
-                label: `${BULK_ROLE_LABEL[r]} (${roleCounts[r].managed}/${roleCounts[r].total})`,
-              }))}
-            />
+            <>
+              <Select
+                placeholder="Select a template"
+                style={{ minWidth: 240 }}
+                allowClear
+                value={selectedTemplateId}
+                loading={templatesLoading}
+                onChange={(value) => {
+                  setSelectedTemplateId(value || null);
+                }}
+                options={[
+                  { value: '', label: '— Role-based template —', disabled: true },
+                  ...userTemplates.map((t) => ({
+                    value: t.id,
+                    label: `${t.name} (${t.vendor})`,
+                  })),
+                ]}
+              />
+              {userTemplates.length === 0 && !templatesLoading && (
+                <Typography.Text type="secondary">
+                  No user templates.{' '}
+                  <Link to="/generate-config?tab=templates">Create one in Templates tab</Link>
+                </Typography.Text>
+              )}
+              {!selectedTemplateId && (
+                <Segmented
+                  value={role}
+                  onChange={(value) => setRole(value as Exclude<ConfigRole, 'custom'>)}
+                  options={BULK_ROLE_OPTIONS.map((r) => ({
+                    value: r,
+                    label: `${BULK_ROLE_LABEL[r]} (${roleCounts[r].managed}/${roleCounts[r].total})`,
+                  }))}
+                />
+              )}
+              {selectedTemplateId && (
+                <Typography.Text type="secondary">
+                  Template selected — pushing raw template content to all devices
+                </Typography.Text>
+              )}
+            </>
           ) : (
             <Typography.Text type="secondary">
               Draft mode — all roles are eligible. Pick any device below.
@@ -1187,7 +1275,13 @@ set system services netconf ssh`}
 
         <Card
           bordered={false}
-          title={mode === 'template' ? 'Preview (per device)' : 'Preview (literal draft)'}
+          title={
+            mode === 'template'
+              ? selectedTemplateId
+                ? 'Preview (user template)'
+                : 'Preview (per device)'
+              : 'Preview (literal draft)'
+          }
         >
           {mode === 'template' ? (
             previewDevice ? (
@@ -1250,7 +1344,9 @@ set system services netconf ssh`}
             onClick={confirmDeploy}
           >
             {mode === 'template'
-              ? `Deploy ${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)`
+              ? selectedTemplateId
+                ? `Deploy user template to ${managedSelected} device(s)`
+                : `Deploy ${BULK_ROLE_LABEL[role]} template to ${managedSelected} device(s)`
               : `Push draft to ${managedSelected} device(s)`}
           </Button>
           <Button
