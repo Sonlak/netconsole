@@ -53,7 +53,7 @@ import { PortsPanel } from '@/features/ports/PortsPanel';
 import { useJobs } from '@/hooks/useJobs';
 import { useAuth } from '@/hooks/useAuth';
 import { useUrlState } from '@/hooks/useUrlState';
-import { isNotFound, toError } from '@/lib/errors';
+import { DeviceBusyError, isNotFound, toError } from '@/lib/errors';
 import { formatPing, formatUptime, prettyJson, redactForDisplay, summarizeJson } from '@/lib/format';
 import { tablePagination, tableScroll } from '@/lib/table';
 import { isFullyManaged, type Device } from '@/types/device';
@@ -115,13 +115,20 @@ function ConfigTab({ deviceId }: { deviceId: string }) {
     setCollecting(true);
     try {
       const { job } = await triggerDeviceConfig(deviceId);
-      const finished = await waitForJobIfNeeded(job, { timeoutMs: 20000 });
+      const finished = await waitForJobIfNeeded(job, { timeoutMs: 45000 });
       if (!finished) throw new Error('Job not available');
       if (finished.status === 'FAILED') throw new Error(finished.error || 'Config collection failed');
       await load();
       message.success('Collected running config');
     } catch (cause) {
-      if (cause instanceof JobWaitTimeoutError) {
+      if (cause instanceof DeviceBusyError) {
+        const username = cause.lockedBy.username;
+        message.warning(
+          username
+            ? `Device đang được cấu hình bởi user "${username}". Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.`
+            : 'Device đang bận (job đang chạy). Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+        );
+      } else if (cause instanceof JobWaitTimeoutError) {
         message.warning(cause.message);
       } else {
         message.error(cause instanceof Error ? cause.message : 'Could not collect config');

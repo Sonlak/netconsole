@@ -63,7 +63,7 @@ import ManagedChecksTags from '@/components/ManagedChecksTags';
 import { SITES, deviceFloor, deviceRole, deviceSite, deviceVendorFamily, DEVICE_VENDOR_LABELS, floorLabel, floorNumbers, floorsMatch, isKnownSite, type DeviceVendorFamily } from '@/data/bank';
 import { useDevices } from '@/hooks/useDevices';
 import { useSiteFilter } from '@/hooks/useSiteFilter';
-import { toError } from '@/lib/errors';
+import { toError, DeviceBusyError } from '@/lib/errors';
 import type { Device } from '@/types/device';
 
 const BULK_ROLE_OPTIONS: Exclude<ConfigRole, 'custom'>[] = ['core', 'dist', 'access'];
@@ -236,13 +236,20 @@ function SingleDevicePanel() {
     setCollecting(true);
     try {
       const { job } = await triggerDeviceConfig(deviceId);
-      const finished = await waitForJobIfNeeded(job, { timeoutMs: 20000 });
+      const finished = await waitForJobIfNeeded(job, { timeoutMs: 45000 });
       if (!finished) throw new Error('Job not available');
       if (finished.status === 'FAILED') throw new Error(finished.error || 'Config collection failed');
       await loadState(deviceId, { keepDraft: true });
       message.success('Collected running config from device');
     } catch (cause) {
-      if (cause instanceof JobWaitTimeoutError) {
+      if (cause instanceof DeviceBusyError) {
+        const username = cause.lockedBy.username;
+        message.warning(
+          username
+            ? `Device đang được cấu hình bởi user "${username}". Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.`
+            : 'Device đang bận (job đang chạy). Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+        );
+      } else if (cause instanceof JobWaitTimeoutError) {
         message.warning(
           <span>
             {cause.message} — <Link to="/jobs">open Jobs</Link>

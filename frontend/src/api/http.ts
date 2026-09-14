@@ -1,4 +1,5 @@
 import { authHeaders, refreshTokens, clearAllAuth } from './auth';
+import { DeviceBusyError } from '../lib/errors';
 
 export class UnauthorizedError extends Error {
   constructor(message = 'Unauthorized') {
@@ -54,6 +55,13 @@ export async function handleResponse<T>(response: Response): Promise<T> {
     }
     if (response.status === 403) {
       throw new Error('You do not have permission to perform this action.');
+    }
+    if (response.status === 409) {
+      const payload = await response.json().catch(() => ({ error: 'Device busy' }));
+      if (payload.code === 'device_locked' && payload.lockedBy) {
+        throw new DeviceBusyError(payload.lockedBy);
+      }
+      throw new Error(payload.error ?? 'Device busy');
     }
     if (response.status === 429) {
       const payload = await response.json().catch(() => ({ error: 'Too many requests' }));

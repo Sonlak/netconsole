@@ -8,6 +8,29 @@ export class HttpError extends Error {
   }
 }
 
+/**
+ * Thrown when a device is locked by another in-flight job.
+ * Includes the blocking job details so the UI can show which user is using the device.
+ */
+export class DeviceBusyError extends Error {
+  status: 409;
+  lockedBy: {
+    jobId: string;
+    jobType: string;
+    jobStatus: string;
+    jobCreatedAt: string;
+    userId: string | null;
+    username: string | null;
+  };
+
+  constructor(lockedBy: DeviceBusyError['lockedBy']) {
+    super('Device busy');
+    this.name = 'DeviceBusyError';
+    this.status = 409;
+    this.lockedBy = lockedBy;
+  }
+}
+
 export function toError(cause: unknown, fallback = 'Request failed'): Error {
   return cause instanceof Error ? cause : new Error(fallback);
 }

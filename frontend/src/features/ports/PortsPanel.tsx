@@ -18,7 +18,7 @@ import { DataTableShell } from '@/components/data-table/DataTableShell';
 import { TableFreshness } from '@/components/data-table/TableFreshness';
 import { IpAddress, MonoValue } from '@/components/display/MonoValue';
 import { linkStatusMeta } from '@/design/status';
-import { toError } from '@/lib/errors';
+import { DeviceBusyError, toError } from '@/lib/errors';
 import { tablePagination, tableScroll } from '@/lib/table';
 import type { DeviceInterface, InterfaceAction } from '@/types/interfaces';
 
@@ -190,7 +190,14 @@ export function PortsPanel({
       setCollectedAt(inventory.collectedAt);
       setSource(inventory.source);
     } catch (cause) {
-      if (cause instanceof JobWaitTimeoutError) {
+      if (cause instanceof DeviceBusyError) {
+        const username = cause.lockedBy.username;
+        message.warning(
+          username
+            ? `Device đang được cấu hình bởi user "${username}". Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.`
+            : 'Device đang bận (job đang chạy). Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+        );
+      } else if (cause instanceof JobWaitTimeoutError) {
         message.warning('Job is still queued. Open Jobs if it does not finish in a few seconds.');
       } else {
         message.error(cause instanceof Error ? cause.message : 'Action failed');
