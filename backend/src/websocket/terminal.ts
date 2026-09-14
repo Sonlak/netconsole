@@ -27,7 +27,7 @@ import { Client as SSH2Client, ConnectConfig } from 'ssh2';
 import { prisma } from '../lib/prisma.js';
 import type { Request } from 'express';
 
-const TIMEOUT_MS = 60000; // 1 minute idle timeout
+const TIMEOUT_MS = 180000; // 3 minutes idle timeout
 
 interface ClientMessage {
   type: 'connect' | 'input' | 'resize' | 'disconnect';
@@ -159,9 +159,10 @@ export function startTerminalWebSocket(httpServer: Server) {
             host: msg.deviceIp,
             username: sshUser,
             password: sshPass,
+            // Try keyboard-interactive first (works for Juniper cRPD), fall back to password
             tryKeyboard: true,
             readyTimeout: 20000,
-            keepaliveInterval: 10000,
+            keepaliveInterval: 30000, // Send keepalive every 30s to maintain session
           };
 
           const ssh = new SSH2Client();
@@ -176,7 +177,7 @@ export function startTerminalWebSocket(httpServer: Server) {
             console.log(`[terminal] Session ${session.id}: SSH connected, opening shell`);
             send(ws, { type: 'ready' });
 
-            // Update session with device name from SSH
+            // Try to get hostname - works for Juniper, silently fails for Cisco/IOS-XE
             ssh.exec('show system uptime | match hostname', (err, stream) => {
               if (err) return;
               stream.on('data', (data: Buffer) => {
@@ -188,9 +189,11 @@ export function startTerminalWebSocket(httpServer: Server) {
                   }).catch(console.error);
                 }
               });
+              // Drain stderr too to prevent hanging
+              stream.stderr.on('data', () => {});
             });
 
-            ssh.shell({ term: 'xterm-256color', cols: 80, rows: 24 }, (err, stream) => {
+            ssh.shell({ term: 'vt100', cols: 80, rows: 24 }, (err, stream) => {
               if (err) {
                 console.error(`[terminal] Session ${session.id}: shell error:`, err.message);
                 send(ws, { type: 'error', message: `Shell error: ${err.message}` });
@@ -220,7 +223,18 @@ export function startTerminalWebSocket(httpServer: Server) {
 
           ssh.on('error', async (err) => {
             console.error(`[terminal] Session ${session.id}: SSH error:`, err.message);
-            send(ws, { type: 'error', message: err.message });
+            // Provide more helpful error messages
+            let userMessage = err.message;
+            if (err.message.includes('authentication')) {
+              userMessage = 'Authentication failed. Check SSH credentials in environment variables.';
+            } else if (err.message.includes('ECONNREFUSED')) {
+              userMessage = 'Connection refused. SSH may not be enabled on this device or port 22 is blocked.';
+            } else if (err.message.includes('ETIMEDOUT') || err.message.includes('timed out')) {
+              userMessage = 'Connection timed out. Check device IP address and network connectivity.';
+            } else if (err.message.includes('ENOTFOUND') || err.message.includes('getaddrinfo')) {
+              userMessage = 'DNS resolution failed. Check device IP address.';
+            }
+            send(ws, { type: 'error', message: userMessage });
 
             // Update session with error
             if (currentSessionId) {

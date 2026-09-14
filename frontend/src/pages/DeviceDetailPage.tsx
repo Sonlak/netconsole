@@ -356,6 +356,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       fontFamily: '"JetBrains Mono", "Cascadia Code", Consolas, monospace',
       fontSize: 13,
       scrollback: 10000,
+      allowProposedApi: true,
       theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
     });
     const fit = new FitAddon();
