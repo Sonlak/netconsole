@@ -119,8 +119,9 @@ templatesRouter.get('/', async (_req, res) => {
 
 // GET /api/templates/:id - Get single template
 templatesRouter.get('/:id', async (req, res) => {
+  const id = req.params.id as string;
   const template = await prisma.configTemplate.findUnique({
-    where: { id: req.params.id },
+    where: { id },
   });
   if (!template) {
     res.status(404).json({ error: 'Template not found' });
@@ -172,9 +173,10 @@ templatesRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res)
 // PUT /api/templates/:id - Update template
 templatesRouter.put('/:id', authMiddleware, async (req: AuthenticatedRequest, res) => {
   const { name, description, content } = req.body;
+  const id = req.params.id as string;
 
   const existing = await prisma.configTemplate.findUnique({
-    where: { id: req.params.id },
+    where: { id },
   });
   if (!existing) {
     res.status(404).json({ error: 'Template not found' });
@@ -196,7 +198,7 @@ templatesRouter.put('/:id', authMiddleware, async (req: AuthenticatedRequest, re
 
   try {
     const updated = await prisma.configTemplate.update({
-      where: { id: req.params.id },
+      where: { id },
       data: {
         name: name?.trim() ?? existing.name,
         description: description !== undefined ? (typeof description === 'string' ? description.trim() : null) : existing.description,
@@ -216,8 +218,9 @@ templatesRouter.put('/:id', authMiddleware, async (req: AuthenticatedRequest, re
 
 // DELETE /api/templates/:id
 templatesRouter.delete('/:id', authMiddleware, async (req: AuthenticatedRequest, res) => {
+  const id = req.params.id as string;
   const existing = await prisma.configTemplate.findUnique({
-    where: { id: req.params.id },
+    where: { id },
   });
   if (!existing) {
     res.status(404).json({ error: 'Template not found' });
@@ -225,7 +228,7 @@ templatesRouter.delete('/:id', authMiddleware, async (req: AuthenticatedRequest,
   }
 
   await prisma.configTemplate.delete({
-    where: { id: req.params.id },
+    where: { id },
   });
 
   res.status(204).send();

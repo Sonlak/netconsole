@@ -29,7 +29,7 @@ import {
   notification,
 } from 'antd';
 import { UploadOutlined, PlusOutlined, EditOutlined, DeleteOutlined, CloudUploadOutlined } from '@ant-design/icons';
-import type { UploadFile, UploadProps } from 'antd/es/upload/interface';
+import type { UploadProps } from 'antd/es/upload/interface';
 import {
   BulkDeployProgressModal,
   type BulkDeployQueuedJob,
@@ -40,11 +40,9 @@ import {
   ackRollbackJob,
   bulkCommitGenerateConfig,
   commitGenerateConfig,
-  fetchConfigTemplates,
   fetchGenerateConfig,
   fetchUserTemplates,
   previewBulkConfig,
-  renderConfigTemplate,
   rollbackGenerateConfig,
   saveGenerateConfig,
   createUserTemplate,
@@ -52,7 +50,6 @@ import {
   updateUserTemplate,
   type BulkCommitResult,
   type ConfigRole,
-  type ConfigTemplateMeta,
   type DeviceSavedConfig,
   type UserTemplate,
 } from '@/api/generateConfig';
@@ -311,7 +308,7 @@ function SingleDevicePanel() {
     if (!deviceId || !selectedDevice) return;
     setSaving(true);
     try {
-      const next = await saveGenerateConfig(deviceId, { content: draft, role });
+      const next = await saveGenerateConfig(deviceId, { content: draft, role: saved?.role ?? 'custom' });
       setSaved(next);
       setBaseline(draft);
       message.success('Draft saved in NetConsole (not pushed to the device)');
@@ -356,7 +353,7 @@ function SingleDevicePanel() {
         setDeviceRpcError(null);
         let jobId: string | null = null;
         try {
-          const { job } = await commitGenerateConfig(deviceId, { content: draft, role });
+          const { job } = await commitGenerateConfig(deviceId, { content: draft, role: saved?.role ?? 'custom' });
           jobId = job.id;
           const finished = await waitForJobWithNotification(job.id, {
             kind: 'commit',
@@ -491,14 +488,14 @@ function SingleDevicePanel() {
     ? `Source: ${runningSource || 'device collection'}${runningJobId ? ` · job ${runningJobId}` : ''}`
     : 'Not collected';
 
-  if (templatesLoading && templates.length === 0) return <PageSkeleton />;
-  if (templatesError && templates.length === 0) {
+  if (templatesLoading && userTemplates.length === 0) return <PageSkeleton />;
+  if (templatesError && userTemplates.length === 0) {
     return <ErrorState title="Could not load config templates" error={templatesError} onRetry={() => void loadTemplates()} />;
   }
 
   return (
     <>
-      <StaleDataBanner error={templates.length ? templatesError : null} onRetry={() => void loadTemplates()} />
+      <StaleDataBanner error={userTemplates.length ? templatesError : null} onRetry={() => void loadTemplates()} />
       {devicesError && devices.length === 0 ? (
         <ErrorState title="Could not load devices" error={devicesError} onRetry={() => void refetchDevices()} />
       ) : null}
@@ -1328,7 +1325,6 @@ function TemplateTab() {
   const [templates, setTemplates] = useState<UserTemplate[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
-  const [uploading, setUploading] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingTemplate, setEditingTemplate] = useState<UserTemplate | null>(null);
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
