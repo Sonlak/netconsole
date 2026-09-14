@@ -14,6 +14,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Collapse,
   Empty,
   Input,
   Modal,
@@ -1504,57 +1505,57 @@ function TemplateTab() {
         {templates.length === 0 ? (
           <Empty description="No templates yet. Upload a config file or create one manually." />
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            {templates.map((t) => (
-              <Card
-                key={t.id}
-                size="small"
-                title={
-                  <Space>
-                    <span>{t.name}</span>
-                    <Tag color={VENDOR_COLORS[t.vendor] || 'default'}>{t.vendor}</Tag>
-                  </Space>
-                }
-                extra={
-                  <Space>
-                    <Tooltip title="Edit">
-                      <Button
-                        size="small"
-                        icon={<EditOutlined />}
-                        onClick={() => openEditModal(t)}
-                      />
-                    </Tooltip>
-                    <Tooltip title="Delete">
-                      <Button
-                        size="small"
-                        danger
-                        icon={<DeleteOutlined />}
-                        loading={deleting === t.id}
-                        onClick={() => handleDelete(t)}
-                      />
-                    </Tooltip>
-                  </Space>
-                }
-              >
-                {t.description && (
-                  <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-                    {t.description}
+          <Collapse
+            accordion
+            items={templates.map((t) => ({
+              key: t.id,
+              label: (
+                <Space>
+                  <span style={{ fontWeight: 500 }}>{t.name}</span>
+                  <Tag color={VENDOR_COLORS[t.vendor] || 'default'}>{t.vendor}</Tag>
+                  {t.description && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      — {t.description}
+                    </Typography.Text>
+                  )}
+                </Space>
+              ),
+              extra: (
+                <Space onClick={(e) => e.stopPropagation()}>
+                  <Tooltip title="Edit">
+                    <Button
+                      size="small"
+                      icon={<EditOutlined />}
+                      onClick={() => openEditModal(t)}
+                    />
+                  </Tooltip>
+                  <Tooltip title="Delete">
+                    <Button
+                      size="small"
+                      danger
+                      icon={<DeleteOutlined />}
+                      loading={deleting === t.id}
+                      onClick={() => handleDelete(t)}
+                    />
+                  </Tooltip>
+                </Space>
+              ),
+              children: (
+                <>
+                  <Input.TextArea
+                    className="nc-code-area"
+                    value={t.content}
+                    readOnly
+                    autoSize={{ minRows: 5, maxRows: 15 }}
+                    style={{ fontSize: 12 }}
+                  />
+                  <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
+                    {t.content.split('\n').length} lines · created <Timestamp value={t.createdAt} /> · updated <Timestamp value={t.updatedAt} />
                   </Typography.Paragraph>
-                )}
-                <Input.TextArea
-                  className="nc-code-area"
-                  value={t.content}
-                  readOnly
-                  autoSize={{ minRows: 3, maxRows: 10 }}
-                  style={{ fontSize: 12 }}
-                />
-                <Typography.Paragraph type="secondary" style={{ marginTop: 4, marginBottom: 0 }}>
-                  {t.content.split('\n').length} lines ·{' '}
-                  <Timestamp value={t.createdAt} /> · updated <Timestamp value={t.updatedAt} />
-                </Typography.Paragraph>
-              </Card>
-            ))}
-          </div>
+                </>
+              ),
+            }))}
+          />
         )}
       </Card>
 
