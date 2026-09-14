@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, Space, Typography, Empty, Select } from 'antd';
+import { Button, Space, Typography, Empty, Select, DatePicker } from 'antd';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import type { SavedConfigEntry } from '@/api/configCompare';
@@ -85,7 +85,7 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
 
   return (
     <div style={{ display: 'flex', height: 'calc(100vh - 340px)', minHeight: 400 }}>
-      {/* Left = current */}
+      {/* Left = current running config */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', borderRight: `1px solid ${C.border}` }}>
         <div style={{
           padding: '6px 12px', background: C.panel, borderBottom: `1px solid ${C.border}`,
@@ -96,13 +96,13 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
           <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
             <tbody>
               {Array.from({ length: maxLines }, (_, idx) => {
-                const right = rightLines[idx] ?? '';
-                const isGap = !right;
+                const left = leftLines[idx] ?? '';
+                const isGap = !left;
                 return (
                   <tr key={idx} style={{ background: isGap ? C.panelAlt : undefined }}>
                     <td style={{ width: 44, padding: '1px 4px', textAlign: 'right', color: C.textMuted, fontSize: 11, userSelect: 'none', borderRight: `1px solid ${C.border}`, fontFamily: '"JetBrains Mono", Consolas, monospace' }}>{idx + 1}</td>
                     <td style={{ padding: '1px 8px', fontFamily: '"JetBrains Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.6, color: isGap ? C.textMuted : C.text, whiteSpace: 'pre' }}>
-                      {right || <span style={{ color: C.textMuted }}>…</span>}
+                      {left || <span style={{ color: C.textMuted }}>…</span>}
                     </td>
                   </tr>
                 );
@@ -112,7 +112,7 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
         </div>
       </div>
 
-      {/* Right = old */}
+      {/* Right = old config */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         <div style={{
           padding: '6px 12px', background: C.panel, borderBottom: `1px solid ${C.border}`,
@@ -123,13 +123,13 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
           <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
             <tbody>
               {Array.from({ length: maxLines }, (_, idx) => {
-                const left = leftLines[idx] ?? '';
-                const isGap = !left;
+                const right = rightLines[idx] ?? '';
+                const isGap = !right;
                 return (
                   <tr key={idx} style={{ background: isGap ? C.panelAlt : undefined }}>
                     <td style={{ width: 44, padding: '1px 4px', textAlign: 'right', color: C.textMuted, fontSize: 11, userSelect: 'none', borderRight: `1px solid ${C.border}`, fontFamily: '"JetBrains Mono", Consolas, monospace' }}>{idx + 1}</td>
                     <td style={{ padding: '1px 8px', fontFamily: '"JetBrains Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.6, color: isGap ? C.textMuted : C.text, whiteSpace: 'pre' }}>
-                      {left || <span style={{ color: C.textMuted }}>…</span>}
+                      {right || <span style={{ color: C.textMuted }}>…</span>}
                     </td>
                   </tr>
                 );
@@ -203,6 +203,7 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
   const [historyError, setHistoryError] = useState<Error | null>(null);
   const [selectedOldId, setSelectedOldId] = useState<string>('');
   const [viewMode, setViewMode] = useState<'split' | 'unified'>('unified');
+  const [selectedDate, setSelectedDate] = useState<dayjs.Dayjs | null>(null);
 
   // Load commit history
   useEffect(() => {
@@ -220,6 +221,20 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
   if (loadingHistory) return <PageSkeleton />;
   if (historyError) return <ErrorState title="Không tải được lịch sử commit" error={historyError} onRetry={() => window.location.reload()} />;
 
+  // All history entries (loaded once); filter by date client-side
+  const filteredHistory = selectedDate
+    ? history.filter((h) => dayjs(h.timestamp).isSame(selectedDate, 'day'))
+    : history;
+
+  if (filteredHistory.length === 0 && history.length > 0) {
+    return (
+      <Empty
+        image={Empty.PRESENTED_IMAGE_SIMPLE}
+        description={`Không có config nào trong ngày ${selectedDate?.format('DD/MM/YYYY')}. Chọn ngày khác hoặc bỏ lọc.`}
+      />
+    );
+  }
+
   if (history.length === 0) {
     return (
       <Empty
@@ -229,13 +244,15 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
     );
   }
 
-  const selectedOld = history.find((h) => h.id === selectedOldId) ?? history[0];
+  const selectedOld = filteredHistory.find((h) => h.id === selectedOldId) ?? filteredHistory[0];
   const leftLines = currentConfig.split('\n');
   const rightLines = (selectedOld?.content ?? '').split('\n');
   const diffLines = computeDiff(leftLines, rightLines);
 
   const leftLabel = `Running config hiện tại · ${leftLines.length} dòng · ${dayjs().format('DD/MM/YYYY HH:mm')}`;
-  const rightLabel = `${selectedOld.label} · ${rightLines.length} dòng · ${dayjs(selectedOld.timestamp).format('DD/MM/YYYY HH:mm')}`;
+  const rightLabel = selectedOld
+    ? `${selectedOld.label} · ${rightLines.length} dòng · ${dayjs(selectedOld.timestamp).format('DD/MM/YYYY HH:mm')}`
+    : 'Chưa chọn phiên bản';
 
   return (
     <div>
@@ -243,12 +260,27 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
       <div style={{ marginBottom: 12 }}>
         <Space wrap align="center" size="middle">
           <Typography.Text style={{ color: C.textDim, fontSize: 12 }}>So với:</Typography.Text>
+          <DatePicker
+            size="small"
+            placeholder="Lọc theo ngày"
+            format="DD/MM/YYYY"
+            allowClear
+            value={selectedDate}
+            onChange={(d) => {
+              setSelectedDate(d);
+              if (d) {
+                const sameDay = history.filter((h) => dayjs(h.timestamp).isSame(d, 'day'));
+                if (sameDay.length > 0) setSelectedOldId(sameDay[0].id);
+              }
+            }}
+            style={{ fontSize: 11 }}
+          />
           <Select
             size="small"
-            style={{ minWidth: 300 }}
-            value={selectedOldId || history[0]?.id}
+            style={{ minWidth: 320 }}
+            value={selectedOldId || filteredHistory[0]?.id}
             onChange={(v) => setSelectedOldId(v)}
-            options={history.map((h) => ({
+            options={filteredHistory.map((h) => ({
               value: h.id,
               label: (
                 <Space size={4}>
