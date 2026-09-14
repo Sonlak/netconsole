@@ -159,9 +159,8 @@ export function startTerminalWebSocket(httpServer: Server) {
             host: msg.deviceIp,
             username: sshUser,
             password: sshPass,
-            // Don't try keyboard-interactive - use password auth directly
-            // This works for both Cisco IOS and Juniper cRPD
-            tryKeyboard: false,
+            // Use both keyboard-interactive (for Juniper) and password (for Cisco)
+            tryKeyboard: true,
             readyTimeout: 30000,
             keepaliveInterval: 30000,
           };
@@ -175,28 +174,39 @@ export function startTerminalWebSocket(httpServer: Server) {
           });
 
           ssh.on('ready', () => {
-            console.log(`[terminal] Session ${session.id}: SSH connected, opening shell`);
+            console.log(`[terminal] Session ${session.id}: SSH connected`);
             send(ws, { type: 'ready' });
 
             // Try to get hostname - works for Juniper, silently fails for Cisco/IOS-XE
             ssh.exec('show system uptime | match hostname', (err, stream) => {
-              if (err) return;
-              stream.on('data', (data: Buffer) => {
-                const match = data.toString().match(/hostname\s+(.+)/);
-                if (match) {
-                  prisma.terminalSession.update({
-                    where: { id: session.id },
-                    data: { hostname: match[1].trim() },
-                  }).catch(console.error);
-                }
-              });
-              // Drain stderr too to prevent hanging
-              stream.stderr.on('data', () => {});
+              if (err) {
+                console.log(`[terminal] Session ${session.id}: hostname exec failed (non-fatal): ${err.message}`);
+              } else {
+                stream.on('data', (data: Buffer) => {
+                  const match = data.toString().match(/hostname\s+(.+)/);
+                  if (match) {
+                    prisma.terminalSession.update({
+                      where: { id: session.id },
+                      data: { hostname: match[1].trim() },
+                    }).catch(console.error);
+                  }
+                });
+                // Drain stderr too to prevent hanging
+                stream.stderr.on('data', () => {});
+              }
             });
 
             // Delay shell open slightly to ensure connection is stable
             // Some devices (like Cisco IOS-XE) need time to be ready for shell channel
             setTimeout(() => {
+              // Check if SSH is still connected
+              if (!ws._ssh || (ws._ssh as SSH2Client)._state === undefined) {
+                console.log(`[terminal] Session ${session.id}: SSH disconnected before shell open`);
+                send(ws, { type: 'error', message: 'Connection closed before shell could be opened' });
+                close(ws);
+                return;
+              }
+
               // Try with PTY first, then retry without PTY if it fails
               const tryOpenShell = (termType: string, withPty: boolean) => {
                 const options: Record<string, unknown> = { term: termType, cols: 80, rows: 24 };
@@ -204,7 +214,7 @@ export function startTerminalWebSocket(httpServer: Server) {
                   options.modes = {};
                 }
                 console.log(`[terminal] Session ${session.id}: opening shell (pty=${withPty}, term=${termType})`);
-                ssh.shell(options, (err, stream) => {
+                (ws._ssh as SSH2Client).shell(options, (err, stream) => {
                   if (err) {
                     console.error(`[terminal] Session ${session.id}: shell (pty=${withPty}) error:`, err.message);
                     // If PTY failed, try without PTY
@@ -238,7 +248,7 @@ export function startTerminalWebSocket(httpServer: Server) {
                 });
               };
               tryOpenShell('xterm-256color', true);
-            }, 1000); // 1 second delay
+            }, 2000); // 2 second delay
           });
 
           ssh.on('error', async (err) => {
@@ -266,7 +276,7 @@ export function startTerminalWebSocket(httpServer: Server) {
           });
 
           ssh.on('close', () => {
-            console.log(`[terminal] Session ${session.id}: SSH closed`);
+            console.log(`[terminal] Session ${session.id}: SSH closed unexpectedly`);
             send(ws, { type: 'closed' });
           });
 
