@@ -159,10 +159,11 @@ export function startTerminalWebSocket(httpServer: Server) {
             host: msg.deviceIp,
             username: sshUser,
             password: sshPass,
-            // Try keyboard-interactive first (works for Juniper cRPD), fall back to password
-            tryKeyboard: true,
-            readyTimeout: 20000,
-            keepaliveInterval: 30000, // Send keepalive every 30s to maintain session
+            // Don't try keyboard-interactive - use password auth directly
+            // This works for both Cisco IOS and Juniper cRPD
+            tryKeyboard: false,
+            readyTimeout: 30000,
+            keepaliveInterval: 30000,
           };
 
           const ssh = new SSH2Client();
@@ -193,48 +194,51 @@ export function startTerminalWebSocket(httpServer: Server) {
               stream.stderr.on('data', () => {});
             });
 
-            // Try with no PTY first, then with PTY if it fails
-            // Some devices (like Cisco IOS-XE) reject PTY requests
-            // Open shell - try multiple approaches for different device types
-            const tryOpenShell = (termType: string, withPty: boolean) => {
-              const options: Record<string, unknown> = { term: termType, cols: 80, rows: 24 };
-              if (withPty) {
-                options.modes = {};
-              }
-              ssh.shell(options, (err, stream) => {
-                if (err) {
-                  console.error(`[terminal] Session ${session.id}: shell (pty=${withPty}) error:`, err.message);
-                  // If PTY failed, try without PTY
-                  if (withPty) {
-                    console.log(`[terminal] Session ${session.id}: retrying without PTY`);
-                    tryOpenShell(termType, false);
+            // Delay shell open slightly to ensure connection is stable
+            // Some devices (like Cisco IOS-XE) need time to be ready for shell channel
+            setTimeout(() => {
+              // Try with PTY first, then retry without PTY if it fails
+              const tryOpenShell = (termType: string, withPty: boolean) => {
+                const options: Record<string, unknown> = { term: termType, cols: 80, rows: 24 };
+                if (withPty) {
+                  options.modes = {};
+                }
+                console.log(`[terminal] Session ${session.id}: opening shell (pty=${withPty}, term=${termType})`);
+                ssh.shell(options, (err, stream) => {
+                  if (err) {
+                    console.error(`[terminal] Session ${session.id}: shell (pty=${withPty}) error:`, err.message);
+                    // If PTY failed, try without PTY
+                    if (withPty) {
+                      console.log(`[terminal] Session ${session.id}: retrying without PTY`);
+                      tryOpenShell(termType, false);
+                      return;
+                    }
+                    send(ws, { type: 'error', message: `Shell error: ${err.message}` });
+                    close(ws);
                     return;
                   }
-                  send(ws, { type: 'error', message: `Shell error: ${err.message}` });
-                  close(ws);
-                  return;
-                }
-                console.log(`[terminal] Session ${session.id}: shell opened`);
+                  console.log(`[terminal] Session ${session.id}: shell opened`);
 
-                stream.on('data', (data: Buffer) => {
-                  const text = data.toString();
-                  console.log(`[terminal] Session ${session.id}: shell data len=${text.length} preview=${JSON.stringify(text.substring(0, 80))}`);
-                  send(ws, { type: 'data', data: text });
+                  stream.on('data', (data: Buffer) => {
+                    const text = data.toString();
+                    console.log(`[terminal] Session ${session.id}: shell data len=${text.length} preview=${JSON.stringify(text.substring(0, 80))}`);
+                    send(ws, { type: 'data', data: text });
+                  });
+
+                  stream.stderr.on('data', (data: Buffer) => {
+                    send(ws, { type: 'data', data: data.toString() });
+                  });
+
+                  stream.on('close', () => {
+                    console.log(`[terminal] Session ${session.id}: stream closed`);
+                    close(ws);
+                  });
+
+                  ws._stream = stream;
                 });
-
-                stream.stderr.on('data', (data: Buffer) => {
-                  send(ws, { type: 'data', data: data.toString() });
-                });
-
-                stream.on('close', () => {
-                  console.log(`[terminal] Session ${session.id}: stream closed`);
-                  close(ws);
-                });
-
-                ws._stream = stream;
-              });
-            };
-            tryOpenShell('vt100', true);
+              };
+              tryOpenShell('xterm-256color', true);
+            }, 1000); // 1 second delay
           });
 
           ssh.on('error', async (err) => {
