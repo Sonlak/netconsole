@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   ArrowLeftOutlined,
   CloudDownloadOutlined,
+  BranchesOutlined,
   EllipsisOutlined,
   FileTextOutlined,
   LinkOutlined,
@@ -28,6 +29,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import './Terminal.css';
+import { ConfigCompare } from '@/components/config/ConfigCompare';
 import {
   fetchDeviceArp,
   fetchDeviceById,
@@ -101,6 +103,7 @@ function ConfigTab({ deviceId }: { deviceId: string }) {
   const [collecting, setCollecting] = useState(false);
   const [payload, setPayload] = useState<OperationResponse | null>(null);
   const [error, setError] = useState<Error | null>(null);
+  const [activeSubTab, setActiveSubTab] = useState<'view' | 'compare'>('view');
 
   const load = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) setLoading(true);
@@ -184,11 +187,38 @@ function ConfigTab({ deviceId }: { deviceId: string }) {
           Source: {payload?.source === 'job' ? 'device collection' : payload?.source || 'unknown'}
           {payload?.jobId ? ` · job ${payload.jobId}` : ''}
         </Typography.Paragraph>
-        {configText ? (
-          <pre className="nc-code-block">{configText}</pre>
-        ) : (
-          <EmptyState title="Not collected" description="Running config is collected after the device is synced and refreshed on a schedule." />
-        )}
+
+        {/* Sub-tabs: View / Compare */}
+        <Tabs
+          size="small"
+          activeKey={activeSubTab}
+          onChange={(k) => setActiveSubTab(k as 'view' | 'compare')}
+          style={{ marginTop: 8 }}
+          items={[
+            {
+              key: 'view',
+              label: 'Xem',
+              children: configText ? (
+                <pre className="nc-code-block">{configText}</pre>
+              ) : (
+                <EmptyState
+                  title="Not collected"
+                  description="Running config is collected after the device is synced and refreshed on a schedule."
+                />
+              ),
+            },
+            {
+              key: 'compare',
+              label: (
+                <span>
+                  <BranchesOutlined style={{ marginRight: 4 }} />
+                  So sánh
+                </span>
+              ),
+              children: <ConfigCompare deviceId={deviceId} />,
+            },
+          ]}
+        />
       </DataTableShell>
     </div>
   );
