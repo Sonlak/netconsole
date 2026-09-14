@@ -1,0 +1,18 @@
+/* Override xterm.js default black background with our dark theme */
+.xterm {
+  background-color: #161d27 !important;
+}
+
+.xterm .xterm-viewport,
+.xterm .xterm-viewport-wrap {
+  background-color: #161d27 !important;
+}
+
+.xterm .xterm-screen {
+  background-color: #161d27 !important;
+}
+
+.xterm .xterm-screen canvas,
+.xterm .xterm-screen .xterm-char-measure {
+  background-color: #161d27 !important;
+}

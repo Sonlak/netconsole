@@ -26,6 +26,7 @@ import type { ColumnsType } from 'antd/es/table';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
+import './Terminal.css';
 import {
   fetchDeviceArp,
   fetchDeviceById,
@@ -394,6 +395,14 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       term.open(containerRef.current);
       fit.fit();
       term.write('Connecting to ' + deviceIp + '...\r\n');
+      // Set background using xterm's internal API after a short delay to ensure render
+      setTimeout(() => {
+        const screenEl = containerRef.current?.querySelector('.xterm-screen');
+        const canvasEl = screenEl?.querySelector('canvas') as HTMLCanvasElement | null;
+        if (canvasEl) {
+          canvasEl.style.backgroundColor = '#161d27';
+        }
+      }, 100);
     } else {
       // Fallback: observe tab pane for when container appears
       const tabPane = document.querySelector('.ant-tabs-tabpane-active');
@@ -520,7 +529,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, padding: 8, background: '#161d27', overflow: 'hidden', minHeight: 0 }}
+        style={{ flex: 1, padding: 8, background: '#161d27', overflow: 'hidden', minHeight: 0, position: 'relative' } as React.CSSProperties}
       />
     </div>
   );
