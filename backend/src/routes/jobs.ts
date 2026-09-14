@@ -85,6 +85,9 @@ jobsRouter.get('/', authMiddleware, async (req, res) => {
       device: {
         select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
       },
+      createdBy: {
+        select: { id: true, username: true },
+      },
     },
     orderBy: { createdAt: 'desc' },
     take: limit,
@@ -165,6 +168,9 @@ jobsRouter.get('/:id', async (req, res) => {
       device: {
         select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
       },
+      createdBy: {
+        select: { id: true, username: true },
+      },
     },
   });
 
@@ -181,7 +187,7 @@ jobsRouter.patch('/:id/claim', workerAuth, async (req, res) => {
     const job = await prisma.job.update({
       where: { id: String(req.params.id), status: JobStatus.PENDING },
       data: { status: JobStatus.RUNNING },
-      include: { device: true },
+      include: { device: true, createdBy: { select: { id: true, username: true } } },
     });
     res.json(job);
   } catch {
@@ -203,7 +209,7 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
             : (result as Prisma.InputJsonValue),
         error: error ?? null,
       },
-      include: { device: true },
+      include: { device: true, createdBy: { select: { id: true, username: true } } },
     });
 
     let device = null;
@@ -339,7 +345,7 @@ jobsRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
   // for existing clients (they expect job.device).
   const job = await prisma.job.findUnique({
     where: { id: outcome.job.id },
-    include: { device: true },
+    include: { device: true, createdBy: { select: { id: true, username: true } } },
   });
 
   res.status(201).json(job);

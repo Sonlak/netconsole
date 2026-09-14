@@ -2,7 +2,7 @@ import { JobStatus, JobType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { applyCollectedDeviceFacts } from './deviceIdentity.js';
 import { fetchConfigurationSet, junosRestEnabled } from './junosRest.js';
-import { tryCreateDeviceJob } from './deviceOperations.js';
+import { blockingJobToLockedBy, tryCreateDeviceJob } from './deviceOperations.js';
 
 export async function collectDeviceConfig(deviceId: string, createdById: string | null) {
   const device = await prisma.device.findUnique({ where: { id: deviceId } });
@@ -22,7 +22,7 @@ export async function collectDeviceConfig(deviceId: string, createdById: string 
     if (outcome.kind === 'busy') {
       const err = new Error('Device busy');
       (err as Error & { code?: string; lockedBy?: unknown }).code = 'device_locked';
-      (err as Error & { code?: string; lockedBy?: unknown }).lockedBy = outcome.error.blockingJob;
+      (err as Error & { code?: string; lockedBy?: unknown }).lockedBy = blockingJobToLockedBy(outcome.error.blockingJob);
       throw err;
     }
 
@@ -49,7 +49,7 @@ export async function collectDeviceConfig(deviceId: string, createdById: string 
     if (outcome.kind === 'busy') {
       const err = new Error('Device busy');
       (err as Error & { code?: string; lockedBy?: unknown }).code = 'device_locked';
-      (err as Error & { lockedBy?: unknown }).lockedBy = outcome.error.blockingJob;
+      (err as Error & { lockedBy?: unknown }).lockedBy = blockingJobToLockedBy(outcome.error.blockingJob);
       throw err;
     }
 
@@ -66,7 +66,7 @@ export async function collectDeviceConfig(deviceId: string, createdById: string 
     if (outcome.kind === 'busy') {
       throw Object.assign(new Error('Device busy'), {
         code: 'device_locked',
-        lockedBy: outcome.error.blockingJob,
+        lockedBy: blockingJobToLockedBy(outcome.error.blockingJob),
       });
     }
     // Overwrite the PENDING row to SUCCESS in the same transaction so we

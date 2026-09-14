@@ -102,7 +102,7 @@ export default function JobsPage() {
       if (typeFilter !== 'all' && job.type !== typeFilter) return false;
       if (deviceFilter !== 'all' && job.deviceId !== deviceFilter) return false;
       if (!keyword) return true;
-      const hay = [job.id, job.type, job.device?.name, job.device?.ip, job.error, job.deviceId]
+      const hay = [job.id, job.type, job.device?.name, job.device?.ip, job.error, job.deviceId, job.createdBy?.username]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
@@ -132,6 +132,11 @@ export default function JobsPage() {
         ) : (
           record.deviceId || '—'
         ),
+    },
+    {
+      title: 'User',
+      width: 120,
+      render: (_value, record) => record.createdBy?.username ?? <span style={{ color: 'var(--ant-color-text-secondary)' }}>—</span>,
     },
     {
       title: 'Created',

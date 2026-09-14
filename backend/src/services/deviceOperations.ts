@@ -15,6 +15,21 @@ export type DeviceBusyError = {
 };
 
 /**
+ * Maps a blockingJob (from tryCreateDeviceJob) to the lockedBy shape
+ * expected by the frontend DeviceBusyError type.
+ */
+export function blockingJobToLockedBy(b: DeviceBusyError['blockingJob']) {
+  return {
+    jobId: b.id,
+    jobType: b.type,
+    jobStatus: b.status,
+    jobCreatedAt: b.createdAt,
+    userId: null, // not available from the blocking row alone
+    username: b.createdByUsername,
+  };
+}
+
+/**
  * Job types that originate from the Config Studio UI and MUST be picked up
  * by the worker ahead of any scheduled collection jobs. Config Studio jobs
  * are the ones an admin triggered interactively — they should never wait
@@ -191,13 +206,7 @@ export async function createDeviceJob(
     res.status(409).json({
       error: 'Device busy',
       code: 'device_locked',
-      lockedBy: {
-        jobId: outcome.error.blockingJob.id,
-        jobType: outcome.error.blockingJob.type,
-        jobStatus: outcome.error.blockingJob.status,
-        jobCreatedAt: outcome.error.blockingJob.createdAt,
-        username: outcome.error.blockingJob.createdByUsername,
-      },
+      lockedBy: blockingJobToLockedBy(outcome.error.blockingJob),
     });
     return null;
   }
