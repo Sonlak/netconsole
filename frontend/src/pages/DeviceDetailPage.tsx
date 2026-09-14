@@ -357,7 +357,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       fontSize: 13,
       scrollback: 10000,
       allowProposedApi: true,
-      theme: { background: '#1e1e1e', foreground: '#d4d4d4' },
+      theme: { background: '#ffffff', foreground: '#000000' },
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -478,7 +478,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
   // Status is only used for the status bar color and disconnect behavior
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 240px)', minHeight: 400 }}>
-      <div style={{ padding: '8px 12px', background: '#2d2d2d', borderBottom: '1px solid #404040', flexShrink: 0 }}>
+      <div style={{ padding: '8px 12px', background: '#f5f5f5', borderBottom: '1px solid #d9d9d9', flexShrink: 0 }}>
         <Space>
           <Typography.Text style={{ color: status === 'connected' ? '#52c41a' : status === 'connecting' ? '#faad14' : '#ff4d4f', fontSize: 12 }}>
             {status === 'connected' ? 'Connected' : status === 'connecting' ? 'Connecting…' : 'Disconnected'} to {deviceName} ({deviceIp})
@@ -499,7 +499,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, padding: 8, background: '#1e1e1e', overflow: 'hidden', minHeight: 0 }}
+        style={{ flex: 1, padding: 8, background: '#ffffff', overflow: 'hidden', minHeight: 0 }}
       />
     </div>
   );
