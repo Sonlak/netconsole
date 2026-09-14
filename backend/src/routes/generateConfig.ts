@@ -8,6 +8,8 @@ import {
   type ConfigRole,
 } from '../services/labConfigTemplates.js';
 import { jobPriority } from '../services/deviceOperations.js';
+import { authMiddleware } from '../middleware/auth.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 export const generateConfigRouter = Router();
 
@@ -119,10 +121,10 @@ async function enqueue(
   type: JobType,
   payload: Prisma.InputJsonValue | undefined,
   res: import('express').Response,
+  createdById: string | null,
 ) {
   const device = await prisma.device.findUnique({
     where: { id: deviceId },
-    include: { savedConfig: true },
   });
   if (!device) {
     res.status(404).json({ error: 'Device not found' });
@@ -139,12 +141,13 @@ async function enqueue(
       type,
       status: JobStatus.PENDING,
       priority: jobPriority(type),
+      ...(createdById ? { createdById } : {}),
       ...(payload !== undefined ? { payload } : {}),
     },
-    include: { device: true },
+    include: { device: true, createdBy: { select: { id: true, username: true } } },
   });
 
-  res.status(202).json({ job, saved: device.savedConfig });
+  res.status(202).json({ job });
 }
 
 /**
@@ -185,80 +188,88 @@ function validateConfigPayload(
   return { ok: true };
 }
 
-generateConfigRouter.post('/devices/:id/commit', async (req, res) => {
-  const device = await prisma.device.findUnique({
-    where: { id: req.params.id },
-    include: { savedConfig: true },
-  });
-  if (!device) {
-    res.status(404).json({ error: 'Device not found' });
-    return;
-  }
-  if (device.status !== DeviceStatus.MANAGED) {
-    res.status(409).json({ error: 'Thiết bị phải MANAGED trước khi commit' });
-    return;
-  }
+generateConfigRouter.post('/devices/:id/commit', authMiddleware, (req: AuthenticatedRequest, res) => {
+  void (async () => {
+    const device = await prisma.device.findUnique({
+      where: { id: req.params.id as string },
+    });
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    if (device.status !== DeviceStatus.MANAGED) {
+      res.status(409).json({ error: 'Thiết bị phải MANAGED trước khi commit' });
+      return;
+    }
 
-  const content =
-    (typeof req.body?.content === 'string' && req.body.content.trim()
-      ? req.body.content
-      : device.savedConfig?.content) ?? '';
-  if (!content.trim()) {
-    res.status(400).json({ error: 'Chưa có config để commit — lưu trên tool trước' });
-    return;
-  }
+    const savedConfig = await prisma.deviceSavedConfig.findUnique({ where: { deviceId: device.id } });
+    const content =
+      (typeof req.body?.content === 'string' && req.body.content.trim()
+        ? req.body.content
+        : savedConfig?.content) ?? '';
+    if (!content.trim()) {
+      res.status(400).json({ error: 'Chưa có config để commit — lưu trên tool trước' });
+      return;
+    }
 
-  const validation = validateConfigPayload(content, device.vendor);
-  if (!validation.ok) {
-    res.status(400).json({ error: validation.error });
-    return;
-  }
+    const validation = validateConfigPayload(content, device.vendor);
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error });
+      return;
+    }
 
-  const role = asRole(req.body?.role) ?? device.savedConfig?.role ?? 'custom';
-  await prisma.deviceSavedConfig.upsert({
-    where: { deviceId: device.id },
-    create: { deviceId: device.id, role, content },
-    update: { role, content },
-  });
+    const role = asRole(req.body?.role) ?? savedConfig?.role ?? 'custom';
+    await prisma.deviceSavedConfig.upsert({
+      where: { deviceId: device.id },
+      create: { deviceId: device.id, role, content },
+      update: { role, content },
+    });
 
-  const latest = await prisma.job.findFirst({
-    where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
-    orderBy: { updatedAt: 'desc' },
-  });
-  const previous =
-    device.savedConfig?.committedContent ||
-    ((latest?.result ?? {}) as { config?: string }).config ||
-    '';
+    const latest = await prisma.job.findFirst({
+      where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
+      orderBy: { updatedAt: 'desc' },
+    });
+    const previous =
+      savedConfig?.committedContent ||
+      ((latest?.result ?? {}) as { config?: string }).config ||
+      '';
 
-  const job = await prisma.job.create({
-    data: {
-      deviceId: device.id,
-      type: JobType.APPLY_CONFIG,
-      status: JobStatus.PENDING,
-      priority: jobPriority(JobType.APPLY_CONFIG),
-      payload: { config: content, role, previous },
-    },
-    include: { device: true },
-  });
+    const userId = req.user?.userId ?? null;
+    const job = await prisma.job.create({
+      data: {
+        deviceId: device.id,
+        type: JobType.APPLY_CONFIG,
+        status: JobStatus.PENDING,
+        priority: jobPriority(JobType.APPLY_CONFIG),
+        ...(userId ? { createdById: userId } : {}),
+        payload: { config: content, role, previous },
+      },
+      include: { device: true, createdBy: { select: { id: true, username: true } } },
+    });
 
-  res.status(202).json({ job });
+    res.status(202).json({ job });
+  })();
 });
 
-generateConfigRouter.post('/devices/:id/rollback', async (req, res) => {
-  const device = await prisma.device.findUnique({
-    where: { id: req.params.id },
-    include: { savedConfig: true },
-  });
-  if (!device) {
-    res.status(404).json({ error: 'Device not found' });
-    return;
-  }
-  await enqueue(
-    device.id,
-    JobType.ROLLBACK_CONFIG,
-    { rollback: 1, previous: device.savedConfig?.rollbackContent ?? '' },
-    res,
-  );
+generateConfigRouter.post('/devices/:id/rollback', authMiddleware, (req: AuthenticatedRequest, res) => {
+  void (async () => {
+    const device = await prisma.device.findUnique({
+      where: { id: req.params.id as string },
+    });
+    if (!device) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+    const savedConfig = await prisma.deviceSavedConfig.findUnique({ where: { deviceId: device.id } });
+    const userId = req.user?.userId ?? null;
+    await enqueue(
+      device.id,
+      JobType.ROLLBACK_CONFIG,
+      { rollback: 1, previous: savedConfig?.rollbackContent ?? '' },
+      res,
+      userId,
+    );
+  })();
 });
 
 /**
@@ -279,124 +290,117 @@ generateConfigRouter.post('/devices/:id/rollback', async (req, res) => {
  *
  * Caps at 64 devices per request to keep the response bounded.
  */
-generateConfigRouter.post('/bulk-commit', async (req, res) => {
-  const rawIds = req.body?.deviceIds;
-  if (!Array.isArray(rawIds) || rawIds.length === 0) {
-    res.status(400).json({ error: 'deviceIds must be a non-empty array' });
-    return;
-  }
-  if (rawIds.length > 64) {
-    res.status(400).json({ error: 'deviceIds cap is 64 per request' });
-    return;
-  }
+generateConfigRouter.post('/bulk-commit', authMiddleware, (req, res) => {
+  void (async () => {
+    const userId = (req as AuthenticatedRequest).user?.userId ?? null;
 
-  const literalContent = typeof req.body?.content === 'string' ? req.body.content : '';
-  const templateRole = asRole(req.body?.role);
-
-  if (!literalContent.trim() && !templateRole) {
-    res.status(400).json({ error: 'Either content (literal draft) or role (template) is required' });
-    return;
-  }
-  // Literal-draft mode stores role as 'custom' on DeviceSavedConfig.
-  // The DB column is plain String, so 'custom' is fine even though it's
-  // outside the ConfigRole union used by template rendering.
-  const useLiteral = literalContent.trim().length > 0;
-  const effectiveRole: string = useLiteral && !templateRole ? 'custom' : templateRole!;
-
-  // Drop non-string ids and dedupe (caller may double-tap a checkbox).
-  const deviceIds = Array.from(
-    new Set(rawIds.filter((v): v is string => typeof v === 'string' && v.length > 0)),
-  );
-
-  const devices = await prisma.device.findMany({
-    where: { id: { in: deviceIds } },
-    select: {
-      id: true,
-      name: true,
-      ip: true,
-      status: true,
-      vendor: true,
-      savedConfig: { select: { committedContent: true } },
-    },
-  });
-
-  const found = new Map(devices.map((d) => [d.id, d]));
-  const jobs: Array<{ id: string; deviceId: string; deviceName: string; deviceIp: string }> = [];
-  const skipped: Array<{ deviceId: string; reason: string }> = [];
-
-  for (const deviceId of deviceIds) {
-    const device = found.get(deviceId);
-    if (!device) {
-      skipped.push({ deviceId, reason: 'Device not found' });
-      continue;
+    const rawIds = req.body?.deviceIds;
+    if (!Array.isArray(rawIds) || rawIds.length === 0) {
+      res.status(400).json({ error: 'deviceIds must be a non-empty array' });
+      return;
     }
-    if (device.status !== DeviceStatus.MANAGED) {
-      skipped.push({ deviceId, reason: 'Thiết bị phải MANAGED trước khi commit' });
-      continue;
+    if (rawIds.length > 64) {
+      res.status(400).json({ error: 'deviceIds cap is 64 per request' });
+      return;
     }
 
-    // Either use the literal draft verbatim (same for every device) or
-    // render the chosen template per-device so hostname/IP stay correct.
-    // In literal mode there's no template role to render with.
-    const content = useLiteral
-      ? literalContent
-      : renderConfigTemplate(effectiveRole as ConfigRole, device);
+    const literalContent = typeof req.body?.content === 'string' ? req.body.content : '';
+    const templateRole = asRole(req.body?.role);
 
-    // Reject the whole bulk deploy early if the payload would crash the
-    // Junos parser on any Juniper target in the selection. Catching it
-    // here means the operator sees the failure once instead of having
-    // half the batch land and the other half leave the candidate
-    // database in a "modified" state on every remaining device.
-    if (useLiteral) {
-      const validation = validateConfigPayload(content, device.vendor);
-      if (!validation.ok) {
-        skipped.push({ deviceId, reason: validation.error });
+    if (!literalContent.trim() && !templateRole) {
+      res.status(400).json({ error: 'Either content (literal draft) or role (template) is required' });
+      return;
+    }
+    const useLiteral = literalContent.trim().length > 0;
+    const effectiveRole: string = useLiteral && !templateRole ? 'custom' : templateRole!;
+
+    const deviceIds = Array.from(
+      new Set(rawIds.filter((v): v is string => typeof v === 'string' && v.length > 0)),
+    );
+
+    const devices = await prisma.device.findMany({
+      where: { id: { in: deviceIds } },
+      select: {
+        id: true,
+        name: true,
+        ip: true,
+        status: true,
+        vendor: true,
+        savedConfig: { select: { committedContent: true } },
+      },
+    });
+
+    const found = new Map(devices.map((d) => [d.id, d]));
+    const jobs: Array<{ id: string; deviceId: string; deviceName: string; deviceIp: string }> = [];
+    const skipped: Array<{ deviceId: string; reason: string }> = [];
+
+    for (const deviceId of deviceIds) {
+      const device = found.get(deviceId);
+      if (!device) {
+        skipped.push({ deviceId, reason: 'Device not found' });
         continue;
       }
-    }
-    const previous = device.savedConfig?.committedContent ?? '';
+      if (device.status !== DeviceStatus.MANAGED) {
+        skipped.push({ deviceId, reason: 'Thiết bị phải MANAGED trước khi commit' });
+        continue;
+      }
 
-    await prisma.deviceSavedConfig.upsert({
-      where: { deviceId: device.id },
-      create: { deviceId: device.id, role: effectiveRole, content },
-      update: { role: effectiveRole, content },
-    });
+      const content = useLiteral
+        ? literalContent
+        : renderConfigTemplate(effectiveRole as ConfigRole, device);
 
-    const job = await prisma.job.create({
-      data: {
-        deviceId: device.id,
-        type: JobType.APPLY_CONFIG,
-        status: JobStatus.PENDING,
-        priority: jobPriority(JobType.APPLY_CONFIG),
-        payload: {
-          config: content,
-          role: effectiveRole,
-          previous,
-          bulk: true,
-          bulkRole: effectiveRole,
-          bulkTotal: deviceIds.length,
-          bulkMode: useLiteral ? 'literal' : 'template',
+      if (useLiteral) {
+        const validation = validateConfigPayload(content, device.vendor);
+        if (!validation.ok) {
+          skipped.push({ deviceId, reason: validation.error });
+          continue;
+        }
+      }
+      const previous = device.savedConfig?.committedContent ?? '';
+
+      await prisma.deviceSavedConfig.upsert({
+        where: { deviceId: device.id },
+        create: { deviceId: device.id, role: effectiveRole, content },
+        update: { role: effectiveRole, content },
+      });
+
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.APPLY_CONFIG,
+          status: JobStatus.PENDING,
+          priority: jobPriority(JobType.APPLY_CONFIG),
+          ...(userId ? { createdById: userId } : {}),
+          payload: {
+            config: content,
+            role: effectiveRole,
+            previous,
+            bulk: true,
+            bulkRole: effectiveRole,
+            bulkTotal: deviceIds.length,
+            bulkMode: useLiteral ? 'literal' : 'template',
+          },
         },
-      },
-      include: {
-        device: { select: { id: true, name: true, ip: true } },
-      },
-    });
+        include: {
+          device: { select: { id: true, name: true, ip: true } },
+        },
+      });
 
-    if (!job.device) {
-      skipped.push({ deviceId: device.id, reason: 'Device disappeared after job create' });
-      continue;
+      if (!job.device) {
+        skipped.push({ deviceId: device.id, reason: 'Device disappeared after job create' });
+        continue;
+      }
+
+      jobs.push({
+        id: job.id,
+        deviceId: device.id,
+        deviceName: job.device.name,
+        deviceIp: job.device.ip,
+      });
     }
 
-    jobs.push({
-      id: job.id,
-      deviceId: device.id,
-      deviceName: job.device.name,
-      deviceIp: job.device.ip,
-    });
-  }
-
-  res.status(202).json({ jobs, skipped });
+    res.status(202).json({ jobs, skipped });
+  })();
 });
 
 generateConfigRouter.post('/jobs/:jobId/ack-commit', async (req, res) => {
