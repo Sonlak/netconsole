@@ -7,7 +7,7 @@ import {
   suggestRole,
   type ConfigRole,
 } from '../services/labConfigTemplates.js';
-import { jobPriority } from '../services/deviceOperations.js';
+import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
@@ -135,15 +135,27 @@ async function enqueue(
     return;
   }
 
-  const job = await prisma.job.create({
-    data: {
-      deviceId,
-      type,
-      status: JobStatus.PENDING,
-      priority: jobPriority(type),
-      ...(createdById ? { createdById } : {}),
-      ...(payload !== undefined ? { payload } : {}),
-    },
+  const outcome = await prisma.$transaction(async (tx) =>
+    tryCreateDeviceJob(tx, deviceId, type, createdById, payload),
+  );
+
+  if (outcome.kind === 'busy') {
+    res.status(409).json({
+      error: 'Device busy',
+      code: 'device_locked',
+      lockedBy: {
+        jobId: outcome.error.blockingJob.id,
+        jobType: outcome.error.blockingJob.type,
+        jobStatus: outcome.error.blockingJob.status,
+        jobCreatedAt: outcome.error.blockingJob.createdAt,
+        username: outcome.error.blockingJob.createdByUsername,
+      },
+    });
+    return;
+  }
+
+  const job = await prisma.job.findUnique({
+    where: { id: outcome.job.id },
     include: { device: true, createdBy: { select: { id: true, username: true } } },
   });
 
@@ -235,15 +247,33 @@ generateConfigRouter.post('/devices/:id/commit', authMiddleware, (req: Authentic
       '';
 
     const userId = req.user?.userId ?? null;
-    const job = await prisma.job.create({
-      data: {
-        deviceId: device.id,
-        type: JobType.APPLY_CONFIG,
-        status: JobStatus.PENDING,
-        priority: jobPriority(JobType.APPLY_CONFIG),
-        ...(userId ? { createdById: userId } : {}),
-        payload: { config: content, role, previous },
-      },
+
+    const outcome = await prisma.$transaction(async (tx) =>
+      tryCreateDeviceJob(tx, device.id, JobType.APPLY_CONFIG, userId, {
+        config: content,
+        role,
+        previous,
+      }),
+    );
+
+    if (outcome.kind === 'busy') {
+      res.status(409).json({
+        error: 'Device busy',
+        code: 'device_locked',
+        lockedBy: {
+          jobId: outcome.error.blockingJob.id,
+          jobType: outcome.error.blockingJob.type,
+          jobStatus: outcome.error.blockingJob.status,
+          jobCreatedAt: outcome.error.blockingJob.createdAt,
+          username: outcome.error.blockingJob.createdByUsername,
+        },
+      });
+      return;
+    }
+
+    // Re-fetch with relations for the 202 response.
+    const job = await prisma.job.findUnique({
+      where: { id: outcome.job.id },
       include: { device: true, createdBy: { select: { id: true, username: true } } },
     });
 
@@ -364,29 +394,32 @@ generateConfigRouter.post('/bulk-commit', authMiddleware, (req, res) => {
         update: { role: effectiveRole, content },
       });
 
-      const job = await prisma.job.create({
-        data: {
+      const jobOutcome = await prisma.$transaction(async (tx) =>
+        tryCreateDeviceJob(tx, device.id, JobType.APPLY_CONFIG, userId, {
+          config: content,
+          role: effectiveRole,
+          previous,
+          bulk: true,
+          bulkRole: effectiveRole,
+          bulkTotal: deviceIds.length,
+          bulkMode: useLiteral ? 'literal' : 'template',
+        }),
+      );
+
+      if (jobOutcome.kind === 'busy') {
+        skipped.push({
           deviceId: device.id,
-          type: JobType.APPLY_CONFIG,
-          status: JobStatus.PENDING,
-          priority: jobPriority(JobType.APPLY_CONFIG),
-          ...(userId ? { createdById: userId } : {}),
-          payload: {
-            config: content,
-            role: effectiveRole,
-            previous,
-            bulk: true,
-            bulkRole: effectiveRole,
-            bulkTotal: deviceIds.length,
-            bulkMode: useLiteral ? 'literal' : 'template',
-          },
-        },
-        include: {
-          device: { select: { id: true, name: true, ip: true } },
-        },
+          reason: `Device busy — job ${jobOutcome.error.blockingJob.id} (${jobOutcome.error.blockingJob.type}) đang chạy`,
+        });
+        continue;
+      }
+
+      const job = await prisma.job.findUnique({
+        where: { id: jobOutcome.job.id },
+        select: { id: true, device: { select: { id: true, name: true, ip: true } } },
       });
 
-      if (!job.device) {
+      if (!job?.device) {
         skipped.push({ deviceId: device.id, reason: 'Device disappeared after job create' });
         continue;
       }
