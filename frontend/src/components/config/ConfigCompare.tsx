@@ -239,7 +239,7 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
     return (
       <Empty
         image={Empty.PRESENTED_IMAGE_SIMPLE}
-        description="Chưa có commit nào. Dùng Config Studio để commit config trước."
+        description="Chưa có snapshot nào. ConfigCheck job cần chạy trước để lưu running config."
       />
     );
   }
@@ -283,20 +283,9 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
             options={filteredHistory.map((h) => ({
               value: h.id,
               label: (
-                <Space size={4}>
-                  <span style={{
-                    padding: '1px 6px', borderRadius: 3, fontSize: 10, fontWeight: 600,
-                    background: h.label.startsWith('Đã commit') ? '#1a3a2a'
-                      : h.label.startsWith('Rollback') ? '#3a2a1a' : '#1a2a3a',
-                    color: h.label.startsWith('Đã commit') ? '#4ade80'
-                      : h.label.startsWith('Rollback') ? '#fbbf24' : '#60a5fa',
-                  }}>
-                    {h.label.startsWith('Đã commit') ? 'COMMIT' : h.label.startsWith('Rollback') ? 'ROLLBACK' : 'DRAFT'}
-                  </span>
-                  <Typography.Text style={{ fontSize: 12, color: C.text }}>
-                    {dayjs(h.timestamp).format('DD/MM/YYYY HH:mm')} · {h.role} · {h.content.split('\n').length}L
-                  </Typography.Text>
-                </Space>
+                <Typography.Text style={{ fontSize: 12, color: C.text }}>
+                  {dayjs(h.timestamp).format('DD/MM/YYYY HH:mm')} · {h.role} · {h.content.split('\n').length}L dòng
+                </Typography.Text>
               ),
             }))}
           />
