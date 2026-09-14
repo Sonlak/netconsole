@@ -215,7 +215,7 @@ function ConfigTab({ deviceId }: { deviceId: string }) {
                   So sánh
                 </span>
               ),
-              children: <ConfigCompare deviceId={deviceId} />,
+              children: <ConfigCompare deviceId={deviceId} currentConfig={configText} />,
             },
           ]}
         />

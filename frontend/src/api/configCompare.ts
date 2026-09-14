@@ -2,44 +2,41 @@ import { authJsonFetch } from './http';
 
 const BASE = '/api/config-snapshots';
 
-export type ConfigSnapshot = {
-  jobId: string;
-  collectedAt: string;
-  collectMs: number;
-  username: string | null;
-  lineCount: number;
-};
-
-export type DiffLine = {
-  type: 'added' | 'removed' | 'unchanged';
+export type SavedConfigEntry = {
+  id: string;
+  label: string;
   content: string;
+  timestamp: string;
+  role: string;
 };
 
-export type DiffResult = {
-  lines: DiffLine[];
-  added: number;
-  removed: number;
-  unchanged: number;
-};
-
-export type SnapshotSide = {
-  jobId: string;
-  collectedAt: string | null;
-  username: string | null;
-  collectMs: number;
-  lineCount: number;
-};
-
-export async function fetchConfigSnapshots(deviceId: string): Promise<ConfigSnapshot[]> {
-  const data = await authJsonFetch<{ snapshots: ConfigSnapshot[] }>(`${BASE}/${deviceId}`);
-  return data.snapshots;
+export async function fetchConfigHistory(deviceId: string): Promise<SavedConfigEntry[]> {
+  const data = await authJsonFetch<{ entries: SavedConfigEntry[] }>(`${BASE}/${deviceId}/history`);
+  return data.entries;
 }
 
-export async function fetchConfigDiff(
+export type DiffSides = {
+  from: {
+    id: string;
+    label: string;
+    content: string;
+    timestamp: string;
+    lineCount: number;
+  };
+  to: {
+    id: string;
+    label: string;
+    content: string;
+    timestamp: string;
+    lineCount: number;
+  };
+};
+
+export async function fetchSavedConfigDiff(
   deviceId: string,
-  fromJobId: string,
-  toJobId: string,
-): Promise<{ from: SnapshotSide; to: SnapshotSide; diff: DiffResult }> {
-  const url = `${BASE}/${deviceId}/diff?from=${encodeURIComponent(fromJobId)}&to=${encodeURIComponent(toJobId)}`;
-  return authJsonFetch<{ from: SnapshotSide; to: SnapshotSide; diff: DiffResult }>(url);
+  fromId: string,
+  toId: string,
+): Promise<DiffSides> {
+  const url = `${BASE}/${deviceId}/diff?from=${encodeURIComponent(fromId)}&to=${encodeURIComponent(toId)}`;
+  return authJsonFetch<DiffSides>(url);
 }
