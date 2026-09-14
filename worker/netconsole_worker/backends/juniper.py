@@ -760,19 +760,19 @@ class JuniperBackend(DeviceBackend):
         # Junos exposes NETCONF-over-SSH on 830 and RESTCONF on 8443 by
         # default. We probe both — either one counts as `rest` so a
         # device configured with only one of them still passes. No
-        # RESTCONF GET, no SSH login, no `show version`, no `show
-        # configuration | display set`. The old implementation pushed
-        # the full set-format config on every probe, which flooded
-        # auth.log and burned SSH pool slots.
-        # Probe API ports only (830 = NETCONF SSH, 8443 = RESTCONF).
-        # Port 22 (plain SSH) is intentionally excluded: a TCP connect to
-        # port 22 still triggers Junos sshd, which writes to auth.log even
-        # when the connection is dropped immediately (status 255). Since the
-        # "fully managed" gate is now `ping + rest` (isFullyManaged), the
-        # ssh: True/False flag is informational only — no operational logic
-        # depends on it, so skipping port 22 eliminates the auth.log noise
-        # without any functional change.
-        ssh_open = False
+        # RESTCONF GET, no `show version`, no `show configuration | display set`.
+        #
+        # Probe path:
+        # 1. NETCONF-over-SSH (port 830) - when JUNOS_NETCONF_SSH_ENABLED
+        # 2. RESTCONF (port 8443) - when JUNOS_REST_ENABLED
+        # 3. Plain SSH (port 22) - when LAB_SSH_ENABLED (for uptime via CLI fallback)
+        ssh_open = (
+            probe_rest_or_netconf(
+                device.ip, self.config.ssh_port, timeout=1.5
+            )
+            if self.config.ssh_enabled
+            else False
+        )
         netconf_open = (
             probe_rest_or_netconf(
                 device.ip, self.config.junos_netconf_ssh_port, timeout=1.5
