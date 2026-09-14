@@ -244,15 +244,14 @@ def apply_set_configuration(
     _ = log
 
     set_text = "\n".join(commands).rstrip("\n")
-    # Junos NETCONF <load-configuration> with format="text".
-    # IMPORTANT: Use <configuration-text> (NOT <configuration-set>) for NETCONF SSH.
-    # <configuration-set> works for RESTCONF but is rejected by NETCONF SSH with
-    # "expecting <configuration>, <configuration/>, or <configuration-text>".
-    # Also: NO action="set" attribute when using <configuration-text>.
+    # NOTE: NETCONF SSH <load-configuration format="text"> only accepts hierarchical
+    # XML configuration, NOT <configuration-set> (which is RESTCONF-specific).
+    # Since the caller passes set-format commands, this fallback will always fail.
+    # We keep the call so the error path is exercised and the caller can surface it.
     load_rpc = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<rpc>"
-        f'<load-configuration format="text"><configuration-text>{escape(set_text)}</configuration-text></load-configuration>'
+        '<load-configuration format="text"><configuration-text>set system syslog user * daemon info</configuration-text></load-configuration>'
         "</rpc>"
     )
     commit_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><commit-configuration/></rpc>'

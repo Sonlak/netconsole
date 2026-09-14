@@ -26,7 +26,6 @@ from netconsole_worker.junos_rest import (
     rollback_configuration as rest_rollback_configuration,
 )
 from netconsole_worker.junos_netconf import (
-    apply_set_configuration as nc_apply_set_configuration,
     fetch_full_configuration as nc_fetch_full_configuration,
     fetch_interface_configuration as nc_fetch_interface_configuration,
     fetch_system_uptime as nc_fetch_system_uptime,
@@ -423,36 +422,10 @@ class JuniperBackend(DeviceBackend):
 
         rest_error: str | None = None
 
-        # --- NETCONF-over-SSH (primary) ---
-        if self.config.junos_netconf_ssh:
-            nc_user = self.config.ssh_user
-            nc_pass = self.config.ssh_password
-            nc_port = self.config.junos_netconf_ssh_port
-            applied = nc_apply_set_configuration(
-                device.ip,
-                commands,
-                log=log,
-                username=nc_user,
-                password=nc_pass,
-                port=nc_port,
-                timeout=90.0,
-            )
-            if applied["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "junos-netconf-ssh",
-                    "previous": previous or "",
-                    "config": config,
-                    "commands": commands,
-                    "loadMs": applied.get("loadMs"),
-                    "commitMs": applied.get("commitMs"),
-                    "message": f"Committed config to {device.name} via NETCONF SSH",
-                    "raw": compact_raw(applied.get("raw") or ""),
-                }
-            rest_error = applied.get("error") or "NETCONF SSH load/commit failed"
-            logger.warning("NETCONF SSH failed, falling back to RESTCONF: %s", rest_error)
-
-        # --- RESTCONF (fallback) ---
+        # --- RESTCONF (primary) ---
+        # NOTE: NETCONF SSH (port 830) cannot load set commands on Junos 24.4R1.9.
+        # It only accepts hierarchical XML configuration, not <configuration-set>.
+        # RESTCONF (port 8443) with <configuration-set> is the working path for set commands.
         if self.config.juniper.enabled:
             creds = _rest_creds(self.config)
             applied = rest_apply_set_configuration(
@@ -474,17 +447,10 @@ class JuniperBackend(DeviceBackend):
                     "message": f"Committed config to {device.name}",
                     "raw": compact_raw(applied.get("raw") or ""),
                 }
-                # Surface the NETCONF failure so operators can see why
-                # this device fell back instead of silently degrading.
-                if rest_error:
-                    result["netconfFallbackError"] = rest_error
                 return result
             rest_error = applied.get("error") or "Junos REST load/commit failed"
 
-        raise RuntimeError(
-            rest_error
-            or "APPLY_CONFIG requires JUNOS_NETCONF_SSH or JUNOS_REST enabled"
-        )
+        raise RuntimeError(rest_error or "APPLY_CONFIG requires JUNOS_REST enabled")
 
     def rollback_config(
         self,
@@ -498,8 +464,29 @@ class JuniperBackend(DeviceBackend):
             rollback = 1
 
         rest_error: str | None = None
+        nc_error: str | None = None
 
-        # --- NETCONF-over-SSH (primary) ---
+        # --- RESTCONF (primary) ---
+        if self.config.juniper.enabled:
+            creds = _rest_creds(self.config)
+            rolled = rest_rollback_configuration(
+                device.ip,
+                rollback=rollback,
+                timeout=60.0,
+                **creds,
+            )
+            if rolled["ok"]:
+                return {
+                    "implemented": True,
+                    "source": "junos-rest",
+                    "rollback": rollback,
+                    "config": previous or "",
+                    "message": f"Rolled back config on {device.name}",
+                    "raw": compact_raw(rolled.get("raw") or ""),
+                }
+            rest_error = rolled.get("error") or "Junos REST rollback failed"
+
+        # --- NETCONF-over-SSH (fallback) ---
         if self.config.junos_netconf_ssh:
             nc_user = self.config.ssh_user
             nc_pass = self.config.ssh_password
@@ -521,30 +508,12 @@ class JuniperBackend(DeviceBackend):
                     "message": f"Rolled back config on {device.name} via NETCONF SSH",
                     "raw": compact_raw(rolled.get("raw") or ""),
                 }
-            rest_error = rolled.get("error") or "NETCONF SSH rollback failed"
-
-        # --- RESTCONF (fallback) ---
-        if self.config.juniper.enabled:
-            creds = _rest_creds(self.config)
-            rolled = rest_rollback_configuration(
-                device.ip,
-                rollback=rollback,
-                timeout=60.0,
-                **creds,
-            )
-            if rolled["ok"]:
-                return {
-                    "implemented": True,
-                    "source": "junos-rest",
-                    "rollback": rollback,
-                    "config": previous or "",
-                    "message": f"Rolled back config on {device.name}",
-                    "raw": compact_raw(rolled.get("raw") or ""),
-                }
-            rest_error = rolled.get("error") or "Junos REST rollback failed"
+            nc_error = rolled.get("error") or "NETCONF SSH rollback failed"
 
         raise RuntimeError(
-            rest_error
+            (rest_error and nc_error and f"RESTCONF: {rest_error} | NETCONF SSH: {nc_error}")
+            or nc_error
+            or rest_error
             or "ROLLBACK_CONFIG requires JUNOS_NETCONF_SSH or JUNOS_REST enabled"
         )
 
@@ -687,20 +656,19 @@ class JuniperBackend(DeviceBackend):
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 
-            # Write path: RESTCONF (primary) → NETCONF SSH (fallback) → SSH CLI.
+            # Write path: RESTCONF (primary) → SSH CLI (fallback).
             #
             # Measurements on Junos cRPD (lab):
             #   - RESTCONF load+commit: ~17s (reliable, always works)
-            #   - NETCONF SSH cold-start: 20-30s (gotcha #15) — can time out
-            #     at 27s before failing, adding 27s of dead time to the job.
-            # Putting RESTCONF first avoids the NETCONF cold-start penalty.
-            # NETCONF SSH stays as a fallback in case RESTCONF is broken.
+            # NETCONF SSH (port 830) cannot load set commands on Junos 24.4R1.9
+            # — it only accepts hierarchical XML, not <configuration-set>.
+            # Keeping NETCONF SSH as fallback is useless (always fails for set
+            # commands) and wastes 60s on timeout. Removed.
             source = None
             applied: dict[str, Any] | None = None
-            netconf_error: str | None = None
             rest_error: str | None = None
 
-            # --- 1. RESTCONF (primary — faster on cRPD than NETCONF SSH cold-start) ---
+            # --- RESTCONF (primary — works for set commands) ---
             rest_result = rest_apply_set_configuration(
                 device.ip,
                 commands,
@@ -712,33 +680,6 @@ class JuniperBackend(DeviceBackend):
                 source = "junos-rest"
             else:
                 rest_error = rest_result.get("error") or "Junos REST configure failed"
-
-            # --- 2. NETCONF SSH (fallback when RESTCONF fails or is disabled) ---
-            if applied is None and self.config.junos_netconf_ssh:
-                nc_user = creds["username"]
-                nc_pass = creds["password"]
-                nc_port = self.config.junos_netconf_ssh_port
-                # 60s timeout: enough for a full load+commit on a cold NETCONF SSH
-                # session. Hardware ex9214 can take 22-45s for commit. The 15s
-                # timeout was too short and always caused fallback to SSH CLI.
-                nc_result = nc_apply_set_configuration(
-                    device.ip,
-                    commands,
-                    log=f"NetConsole {action} {iface}",
-                    username=nc_user,
-                    password=nc_pass,
-                    port=nc_port,
-                    timeout=60.0,
-                )
-                if nc_result["ok"]:
-                    applied = nc_result
-                    source = "junos-netconf-ssh"
-                else:
-                    netconf_error = nc_result.get("error") or "NETCONF SSH load/commit failed"
-                    logger.warning(
-                        "junos %s %s %s: NETCONF SSH failed (%s), trying RESTCONF",
-                        device.ip, action, iface, netconf_error,
-                    )
 
             if applied is not None:
                 result: dict[str, Any] = {
@@ -755,28 +696,17 @@ class JuniperBackend(DeviceBackend):
                     "loadMs": applied.get("loadMs"),
                     "commitMs": applied.get("commitMs"),
                 }
-                # Surface the transport we *didn't* use so operators can see
-                # why this device fell back (or didn't).
-                if source != "junos-netconf-ssh" and netconf_error:
-                    result["netconfFallbackError"] = netconf_error
                 if source != "junos-rest" and rest_error:
                     result["restFallbackError"] = rest_error
                 return result
 
-            # Both NETCONF and RESTCONF failed. Fall through to SSH CLI
+            # RESTCONF failed. Fall through to SSH CLI
             # so the operator can at least see the on-device error verbatim.
-            logger.warning(
-                "junos %s %s %s: NETCONF and RESTCONF both failed "
-                "(netconf=%s, rest=%s), falling back to SSH CLI",
-                device.ip, action, iface, netconf_error, rest_error,
-            )
-
-        if not self.config.ssh_enabled:
-            raise RuntimeError(
-                (netconf_error and f"NETCONF: {netconf_error} ")
-                or (rest_error and f"RESTCONF: {rest_error} ")
-                or "Interface actions require NETCONF, JUNOS_REST, or LAB_SSH"
-            )
+            if not self.config.ssh_enabled:
+                raise RuntimeError(
+                    (rest_error and f"RESTCONF: {rest_error} ")
+                    or "Interface actions require JUNOS_REST or LAB_SSH"
+                )
 
         commands: list[str] = []
         if action == "shut" or action == "no-shut":
