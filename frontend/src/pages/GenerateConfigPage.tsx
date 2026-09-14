@@ -25,6 +25,7 @@ import {
   Tooltip,
   Typography,
   message,
+  notification,
 } from 'antd';
 import {
   BulkDeployProgressModal,
@@ -244,11 +245,11 @@ function SingleDevicePanel() {
     } catch (cause) {
       if (cause instanceof DeviceBusyError) {
         const username = cause.lockedBy.username;
-        message.warning(
-          username
-            ? `Device đang được cấu hình bởi user "${username}". Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.`
-            : 'Device đang bận (job đang chạy). Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
-        );
+        notification.warning({
+          message: username ? `Device đang được cấu hình bởi user "${username}"` : 'Device đang bận',
+          description: 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+          duration: 0,
+        });
       } else if (cause instanceof JobWaitTimeoutError) {
         message.warning(
           <span>

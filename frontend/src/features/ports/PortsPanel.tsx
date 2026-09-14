@@ -6,7 +6,7 @@ import {
   PoweroffOutlined,
   SwapOutlined,
 } from '@ant-design/icons';
-import { Button, Input, Modal, Space, Table, Tooltip, Typography, App } from 'antd';
+import { Button, Input, Modal, notification, Space, Table, Tooltip, Typography, App } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { collectDeviceInterfaces, fetchDeviceInterfaces, runInterfaceAction } from '@/api/interfaces';
 import { JobWaitTimeoutError, waitForJob } from '@/api/jobs';
@@ -192,11 +192,11 @@ export function PortsPanel({
     } catch (cause) {
       if (cause instanceof DeviceBusyError) {
         const username = cause.lockedBy.username;
-        message.warning(
-          username
-            ? `Device đang được cấu hình bởi user "${username}". Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.`
-            : 'Device đang bận (job đang chạy). Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
-        );
+        notification.warning({
+          message: username ? `Device đang được cấu hình bởi user "${username}"` : 'Device đang bận',
+          description: 'Vui lòng chờ hoặc vào Jobs để hủy job đang chạy.',
+          duration: 0,
+        });
       } else if (cause instanceof JobWaitTimeoutError) {
         message.warning('Job is still queued. Open Jobs if it does not finish in a few seconds.');
       } else {
