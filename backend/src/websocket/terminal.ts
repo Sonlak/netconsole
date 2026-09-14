@@ -177,12 +177,6 @@ export function startTerminalWebSocket(httpServer: Server) {
             finish(answers);
           });
 
-          // Also handle password auth directly
-          ssh.on('password', (piry) => {
-            console.log(`[terminal] Session ${session.id}: password auth requested`);
-            piry(sshPass);
-          });
-
           ssh.on('ready', () => {
             console.log(`[terminal] Session ${session.id}: SSH connected`);
             send(ws, { type: 'ready' });
@@ -209,14 +203,6 @@ export function startTerminalWebSocket(httpServer: Server) {
             // Delay shell open slightly to ensure connection is stable
             // Some devices (like Cisco IOS-XE) need time to be ready for shell channel
             setTimeout(() => {
-              // Check if SSH is still connected
-              if (!ws._ssh || (ws._ssh as SSH2Client)._state === undefined) {
-                console.log(`[terminal] Session ${session.id}: SSH disconnected before shell open`);
-                send(ws, { type: 'error', message: 'Connection closed before shell could be opened' });
-                close(ws);
-                return;
-              }
-
               // Try with PTY first, then retry without PTY if it fails
               const tryOpenShell = (termType: string, withPty: boolean) => {
                 const options: Record<string, unknown> = { term: termType, cols: 80, rows: 24 };
