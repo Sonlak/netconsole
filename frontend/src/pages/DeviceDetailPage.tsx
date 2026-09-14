@@ -358,7 +358,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       scrollback: 10000,
       allowProposedApi: true,
       theme: {
-        background: '#0b0f14',
+        background: '#161d27',
         foreground: '#e4e4e7',
         cursor: '#e4e4e7',
         selectionBackground: '#264f78',
@@ -520,7 +520,7 @@ function TerminalTab({ deviceIp, deviceName }: TerminalTabProps) {
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, padding: 8, background: '#0b0f14', overflow: 'hidden', minHeight: 0 }}
+        style={{ flex: 1, padding: 8, background: '#161d27', overflow: 'hidden', minHeight: 0 }}
       />
     </div>
   );
