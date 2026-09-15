@@ -98,8 +98,8 @@ jobs:
         run: |
           set -euo pipefail
           rsync -a --delete \
-            --exclude '.git/' \
-            --exclude '.git' \
+            --exclude '.git/hooks/' \
+            --exclude '.git/info/' \
             --exclude 'data/' \
             --exclude 'volumes/' \
             --exclude 'netconsole-app.tar.gz' \

@@ -89,9 +89,13 @@ jobs:
           # make the rollback chain point to the wrong commit.
           # This block is intentionally NOT inside a loop — idempotent by design.
           if [ ! -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
-            cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null || true
-            cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || true
-            echo "Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null || echo 'none (first deploy)')"
+            if [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
+              cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+              cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || true
+              echo "✅ Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
+            else
+              echo "⚠️  No existing .last-deploy-sha to back up — first deploy or git fallback was used"
+            fi
           else
             echo "Rollback anchor already exists — NOT overwriting (preserves original good state)"
             echo "Current anchor: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
@@ -99,14 +103,21 @@ jobs:
 
           # The auto-rollback job reads .last-deploy-sha, so we must
           # preserve the CURRENT (pre-deploy) state there.
-          # Read it now; if it doesn't exist, read from git HEAD on VPS.
-          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+          # Read it now; if it doesn't exist or is empty, read from git HEAD on VPS.
+          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
             CURRENT_SHA=$(cat "$DEPLOY_DIR/.last-deploy-sha")
-            CURRENT_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
+            CURRENT_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null || echo "unknown")
           else
             # Fallback: read git HEAD from the deployed source tree
-            CURRENT_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
-            CURRENT_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+            if [ -d "$DEPLOY_DIR/.git" ]; then
+              CURRENT_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+              CURRENT_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+              echo "⚠️  No .last-deploy-sha found; using git HEAD: sha=$CURRENT_SHA"
+            else
+              CURRENT_SHA="unknown"
+              CURRENT_REF="unknown"
+              echo "⚠️  No marker and no git repo at $DEPLOY_DIR. First deploy?"
+            fi
           fi
           printf '%s\n' "$CURRENT_SHA" > "$DEPLOY_DIR/.last-deploy-sha"
           printf '%s\n' "$CURRENT_REF" > "$DEPLOY_DIR/.last-deploy-ref"
@@ -127,8 +138,8 @@ jobs:
           # `data/` would also wipe source-tree folders such as
           # `frontend/src/data/`, which broke the frontend build for weeks.
           rsync -a --delete \
-            --exclude '/.git/' \
-            --exclude '/.git' \
+            --exclude '/.git/hooks/' \
+            --exclude '/.git/info/' \
             --exclude '/data/' \
             --exclude '/volumes/' \
             --exclude '/netconsole-app.tar.gz' \
@@ -274,27 +285,33 @@ jobs:
           mkdir -p "$DEPLOY_DIR"
 
           # Priority 1: pre-deploy backup (survives consecutive failures)
-          if [ -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+          if [ -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ] && \
+             [ -s "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
             PREV_SHA=$(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")
-            PREV_REF=$(cat "$DEPLOY_DIR/.rollback-before-deploy-ref")
-            echo "Using pre-deploy backup marker: sha=$PREV_SHA ref=$PREV_REF"
+            PREV_REF=$(cat "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || echo "unknown")
+            echo "✅ Using pre-deploy backup: sha=$PREV_SHA ref=$PREV_REF"
 
-          # Priority 2: last deploy marker (fallback for first-ever deploy scenario)
-          elif [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+          # Priority 2: last deploy marker (written by successful deploys)
+          elif [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && \
+               [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
             PREV_SHA=$(cat "$DEPLOY_DIR/.last-deploy-sha")
-            PREV_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref")
-            echo "Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
+            PREV_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null || echo "unknown")
+            echo "✅ Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
 
           # Priority 3: git HEAD from deployed source (fresh VPS with no marker)
           else
-            PREV_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || true)
-            if [ -n "$PREV_SHA" ]; then
+            if [ -d "$DEPLOY_DIR/.git" ]; then
+              PREV_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "")
               PREV_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-              echo "No marker file found — falling back to git HEAD: sha=$PREV_SHA ref=$PREV_REF"
+              if [ -n "$PREV_SHA" ]; then
+                echo "✅ Using git HEAD: sha=$PREV_SHA ref=$PREV_REF"
+              else
+                echo "::error::Git repo exists at $DEPLOY_DIR but cannot read HEAD. Check permissions."
+                exit 1
+              fi
             else
-              echo "::error::No rollback marker found at $DEPLOY_DIR and no git history available."
-              echo "::error::This VPS has never had a successful deploy. Manual intervention required."
-              echo "::error::Run: .github/workflows/rollback.yml with a known-good commit SHA."
+              echo "::error::No rollback marker found at $DEPLOY_DIR and /opt/netconsole is not a git repo."
+              echo "::error::Run manual rollback: .github/workflows/rollback.yml with a known-good commit SHA."
               exit 1
             fi
           fi
@@ -312,8 +329,8 @@ jobs:
         run: |
           set -euo pipefail
           rsync -a --delete \
-            --exclude '/.git/' \
-            --exclude '/.git' \
+            --exclude '/.git/hooks/' \
+            --exclude '/.git/info/' \
             --exclude '/data/' \
             --exclude '/volumes/' \
             --exclude '/netconsole-app.tar.gz' \
