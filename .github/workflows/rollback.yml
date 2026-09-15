@@ -20,6 +20,14 @@
 #   1. .rollback-before-deploy-sha — set by the PREVIOUS successful deploy
 #   2. .last-deploy-sha — current VPS HEAD (from .git/), fallback only
 #   3. git rev-parse HEAD — last resort, same as .last-deploy-sha
+#
+# SCHEMA DRIFT SAFETY (fixed 2026-09-15):
+#   The backend container now uses scripts/docker-start.sh, which runs
+#   `prisma db push --accept-data-loss` and proceeds to start the backend
+#   regardless of its exit code. This means rollback ALWAYS brings the
+#   service up — even when the rolled-back schema.prisma differs from the
+#   DB's current schema. Field-level API errors may occur until the next
+#   correct deploy, but the service is live and healthchecks pass.
 # =============================================================================
 name: Rollback
 
@@ -28,6 +36,19 @@ on:
     workflows: ["Deploy"]
     types: [completed]
     branches: [main]
+  # Allow manual rollback from GitHub Actions UI.
+  # Useful when the auto-rollback cannot reach the VPS (e.g. SSH auth issue,
+  # marker file missing) and ops needs to specify an exact known-good SHA.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Known-good git ref (branch / tag / sha) to roll back to"
+        required: false
+        default: ""
+      clear_markers:
+        description: "Wipe .rollback-before-deploy-* on the VPS before running (used when markers are stale/corrupt)"
+        required: false
+        default: "false"
 
 # Prevent concurrent deploy+rollback on the same VPS.
 concurrency:
@@ -88,8 +109,38 @@ jobs:
 
       - name: Read last known-good marker from VPS
         id: marker
+        # When invoked manually via workflow_dispatch with `ref` set, skip the
+        # VPS marker read entirely — ops specifies the exact git ref to roll
+        # back to. The auto-rollback path (no inputs) keeps the original
+        # 3-tier priority logic.
         run: |
           set -euo pipefail
+
+          INPUT_REF='${{ inputs.ref }}'
+          CLEAR_MARKERS='${{ inputs.clear_markers }}'
+
+          # Manual dispatch with explicit ref — use it directly, no VPS probe.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_REF" ]; then
+            echo "==> Manual rollback: using ref from workflow_dispatch input: $INPUT_REF"
+            # Allow branch/tag/sha inputs. GitHub Actions "ref" can be a branch,
+            # tag, or full SHA. We treat all as-is.
+            PREV_SHA="$INPUT_REF"
+            PREV_REF="manual-dispatch"
+            echo "PREV_SHA=$PREV_SHA" >> "$GITHUB_OUTPUT"
+            echo "PREV_REF=$PREV_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Optional: clear stale marker files before reading.
+          if [ "$CLEAR_MARKERS" = "true" ]; then
+            echo "==> Clearing VPS rollback markers as requested"
+            ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              'rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
+                     "$DEPLOY_DIR/.rollback-before-deploy-ref" \
+                     "$DEPLOY_DIR/.last-deploy-sha" \
+                     "$DEPLOY_DIR/.last-deploy-ref"' || true
+          fi
+
           ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
             'mkdir -p "$DEPLOY_DIR"'
 
@@ -138,7 +189,7 @@ jobs:
 
           if [ -z "$PREV_SHA" ]; then
             echo "::error::No rollback marker found on VPS at $DEPLOY_DIR and git repo unavailable."
-            echo "::error::Run manual rollback via GitHub Actions → Rollback workflow dispatch."
+            echo "::error::Re-run this workflow with workflow_dispatch and provide ref=<sha> input."
             exit 1
           fi
 
@@ -180,6 +231,10 @@ jobs:
           # Safe rebuild: use `up --build` directly without stop+rm.
           # Compose recreates only containers whose image needs rebuilding.
           # If build fails, old containers STAY RUNNING — service preserved.
+          #
+          # The backend startup script (scripts/docker-start.sh) is resilient:
+          # it never blocks container start even if prisma db push fails due
+          # to schema drift between the rolled-back schema.prisma and the DB.
           echo "==> Building + recreating containers..."
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
             up -d --build --no-deps $DEPLOY_SERVICES

@@ -176,7 +176,12 @@ jobs:
           set -euo pipefail
           echo "Probing backend /api/health via container network..."
           for i in $(seq 1 40); do
-            # Backend container's bridge IP (deterministic from compose ipam)
+            # Backend container's bridge IP (deterministic from compose ipam).
+            # Note: the backend startup script (scripts/docker-start.sh) applies
+            # schema migrations resiliently — it NEVER blocks container start,
+            # even if prisma db push fails due to data-loss. The backend binary
+            # starts as soon as Prisma steps complete (or skip), so this probe
+            # waits for that to settle.
             if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
               echo "✅ Backend healthy after ${i} attempt(s)"
               exit 0
