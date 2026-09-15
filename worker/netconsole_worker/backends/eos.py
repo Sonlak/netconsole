@@ -19,7 +19,6 @@ frontend Ports panel shows trunk/access correctly for EOS devices.
 from __future__ import annotations
 
 import logging
-import re
 from ipaddress import ip_address
 from typing import Any
 
