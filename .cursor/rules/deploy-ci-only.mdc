@@ -1,0 +1,63 @@
+---
+description: Deploy pipeline - GitHub CI/CD only, no direct VPS edits
+alwaysApply: true
+---
+
+# Deploy Pipeline Rule
+
+## CRITICAL: All Production Deployments Go Through GitHub CI
+
+**NEVER edit files directly on VPS via SSH for production changes.** This causes code drift between GitHub and VPS, making rollback impossible.
+
+## The Only Correct Deploy Flow
+
+```
+Local changes → Git commit → git push → GitHub Actions → VPS
+```
+
+### Steps:
+1. **Commit to Git**: `git add <files>` → `git commit -m "<message>"`
+2. **Push to GitHub**: `git push origin <branch>`
+3. **Merge to main** (via PR or direct push to main)
+4. **GitHub Actions deploys automatically** via `.github/workflows/deploy.yml`
+
+## What Triggers Deploy
+
+- Push to `main` branch
+- Push version tag (`git tag v1.0.0 && git push --tags`)
+- Manual workflow dispatch in GitHub Actions UI
+
+## Why Direct VPS Edits Are Forbidden
+
+| Problem | Consequence |
+|---------|------------|
+| No git history on VPS | Cannot rollback |
+| Code drift | VPS has different code than GitHub |
+| Next CI deploy overwrites | Manual edits are lost |
+| No audit trail | Who changed what, when? |
+
+## If You Need Emergency Fix on VPS
+
+1. **Preferred**: Push fix to GitHub, let CI deploy
+2. **If CI is broken**: 
+   - SSH to VPS and edit files
+   - Document the change immediately
+   - Create a compensating commit on GitHub ASAP
+   - Note in session log: "Emergency VPS edit - must sync to GitHub"
+
+## Rollback
+
+If a deploy fails:
+1. Check GitHub Actions deploy log
+2. If needed, run `.github/workflows/rollback.yml` with a known-good commit SHA
+3. Never manually `docker rm` containers without syncing to GitHub first
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Check CI status | https://github.com/Sonlak/netconsole/actions |
+| Deploy main branch | `git push origin main` |
+| Create version tag | `git tag v1.0.0 && git push --tags` |
+| Check VPS marker | SSH and `cat /opt/netconsole/.last-deploy-sha` |
+| Manual rollback | GitHub Actions → Rollback workflow |

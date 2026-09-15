@@ -83,6 +83,7 @@ Full detail: `docs/agents/05-gotchas.md`
 - `.cursor/rules/netconsole-backend.mdc` -- Backend (Express/Prisma/JWT)
 - `.cursor/rules/netconsole-worker.mdc` -- Worker (Python/SSH/RESTCONF)
 - `.cursor/rules/netconsole-vps-ops.mdc` -- SSH / compose flags / log queries / rollback (read before any deploy ops)
+- `.cursor/rules/deploy-ci-only.mdc` -- **ALL production deploys via GitHub CI only, no direct VPS edits**
 - `.cursor/rules/project-notebook.md` -- auto-load chain (read this FIRST in every session)
 
 ---
