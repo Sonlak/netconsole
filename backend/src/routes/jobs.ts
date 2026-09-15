@@ -13,6 +13,9 @@ import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 
 export const jobsRouter = Router();
 
+// ROLLBACK TEST v3: intentional type error
+const testRollback3: string = 999; // TS error: number not assignable to string
+
 /**
  * Worker-only auth. Accepts a Bearer JWT signed with JWT_SECRET whose payload
  * has `role: "worker"`. Returns 401 otherwise.
