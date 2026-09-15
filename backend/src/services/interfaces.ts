@@ -5,6 +5,7 @@ import { reclaimStaleJobs } from './jobWatchdog.js';
 import { jobPriority, tryCreateDeviceJob, type DeviceBusyError } from './deviceOperations.js';
 import { fetchInterfaceList, fetchConfigurationSet, fetchVlanInformation, parseVlanInformation, applyVlanMembershipToInterfaces, parseConfigurationSet, applySwitchingModesToInterfaces, parseSwitchingModesFromSet } from './junosRest.js';
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
+import { fetchEosInterfaceList } from './eosApi.js';
 
 export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
 
@@ -316,6 +317,34 @@ export async function collectInterfacesForDevice(
       return { job, queued: false };
     }
     console.warn(`[interfaces] ${device.ip} RESTCONF failed (${rest.error}), falling back to job queue`);
+  }
+
+  // Arista EOS: try eAPI
+  if (vendor === 'arista') {
+    const eapi = await fetchEosInterfaceList(device.ip);
+    if (eapi.ok) {
+      const job = await prisma.job.create({
+        data: {
+          deviceId: device.id,
+          type: JobType.GET_INTERFACES,
+          status: JobStatus.SUCCESS,
+          priority: 100,
+          ...(createdById ? { createdById } : {}),
+          result: {
+            implemented: true,
+            source: 'eos-api',
+            interfaces: eapi.interfaces,
+            command: 'show interfaces + description + switchport',
+            message: `Collected interfaces from ${device.name} via eAPI`,
+            collectMs: eapi.collectMs,
+          } as object,
+        },
+        select: { id: true, type: true, status: true, createdAt: true, deviceId: true },
+      });
+      console.log(`[interfaces] ${device.ip} collected via eAPI in ${eapi.collectMs}ms (${eapi.interfaces.length} interfaces)`);
+      return { job, queued: false };
+    }
+    console.warn(`[interfaces] ${device.ip} eAPI failed (${eapi.error}), falling back to job queue`);
   }
 
   // Default: queue a job (worker handles vendor-specific logic)
