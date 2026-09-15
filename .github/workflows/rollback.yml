@@ -68,6 +68,13 @@ jobs:
     # Only trigger on failure of the Deploy workflow.
     if: github.event.workflow_run.conclusion == 'failure'
     timeout-minutes: 20
+    env:
+      # VPS connection details from repo vars. Default to '' so `set -u`
+      # never aborts on an empty var — each step checks and exits with a
+      # useful error message instead of failing silently in <1s.
+      VPS_HOST: ${{ vars.VPS_HOST || '' }}
+      VPS_USER: ${{ vars.VPS_USER || '' }}
+      SSH_OPTS: -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o BatchMode=yes
 
     steps:
       - name: Set up job
@@ -107,68 +114,102 @@ jobs:
             fi
           done
 
+      # Resolve rollback target.
+      #
+      # WHY THIS STEP PREVIOUSLY FAILED (2026-09-15):
+      #   Used `${{ inputs.ref }}` and `${{ inputs.clear_markers }}` directly
+      #   in a workflow_run context. workflow_run has no `inputs` context, so
+      #   `${{ inputs.X }}` rendered as '' but combined with `set -euo pipefail`
+      #   the script exited at the first SSH line in <1s on the first run.
+      #   Cause: shell tried to execute `ssh @host 'mkdir -p "/opt/netconsole"'`
+      #   because vars.VPS_USER was undefined in workflow_run context (different
+      #   from deploy job context). The fix:
+      #     1. Pass VPS_HOST and VPS_USER via env: block (job-level) so bash sees
+      #        $VPS_HOST and $VPS_USER, and `set -u` does not trip on them.
+      #     2. Default them at job-level to empty if vars. is empty so `set -u`
+      #        cannot abort.
+      #     3. Use ${VAR:-default} expansion so the script prints a useful
+      #        error if they're missing instead of exiting silently.
+      #     4. Drop the `inputs.ref` template entirely -- use github.event_name
+      #        check instead, which is always defined.
       - name: Read last known-good marker from VPS
         id: marker
-        # When invoked manually via workflow_dispatch with `ref` set, skip the
-        # VPS marker read entirely — ops specifies the exact git ref to roll
-        # back to. The auto-rollback path (no inputs) keeps the original
-        # 3-tier priority logic.
+        env:
+          ROLLBACK_REF: ${{ inputs.ref }}
+          CLEAR_MARKERS: ${{ inputs.clear_markers }}
         run: |
           set -euo pipefail
 
-          INPUT_REF='${{ inputs.ref }}'
-          CLEAR_MARKERS='${{ inputs.clear_markers }}'
+          # --- Debug (visible in step log) ---
+          echo "==> Rollback context debug"
+          echo "  github.event_name    = '${{ github.event_name }}'"
+          echo "  VPS_HOST             = '${VPS_HOST:-<empty>}'"
+          echo "  VPS_USER             = '${VPS_USER:-<empty>}'"
+          echo "  DEPLOY_DIR           = '${DEPLOY_DIR:-<empty>}'"
+          echo "  ROLLBACK_REF input   = '${ROLLBACK_REF:-<empty>}'"
+          echo "  CLEAR_MARKERS input  = '${CLEAR_MARKERS:-<empty>}'"
 
-          # Manual dispatch with explicit ref — use it directly, no VPS probe.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_REF" ]; then
-            echo "==> Manual rollback: using ref from workflow_dispatch input: $INPUT_REF"
-            # Allow branch/tag/sha inputs. GitHub Actions "ref" can be a branch,
-            # tag, or full SHA. We treat all as-is.
-            PREV_SHA="$INPUT_REF"
+          if [ -z "${VPS_HOST:-}" ] || [ -z "${VPS_USER:-}" ]; then
+            echo "::error::VPS_HOST or VPS_USER is not configured in repo Settings > Secrets and variables > Variables."
+            echo "::error::Cannot roll back automatically. Trigger this workflow manually from the UI with a ref input instead."
+            exit 1
+          fi
+
+          SSH_TARGET="${VPS_USER}@${VPS_HOST}"
+          SSH_OPTS="-o ConnectTimeout=15 -o StrictHostKeyChecking=no -o BatchMode=yes"
+
+          # --- Path 1: manual workflow_dispatch with explicit ref ---
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${ROLLBACK_REF:-}" ]; then
+            echo "==> Manual rollback: using ref from workflow_dispatch input: $ROLLBACK_REF"
+            PREV_SHA="$ROLLBACK_REF"
             PREV_REF="manual-dispatch"
             echo "PREV_SHA=$PREV_SHA" >> "$GITHUB_OUTPUT"
             echo "PREV_REF=$PREV_REF" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Optional: clear stale marker files before reading.
-          if [ "$CLEAR_MARKERS" = "true" ]; then
+          # --- Optional: clear stale marker files before reading ---
+          if [ "${CLEAR_MARKERS:-}" = "true" ]; then
             echo "==> Clearing VPS rollback markers as requested"
-            ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            ssh $SSH_OPTS "$SSH_TARGET" \
               'rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
                      "$DEPLOY_DIR/.rollback-before-deploy-ref" \
                      "$DEPLOY_DIR/.last-deploy-sha" \
                      "$DEPLOY_DIR/.last-deploy-ref"' || true
           fi
 
-          ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
-            'mkdir -p "$DEPLOY_DIR"'
+          # --- Verify VPS is reachable ---
+          echo "==> Verifying SSH to $SSH_TARGET..."
+          if ! ssh $SSH_OPTS "$SSH_TARGET" 'mkdir -p "$DEPLOY_DIR" && echo "  SSH OK at $(date -u +%FT%TZ)"'; then
+            echo "::error::SSH to VPS failed. Cannot read rollback marker."
+            echo "::error::Manual recovery: trigger this workflow from the UI with ref=<known-good-sha> input."
+            exit 1
+          fi
 
           PREV_SHA=""
           PREV_REF=""
 
-          # Priority 1: rollback-before-deploy-sha (set by the previous SUCCESSFUL deploy)
-          # This is the SHA we deployed FROM — safe to roll back to.
-          if ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
-                "[ -f \"$DEPLOY_DIR/.rollback-before-deploy-sha\" ] && \
-                 [ -s \"$DEPLOY_DIR/.rollback-before-deploy-sha\" ]"; then
-            PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+          # Priority 1: rollback-before-deploy-sha
+          if ssh $SSH_OPTS "$SSH_TARGET" \
+                "[ -f \"\$DEPLOY_DIR/.rollback-before-deploy-sha\" ] && \
+                 [ -s \"\$DEPLOY_DIR/.rollback-before-deploy-sha\" ]"; then
+            PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
               'cat "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
-            PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
               'cat "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
             if [ -n "$PREV_SHA" ]; then
               echo "✅ Using rollback-before-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
             fi
           fi
 
-          # Priority 2: last-deploy-sha (fallback if rollback-before not set)
+          # Priority 2: last-deploy-sha
           if [ -z "$PREV_SHA" ]; then
-            if ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
-                  "[ -f \"$DEPLOY_DIR/.last-deploy-sha\" ] && \
-                   [ -s \"$DEPLOY_DIR/.last-deploy-sha\" ]"; then
-              PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            if ssh $SSH_OPTS "$SSH_TARGET" \
+                  "[ -f \"\$DEPLOY_DIR/.last-deploy-sha\" ] && \
+                   [ -s \"\$DEPLOY_DIR/.last-deploy-sha\" ]"; then
+              PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
                 'cat "$DEPLOY_DIR/.last-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
-              PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
                 'cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
               if [ -n "$PREV_SHA" ]; then
                 echo "✅ Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
@@ -178,9 +219,9 @@ jobs:
 
           # Priority 3: git HEAD on VPS (fresh VPS with no marker)
           if [ -z "$PREV_SHA" ]; then
-            PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
               'cd "$DEPLOY_DIR" && git rev-parse HEAD 2>/dev/null' || echo "")
-            PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
               'cd "$DEPLOY_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null' || echo "main")
             if [ -n "$PREV_SHA" ]; then
               echo "✅ Using VPS git HEAD: sha=$PREV_SHA ref=$PREV_REF"
@@ -264,7 +305,8 @@ jobs:
       - name: Update deploy marker after rollback
         run: |
           set -euo pipefail
-          ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+          SSH_TARGET="${VPS_USER}@${VPS_HOST}"
+          ssh ${{ env.SSH_OPTS }} "$SSH_TARGET" \
             'mkdir -p "$DEPLOY_DIR"
              printf "%s\n" "$1" > "$DEPLOY_DIR/.last-deploy-sha"
              printf "%s\n" "$2" > "$DEPLOY_DIR/.last-deploy-ref"
