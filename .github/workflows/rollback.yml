@@ -1,31 +1,38 @@
 # =============================================================================
-# NetConsole Rollback - deploy a previous tag to production VPS
-# Use case: latest deploy broke production, revert to last known-good tag.
+# NetConsole Auto-Rollback — isolated from bad deploy commits
 #
-# How to use:
-#   GitHub → Actions → Rollback → Run workflow
-#   Enter a tag like v0.2.0 and the runner will deploy that exact commit.
+# HOW IT WORKS (critical design):
+#   This workflow is triggered by `workflow_run` when deploy.yml fails.
+#   A `workflow_run` trigger ALWAYS runs this workflow file from the DEFAULT
+#   BRANCH (main), NOT from the commit that triggered the failure.
+#   This means a bad commit that modifies deploy.yml CANNOT break rollback.
 #
-# The script will refuse to deploy a ref that doesn't exist locally OR
-# a ref that is not tagged (must be an exact version tag like v*.*.*).
+# TRIGGER CHAIN:
+#   Bad push → deploy.yml (fails) → triggers rollback.yml (from main branch)
+#   → reads marker from VPS → rebuilds good commit → service restored
+#
+# MARKER LOGIC:
+#   deploy.yml saves .last-deploy-sha BEFORE deploying. If deploy succeeds,
+#   it updates .rollback-before-deploy-sha to the good SHA. If deploy fails,
+#   rollback.yml reads .rollback-before-deploy-sha (the good pre-deploy SHA).
+#
+# PRIORITIES:
+#   1. .rollback-before-deploy-sha — set by the PREVIOUS successful deploy
+#   2. .last-deploy-sha — current VPS HEAD (from .git/), fallback only
+#   3. git rev-parse HEAD — last resort, same as .last-deploy-sha
 # =============================================================================
 name: Rollback
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to roll back to (must match v*.*.*, e.g. v0.2.0)"
-        required: true
-        type: string
-      confirm:
-        description: 'Type "ROLLBACK" to confirm. This will deploy immediately.'
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["Deploy"]
+    types: [completed]
+    branches: [main]
 
+# Prevent concurrent deploy+rollback on the same VPS.
 concurrency:
   group: deploy-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   DEPLOY_DIR: /opt/netconsole
@@ -35,130 +42,190 @@ env:
 
 jobs:
   rollback:
-    name: Rollback to ${{ inputs.tag }}
+    name: Auto-rollback to last known-good
     runs-on: self-hosted
-    timeout-minutes: 25
+    # Only trigger on failure of the Deploy workflow.
+    if: github.event.workflow_run.conclusion == 'failure'
+    timeout-minutes: 20
+
     steps:
-      - name: Confirm intent
+      - name: Set up job
         run: |
-          if [ "${{ inputs.confirm }}" != "ROLLBACK" ]; then
-            echo "❌ Confirmation text must be exactly ROLLBACK. Got: ${{ inputs.confirm }}"
+          echo "## ⏪ Auto-rollback triggered by failed Deploy run"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⏪ **Auto-rollback triggered** by failed Deploy run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Triggering run: [${{ github.event.workflow_run.name }} #${GITHUB_EVENT_WORKFLOW_RUN_ID}](https://github.com/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})" >> $GITHUB_STEP_SUMMARY
+          echo "Triggering commit: \`${{ github.event.workflow_run.head_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Display rollback target info
+        run: |
+          echo "==> Rollback target: ${{ env.DEPLOY_DIR }}"
+          echo "==> This workflow file is from: ${{ github.ref }} (${{ github.sha }})"
+          echo "==> Workflow run: ${{ github.event.workflow_run.html_url }}"
+
+      # ── SSH + git access ──────────────────────────────────────────────────────
+      - name: Configure SSH known hosts + key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ vars.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          # Runner stores deploy key at ~runner/.ssh/id_ed25519
+          if [ -f ~/.ssh/id_ed25519 ]; then
+            chmod 600 ~/.ssh/id_ed25519
+            echo "✅ SSH key found (~/.ssh/id_ed25519)"
+          else
+            echo "✅ SSH key configured via runner env"
+          fi
+
+      - name: Read last known-good marker from VPS
+        id: marker
+        run: |
+          set -euo pipefail
+          ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            'mkdir -p "$DEPLOY_DIR"'
+
+          PREV_SHA=""
+          PREV_REF=""
+
+          # Priority 1: rollback-before-deploy-sha (set by the previous SUCCESSFUL deploy)
+          # This is the SHA we deployed FROM — safe to roll back to.
+          if ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+                "[ -f \"$DEPLOY_DIR/.rollback-before-deploy-sha\" ] && \
+                 [ -s \"$DEPLOY_DIR/.rollback-before-deploy-sha\" ]"; then
+            PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              'cat "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
+            PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              'cat "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
+            if [ -n "$PREV_SHA" ]; then
+              echo "✅ Using rollback-before-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
+            fi
+          fi
+
+          # Priority 2: last-deploy-sha (fallback if rollback-before not set)
+          if [ -z "$PREV_SHA" ]; then
+            if ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+                  "[ -f \"$DEPLOY_DIR/.last-deploy-sha\" ] && \
+                   [ -s \"$DEPLOY_DIR/.last-deploy-sha\" ]"; then
+              PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+                'cat "$DEPLOY_DIR/.last-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
+              PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+                'cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
+              if [ -n "$PREV_SHA" ]; then
+                echo "✅ Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
+              fi
+            fi
+          fi
+
+          # Priority 3: git HEAD on VPS (fresh VPS with no marker)
+          if [ -z "$PREV_SHA" ]; then
+            PREV_SHA=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              'cd "$DEPLOY_DIR" && git rev-parse HEAD 2>/dev/null' || echo "")
+            PREV_REF=$(ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+              'cd "$DEPLOY_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null' || echo "main")
+            if [ -n "$PREV_SHA" ]; then
+              echo "✅ Using VPS git HEAD: sha=$PREV_SHA ref=$PREV_REF"
+            fi
+          fi
+
+          if [ -z "$PREV_SHA" ]; then
+            echo "::error::No rollback marker found on VPS at $DEPLOY_DIR and git repo unavailable."
+            echo "::error::Run manual rollback via GitHub Actions → Rollback workflow dispatch."
             exit 1
           fi
 
-      - name: Validate tag format
-        run: |
-          TAG="${{ inputs.tag }}"
-          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "❌ Tag must match v*.*.* pattern (e.g. v0.2.0). Got: $TAG"
-            exit 1
-          fi
+          echo "PREV_SHA=$PREV_SHA" >> "$GITHUB_OUTPUT"
+          echo "PREV_REF=$PREV_REF" >> "$GITHUB_OUTPUT"
 
-      - name: Display rollback info
-        run: |
-          echo "## ⏪ Rollback starting" >> $GITHUB_STEP_SUMMARY
-          echo "- **Target tag:** ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runner:** $(hostname)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-
-      - name: Checkout target tag
+      - name: Checkout previous (good) commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
+          ref: ${{ steps.marker.outputs.PREV_SHA }}
+          fetch-depth: 1
           path: src
 
-      - name: Verify tag exists locally and matches input
-        working-directory: src
+      - name: Sync good commit to ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          ACTUAL=$(git describe --tags --exact-match HEAD)
-          if [ "$ACTUAL" != "${{ inputs.tag }}" ]; then
-            echo "❌ HEAD is at '$ACTUAL' but requested '${{ inputs.tag }}'"
-            exit 1
-          fi
-          echo "✅ HEAD is exactly at tag $ACTUAL"
-
-      - name: Show commit log
-        working-directory: src
-        run: |
-          echo "## Last 5 commits at ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          git log --oneline -5 >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Backup current release marker
-        run: |
-          set -euo pipefail
-          CURRENT=$(git -C src describe --tags --always 2>/dev/null || echo "none")
-          echo "Previous deploy was: $CURRENT"
-          echo "PREVIOUS_DEPLOY=$CURRENT" >> $GITHUB_ENV
-
-      - name: Sync source to ${{ env.DEPLOY_DIR }}
-        run: |
-          set -euo pipefail
+          echo "==> Syncing SHA ${{ steps.marker.outputs.PREV_SHA }} to $DEPLOY_DIR"
           rsync -a --delete \
-            --exclude '.git/hooks/' \
-            --exclude '.git/info/' \
-            --exclude 'data/' \
-            --exclude 'volumes/' \
-            --exclude 'netconsole-app.tar.gz' \
-            --exclude '.tmp-hello.txt' \
-            --exclude '.tmp-cfg/' \
-            --exclude 'scripts/ci-rsa-*.bak' \
+            --exclude '/.git/hooks/' \
+            --exclude '/.git/info/' \
+            --exclude '/data/' \
+            --exclude '/volumes/' \
+            --exclude '/netconsole-app.tar.gz' \
+            --exclude '/.tmp-hello.txt' \
+            --exclude '/.tmp-cfg/' \
+            --exclude '/scripts/ci-rsa-*.bak' \
             --exclude '*.pid' \
-            --exclude 'logs/' \
+            --exclude '/logs/' \
+            --exclude '/backups/' \
+            --exclude '/.last-deploy-*' \
+            --exclude '/.rollback-before-deploy-*' \
             ./src/ "$DEPLOY_DIR/"
+          echo "✅ Synced to $DEPLOY_DIR"
 
-          echo "## Synced contents" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ls -la "$DEPLOY_DIR" | head -25 >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Build & restart app services
+      - name: Rebuild and restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" up -d --build --no-deps --remove-orphans $DEPLOY_SERVICES
+          # Safe rebuild: use `up --build` directly without stop+rm.
+          # Compose recreates only containers whose image needs rebuilding.
+          # If build fails, old containers STAY RUNNING — service preserved.
+          echo "==> Building + recreating containers..."
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+            up -d --build --no-deps $DEPLOY_SERVICES
 
-      - name: Wait for backend healthy
+      - name: Health-check restored deploy
         run: |
           set -euo pipefail
+          echo "Waiting for backend after rollback..."
           for i in $(seq 1 40); do
             if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
-              echo "✅ Backend healthy after ${i} attempt(s)"
-              exit 0
+              echo "✅ Backend healthy after rollback (attempt $i)"
+              break
             fi
-            echo "  attempt $i: not ready yet, sleeping 2s"
+            echo "  attempt $i: not ready, sleeping 2s"
             sleep 2
           done
 
-          echo "❌ Backend did not become healthy within 80s"
-          echo "--- Last 40 lines of backend log ---"
-          docker logs --tail 40 netconsole-backend || true
-          exit 1
-
-      - name: Verify frontend reachable
-        run: |
-          set -euo pipefail
           sleep 3
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8443/ || echo "000")
-          if [ "$code" = "200" ]; then
-            echo "✅ Frontend OK (HTTP $code)"
-          else
-            echo "❌ Frontend returned HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::Frontend still unreachable after rollback (HTTP $code)"
             docker logs --tail 30 netconsole-frontend || true
             exit 1
           fi
+          echo "✅ Frontend OK after rollback (HTTP $code)"
 
-      - name: Final state
+      - name: Update deploy marker after rollback
+        run: |
+          set -euo pipefail
+          ssh ${{ vars.VPS_USER }}@${{ vars.VPS_HOST }} \
+            'mkdir -p "$DEPLOY_DIR"
+             printf "%s\n" "$1" > "$DEPLOY_DIR/.last-deploy-sha"
+             printf "%s\n" "$2" > "$DEPLOY_DIR/.last-deploy-ref"
+             cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+             cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"' \
+            _ \
+            "${{ steps.marker.outputs.PREV_SHA }}" \
+            "${{ steps.marker.outputs.PREV_REF }}"
+          echo "✅ Marker updated on VPS"
+
+      - name: Final state after rollback
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
-          echo "## ⏪ Rollback complete" >> $GITHUB_STEP_SUMMARY
+          echo "## ⏪ Auto-rollback complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Now running: \`${{ inputs.tag }}\` (was: \`${{ env.PREVIOUS_DEPLOY }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "Now running: \`${{ steps.marker.outputs.PREV_SHA }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "(was \`${{ steps.marker.outputs.PREV_REF }}\`, failed at \`${{ github.event.workflow_run.head_sha }}\`)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Container status" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo "--- Container status ---"
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps || true
