@@ -11,9 +11,6 @@ import { isAllowedLogFilename } from '../lib/junosLogFiles.js';
 import { persistLogsForJob } from '../services/logs.js';
 import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 
-// ROLLBACK TEST v6: deliberate type error to verify FIXED auto-rollback recovers
-const testRollback6: string = 999;
-
 export const jobsRouter = Router();
 
 /**
