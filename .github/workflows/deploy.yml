@@ -36,7 +36,7 @@ on:
 
 concurrency:
   group: deploy-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   DEPLOY_DIR: /opt/netconsole
@@ -83,15 +83,18 @@ jobs:
           set -euo pipefail
           mkdir -p "$DEPLOY_DIR"
 
-          # Always preserve the current running SHA — this is our anchor.
-          # Even if the next deploy fails and .last-deploy-sha gets overwritten
-          # with the bad commit, this backup survives and can still recover us.
-          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
-            cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
-            cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
-            echo "Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
+          # IMPORTANT: Only write this backup ONCE. Once set, it is the anchor
+          # for the entire rollback chain. Overwriting it with a mid-deploy
+          # SHA (e.g. deploy-2 started while deploy-1 was still failing) would
+          # make the rollback chain point to the wrong commit.
+          # This block is intentionally NOT inside a loop — idempotent by design.
+          if [ ! -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+            cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null || true
+            cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || true
+            echo "Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null || echo 'none (first deploy)')"
           else
-            echo "No existing marker — first deploy? Will use git HEAD from deployed source."
+            echo "Rollback anchor already exists — NOT overwriting (preserves original good state)"
+            echo "Current anchor: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
           fi
 
           # The auto-rollback job reads .last-deploy-sha, so we must
@@ -215,6 +218,12 @@ jobs:
           printf '%s\n' "$EVENT" > "$DEPLOY_DIR/.last-deploy-event"
           echo "💾 Saved deploy marker: sha=$SHA ref=$REF event=$EVENT"
 
+          # Update the immutable rollback anchor so next failure rolls back to THIS.
+          # This is safe because we just wrote .last-deploy-sha with the good SHA.
+          cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+          cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
+          echo "💾 Updated rollback anchor to this successful deploy: sha=$SHA"
+
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
@@ -249,9 +258,13 @@ jobs:
     steps:
       - name: Notify deploy failure
         run: |
-          echo "## ❌ Deploy failed — attempting auto-rollback" >> $GITHUB_STEP_SUMMARY
+          echo "## ❌ Deploy FAILED — auto-rollback triggered!" >> $GITHUB_STEP_SUMMARY
           echo "- **Failed SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Failed ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **ALERT:** A failed deploy has triggered auto-rollback." >> $GITHUB_STEP_SUMMARY
+          echo "Check GitHub Actions log and notify team if service is still down." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
       - name: Read last known-good marker
