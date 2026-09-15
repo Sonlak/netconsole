@@ -193,8 +193,9 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
               }
             }
           }
-          // Trunk VLANs (only if not already set)
-          if (!accessVlan) {
+          // Trunk VLANs — extract regardless of accessVlan state.
+          // accessVlan field carries trunk VLANs for trunk ports.
+          if (mode === 'trunk') {
             const trunkObj = (sw['trunk'] ?? sw['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
             if (trunkObj && typeof trunkObj === 'object') {
               const allowedObj = (trunkObj['allowed'] ?? trunkObj['Cisco-IOS-XE-switch:allowed']) as Record<string, unknown> | undefined;

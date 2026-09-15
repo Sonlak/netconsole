@@ -39,7 +39,7 @@ function vlanIdFromRecord(record: DeviceInterface): string {
   const tagged = raw.match(/\((\d{1,4})\)\s*$/);
   if (tagged) return tagged[1];
   if (/^\d{1,4}$/.test(raw)) return raw;
-  return '10';
+  return '1';  // VLAN 1 is the default, not 10
 }
 
 function looksLikeTrunk(iface: DeviceInterface): boolean {

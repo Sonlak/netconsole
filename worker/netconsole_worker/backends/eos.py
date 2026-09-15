@@ -1201,14 +1201,14 @@ def _parse_eos_switchport_text(text: str) -> dict[str, dict[str, str]]:
         # Access Mode VLAN
         if line.lower().startswith("access mode vlan:"):
             vlan = line.split(":", 1)[1].strip()
-            if vlan and vlan != "1":  # VLAN 1 is usually default/untagged
+            if vlan:  # Always capture, even VLAN 1 (frontend default is 10, not 1)
                 current["accessVlan"] = vlan
             continue
 
         # Trunking VLANs Allowed
         if line.lower().startswith("trunking vlans allowed:"):
             vlans = line.split(":", 1)[1].strip()
-            if vlans and vlans != "1":
+            if vlans:  # Always capture, even if just "1" — trunk needs to show allowed VLANs
                 current["trunkVlans"] = vlans
             continue
 

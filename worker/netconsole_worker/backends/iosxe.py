@@ -1098,7 +1098,7 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         elif "trunk" in mode_obj:
                             mode = "trunk"
 
-                    # Access VLAN
+                    # Access VLAN (always extract so we know the port's access VLAN)
                     access_obj = sw.get("access") or sw.get("Cisco-IOS-XE-switch:access") or {}
                     if isinstance(access_obj, dict):
                         vlan_obj = access_obj.get("vlan") or access_obj.get("Cisco-IOS-XE-switch:vlan") or {}
@@ -1107,8 +1107,9 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             if vlan_num is not None and vlan_num != 1:
                                 access_vlan = str(vlan_num)
 
-                    # Trunk VLANs (only if not already set)
-                    if not access_vlan:
+                    # Trunk VLANs — extract regardless of access_vlan state.
+                    # accessVlan field carries trunk VLANs for trunk ports.
+                    if mode == "trunk":
                         trunk_obj = sw.get("trunk") or sw.get("Cisco-IOS-XE-switch:trunk") or {}
                         if isinstance(trunk_obj, dict):
                             allowed_obj = trunk_obj.get("allowed") or trunk_obj.get("Cisco-IOS-XE-switch:allowed") or {}

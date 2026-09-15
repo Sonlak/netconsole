@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { reclaimStaleJobs } from './jobWatchdog.js';
 import { jobPriority, tryCreateDeviceJob, type DeviceBusyError } from './deviceOperations.js';
-import { fetchInterfaceList } from './junosRest.js';
+import { fetchInterfaceList, fetchConfigurationSet, parseConfigurationSet, applySwitchingModesToInterfaces, parseSwitchingModesFromSet } from './junosRest.js';
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
 
 export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
@@ -251,10 +251,16 @@ export async function collectInterfacesForDevice(
 
   const vendor = (device.vendor ?? '').toLowerCase();
 
-  // Juniper: try REST first
+  // Juniper: try REST first — fetch terse interfaces + config for switchport modes
   if (vendor === 'juniper') {
     const rest = await fetchInterfaceList(device.ip);
     if (rest.ok) {
+      // Fetch configuration to get switchport mode (trunk/access) and VLAN membership
+      const cfgResult = await fetchConfigurationSet(device.ip);
+      if (cfgResult.ok && cfgResult.config) {
+        const modes = parseSwitchingModesFromSet(cfgResult.config);
+        applySwitchingModesToInterfaces(rest.interfaces, modes);
+      }
       const job = await prisma.job.create({
         data: {
           deviceId: device.id,
@@ -266,7 +272,7 @@ export async function collectInterfacesForDevice(
             implemented: true,
             source: 'junos-rest',
             interfaces: rest.interfaces,
-            command: 'get-interface-information terse',
+            command: 'get-interface-information terse + get-configuration (set format)',
             message: `Collected interfaces from ${device.name} via REST`,
             collectMs: rest.collectMs,
           } as object,

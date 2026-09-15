@@ -517,6 +517,81 @@ function unescapeXml(text: string): string {
     .replace(/&amp;/g, '&');
 }
 
+// ----------------------------------------------------------------
+// Switchport mode / VLAN membership parser (mirrors worker/parsers/interface_set.py)
+// ----------------------------------------------------------------
+
+function physicalInterfaceName(name: string): string {
+  const text = (name || '').trim();
+  if (text.includes('.') && !text.toLowerCase().startsWith('irb.')) {
+    const idx = text.lastIndexOf('.');
+    const tail = text.slice(idx + 1);
+    if (/^\d+$/.test(tail)) return text.slice(0, idx);
+  }
+  return text;
+}
+
+const _SWITCH_MODE_RE = /^set interfaces (\S+)(?: unit \d+)? family ethernet-switching (?:interface-mode|port-mode) (trunk|access)\s*$/gim;
+const _SWITCH_MEMBERS_RE = /^set interfaces (\S+)(?: unit \d+)? family ethernet-switching vlan members (.+)$/gim;
+
+interface SwitchModeInfo {
+  mode?: string;
+  members?: string;
+}
+
+export function parseSwitchingModesFromSet(config: string): Record<string, SwitchModeInfo> {
+  const modes: Record<string, SwitchModeInfo> = {};
+
+  // Reset lastIndex before each use
+  _SWITCH_MODE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = _SWITCH_MODE_RE.exec(config)) !== null) {
+    const name = physicalInterfaceName(match[1] || '');
+    if (!modes[name]) modes[name] = {};
+    modes[name].mode = (match[2] || '').toLowerCase();
+  }
+
+  _SWITCH_MEMBERS_RE.lastIndex = 0;
+  while ((match = _SWITCH_MEMBERS_RE.exec(config)) !== null) {
+    const name = physicalInterfaceName(match[1] || '');
+    const members = (match[2] || '').trim();
+    if (!members) continue;
+    if (!modes[name]) modes[name] = {};
+    modes[name].members = members;
+  }
+
+  return modes;
+}
+
+const L3_MODES = new Set(['inet', 'l3', 'routed']);
+
+export function applySwitchingModesToInterfaces(
+  interfaces: JunosInterfaceEntry[],
+  modes: Record<string, SwitchModeInfo>,
+): void {
+  for (const iface of interfaces) {
+    const name = physicalInterfaceName(iface.name || '');
+    const info = modes[name];
+    if (!info) continue;
+
+    const currentMode = (iface.mode || '').toLowerCase();
+    if (L3_MODES.has(currentMode) || iface.address) continue;
+
+    const mode = (info.mode || '').toLowerCase();
+    const members = (info.members || '').trim();
+
+    if (mode === 'trunk' || mode === 'access') {
+      iface.mode = mode;
+    }
+
+    if (mode === 'trunk') {
+      iface.accessVlan = members.toLowerCase() === 'all' ? 'all' : (members || iface.accessVlan || '');
+    } else if (mode === 'access' && members && !iface.accessVlan) {
+      iface.accessVlan = members;
+    }
+  }
+}
+
 const SET_TAG = /<(?:[\w.-]+:)?(configuration-set|configuration-text|configuration-output|config-text)\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?\1>/i;
 const HOST_NAME = /^set system host-name\s+(\S+)/m;
 const VERSION = /^set version\s+(\S+)/m;
