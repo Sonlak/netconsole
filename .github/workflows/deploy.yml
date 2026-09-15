@@ -348,13 +348,12 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          echo "==> Stopping old containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-            stop $DEPLOY_SERVICES || true
-          echo "==> Removing old containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-            rm -sf $DEPLOY_SERVICES || true
-          echo "==> Building + starting fresh containers..."
+          # Safe approach: use `up --build` directly.
+          # This recreates only containers that need rebuilding (image changed),
+          # and LEAVES RUNNING containers alone if build fails.
+          # DO NOT stop+rm before up --build — if build fails, old containers
+          # would be gone and the service would be dead.
+          echo "==> Building + recreating containers..."
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
             up -d --build --no-deps $DEPLOY_SERVICES
 
