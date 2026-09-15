@@ -256,16 +256,15 @@ jobs:
   # regardless of which commit triggered the failure.
   # See rollback.yml for the full auto-rollback implementation.
 
-  push-images:  # Push immutable image tags to GitHub Container Registry.
-  # Runs in PARALLEL with `deploy` (no `needs:`). Does NOT replace the
-  # local-build-on-VPS path used by `deploy` — the registry is an audit
-  # trail / rollback artifact, not the production image source.
-  #
-  # Tags produced:
-  #   - ghcr.io/sonlak/netconsole-backend:sha-<7>
-  #   - ghcr.io/sonlak/netconsole-backend:v0.4.0    (only on tag push)
-  #   - ghcr.io/sonlak/netconsole-backend:latest    (only on main push)
-  # Same for worker + frontend.
+    # Runs in PARALLEL with `deploy` (no `needs:`). Does NOT replace the
+    # local-build-on-VPS path used by `deploy` — the registry is an audit
+    # trail / rollback artifact, not the production image source.
+    #
+    # Tags produced:
+    #   - ghcr.io/sonlak/netconsole-backend:sha-<7>
+    #   - ghcr.io/sonlak/netconsole-backend:v0.4.0    (only on tag push)
+    #   - ghcr.io/sonlak/netconsole-backend:latest    (only on main push)
+    # Same for worker + frontend.
   push-images:
     name: Push images to GHCR
     runs-on: ubuntu-latest
