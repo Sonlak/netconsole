@@ -312,6 +312,58 @@ function eosShortToLong(name: string): string {
   return n;
 }
 
+function parseEosSwitchportJson(result: unknown[]): Record<string, { mode: string; accessVlan: string; trunkVlans: string }> {
+  const out: Record<string, { mode: string; accessVlan: string; trunkVlans: string }> = {};
+  
+  // EOS eAPI JSON format: result[0] = empty, result[1] = { switchports: {...} }
+  if (!result || !Array.isArray(result) || result.length < 2) return out;
+  
+  const data = result[1] as Record<string, unknown>;
+  if (!data || typeof data !== 'object') return out;
+  
+  const switchports = (data as Record<string, unknown>).switchports as Record<string, unknown> | undefined;
+  if (!switchports || typeof switchports !== 'object') return out;
+  
+  for (const [name, info] of Object.entries(switchports)) {
+    if (!info || typeof info !== 'object') continue;
+    
+    const switchportInfo = (info as Record<string, unknown>).switchportInfo as Record<string, unknown> | undefined;
+    if (!switchportInfo || typeof switchportInfo !== 'object') continue;
+    
+    const mode = String(switchportInfo.mode || '').toLowerCase();
+    const accessVlanId = switchportInfo.accessVlanId;
+    const trunkAllowedVlans = String(switchportInfo.trunkAllowedVlans || '');
+    
+    const entry: { mode: string; accessVlan: string; trunkVlans: string } = {
+      mode: '',
+      accessVlan: '',
+      trunkVlans: ''
+    };
+    
+    // Set mode if valid
+    if (mode === 'access' || mode === 'trunk') {
+      entry.mode = mode;
+    }
+    
+    // Set access VLAN
+    if (typeof accessVlanId === 'number' && accessVlanId > 1) {
+      entry.accessVlan = String(accessVlanId);
+    }
+    
+    // Set trunk VLANs
+    if (trunkAllowedVlans && trunkAllowedVlans !== '1') {
+      entry.trunkVlans = trunkAllowedVlans;
+    }
+    
+    // Only add if we have some data
+    if (entry.mode || entry.accessVlan || entry.trunkVlans) {
+      out[name] = entry;
+    }
+  }
+  
+  return out;
+}
+
 function parseEosSwitchport(text: string): Record<string, { mode: string; accessVlan: string; trunkVlans: string }> {
   const out: Record<string, { mode: string; accessVlan: string; trunkVlans: string }> = {};
   if (!text) return out;
@@ -437,15 +489,20 @@ export async function fetchEosInterfaceList(host: string): Promise<{
     }
   }
 
-  // Step 3: Get switchport mode and VLANs via text
-  const swResult = await eosRpc(host, [{ cmd: 'show interfaces switchport', format: 'text' }]);
-  if (swResult.ok && swResult.raw) {
-    console.log(`[eosApi] switchport raw output for ${host}:`, swResult.raw.substring(0, 2000));
-    const switchport = parseEosSwitchport(swResult.raw);
-    console.log(`[eosApi] parsed switchport for ${host}:`, JSON.stringify(switchport).substring(0, 1000));
+  // Step 3: Get switchport mode and VLANs via JSON (preferred over text)
+  const swResult = await eosRpc(host, [{ cmd: 'show interfaces switchport', format: 'json' }]);
+  if (swResult.ok && swResult.result) {
+    const switchport = parseEosSwitchportJson(swResult.result);
+    console.log(`[eosApi] parsed JSON switchport for ${host}:`, JSON.stringify(switchport).substring(0, 1500));
     mergeEosSwitchport(interfaces, switchport);
   } else {
-    console.warn(`[eosApi] switchport fetch failed for ${host}:`, swResult.error);
+    // Fallback to text format if JSON fails
+    console.warn(`[eosApi] switchport JSON fetch failed for ${host}:`, swResult.error, "Trying text format...");
+    if (swResult.raw) {
+      const switchport = parseEosSwitchport(swResult.raw);
+      console.log(`[eosApi] parsed TEXT switchport for ${host}:`, JSON.stringify(switchport).substring(0, 1500));
+      mergeEosSwitchport(interfaces, switchport);
+    }
   }
 
   return { ok: true, interfaces, collectMs: Date.now() - started };

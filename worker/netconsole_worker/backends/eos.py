@@ -245,19 +245,35 @@ class EOSBackend(DeviceBackend):
     def _fetch_eos_switchport(self, device: DeviceInfo) -> dict[str, dict[str, str]]:
         """Pull `show interfaces switchport` and return {iface_name: {mode, accessVlan, trunkVlans}}.
 
-        EOS `show interfaces switchport` returns text with a `Switchport Mode` field
-        (Access/Trunk/Dynamic) and `Access Mode VLAN` / `Trunking Native VLAN`
-        / `Trunking VLANs Allowed` fields. We parse the per-interface blocks and
-        return a dict keyed by interface name (long form: Ethernet1, Port-Channel1, etc.).
-
-        Best-effort: on any failure we return an empty dict so the caller can still
-        serve the rest of the interface data without VLAN/mode enrichment.
+        Prefer JSON format (more reliable parsing). Fallback to text format if JSON fails.
+        
+        JSON format:
+            result[1].switchports.<name>.switchportInfo.mode = "trunk"|"access"
+            result[1].switchports.<name>.switchportInfo.accessVlanId = number
+            result[1].switchports.<name>.switchportInfo.trunkAllowedVlans = string
+        
+        Text format: parse `Switchport Mode:`, `Access Mode VLAN:`, `Trunking VLANs Allowed:` fields.
         """
+        # Try JSON format first
+        r = self._run_cmds(device, [{"cmd": "show interfaces switchport", "format": "json"}])
+        if r["ok"]:
+            result = r.get("result") or []
+            if result:
+                parsed = _parse_eos_switchport_json(result)
+                if parsed:
+                    logger.debug("[EOS] _fetch_eos_switchport JSON for %s: %s", device.ip, {
+                        k: v for k, v in list(parsed.items())[:5]
+                    })
+                    return parsed
+        
+        # Fallback to text format
+        logger.warning("[EOS] _fetch_eos_switchport JSON failed for %s, trying text format", device.ip)
         r = self._run_cmds(device, [{"cmd": "show interfaces switchport", "format": "text"}])
         if not r["ok"]:
-            logger.warning("[EOS] _fetch_eos_switchport failed for %s: %s", device.ip, r.get("error"))
+            logger.warning("[EOS] _fetch_eos_switchport text also failed for %s: %s", device.ip, r.get("error"))
             return {}
-        result = r["result"] or []
+        
+        result = r.get("result") or []
         text = ""
         if result and isinstance(result[0], dict):
             text = result[0].get("output") or ""
@@ -266,11 +282,12 @@ class EOSBackend(DeviceBackend):
         if not text:
             logger.warning("[EOS] _fetch_eos_switchport got empty text for %s", device.ip)
             return {}
+        
         # Debug: log raw switchport output for first 3 interfaces
         sample_lines = text.split("\n")[:50]
-        logger.debug("[EOS] switchport raw output for %s:\n%s", device.ip, "\n".join(sample_lines))
+        logger.debug("[EOS] switchport raw TEXT output for %s:\n%s", device.ip, "\n".join(sample_lines))
         parsed = _parse_eos_switchport_text(text)
-        logger.debug("[EOS] parsed switchport data for %s: %s", device.ip, {
+        logger.debug("[EOS] parsed TEXT switchport data for %s: %s", device.ip, {
             k: v for k, v in list(parsed.items())[:5]
         })
         return parsed
@@ -1156,6 +1173,69 @@ def _merge_eos_descriptions(interfaces: list[dict[str, Any]], desc_by_name: dict
         old_desc = str(iface.get("description") or "").strip()
         if not old_desc:
             iface["description"] = new_desc
+
+
+def _parse_eos_switchport_json(result: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Parse EOS `show interfaces switchport` JSON output.
+    
+    EOS eAPI JSON format returns:
+    {
+        "switchports": {
+            "Ethernet1": {
+                "switchportInfo": {
+                    "mode": "trunk",        // or "access"
+                    "accessVlanId": 1,       // number
+                    "trunkAllowedVlans": "999"  // string like "10,20,30" or "ALL"
+                }
+            }
+        }
+    }
+    
+    We return a dict keyed by interface name with keys: mode, accessVlan, trunkVlans.
+    """
+    out: dict[str, dict[str, str]] = {}
+    
+    # EOS eAPI JSON format: result[0] = empty, result[1] = { switchports: {...} }
+    if not result or not isinstance(result, list) or len(result) < 2:
+        return out
+    
+    data = result[1] if isinstance(result[1], dict) else {}
+    switchports = data.get("switchports")
+    
+    if not switchports or not isinstance(switchports, dict):
+        return out
+    
+    for name, info in switchports.items():
+        if not isinstance(info, dict):
+            continue
+        
+        switchport_info = info.get("switchportInfo")
+        if not switchport_info or not isinstance(switchport_info, dict):
+            continue
+        
+        mode = str(switchport_info.get("mode") or "").lower()
+        access_vlan_id = switchport_info.get("accessVlanId")
+        trunk_allowed = str(switchport_info.get("trunkAllowedVlans") or "")
+        
+        entry: dict[str, str] = {}
+        
+        # Set mode if valid
+        if mode in ("access", "trunk"):
+            entry["mode"] = mode
+        
+        # Set access VLAN (only if > 1)
+        if isinstance(access_vlan_id, int) and access_vlan_id > 1:
+            entry["accessVlan"] = str(access_vlan_id)
+        
+        # Set trunk VLANs
+        if trunk_allowed and trunk_allowed != "1":
+            entry["trunkVlans"] = trunk_allowed
+        
+        # Only add if we have some data
+        if entry:
+            out[name] = entry
+    
+    return out
 
 
 def _parse_eos_switchport_text(text: str) -> dict[str, dict[str, str]]:
