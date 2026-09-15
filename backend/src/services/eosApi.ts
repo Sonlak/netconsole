@@ -314,11 +314,14 @@ function eosShortToLong(name: string): string {
 
 function parseEosSwitchportJson(result: unknown[]): Record<string, { mode: string; accessVlan: string; trunkVlans: string }> {
   const out: Record<string, { mode: string; accessVlan: string; trunkVlans: string }> = {};
-  
-  // EOS eAPI JSON format: result[0] = empty, result[1] = { switchports: {...} }
-  if (!result || !Array.isArray(result) || result.length < 2) return out;
-  
-  const data = result[1] as Record<string, unknown>;
+
+  // EOS eAPI JSON format for `show interfaces switchport`:
+  // Single-command request returns { "result": [{ switchports: {...} }] }
+  // i.e. result[0].switchports contains the data (NOT result[1]).
+  // Verified against real EOS (10.10.20.131) on 2026-09-15.
+  if (!result || !Array.isArray(result) || result.length < 1) return out;
+
+  const data = result[0] as Record<string, unknown>;
   if (!data || typeof data !== 'object') return out;
   
   const switchports = (data as Record<string, unknown>).switchports as Record<string, unknown> | undefined;

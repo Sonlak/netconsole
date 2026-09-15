@@ -1194,12 +1194,15 @@ def _parse_eos_switchport_json(result: list[dict[str, Any]]) -> dict[str, dict[s
     We return a dict keyed by interface name with keys: mode, accessVlan, trunkVlans.
     """
     out: dict[str, dict[str, str]] = {}
-    
-    # EOS eAPI JSON format: result[0] = empty, result[1] = { switchports: {...} }
-    if not result or not isinstance(result, list) or len(result) < 2:
+
+    # EOS eAPI JSON format for `show interfaces switchport`:
+    # Single-command request returns { "result": [{ switchports: {...} }] }
+    # i.e. result[0].switchports contains the data (NOT result[1]).
+    # Verified against real EOS (10.10.20.131) on 2026-09-15.
+    if not result or not isinstance(result, list) or len(result) < 1:
         return out
-    
-    data = result[1] if isinstance(result[1], dict) else {}
+
+    data = result[0] if isinstance(result[0], dict) else {}
     switchports = data.get("switchports")
     
     if not switchports or not isinstance(switchports, dict):
