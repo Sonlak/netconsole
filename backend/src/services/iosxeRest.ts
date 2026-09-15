@@ -131,33 +131,99 @@ function parseIosxeArpEntries(payload: unknown): IosxeArpEntry[] {
   return result;
 }
 
-function parseIosxeInterfaceEntries(payload: unknown): IosxeInterfaceEntry[] {
+function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
+  /**
+   * Parse `Cisco-IOS-XE-native:native/interface` for interface list + switchport config.
+   *
+   * The native YANG model includes `switchport-config` which carries:
+   *   - switchport.mode.access / switchport.mode.trunk
+   *   - switchport.access.vlan.vlan (access VLAN number)
+   *   - switchport.trunk.allowed.vlan.vlans (trunk allowed VLANs)
+   *
+   * This is richer than `ietf-interfaces:interfaces` which only has name/enabled/MTU.
+   */
   if (!payload || typeof payload !== 'object') return [];
   const record = payload as Record<string, unknown>;
-  const ifacesData = record['ietf-interfaces:interfaces'];
-  if (!ifacesData || typeof ifacesData !== 'object') return [];
-  const ifacesObj = ifacesData as Record<string, unknown>;
-  const ifaces = Array.isArray(ifacesObj['interface']) ? ifacesObj['interface'] : [ifacesObj['interface']].filter(Boolean);
+
+  // The response is keyed by interface type (GigabitEthernet, TenGigabitEthernet, etc.)
+  // Each key maps to an array of interface instances.
   const result: IosxeInterfaceEntry[] = [];
-  for (const iface of ifaces) {
-    if (!iface || typeof iface !== 'object') continue;
-    const i = iface as Record<string, unknown>;
-    const name = String(i.name ?? '');
-    if (!name) continue;
-    const enabled = i.enabled;
-    const admin = enabled === false ? 'down' : 'up';
-    const oper = i['oper-status'] ? String(i['oper-status']) : admin;
-    result.push({
-      name,
-      adminStatus: admin,
-      operStatus: oper,
-      description: String(i.description ?? ''),
-      mode: '',
-      accessVlan: '',
-      address: '',
-      mtu: String(i['nsci:mtu'] ?? i.mtu ?? ''),
-      speed: '', // ietf-interfaces doesn't carry speed
-    });
+
+  for (const [, typeValue] of Object.entries(record)) {
+    if (!typeValue || typeof typeValue !== 'object') continue;
+    const ifaces = Array.isArray(typeValue) ? typeValue : [typeValue];
+    for (const iface of ifaces) {
+      if (!iface || typeof iface !== 'object') continue;
+      const i = iface as Record<string, unknown>;
+      const name = String(i.name ?? '');
+      if (!name) continue;
+
+      // Build full interface name: type prefix + name (e.g. "GigabitEthernet1/0/1")
+      const typeName = String(Object.keys(record).find(k => record[k] === typeValue) ?? '');
+      const fullName = typeName + name;
+
+      // adminStatus from `enabled` leaf
+      const enabled = i.enabled;
+      const admin = enabled === false ? 'down' : 'up';
+
+      // description from native model
+      const description = String(i.description ?? '');
+
+      // Parse switchport-config for mode + VLANs
+      let mode = '';
+      let accessVlan = '';
+      const swConfig = (i as Record<string, unknown>)['switchport-config'] as Record<string, unknown> | undefined;
+      if (swConfig && typeof swConfig === 'object') {
+        const sw = swConfig['switchport'] as Record<string, unknown> | undefined;
+        if (sw && typeof sw === 'object') {
+          // Mode: access or trunk
+          const modeObj = sw['mode'] as Record<string, unknown> | undefined;
+          if (modeObj && typeof modeObj === 'object') {
+            if ('access' in modeObj) mode = 'access';
+            else if ('trunk' in modeObj) mode = 'trunk';
+          }
+          // Access VLAN
+          const accessObj = (sw['access'] ?? sw['Cisco-IOS-XE-switch:access']) as Record<string, unknown> | undefined;
+          if (accessObj && typeof accessObj === 'object') {
+            const vlanObj = (accessObj['vlan'] ?? accessObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+            if (vlanObj && typeof vlanObj === 'object') {
+              const vlanNum = vlanObj['vlan'];
+              if (vlanNum !== undefined && vlanNum !== 1) {
+                accessVlan = String(vlanNum);
+              }
+            }
+          }
+          // Trunk VLANs (only if not already set)
+          if (!accessVlan) {
+            const trunkObj = (sw['trunk'] ?? sw['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
+            if (trunkObj && typeof trunkObj === 'object') {
+              const allowedObj = (trunkObj['allowed'] ?? trunkObj['Cisco-IOS-XE-switch:allowed']) as Record<string, unknown> | undefined;
+              if (allowedObj && typeof allowedObj === 'object') {
+                const vlanObj = (allowedObj['vlan'] ?? allowedObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+                if (vlanObj && typeof vlanObj === 'object') {
+                  const vlans = vlanObj['vlans'];
+                  if (vlans !== undefined) {
+                    accessVlan = String(vlans);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      result.push({
+        name: fullName,
+        adminStatus: admin,
+        operStatus: admin, // operStatus not in native model — use admin as proxy
+        description,
+        mode,
+        accessVlan,
+        address: '',
+        mtu: String(i.mtu ?? ''),
+        speed: '',
+      });
+    }
   }
   return result;
 }
@@ -205,11 +271,13 @@ export async function fetchIosxeInterfaceList(host: string): Promise<{
     return { ok: false, interfaces: [], collectMs: 0, error: 'IOSXE_API_ENABLED=false' };
   }
   const started = Date.now();
-  const result = await rcGet(host, '/ietf-interfaces:interfaces', 20000);
+  // Use Cisco-IOS-XE-native:native/interface to get both interface list AND
+  // switchport-config (mode + VLANs) in one request.
+  const result = await rcGet(host, '/Cisco-IOS-XE-native:native/interface', 20000);
   if (!result.ok) {
     return { ok: false, interfaces: [], collectMs: Date.now() - started, error: result.error };
   }
-  const interfaces = parseIosxeInterfaceEntries(result.payload);
+  const interfaces = parseIosxeNativeInterfaces(result.payload);
   if (interfaces.length === 0) {
     return { ok: false, interfaces: [], collectMs: Date.now() - started, error: 'No interfaces in RESTCONF response' };
   }

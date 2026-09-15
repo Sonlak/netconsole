@@ -204,18 +204,18 @@ class IOSxeBackend(DeviceBackend):
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
         # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
-        # Fall back to SSH CLI when RESTCONF is unavailable or returns empty
-        # (sparse on some lab images — `ietf-interfaces` lacks MTU/speed).
+        # Use `Cisco-IOS-XE-native:native/interface` (not `ietf-interfaces`) because
+        # it includes switchport-config (mode + VLANs) in the same response.
         rest_error: str | None = None
         if self.config.iosxe.enabled:
-            r = self._rc_get(device, "/ietf-interfaces:interfaces")
+            r = self._rc_get(device, "/Cisco-IOS-XE-native:native/interface")
             if r["ok"]:
                 interfaces = _parse_iosxe_interfaces(r["payload"])
                 if interfaces:
                     return {
                         "implemented": True,
                         "source": "iosxe-rest",
-                        "command": "ietf-interfaces:interfaces",
+                        "command": "Cisco-IOS-XE-native:native/interface",
                         "interfaces": interfaces,
                         "message": "IOS-XE RESTCONF interfaces OK",
                         "restError": rest_error,
@@ -1049,18 +1049,88 @@ def _normalize_cisco_mac(mac: str) -> str:
 
 
 def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """`ietf-interfaces:interfaces` → list of {name, adminStatus, operStatus, ...}."""
-    interfaces = payload.get("ietf-interfaces:interfaces", {}).get("interface", [])
+    """Parse `Cisco-IOS-XE-native:native/interface` for interface list + switchport config.
+
+    The native YANG model includes `switchport-config` which carries:
+      - switchport.mode.access / switchport.mode.trunk
+      - switchport.access.vlan.vlan (access VLAN number)
+      - switchport.trunk.allowed.vlan.vlans (trunk allowed VLANs)
+
+    This is richer than `ietf-interfaces:interfaces` which only has name/enabled/MTU.
+    """
     out: list[dict[str, Any]] = []
-    for entry in interfaces:
-        out.append({
-            "name": entry.get("name"),
-            "adminStatus": (entry.get("enabled") and "up") or "down",
-            "operStatus": entry.get("oper-status", "unknown"),
-            "description": entry.get("description"),
-            "speed": None,  # ietf-interfaces doesn't carry speed
-            "macAddress": entry.get("phys-address"),
-        })
+
+    # The response is keyed by interface type (GigabitEthernet, TenGigabitEthernet, etc.)
+    # Each key maps to an array of interface instances.
+    for type_name, type_value in payload.items():
+        if not isinstance(type_value, (list, dict)):
+            continue
+        ifaces = type_value if isinstance(type_value, list) else [type_value]
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            name = str(iface.get("name") or "")
+            if not name:
+                continue
+
+            # Build full interface name: type prefix + name (e.g. "GigabitEthernet1/0/1")
+            full_name = f"{type_name}{name}"
+
+            # adminStatus from `enabled` leaf
+            enabled = iface.get("enabled")
+            admin = "up" if enabled else "down"
+
+            # description
+            description = str(iface.get("description") or "")
+
+            # Parse switchport-config for mode + VLANs
+            mode = ""
+            access_vlan = ""
+            sw_config = iface.get("switchport-config") or iface.get("Cisco-IOS-XE-switch:switchport-config") or {}
+            if isinstance(sw_config, dict):
+                sw = sw_config.get("switchport") or sw_config.get("Cisco-IOS-XE-switch:switchport") or {}
+                if isinstance(sw, dict):
+                    # Mode: access or trunk
+                    mode_obj = sw.get("mode") or sw.get("Cisco-IOS-XE-switch:mode") or {}
+                    if isinstance(mode_obj, dict):
+                        if "access" in mode_obj:
+                            mode = "access"
+                        elif "trunk" in mode_obj:
+                            mode = "trunk"
+
+                    # Access VLAN
+                    access_obj = sw.get("access") or sw.get("Cisco-IOS-XE-switch:access") or {}
+                    if isinstance(access_obj, dict):
+                        vlan_obj = access_obj.get("vlan") or access_obj.get("Cisco-IOS-XE-switch:vlan") or {}
+                        if isinstance(vlan_obj, dict):
+                            vlan_num = vlan_obj.get("vlan")
+                            if vlan_num is not None and vlan_num != 1:
+                                access_vlan = str(vlan_num)
+
+                    # Trunk VLANs (only if not already set)
+                    if not access_vlan:
+                        trunk_obj = sw.get("trunk") or sw.get("Cisco-IOS-XE-switch:trunk") or {}
+                        if isinstance(trunk_obj, dict):
+                            allowed_obj = trunk_obj.get("allowed") or trunk_obj.get("Cisco-IOS-XE-switch:allowed") or {}
+                            if isinstance(allowed_obj, dict):
+                                vlan_obj = allowed_obj.get("vlan") or allowed_obj.get("Cisco-IOS-XE-switch:vlan") or {}
+                                if isinstance(vlan_obj, dict):
+                                    vlans = vlan_obj.get("vlans")
+                                    if vlans is not None:
+                                        access_vlan = str(vlans)
+
+            out.append({
+                "name": full_name,
+                "adminStatus": admin,
+                "operStatus": admin,  # operStatus not in native model
+                "description": description,
+                "mode": mode,
+                "accessVlan": access_vlan,
+                "address": "",
+                "mtu": str(iface.get("mtu") or ""),
+                "speed": None,
+            })
+
     return out
 
 

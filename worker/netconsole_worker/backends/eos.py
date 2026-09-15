@@ -9,11 +9,17 @@ Auth is HTTP Basic. Default eAPI port is 443 (HTTPS) or 80 (HTTP); lab
 containers usually expose 443. Token-based auth (newer EOS) is also
 supported via standard Authorization headers but the lab fleet uses
 basic.
+
+VLAN/mode enrichment: `show interfaces` JSON does not include switchport
+mode or VLAN assignments. We fetch `show interfaces switchport` (text)
+and merge the mode + accessVlan fields into each interface entry so the
+frontend Ports panel shows trunk/access correctly for EOS devices.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from ipaddress import ip_address
 from typing import Any
 
@@ -237,31 +243,57 @@ class EOSBackend(DeviceBackend):
             text = r.get("raw") or ""
         return _parse_eos_descriptions_text(text)
 
+    def _fetch_eos_switchport(self, device: DeviceInfo) -> dict[str, dict[str, str]]:
+        """Pull `show interfaces switchport` and return {iface_name: {mode, accessVlan, trunkVlans}}.
+
+        EOS `show interfaces switchport` returns text with a `Switchport Mode` field
+        (Access/Trunk/Dynamic) and `Access Mode VLAN` / `Trunking Native VLAN`
+        / `Trunking VLANs Allowed` fields. We parse the per-interface blocks and
+        return a dict keyed by interface name (long form: Ethernet1, Port-Channel1, etc.).
+
+        Best-effort: on any failure we return an empty dict so the caller can still
+        serve the rest of the interface data without VLAN/mode enrichment.
+        """
+        r = self._run_cmds(device, [{"cmd": "show interfaces switchport", "format": "text"}])
+        if not r["ok"]:
+            return {}
+        result = r["result"] or []
+        text = ""
+        if result and isinstance(result[0], dict):
+            text = result[0].get("output") or ""
+        if not text:
+            text = r.get("raw") or ""
+        return _parse_eos_switchport_text(text)
+
     # -- READ --------------------------------------------------------------
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
         if self.config.eos.enabled:
-            # Pull status + description in two parallel calls so the JSON
-            # blob from `show interfaces` doesn't have to be re-fetched
-            # just to read the description string. EOS eAPI `show interfaces`
-            # JSON returns the `description` field but it is empty on
-            # EOS 4.28+ (the field exists but is not populated by that
-            # command). The actual description text is only emitted by
-            # `show interfaces description`, which we fetch in text mode
-            # and merge in by interface name. This is the path the
-            # fabric-diagram LLDP-bypass fix relies on (Sep 10, 2026:
-            # LLDP on modular EOS returns bogus intfId ports; we fall
-            # back to the human-typed description like Juniper does).
+            # Pull status + description + switchport in three calls so each
+            # serves its specific purpose:
+            # - `show interfaces` JSON: status (admin/link), MTU, speed, MAC
+            # - `show interfaces description` text: human-typed description
+            # - `show interfaces switchport` text: switchport mode + VLANs
+            #
+            # `show interfaces` JSON returns the `description` field but it is
+            # empty on EOS 4.28+. The actual description text is only emitted
+            # by `show interfaces description`. This is also the path the
+            # fabric-diagram LLDP-bypass fix relies on (Sep 10, 2026: LLDP
+            # on modular EOS returns bogus intfId ports; we fall back to the
+            # human-typed description like Juniper does).
             r = self._run_cmds(device, [{"cmd": "show interfaces", "format": "json"}])
             if r["ok"]:
                 interfaces = _parse_eos_interfaces(r["result"])
                 desc_by_name = self._fetch_eos_descriptions(device)
                 if desc_by_name:
                     _merge_eos_descriptions(interfaces, desc_by_name)
+                switchport_by_name = self._fetch_eos_switchport(device)
+                if switchport_by_name:
+                    _merge_eos_switchport(interfaces, switchport_by_name)
                 return {
                     "implemented": True,
                     "source": "eos-api",
-                    "command": "show interfaces + show interfaces description",
+                    "command": "show interfaces + description + switchport",
                     "interfaces": interfaces,
                     "message": "EOS eAPI show interfaces OK",
                 }
@@ -1114,3 +1146,129 @@ def _merge_eos_descriptions(interfaces: list[dict[str, Any]], desc_by_name: dict
         old_desc = str(iface.get("description") or "").strip()
         if not old_desc:
             iface["description"] = new_desc
+
+
+def _parse_eos_switchport_text(text: str) -> dict[str, dict[str, str]]:
+    """Parse EOS `show interfaces switchport` text output.
+
+    Output format (per interface block):
+
+        Name: Ethernet1
+        Switchport: Enabled
+        Switchport Mode: Access
+        Access Mode VLAN: 10
+        Trunking Native Mode VLAN: 1
+        Trunking VLANs Allowed: 10,20,30
+
+    We return a dict keyed by long interface name (Ethernet1, Port-Channel1, etc.)
+    with keys: mode (access|trunk), accessVlan, trunkVlans.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if not text:
+        return out
+
+    current_name = ""
+    current: dict[str, str] = {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            # End of interface block
+            if current_name:
+                out[current_name] = current
+                current_name = ""
+                current = {}
+            continue
+
+        # Interface name header
+        if line.lower().startswith("name:"):
+            # Save previous if exists
+            if current_name:
+                out[current_name] = current
+            # Parse new interface name (may be short form like "Et1")
+            raw_name = line.split(":", 1)[1].strip()
+            current_name = _eos_short_to_long_iface(raw_name)
+            current = {}
+            continue
+
+        # Switchport Mode
+        if line.lower().startswith("switchport mode:"):
+            mode_raw = line.split(":", 1)[1].strip().lower()
+            if mode_raw in ("access", "trunk"):
+                current["mode"] = mode_raw
+            continue
+
+        # Access Mode VLAN
+        if line.lower().startswith("access mode vlan:"):
+            vlan = line.split(":", 1)[1].strip()
+            if vlan and vlan != "1":  # VLAN 1 is usually default/untagged
+                current["accessVlan"] = vlan
+            continue
+
+        # Trunking VLANs Allowed
+        if line.lower().startswith("trunking vlans allowed:"):
+            vlans = line.split(":", 1)[1].strip()
+            if vlans and vlans != "1":
+                current["trunkVlans"] = vlans
+            continue
+
+        # Trunking Native VLAN
+        if line.lower().startswith("trunking native mode vlan:"):
+            native = line.split(":", 1)[1].strip()
+            if native and native != "1":
+                # Include native VLAN in trunkVlans if not already present
+                existing = current.get("trunkVlans", "")
+                if existing:
+                    if native not in existing:
+                        current["trunkVlans"] = f"{native},{existing}"
+                else:
+                    current["trunkVlans"] = native
+            continue
+
+    # Don't forget the last interface
+    if current_name:
+        out[current_name] = current
+
+    return out
+
+
+def _merge_eos_switchport(
+    interfaces: list[dict[str, Any]],
+    switchport_by_name: dict[str, dict[str, str]],
+) -> None:
+    """Fill mode/accessVlan on each interface row from switchport data.
+
+    Mutates `interfaces` in place. We only set mode if we have a clear
+    Access/Trunk signal; we only set accessVlan if non-default (>1).
+    Trunk VLANs are stored in accessVlan as a comma-separated string
+    so the frontend can render them.
+    """
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or "").strip()
+        if not name:
+            continue
+        sp = switchport_by_name.get(name)
+        if not sp:
+            continue
+
+        # Set mode
+        if "mode" in sp:
+            iface["mode"] = sp["mode"]
+
+        # Set VLAN(s)
+        # Trunk ports: show all allowed VLANs in accessVlan field
+        if sp.get("mode") == "trunk" and sp.get("trunkVlans"):
+            iface["accessVlan"] = sp["trunkVlans"]
+        # Access ports: show the access VLAN
+        elif sp.get("mode") == "access" and sp.get("accessVlan"):
+            iface["accessVlan"] = sp["accessVlan"]
+        # No explicit mode but has trunk VLANs = implicit trunk
+        elif sp.get("trunkVlans") and not sp.get("mode"):
+            iface["mode"] = "trunk"
+            iface["accessVlan"] = sp["trunkVlans"]
+        # Has access VLAN but no mode detected = implicit access
+        elif sp.get("accessVlan") and not sp.get("mode"):
+            iface["mode"] = "access"
+            iface["accessVlan"] = sp["accessVlan"]
