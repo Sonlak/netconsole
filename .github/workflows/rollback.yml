@@ -70,15 +70,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ vars.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
-          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -H ${{ vars.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true
           # Runner stores deploy key at ~runner/.ssh/id_ed25519
-          if [ -f ~/.ssh/id_ed25519 ]; then
-            chmod 600 ~/.ssh/id_ed25519
-            echo "✅ SSH key found (~/.ssh/id_ed25519)"
-          else
-            echo "✅ SSH key configured via runner env"
-          fi
+          # Retry a few times in case runner is still spinning up from previous job.
+          for attempt in 1 2 3; do
+            if [ -f ~/.ssh/id_ed25519 ]; then
+              chmod 600 ~/.ssh/id_ed25519
+              echo "✅ SSH key found (~/.ssh/id_ed25519) on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "  SSH key not ready (attempt $attempt/3), waiting 5s..."
+              sleep 5
+            fi
+          done
 
       - name: Read last known-good marker from VPS
         id: marker
