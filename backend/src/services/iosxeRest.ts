@@ -170,41 +170,77 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
       const description = String(i.description ?? '');
 
       // Parse switchport-config for mode + VLANs
+      // switchport-config is a leafref to Cisco-IOS-XE-switch:switchport.
+      // YANG paths (verified against Cisco-IOS-XE-switch.yang rev 2021-07-01):
+      //   Mode:  mode.access  (presence container = access mode)
+      //          mode.trunk   (presence container = trunk mode)
+      //   Access VLAN:  access.vlan.vlan  (uint16, e.g. 10)
+      //   Trunk VLANs:  trunk.allowed.vlan.vlans  (string, e.g. "1,2,10")
+      //                 trunk.native.vlan.vlan-id  (uint16, native VLAN)
       let mode = '';
       let accessVlan = '';
       const swConfig = (i as Record<string, unknown>)['switchport-config'] as Record<string, unknown> | undefined;
       if (swConfig && typeof swConfig === 'object') {
+        // switchport-config dereferences to the Cisco-IOS-XE-switch:switchport subtree
         const sw = swConfig['switchport'] as Record<string, unknown> | undefined;
-        if (sw && typeof sw === 'object') {
-          // Mode: access or trunk
-          const modeObj = sw['mode'] as Record<string, unknown> | undefined;
+        // Also check with namespace prefix (some IOS-XE versions include it)
+        const swNs = (swConfig['Cisco-IOS-XE-switch:switchport'] ||
+                      swConfig['switchport']) as Record<string, unknown> | undefined;
+        const swEffective = (sw && typeof sw === 'object') ? sw :
+                           (swNs && typeof swNs === 'object') ? swNs : null;
+        if (swEffective) {
+          // Mode: access or trunk (presence containers inside mode choice)
+          const modeObj = (swEffective['mode'] ||
+                          swEffective['Cisco-IOS-XE-switch:mode']) as Record<string, unknown> | undefined;
           if (modeObj && typeof modeObj === 'object') {
             if ('access' in modeObj) mode = 'access';
             else if ('trunk' in modeObj) mode = 'trunk';
+            // Also check namespace-prefixed keys (some IOS-XE versions)
+            else if ('Cisco-IOS-XE-switch:access' in modeObj) mode = 'access';
+            else if ('Cisco-IOS-XE-switch:trunk' in modeObj) mode = 'trunk';
           }
-          // Access VLAN
-          const accessObj = (sw['access'] ?? sw['Cisco-IOS-XE-switch:access']) as Record<string, unknown> | undefined;
+
+          // Access VLAN — always extract (even VLAN 1) so the frontend shows it
+          const accessObj = (swEffective['access'] ||
+                            swEffective['Cisco-IOS-XE-switch:access']) as Record<string, unknown> | undefined;
           if (accessObj && typeof accessObj === 'object') {
-            const vlanObj = (accessObj['vlan'] ?? accessObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+            const vlanObj = (accessObj['vlan'] ||
+                            accessObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
             if (vlanObj && typeof vlanObj === 'object') {
               const vlanNum = vlanObj['vlan'];
-              if (vlanNum !== undefined && vlanNum !== 1) {
+              if (vlanNum !== undefined && vlanNum !== null) {
                 accessVlan = String(vlanNum);
               }
             }
           }
-          // Trunk VLANs — extract regardless of accessVlan state.
-          // accessVlan field carries trunk VLANs for trunk ports.
+
+          // Trunk VLANs — extract when mode is trunk
           if (mode === 'trunk') {
-            const trunkObj = (sw['trunk'] ?? sw['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
+            const trunkObj = (swEffective['trunk'] ||
+                            swEffective['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
             if (trunkObj && typeof trunkObj === 'object') {
-              const allowedObj = (trunkObj['allowed'] ?? trunkObj['Cisco-IOS-XE-switch:allowed']) as Record<string, unknown> | undefined;
+              const allowedObj = (trunkObj['allowed'] ||
+                                trunkObj['Cisco-IOS-XE-switch:allowed']) as Record<string, unknown> | undefined;
               if (allowedObj && typeof allowedObj === 'object') {
-                const vlanObj = (allowedObj['vlan'] ?? allowedObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+                const vlanObj = (allowedObj['vlan'] ||
+                                allowedObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
                 if (vlanObj && typeof vlanObj === 'object') {
                   const vlans = vlanObj['vlans'];
-                  if (vlans !== undefined) {
+                  if (vlans !== undefined && vlans !== null) {
                     accessVlan = String(vlans);
+                  }
+                }
+              }
+              // Also include native VLAN in trunk display
+              const nativeObj = (trunkObj['native'] ||
+                               trunkObj['Cisco-IOS-XE-switch:native']) as Record<string, unknown> | undefined;
+              if (nativeObj && typeof nativeObj === 'object') {
+                const nativeVlanId = nativeObj['vlan-id'];
+                if (nativeVlanId !== undefined && nativeVlanId !== null && String(nativeVlanId) !== '1') {
+                  // Append native VLAN to allowed VLANs if not already present
+                  const nativeStr = String(nativeVlanId);
+                  if (accessVlan && !accessVlan.split(',').includes(nativeStr)) {
+                    accessVlan = `${nativeStr},${accessVlan}`;
                   }
                 }
               }

@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma.js';
 import { listCollectableDevices } from './collectableDevices.js';
 import { reclaimStaleJobs } from './jobWatchdog.js';
 import { jobPriority, tryCreateDeviceJob, type DeviceBusyError } from './deviceOperations.js';
-import { fetchInterfaceList, fetchConfigurationSet, parseConfigurationSet, applySwitchingModesToInterfaces, parseSwitchingModesFromSet } from './junosRest.js';
+import { fetchInterfaceList, fetchConfigurationSet, fetchVlanInformation, parseVlanInformation, applyVlanMembershipToInterfaces, parseConfigurationSet, applySwitchingModesToInterfaces, parseSwitchingModesFromSet } from './junosRest.js';
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
 
 export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
@@ -261,6 +261,11 @@ export async function collectInterfacesForDevice(
         const modes = parseSwitchingModesFromSet(cfgResult.config);
         applySwitchingModesToInterfaces(rest.interfaces, modes);
       }
+      // Fetch VLAN membership so we know which VLAN each interface belongs to
+      const vlanResult = await fetchVlanInformation(device.ip);
+      if (vlanResult.ok && vlanResult.vlans.length > 0) {
+        applyVlanMembershipToInterfaces(rest.interfaces, vlanResult.vlans);
+      }
       const job = await prisma.job.create({
         data: {
           deviceId: device.id,
@@ -272,7 +277,7 @@ export async function collectInterfacesForDevice(
             implemented: true,
             source: 'junos-rest',
             interfaces: rest.interfaces,
-            command: 'get-interface-information terse + get-configuration (set format)',
+            command: 'get-interface-information terse + get-vlan-information + get-configuration (set format)',
             message: `Collected interfaces from ${device.name} via REST`,
             collectMs: rest.collectMs,
           } as object,

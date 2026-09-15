@@ -671,3 +671,158 @@ export async function fetchConfigurationSet(host: string): Promise<{
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// VLAN membership parser
+// ---------------------------------------------------------------------------
+
+export type JunosVlanMember = {
+  name: string;
+  interfaces: string[];
+};
+
+/** Extract interface name from Junos VLAN member string like "ge-0/0/2.0" or "ge-0/0/0.0". */
+function _vlan_iface_name(raw: string): string {
+  // Strip trailing .0 unit number if present (VLAN unit)
+  const trimmed = (raw || '').trim();
+  if (trimmed.endsWith('.0')) return trimmed.slice(0, -2);
+  return trimmed;
+}
+
+export function parseVlanInformation(xml: string): JunosVlanMember[] {
+  /** Junos VLAN RPC returns XML like:
+   *  <vlans>
+   *    <vlan>
+   *      <name>VLAN100</name>
+   *      <l2ng-l2-static-mac-table>
+   *        <l2ng-l2-static-mac-entry>
+   *          <l2ng-l2-mac-address>...</l2ng-l2-mac-address>
+   *          <l2ng-l2-vlan-name-tag>vlan100</l2ng-l2-vlan-name-tag>
+   *          <l2ng-l2-static-mobile mac-address="" vlan-name="" interface="ge-0/0/2.0" />
+   *        </l2ng-l2-static-mac-entry>
+   *      </l2ng-l2-static-mac-table>
+   *    </vlan>
+   *  </vlans>
+   *
+   *  Or from get-vlan-information RPC:
+   *  <vlan>
+   *    <name>VLAN100</name>
+   *    <vlan-member-list>
+   *      <vlan-member>ge-0/0/2</vlan-member>
+   *      <vlan-member>ge-0/0/3</vlan-member>
+   *    </vlan-member-list>
+   *  </vlan>
+   */
+  const result: JunosVlanMember[] = [];
+  if (!xml) return result;
+
+  // Extract all <vlan> blocks
+  const vlanRe = /<vlan>([\s\S]*?)<\/vlan>/gi;
+  let vlanMatch: RegExpExecArray | null;
+  while ((vlanMatch = vlanRe.exec(xml)) !== null) {
+    const vlanBlock = vlanMatch[1];
+    const nameMatch = /<name>([\s\S]*?)<\/name>/i.exec(vlanBlock);
+    if (!nameMatch) continue;
+    const vlanName = nameMatch[1].trim();
+
+    const interfaces: string[] = [];
+
+    // Try vlan-member-list format (get-vlan-information RPC)
+    const memberRe = /<vlan-member>([\s\S]*?)<\/vlan-member>/gi;
+    let memberMatch: RegExpExecArray | null;
+    while ((memberMatch = memberRe.exec(vlanBlock)) !== null) {
+      const memberName = memberMatch[1].trim();
+      if (memberName) interfaces.push(_vlan_iface_name(memberName));
+    }
+
+    // Try l2ng-l2-static-mobile format (get-ethernet-switching-table-information RPC)
+    if (interfaces.length === 0) {
+      const mobileRe = /<l2ng-l2-static-mobile[^>]*interface="([^"]*)"/gi;
+      let mobileMatch: RegExpExecArray | null;
+      while ((mobileMatch = mobileRe.exec(vlanBlock)) !== null) {
+        const ifaceName = mobileMatch[1].trim();
+        if (ifaceName) interfaces.push(_vlan_iface_name(ifaceName));
+      }
+    }
+
+    if (interfaces.length > 0) {
+      result.push({ name: vlanName, interfaces });
+    }
+  }
+  return result;
+}
+
+export async function fetchVlanInformation(host: string): Promise<{
+  ok: boolean;
+  vlans: JunosVlanMember[];
+  collectMs: number;
+  error?: string;
+}> {
+  if (!restEnabled()) {
+    return { ok: false, vlans: [], collectMs: 0, error: 'JUNOS_REST_ENABLED=false' };
+  }
+  const started = Date.now();
+  const result = await callRpc(host, 'get-vlan-information', 20000);
+  if (!result.ok) {
+    return { ok: false, vlans: [], collectMs: Date.now() - started, error: result.error };
+  }
+  const xml = extractXmlBody(result.raw);
+  if (!xml) {
+    return { ok: false, vlans: [], collectMs: Date.now() - started, error: 'Empty VLAN response' };
+  }
+  const vlans = parseVlanInformation(xml);
+  return { ok: true, vlans, collectMs: Date.now() - started };
+}
+
+/** Apply VLAN membership to interface list.
+ *
+ * For each VLAN, find interfaces that belong to it and set `accessVlan` on those
+ * interfaces (only if not already set by switchport-mode parsing).
+ * Also set `mode = "access"` if mode is empty and the interface is in a VLAN.
+ */
+export function applyVlanMembershipToInterfaces(
+  interfaces: JunosInterfaceEntry[],
+  vlans: JunosVlanMember[],
+): void {
+  // Build reverse map: interface name -> vlan name
+  const ifaceToVlan = new Map<string, string>();
+  for (const vlan of vlans) {
+    for (const ifaceName of vlan.interfaces) {
+      // Store the first VLAN found for this interface
+      if (!ifaceToVlan.has(ifaceName)) {
+        ifaceToVlan.set(ifaceName, vlan.name);
+      }
+    }
+  }
+
+  for (const iface of interfaces) {
+    const name = iface.name || '';
+    // Try exact name match and name without unit
+    let vlanName = ifaceToVlan.get(name);
+    if (!vlanName) {
+      // Try without trailing .0 (unit number)
+      const withoutUnit = name.replace(/\.0$/, '');
+      vlanName = ifaceToVlan.get(withoutUnit);
+    }
+    if (!vlanName) {
+      // Try prefix match (interface name may include unit)
+      for (const [key, val] of ifaceToVlan.entries()) {
+        if (name.startsWith(key) || key.startsWith(name)) {
+          vlanName = val;
+          break;
+        }
+      }
+    }
+
+    if (vlanName) {
+      // Set access VLAN if not already set
+      if (!iface.accessVlan) {
+        iface.accessVlan = vlanName;
+      }
+      // Set mode to access if not already set and not L3
+      if (!iface.mode && !iface.address) {
+        iface.mode = 'access';
+      }
+    }
+  }
+}

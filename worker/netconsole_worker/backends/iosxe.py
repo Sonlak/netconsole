@@ -1051,12 +1051,16 @@ def _normalize_cisco_mac(mac: str) -> str:
 def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Parse `Cisco-IOS-XE-native:native/interface` for interface list + switchport config.
 
-    The native YANG model includes `switchport-config` which carries:
-      - switchport.mode.access / switchport.mode.trunk
-      - switchport.access.vlan.vlan (access VLAN number)
-      - switchport.trunk.allowed.vlan.vlans (trunk allowed VLANs)
+    The native YANG model includes `switchport-config` (a leafref to
+    Cisco-IOS-XE-switch:switchport) which carries:
+      - switchport.mode.access  (presence container = access mode)
+      - switchport.mode.trunk   (presence container = trunk mode)
+      - switchport.access.vlan.vlan         (uint16, access VLAN number)
+      - switchport.trunk.allowed.vlan.vlans (string, trunk allowed VLAN range)
+      - switchport.trunk.native.vlan.vlan-id (uint16, native VLAN on trunk)
 
     This is richer than `ietf-interfaces:interfaces` which only has name/enabled/MTU.
+    Paths verified against Cisco-IOS-XE-switch.yang rev 2021-07-01.
     """
     out: list[dict[str, Any]] = []
 
@@ -1074,7 +1078,10 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
 
             # Build full interface name: type prefix + name (e.g. "GigabitEthernet1/0/1")
-            full_name = f"{type_name}{name}"
+            # Note: type_name may include namespace prefix (e.g. "Cisco-IOS-XE-native:GigabitEthernet")
+            # so strip it if present.
+            base_type = type_name.split(":")[-1] if ":" in type_name else type_name
+            full_name = f"{base_type}{name}"
 
             # adminStatus from `enabled` leaf
             enabled = iface.get("enabled")
@@ -1084,31 +1091,43 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
             description = str(iface.get("description") or "")
 
             # Parse switchport-config for mode + VLANs
+            # switchport-config is a leafref to Cisco-IOS-XE-switch:switchport.
+            # YANG paths (verified against Cisco-IOS-XE-switch.yang rev 2021-07-01):
+            #   Mode:  mode.access  (presence container = access mode)
+            #          mode.trunk   (presence container = trunk mode)
+            #   Access VLAN:  access.vlan.vlan  (uint16, e.g. 10)
+            #   Trunk VLANs:  trunk.allowed.vlan.vlans  (string, e.g. "1,2,10")
+            #                 trunk.native.vlan.vlan-id  (uint16, native VLAN)
             mode = ""
             access_vlan = ""
             sw_config = iface.get("switchport-config") or iface.get("Cisco-IOS-XE-switch:switchport-config") or {}
             if isinstance(sw_config, dict):
+                # switchport-config dereferences to the Cisco-IOS-XE-switch:switchport subtree
                 sw = sw_config.get("switchport") or sw_config.get("Cisco-IOS-XE-switch:switchport") or {}
                 if isinstance(sw, dict):
-                    # Mode: access or trunk
+                    # Mode: access or trunk (presence containers inside mode choice)
                     mode_obj = sw.get("mode") or sw.get("Cisco-IOS-XE-switch:mode") or {}
                     if isinstance(mode_obj, dict):
                         if "access" in mode_obj:
                             mode = "access"
                         elif "trunk" in mode_obj:
                             mode = "trunk"
+                        # Also check namespace-prefixed keys (some IOS-XE versions)
+                        elif "Cisco-IOS-XE-switch:access" in mode_obj:
+                            mode = "access"
+                        elif "Cisco-IOS-XE-switch:trunk" in mode_obj:
+                            mode = "trunk"
 
-                    # Access VLAN (always extract so we know the port's access VLAN)
+                    # Access VLAN — always extract (even VLAN 1) so the frontend shows it
                     access_obj = sw.get("access") or sw.get("Cisco-IOS-XE-switch:access") or {}
                     if isinstance(access_obj, dict):
                         vlan_obj = access_obj.get("vlan") or access_obj.get("Cisco-IOS-XE-switch:vlan") or {}
                         if isinstance(vlan_obj, dict):
                             vlan_num = vlan_obj.get("vlan")
-                            if vlan_num is not None and vlan_num != 1:
+                            if vlan_num is not None and vlan_num != "":
                                 access_vlan = str(vlan_num)
 
-                    # Trunk VLANs — extract regardless of access_vlan state.
-                    # accessVlan field carries trunk VLANs for trunk ports.
+                    # Trunk VLANs — extract when mode is trunk
                     if mode == "trunk":
                         trunk_obj = sw.get("trunk") or sw.get("Cisco-IOS-XE-switch:trunk") or {}
                         if isinstance(trunk_obj, dict):
@@ -1117,8 +1136,19 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
                                 vlan_obj = allowed_obj.get("vlan") or allowed_obj.get("Cisco-IOS-XE-switch:vlan") or {}
                                 if isinstance(vlan_obj, dict):
                                     vlans = vlan_obj.get("vlans")
-                                    if vlans is not None:
+                                    if vlans is not None and vlans != "":
                                         access_vlan = str(vlans)
+                            # Also include native VLAN in trunk display if non-default
+                            native_obj = trunk_obj.get("native") or trunk_obj.get("Cisco-IOS-XE-switch:native") or {}
+                            if isinstance(native_obj, dict):
+                                native_vlan_obj = native_obj.get("vlan") or native_obj.get("Cisco-IOS-XE-switch:vlan") or {}
+                                if isinstance(native_vlan_obj, dict):
+                                    native_vlan_id = native_vlan_obj.get("vlan-id")
+                                    if native_vlan_id is not None and native_vlan_id != "" and str(native_vlan_id) != "1":
+                                        # Append native VLAN if not already in allowed list
+                                        native_str = str(native_vlan_id)
+                                        if access_vlan and native_str not in access_vlan.split(","):
+                                            access_vlan = f"{native_str},{access_vlan}"
 
             out.append({
                 "name": full_name,
