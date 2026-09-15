@@ -255,6 +255,7 @@ class EOSBackend(DeviceBackend):
         """
         r = self._run_cmds(device, [{"cmd": "show interfaces switchport", "format": "text"}])
         if not r["ok"]:
+            logger.warning("[EOS] _fetch_eos_switchport failed for %s: %s", device.ip, r.get("error"))
             return {}
         result = r["result"] or []
         text = ""
@@ -262,7 +263,17 @@ class EOSBackend(DeviceBackend):
             text = result[0].get("output") or ""
         if not text:
             text = r.get("raw") or ""
-        return _parse_eos_switchport_text(text)
+        if not text:
+            logger.warning("[EOS] _fetch_eos_switchport got empty text for %s", device.ip)
+            return {}
+        # Debug: log raw switchport output for first 3 interfaces
+        sample_lines = text.split("\n")[:50]
+        logger.debug("[EOS] switchport raw output for %s:\n%s", device.ip, "\n".join(sample_lines))
+        parsed = _parse_eos_switchport_text(text)
+        logger.debug("[EOS] parsed switchport data for %s: %s", device.ip, {
+            k: v for k, v in list(parsed.items())[:5]
+        })
+        return parsed
 
     # -- READ --------------------------------------------------------------
 
@@ -1250,24 +1261,32 @@ def _merge_eos_switchport(
             continue
         sp = switchport_by_name.get(name)
         if not sp:
+            logger.debug("[EOS] _merge_eos_switchport: no switchport data for %s", name)
             continue
+
+        logger.debug("[EOS] _merge_eos_switchport: %s -> sp=%s", name, sp)
 
         # Set mode
         if "mode" in sp:
             iface["mode"] = sp["mode"]
+            logger.debug("[EOS] _merge_eos_switchport: set mode=%s for %s", sp["mode"], name)
 
         # Set VLAN(s)
         # Trunk ports: show all allowed VLANs in accessVlan field
         if sp.get("mode") == "trunk" and sp.get("trunkVlans"):
             iface["accessVlan"] = sp["trunkVlans"]
+            logger.debug("[EOS] _merge_eos_switchport: trunk VLANs=%s for %s", sp["trunkVlans"], name)
         # Access ports: show the access VLAN
         elif sp.get("mode") == "access" and sp.get("accessVlan"):
             iface["accessVlan"] = sp["accessVlan"]
+            logger.debug("[EOS] _merge_eos_switchport: access VLAN=%s for %s", sp["accessVlan"], name)
         # No explicit mode but has trunk VLANs = implicit trunk
         elif sp.get("trunkVlans") and not sp.get("mode"):
             iface["mode"] = "trunk"
             iface["accessVlan"] = sp["trunkVlans"]
+            logger.debug("[EOS] _merge_eos_switchport: implicit trunk VLANs=%s for %s", sp["trunkVlans"], name)
         # Has access VLAN but no mode detected = implicit access
         elif sp.get("accessVlan") and not sp.get("mode"):
             iface["mode"] = "access"
             iface["accessVlan"] = sp["accessVlan"]
+            logger.debug("[EOS] _merge_eos_switchport: implicit access VLAN=%s for %s", sp["accessVlan"], name)
