@@ -11,9 +11,6 @@ import { isAllowedLogFilename } from '../lib/junosLogFiles.js';
 import { persistLogsForJob } from '../services/logs.js';
 import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 
-// ROLLBACK TEST v8: TS error to verify FINAL fix (env-only templates)
-const testRollback8: string = 999;
-
 export const jobsRouter = Router();
 
 /**
