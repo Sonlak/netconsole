@@ -7,6 +7,7 @@ so we SSH-fallback for those (mirrors the Juniper approach).
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from ipaddress import ip_address
@@ -204,19 +205,24 @@ class IOSxeBackend(DeviceBackend):
 
     def get_interfaces(self, device: DeviceInfo) -> dict[str, Any]:
         # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
-        # Use `Cisco-IOS-XE-native:native/interface` (not `ietf-interfaces`) because
-        # it includes switchport-config (mode + VLANs) in the same response.
+        # IOS-XE RESTCONF does NOT expand `switchport-config` leafref in the
+        # list response (`/native/interface`). We must:
+        #   1. GET /native/interface          → basic interface info (name, desc, MTU)
+        #   2. GET /native/interface/<type>=<name> for each interface → switchport config
+        # This two-pass approach is required to get switchport mode + VLAN data.
         rest_error: str | None = None
         if self.config.iosxe.enabled:
             r = self._rc_get(device, "/Cisco-IOS-XE-native:native/interface")
             if r["ok"]:
-                interfaces = _parse_iosxe_interfaces(r["payload"])
-                if interfaces:
+                basic_interfaces = _parse_iosxe_interfaces(r["payload"])
+                if basic_interfaces:
+                    # Second pass: fetch switchport config for each interface
+                    enriched = self._fetch_iosxe_switchports(device, basic_interfaces)
                     return {
                         "implemented": True,
                         "source": "iosxe-rest",
-                        "command": "Cisco-IOS-XE-native:native/interface",
-                        "interfaces": interfaces,
+                        "command": "Cisco-IOS-XE-native:native/interface (+ per-iface switchport)",
+                        "interfaces": enriched,
                         "message": "IOS-XE RESTCONF interfaces OK",
                         "restError": rest_error,
                     }
@@ -252,6 +258,87 @@ class IOSxeBackend(DeviceBackend):
             "message": rest_error or ssh_error or "Enable IOSXE_API or LAB_SSH",
             "restError": rest_error,
         }
+
+    def _fetch_iosxe_switchports(
+        self,
+        device: DeviceInfo,
+        interfaces: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Fetch switchport config for each interface via per-interface RESTCONF call.
+
+        IOS-XE RESTCONF does NOT expand `switchport-config` in list responses.
+        We must ask for each interface individually:
+          GET /restconf/data/Cisco-IOS-XE-native:native/interface/GigabitEthernet=<id>
+
+        Runs up to 10 concurrent requests to avoid overwhelming the device.
+        """
+        import asyncio
+
+        async def _fetch_one(client: httpx.AsyncClient, iface: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+            m = re.match(r"^([A-Za-z]+?)(\d.*)$", iface.get("name") or "")
+            if not m:
+                return iface["name"], None
+            iface_type, iface_name = m.group(1), m.group(2)
+            path = f"/Cisco-IOS-XE-native:native/interface/{iface_type}={iface_name}"
+            url = f"{self.BASE}{path}"
+            try:
+                resp = client.get(
+                    url,
+                    headers={"Accept": "application/yang-data+json"},
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    sw = _parse_iosxe_switchport_from_iface_response(data)
+                    return iface["name"], sw
+            except Exception:  # noqa: BLE001
+                pass
+            return iface["name"], None
+
+        creds = _creds(self.config)
+
+        try:
+            import httpx
+
+            # Use httpx directly for async concurrent requests
+            auth = f"{creds['username']}:{creds['password']}"
+            basic_auth = base64.b64encode(auth.encode()).decode()
+            base_url = f"{creds['scheme']}://{device.ip}:{creds['port']}"
+
+            async def fetch_all() -> dict[str, dict[str, Any] | None]:
+                async with httpx.AsyncClient(
+                    base_url=base_url,
+                    headers={
+                        "Authorization": f"Basic {basic_auth}",
+                        "Accept": "application/yang-data+json",
+                    },
+                    verify=creds["verify_tls"],
+                    timeout=10.0,
+                ) as async_client:
+                    tasks = [_fetch_one(async_client, iface) for iface in interfaces]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    out: dict[str, dict[str, Any] | None] = {}
+                    for r in results:
+                        if isinstance(r, tuple) and len(r) == 2:
+                            name, sw = r
+                            out[name] = sw
+                    return out
+
+            switchports = asyncio.run(fetch_all())
+
+            for iface in interfaces:
+                name = iface.get("name") or ""
+                sw = switchports.get(name)
+                if sw:
+                    if sw.get("mode"):
+                        iface["mode"] = sw["mode"]
+                    if sw.get("accessVlan"):
+                        iface["accessVlan"] = sw["accessVlan"]
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("IOS-XE per-iface switchport fetch failed: %s", exc)
+
+        return interfaces
 
     def get_arp(self, device: DeviceInfo) -> dict[str, Any]:
         # Prefer RESTCONF — avoids SSH login on every 30-60s collection sweep.
@@ -1163,6 +1250,113 @@ def _parse_iosxe_interfaces(payload: dict[str, Any]) -> list[dict[str, Any]]:
             })
 
     return out
+
+
+def _parse_iosxe_switchport_from_iface_response(
+    payload: dict[str, Any],
+) -> dict[str, str] | None:
+    """Parse switchport mode + VLAN from a per-interface IOS-XE RESTCONF response.
+
+    The per-interface response wraps the interface block under the type key:
+      {
+        "Cisco-IOS-XE-native:GigabitEthernet": {
+          "name": "4",
+          "description": "uplink",
+          "switchport-config": {
+            "switchport": {
+              "mode": { "trunk": {} },
+              "trunk": {
+                "allowed": { "vlan": { "vlans": "10,20" } },
+                "native": { "vlan": { "vlan-id": 1 } }
+              }
+            }
+          }
+        }
+      }
+
+    Returns {mode, accessVlan} or None if no switchport data found.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    for type_value in payload.values():
+        if not isinstance(type_value, dict):
+            continue
+        sw_config = type_value.get("switchport-config") or type_value.get(
+            "Cisco-IOS-XE-switch:switchport-config"
+        )
+        if not isinstance(sw_config, dict):
+            continue
+
+        # Dereference the switchport-config leafref
+        sw = sw_config.get("switchport") or sw_config.get(
+            "Cisco-IOS-XE-switch:switchport"
+        )
+        if not isinstance(sw, dict):
+            continue
+
+        mode = ""
+        access_vlan = ""
+
+        # Mode: access or trunk (presence containers inside mode choice)
+        mode_obj = sw.get("mode") or sw.get("Cisco-IOS-XE-switch:mode") or {}
+        if isinstance(mode_obj, dict):
+            if "access" in mode_obj:
+                mode = "access"
+            elif "trunk" in mode_obj:
+                mode = "trunk"
+            elif "Cisco-IOS-XE-switch:access" in mode_obj:
+                mode = "access"
+            elif "Cisco-IOS-XE-switch:trunk" in mode_obj:
+                mode = "trunk"
+
+        # Access VLAN — always extract (even VLAN 1)
+        access_obj = sw.get("access") or sw.get("Cisco-IOS-XE-switch:access") or {}
+        if isinstance(access_obj, dict):
+            vlan_obj = access_obj.get("vlan") or access_obj.get(
+                "Cisco-IOS-XE-switch:vlan"
+            ) or {}
+            if isinstance(vlan_obj, dict):
+                vlan_num = vlan_obj.get("vlan")
+                if vlan_num is not None and vlan_num != "":
+                    access_vlan = str(vlan_num)
+
+        # Trunk VLANs — extract when mode is trunk
+        if mode == "trunk":
+            trunk_obj = sw.get("trunk") or sw.get(
+                "Cisco-IOS-XE-switch:trunk"
+            ) or {}
+            if isinstance(trunk_obj, dict):
+                allowed_obj = trunk_obj.get("allowed") or trunk_obj.get(
+                    "Cisco-IOS-XE-switch:allowed"
+                ) or {}
+                if isinstance(allowed_obj, dict):
+                    vlan_obj = allowed_obj.get("vlan") or allowed_obj.get(
+                        "Cisco-IOS-XE-switch:vlan"
+                    ) or {}
+                    if isinstance(vlan_obj, dict):
+                        vlans = vlan_obj.get("vlans")
+                        if vlans is not None and vlans != "":
+                            access_vlan = str(vlans)
+                # Native VLAN
+                native_obj = trunk_obj.get("native") or trunk_obj.get(
+                    "Cisco-IOS-XE-switch:native"
+                ) or {}
+                if isinstance(native_obj, dict):
+                    native_vlan_id = native_obj.get("vlan-id")
+                    if (
+                        native_vlan_id is not None
+                        and native_vlan_id != ""
+                        and str(native_vlan_id) != "1"
+                    ):
+                        native_str = str(native_vlan_id)
+                        if access_vlan and native_str not in access_vlan.split(","):
+                            access_vlan = f"{native_str},{access_vlan}"
+
+        if mode or access_vlan:
+            return {"mode": mode, "accessVlan": access_vlan}
+
+    return None
 
 
 def _parse_iosxe_arp(payload: dict[str, Any]) -> list[dict[str, Any]]:

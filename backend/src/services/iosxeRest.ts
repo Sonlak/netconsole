@@ -12,6 +12,13 @@
  *    back to the job queue for MAC.
  *  - Interface list via `ietf-interfaces:interfaces` is sparse (no MTU/speed
  *    on some images) but usable.
+ *
+ *  IMPORTANT: IOS-XE RESTCONF does NOT expand the `switchport-config`
+ *  leafref in the list response (`/native/interface`). The switchport
+ *  subtree must be fetched separately via a per-interface request:
+ *    GET /restconf/data/Cisco-IOS-XE-native:native/interface/GigabitEthernet=<id>
+ *  This function fetches the interface list first (for basic info), then
+ *  makes per-interface requests to fetch switchport data (up to 20 concurrent).
  */
 
 function iosxeRestEnabled(): boolean {
@@ -308,17 +315,154 @@ export async function fetchIosxeInterfaceList(host: string): Promise<{
     return { ok: false, interfaces: [], collectMs: 0, error: 'IOSXE_API_ENABLED=false' };
   }
   const started = Date.now();
-  // Use Cisco-IOS-XE-native:native/interface to get both interface list AND
-  // switchport-config (mode + VLANs) in one request.
-  const result = await rcGet(host, '/Cisco-IOS-XE-native:native/interface', 20000);
-  if (!result.ok) {
-    return { ok: false, interfaces: [], collectMs: Date.now() - started, error: result.error };
+
+  // PASS 1: Get the interface list — gives us name, description, enabled, MTU
+  const listResult = await rcGet(host, '/Cisco-IOS-XE-native:native/interface', 20000);
+  if (!listResult.ok) {
+    return { ok: false, interfaces: [], collectMs: Date.now() - started, error: listResult.error };
   }
-  const interfaces = parseIosxeNativeInterfaces(result.payload);
-  if (interfaces.length === 0) {
+  const basicInterfaces = parseIosxeNativeInterfaces(listResult.payload);
+  if (basicInterfaces.length === 0) {
     return { ok: false, interfaces: [], collectMs: Date.now() - started, error: 'No interfaces in RESTCONF response' };
   }
-  return { ok: true, interfaces, collectMs: Date.now() - started };
+
+  // PASS 2: Fetch switchport config for each interface (per-interface request).
+  // IOS-XE RESTCONF does NOT expand the switchport-config leafref in the
+  // list response. We must ask for each interface individually.
+  // Run up to 20 concurrent requests to avoid overwhelming the device.
+  const BATCH = 20;
+  for (let i = 0; i < basicInterfaces.length; i += BATCH) {
+    const batch = basicInterfaces.slice(i, i + BATCH);
+    const batchResults = await Promise.all(
+      batch.map(async (iface) => {
+        // Split "GigabitEthernet4" → ("GigabitEthernet", "4")
+        const m = /^([A-Za-z]+?)(\d.*)$/.exec(iface.name);
+        if (!m) return { name: iface.name, swData: null };
+        const type = m[1];
+        const name = m[2];
+        const path = `/Cisco-IOS-XE-native:native/interface/${type}=${encodeURIComponent(name)}`;
+        const r = await rcGet(host, path, 10000);
+        if (!r.ok) return { name: iface.name, swData: null };
+        return { name: iface.name, swData: r.payload };
+      }),
+    );
+    for (const br of batchResults) {
+      if (!br.swData) continue;
+      // Find the matching interface in basicInterfaces
+      const match = basicInterfaces.find((b) => b.name === br.name);
+      if (!match) continue;
+      // Parse switchport from the per-interface response
+      const sw = parseSwitchportFromInterfaceResponse(br.swData);
+      if (sw) {
+        match.mode = sw.mode;
+        match.accessVlan = sw.accessVlan;
+      }
+    }
+  }
+
+  return { ok: true, interfaces: basicInterfaces, collectMs: Date.now() - started };
+}
+
+/**
+ * Parse switchport mode + VLAN from a per-interface RESTCONF response.
+ *
+ * The per-interface response looks like:
+ * {
+ *   "Cisco-IOS-XE-native:GigabitEthernet": {
+ *     "id": "4",
+ *     "name": "4",
+ *     "description": "uplink",
+ *     "shutdown": false,
+ *     "switchport-config": {
+ *       "switchport": {
+ *         "mode": { "access": {} }  ← presence container
+ *         "access": { "vlan": { "vlan": 10 } }
+ *       }
+ *     }
+ *   }
+ * }
+ *
+ * We look for `switchport-config.switchport` and extract mode + VLANs.
+ */
+function parseSwitchportFromInterfaceResponse(payload: unknown): { mode: string; accessVlan: string } | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const root = payload as Record<string, unknown>;
+  // The response wraps the interface block under the type key
+  for (const [, value] of Object.entries(root)) {
+    if (!value || typeof value !== 'object') continue;
+    const block = value as Record<string, unknown>;
+    const swConfig = block['switchport-config'] as Record<string, unknown> | undefined;
+    if (!swConfig || typeof swConfig !== 'object') continue;
+    // Dereference the switchport-config leafref
+    const sw = swConfig['switchport'] as Record<string, unknown> | undefined;
+    const swNs = swConfig['Cisco-IOS-XE-switch:switchport'] as Record<string, unknown> | undefined;
+    const swEffective = (sw && typeof sw === 'object') ? sw : (swNs && typeof swNs === 'object') ? swNs : null;
+    if (!swEffective) continue;
+
+    let mode = '';
+    let accessVlan = '';
+
+    // Mode: access or trunk (presence containers inside mode choice)
+    const modeObj = (swEffective['mode'] ||
+      swEffective['Cisco-IOS-XE-switch:mode']) as Record<string, unknown> | undefined;
+    if (modeObj && typeof modeObj === 'object') {
+      if ('access' in modeObj) mode = 'access';
+      else if ('trunk' in modeObj) mode = 'trunk';
+      else if ('Cisco-IOS-XE-switch:access' in modeObj) mode = 'access';
+      else if ('Cisco-IOS-XE-switch:trunk' in modeObj) mode = 'trunk';
+    }
+
+    // Access VLAN — always extract (even VLAN 1)
+    const accessObj = (swEffective['access'] ||
+      swEffective['Cisco-IOS-XE-switch:access']) as Record<string, unknown> | undefined;
+    if (accessObj && typeof accessObj === 'object') {
+      const vlanObj = (accessObj['vlan'] ||
+        accessObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+      if (vlanObj && typeof vlanObj === 'object') {
+        const vlanNum = vlanObj['vlan'];
+        if (vlanNum !== undefined && vlanNum !== null) {
+          accessVlan = String(vlanNum);
+        }
+      }
+    }
+
+    // Trunk VLANs — extract when mode is trunk
+    if (mode === 'trunk') {
+      const trunkObj = (swEffective['trunk'] ||
+        swEffective['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
+      if (trunkObj && typeof trunkObj === 'object') {
+        const allowedObj = (trunkObj['allowed'] ||
+          trunkObj['Cisco-IOS-XE-switch:allowed']) as Record<string, unknown> | undefined;
+        if (allowedObj && typeof allowedObj === 'object') {
+          const vlanObj = (allowedObj['vlan'] ||
+            allowedObj['Cisco-IOS-XE-switch:vlan']) as Record<string, unknown> | undefined;
+          if (vlanObj && typeof vlanObj === 'object') {
+            const vlans = vlanObj['vlans'];
+            if (vlans !== undefined && vlans !== null) {
+              accessVlan = String(vlans);
+            }
+          }
+        }
+        // Native VLAN
+        const nativeObj = (trunkObj['native'] ||
+          trunkObj['Cisco-IOS-XE-switch:native']) as Record<string, unknown> | undefined;
+        if (nativeObj && typeof nativeObj === 'object') {
+          const nativeVlanId = nativeObj['vlan-id'];
+          if (nativeVlanId !== undefined && nativeVlanId !== null && String(nativeVlanId) !== '1') {
+            const nativeStr = String(nativeVlanId);
+            if (accessVlan && !accessVlan.split(',').includes(nativeStr)) {
+              accessVlan = `${nativeStr},${accessVlan}`;
+            }
+          }
+        }
+      }
+    }
+
+    if (mode || accessVlan) {
+      return { mode, accessVlan };
+    }
+  }
+  return null;
 }
 
 /**
