@@ -376,7 +376,12 @@ function parseEosSwitchport(text: string): Record<string, { mode: string; access
 function mergeEosSwitchport(interfaces: EosInterfaceEntry[], switchport: Record<string, { mode: string; accessVlan: string; trunkVlans: string }>): void {
   for (const iface of interfaces) {
     const sp = switchport[iface.name];
-    if (!sp) continue;
+    if (!sp) {
+      console.log(`[eosApi] merge: no switchport data for ${iface.name}`);
+      continue;
+    }
+
+    console.log(`[eosApi] merge: ${iface.name} -> sp=${JSON.stringify(sp)}`);
 
     if (sp.mode) iface.mode = sp.mode;
 
@@ -391,6 +396,7 @@ function mergeEosSwitchport(interfaces: EosInterfaceEntry[], switchport: Record<
       iface.mode = 'access';
       iface.accessVlan = sp.accessVlan;
     }
+    console.log(`[eosApi] merge: ${iface.name} final -> mode=${iface.mode}, accessVlan=${iface.accessVlan}`);
   }
 }
 
@@ -434,8 +440,12 @@ export async function fetchEosInterfaceList(host: string): Promise<{
   // Step 3: Get switchport mode and VLANs via text
   const swResult = await eosRpc(host, [{ cmd: 'show interfaces switchport', format: 'text' }]);
   if (swResult.ok && swResult.raw) {
+    console.log(`[eosApi] switchport raw output for ${host}:`, swResult.raw.substring(0, 2000));
     const switchport = parseEosSwitchport(swResult.raw);
+    console.log(`[eosApi] parsed switchport for ${host}:`, JSON.stringify(switchport).substring(0, 1000));
     mergeEosSwitchport(interfaces, switchport);
+  } else {
+    console.warn(`[eosApi] switchport fetch failed for ${host}:`, swResult.error);
   }
 
   return { ok: true, interfaces, collectMs: Date.now() - started };
