@@ -69,11 +69,10 @@ jobs:
     if: github.event.workflow_run.conclusion == 'failure'
     timeout-minutes: 20
     env:
-      # VPS connection details from repo vars. Default to '' so `set -u`
-      # never aborts on an empty var — each step checks and exits with a
-      # useful error message instead of failing silently in <1s.
-      VPS_HOST: ${{ vars.VPS_HOST || '' }}
-      VPS_USER: ${{ vars.VPS_USER || '' }}
+      # VPS connection details from repo vars. Empty if not configured --
+      # the marker step checks and exits with a useful error.
+      VPS_HOST: ${{ vars.VPS_HOST }}
+      VPS_USER: ${{ vars.VPS_USER }}
       SSH_OPTS: -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o BatchMode=yes
 
     steps:
@@ -116,36 +115,39 @@ jobs:
 
       # Resolve rollback target.
       #
-      # WHY THIS STEP PREVIOUSLY FAILED (2026-09-15):
-      #   Auto-rollback #6, #8, #11 all failed at this step in <1s with
-      #   no log output. After several defensive rewrites, the root cause
-      #   remains: referencing `inputs.X` or `vars.X || ''` in a workflow_run
-      #   triggered step can cause a template-render error that aborts the
-      #   step before any script runs. The fix below avoids all template
-      #   expressions inside the `run:` body -- every variable is either a
-      #   workflow-level env: or hard-coded. The `inputs.ref` escape hatch
-      #   is supported via workflow_dispatch ONLY and is checked using the
-      #   `github.event_name` context (which IS always available).
+      # WHY THIS STEP PREVIOUSLY FAILED (4 consecutive attempts: #6, #8, #11, #13):
+      #   Root cause: `${{ inputs.X }}` referenced INSIDE the `run:` script body
+      #   fails to render in `workflow_run` context (no `inputs` exists), which
+      #   GitHub Actions treats as a fatal template error → step exits in <1s
+      #   with NO log output. `vars.X || ''` similarly may fail in some
+      #   template renderers. The fix below:
+      #     1. ALL template refs go in step-level `env:` (not `run:` body).
+      #     2. Script body uses bash vars (${VAR}) only.
+      #     3. Inputs are read from $ROLLBACK_REF / $CLEAR_MARKERS env vars
+      #        (which render to '' when undefined).
+      #     4. Manual workflow_dispatch path uses bash check on $ROLLBACK_REF,
+      #        not on `${{ github.event_name }}`.
       - name: Read last known-good marker from VPS
         id: marker
         env:
-          # workflow env. Always available.
+          # All template refs -- safe to render to '' when undefined.
+          ROLLBACK_REF: ${{ inputs.ref }}
+          CLEAR_MARKERS: ${{ inputs.clear_markers }}
+          VPS_HOST: ${{ vars.VPS_HOST }}
+          VPS_USER: ${{ vars.VPS_USER }}
           DEPLOY_DIR: /opt/netconsole
-          # job-level env (VPS_HOST, VPS_USER, SSH_OPTS) provides the rest.
         run: |
-          # Intentionally no `set -e` here -- we want to see every error.
-          # `set -u` IS used so any unbound variable is caught loudly.
-          set -u
+          # No `set -e` -- we want every error to print.
+          # No `set -u` -- inputs may be empty.
+          # SSH_OPTS env from job-level.
 
-          # --- Debug (visible in step log) ---
           {
             echo "==> Rollback context debug"
-            echo "  github.event_name    = '${{ github.event_name }}'"
-            echo "  github.run_id        = '${{ github.run_id }}'"
             echo "  VPS_HOST             = '${VPS_HOST:-<empty>}'"
             echo "  VPS_USER             = '${VPS_USER:-<empty>}'"
             echo "  DEPLOY_DIR           = '${DEPLOY_DIR:-<empty>}'"
-            echo "  github.event.workflow_run.conclusion = '${{ github.event.workflow_run.conclusion }}'"
+            echo "  ROLLBACK_REF input   = '${ROLLBACK_REF:-<empty>}'"
+            echo "  CLEAR_MARKERS input  = '${CLEAR_MARKERS:-<empty>}'"
           }
 
           if [ -z "${VPS_HOST:-}" ] || [ -z "${VPS_USER:-}" ]; then
@@ -157,36 +159,25 @@ jobs:
           SSH_TARGET="${VPS_USER}@${VPS_HOST}"
 
           # --- Path 1: manual workflow_dispatch with explicit ref ---
-          # github.event_name is always defined; this is safe to reference.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Read the input via env, but it was empty before, so try a heredoc-safe check.
-            # The dispatch input is rendered at YAML template time -- if it was empty,
-            # the literal string "ROLLBACK_REF=''" was rendered.
-            echo "==> Manual workflow_dispatch detected."
-            ROLLBACK_REF='${{ inputs.ref }}'
-            CLEAR_MARKERS='${{ inputs.clear_markers }}'
-            echo "  ROLLBACK_REF input   = '${ROLLBACK_REF:-<empty>}'"
-            echo "  CLEAR_MARKERS input  = '${CLEAR_MARKERS:-<empty>}'"
+          # Check the bash env var, not a template expression.
+          if [ -n "${ROLLBACK_REF:-}" ]; then
+            echo "==> Manual rollback: using ref from input: $ROLLBACK_REF"
+            PREV_SHA="$ROLLBACK_REF"
+            PREV_REF="manual-dispatch"
+            {
+              echo "PREV_SHA=$PREV_SHA"
+              echo "PREV_REF=$PREV_REF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-            if [ -n "${ROLLBACK_REF:-}" ]; then
-              echo "==> Manual rollback: using ref from workflow_dispatch input: $ROLLBACK_REF"
-              PREV_SHA="$ROLLBACK_REF"
-              PREV_REF="manual-dispatch"
-              {
-                echo "PREV_SHA=$PREV_SHA"
-                echo "PREV_REF=$PREV_REF"
-              } >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            if [ "${CLEAR_MARKERS:-}" = "true" ]; then
-              echo "==> Clearing VPS rollback markers as requested"
-              ssh $SSH_OPTS "$SSH_TARGET" \
-                'rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
-                       "$DEPLOY_DIR/.rollback-before-deploy-ref" \
-                       "$DEPLOY_DIR/.last-deploy-sha" \
-                       "$DEPLOY_DIR/.last-deploy-ref"' || true
-            fi
+          if [ "${CLEAR_MARKERS:-}" = "true" ]; then
+            echo "==> Clearing VPS rollback markers as requested"
+            ssh $SSH_OPTS "$SSH_TARGET" \
+              'rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
+                     "$DEPLOY_DIR/.rollback-before-deploy-ref" \
+                     "$DEPLOY_DIR/.last-deploy-sha" \
+                     "$DEPLOY_DIR/.last-deploy-ref"' || true
           fi
 
           # --- Verify VPS is reachable ---
