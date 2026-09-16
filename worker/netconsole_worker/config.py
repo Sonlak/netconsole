@@ -53,5 +53,14 @@ class Settings(BaseSettings):
     nxos_api_user: str = ""
     nxos_api_password: str = ""
 
+    # Cisco IOS (non-XE) — IOSexec HTTP API on port 443.
+    # Uses TLS 1.0 + Basic Auth + CSRF token. The user must have privilege 15.
+    # NETCONF/RESTCONF are NOT required; this works on any IOS 12.4+ with
+    # `ip http server` + `ip http authentication local`.
+    ios_http_enabled: bool = False
+    ios_http_port: int = 443
+    ios_http_user: str = ""
+    ios_http_password: str = ""
+
 
 settings = Settings()

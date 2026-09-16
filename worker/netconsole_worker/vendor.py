@@ -67,6 +67,7 @@ class BackendConfig:
     eos: VendorConfig = field(default_factory=VendorConfig)
     iosxe: VendorConfig = field(default_factory=VendorConfig)
     nxos: VendorConfig = field(default_factory=VendorConfig)
+    ios_http: VendorConfig = field(default_factory=VendorConfig)
 
     # SSH is shared across vendors.
     ssh_user: str = "lab"
@@ -112,6 +113,14 @@ class BackendConfig:
                 user=settings.nxos_api_user,
                 password=settings.nxos_api_password,
                 verify_tls=settings.nxos_api_verify_tls,
+            ),
+            ios_http=VendorConfig(
+                enabled=settings.ios_http_enabled,
+                scheme="https",  # Always HTTPS for IOSexec
+                port=settings.ios_http_port,
+                user=settings.ios_http_user,
+                password=settings.ios_http_password,
+                verify_tls=False,  # TLS 1.0 + self-signed cert — always verify=False
             ),
             ssh_user=settings.lab_ssh_user,
             ssh_password=settings.lab_ssh_password,
@@ -162,6 +171,11 @@ def detect_vendor(device: DeviceInfo) -> str:
         return "iosxe"
     if vendor in ("cisconexus", "nexus", "nxos", "cisco-nx-os"):
         return "nxos"
+    # Plain IOS (non-XE) — IOSv, vios_l2, ISR 800/880/1900, etc.
+    # Distinguish from IOS-XE by vendor string (ios, cisco-ios, iosv)
+    # and by model keywords (vios, iosv, isr800, isr880, c870).
+    if vendor in ("ios", "cisco-ios", "iosv"):
+        return "ios"
 
     # Fallback to model-keyword matching.
     if any(k in model for k in ("nexus", "n9k", "n3k", "n7k", "n77")):
@@ -182,6 +196,9 @@ def detect_vendor(device: DeviceInfo) -> str:
         )
     ):
         return "iosxe"
+    # Plain IOS model keywords (IOSv, vios_l2, ISR 800/880, C870).
+    if any(k in model for k in ("vios", "iosv", "isr800", "isr880", "c870", "isr8")):
+        return "ios"
     if any(k in model for k in ("arista", "dcs-", "eos-", "ceos", "ccr", "csp")):
         return "eos"
     if any(k in model for k in ("juniper", "mx", "ex", "qfx", "srx", "junos")):
@@ -202,6 +219,7 @@ def select_backend(device: DeviceInfo) -> "DeviceBackend":
     that genuinely need to know can use `detect_vendor()` separately.
     """
     from netconsole_worker.backends.eos import EOSBackend
+    from netconsole_worker.backends.ios import IOSBackend
     from netconsole_worker.backends.iosxe import IOSxeBackend
     from netconsole_worker.backends.juniper import JuniperBackend
     from netconsole_worker.backends.nxos import NxosBackend
@@ -211,6 +229,8 @@ def select_backend(device: DeviceInfo) -> "DeviceBackend":
 
     if kind == "eos" and config.eos.enabled:
         return EOSBackend(config)
+    if kind == "ios" and config.ios_http.enabled:
+        return IOSBackend(config)
     if kind == "iosxe" and config.iosxe.enabled:
         return IOSxeBackend(config)
     if kind == "nxos" and config.nxos.enabled:
