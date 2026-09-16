@@ -1,4 +1,63 @@
-import { Client, type Channel } from 'ssh2';
+import { Client, type Algorithms, type Channel } from 'ssh2';
+
+/**
+ * SSH algorithm preference list shared by all ssh2 Clients in this module.
+ *
+ * Includes legacy algorithms (diffie-hellman-group1-sha1 / ssh-rsa /
+ * 3des-cbc / hmac-sha1) so we can connect to old Cisco IOS SSH servers
+ * (e.g. IOS 15.x running Cisco-1.25 SSH banner — verified on
+ * LAB-F3-AS-01 / 10.10.20.211 on 2026-09-16). Modern ssh2 default list
+ * does not include those, which surfaces as
+ *   "Handshake failed: no matching key exchange algorithm"
+ * in `DiscoveryResult.error`.
+ *
+ * ssh2 picks the first mutually-supported algorithm, so listing modern
+ * algos first preserves security on up-to-date servers (Junos, EOS,
+ * IOS-XE 17+, Linux OpenSSH). Legacy algos are listed last as a fallback.
+ *
+ * Verified algos for Cisco IOS 1.25 (the only ones it offers):
+ *   kex:           diffie-hellman-group1-sha1
+ *   serverHostKey: ssh-rsa
+ *   cipher:        aes256-ctr (and lower)
+ *   hmac:          hmac-sha1  (and lower)
+ */
+const SSH_ALGORITHMS = {
+  kex: [
+    'curve25519-sha256',
+    'curve25519-sha256@libssh.org',
+    'ecdh-sha2-nistp521',
+    'ecdh-sha2-nistp384',
+    'ecdh-sha2-nistp256',
+    'diffie-hellman-group-exchange-sha256',
+    'diffie-hellman-group14-sha256',
+    'diffie-hellman-group14-sha1',
+    'diffie-hellman-group1-sha1',
+  ],
+  serverHostKey: [
+    'ssh-ed25519',
+    'ecdsa-sha2-nistp521',
+    'ecdsa-sha2-nistp384',
+    'ecdsa-sha2-nistp256',
+    'rsa-sha2-512',
+    'rsa-sha2-256',
+    'ssh-rsa',
+  ],
+  cipher: [
+    'aes256-ctr',
+    'aes192-ctr',
+    'aes128-ctr',
+    'aes256-cbc',
+    'aes192-cbc',
+    'aes128-cbc',
+    '3des-cbc',
+  ],
+  hmac: [
+    'hmac-sha2-512',
+    'hmac-sha2-256',
+    'hmac-sha1',
+    'hmac-sha1-96',
+  ],
+} satisfies Algorithms;
 
 export type LabSshResult = {
   sshOk: boolean;
@@ -145,6 +204,7 @@ export async function runIosxeSshApply(
           username: options.username,
           password: options.password,
           readyTimeout: 15000,
+          algorithms: SSH_ALGORITHMS,
         });
     });
 
@@ -301,6 +361,7 @@ export async function runLabSshProbe(
           username: options.username,
           password: options.password,
           readyTimeout: 15000,
+          algorithms: SSH_ALGORITHMS,
         });
     });
 
@@ -357,6 +418,7 @@ export async function runIosxeSshCommand(
           username,
           password,
           readyTimeout: 15000,
+          algorithms: SSH_ALGORITHMS,
         });
     });
     const output = await execCommand(conn, command, timeoutMs);
@@ -372,8 +434,16 @@ export async function runIosxeSshCommand(
   }
 }
 
-export function parseJuniperShowVersion(output: string) {
-  const parsed: Record<string, string> = { vendor: 'Juniper' };
+export function parseJuniperShowVersion(output: string): {
+  vendor: string;
+  hostname?: string;
+  model?: string;
+  version?: string;
+  serial?: string;
+} {
+  const parsed: { vendor: string; hostname?: string; model?: string; version?: string; serial?: string } = {
+    vendor: 'Juniper',
+  };
 
   const hostname = output.match(/^Hostname:\s*(\S+)/m)?.[1];
   const model = output.match(/^Model:\s*(\S+)/m)?.[1];
@@ -384,6 +454,127 @@ export function parseJuniperShowVersion(output: string) {
   if (model) parsed.model = model;
   if (version) parsed.version = version;
   if (serial) parsed.serial = serial;
+
+  return parsed;
+}
+
+/**
+ * SSH-based identity probe for Cisco IOS / IOS-XE devices.
+ *
+ * Used as a fallback when the RESTCONF / HTTP-server-exec probes fail
+ * (e.g. older IOS 15.x without RESTCONF and without `ip http
+ * secure-server`, but with SSH enabled).
+ *
+ * Runs `show version` and parses out hostname / model / version / serial.
+ * Vendor is set to `Cisco`. IOSv (virtual switches) have no serial —
+ * the caller falls back to a `DISC-<ip>` placeholder in that case.
+ */
+export async function runIosxeSshProbe(
+  host: string,
+  options: {
+    username: string;
+    password: string;
+    port?: number;
+  },
+): Promise<LabSshResult> {
+  const conn = new Client();
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      conn
+        .on('ready', () => resolve())
+        .on('error', reject)
+        .connect({
+          host,
+          port: options.port ?? 22,
+          username: options.username,
+          password: options.password,
+          readyTimeout: 20000,
+          algorithms: SSH_ALGORITHMS,
+        });
+    });
+
+    const showVersion = await execCommand(conn, 'show version', 30000);
+    return {
+      sshOk: true,
+      showVersion,
+      showRun: '',
+    };
+  } catch (error) {
+    return {
+      sshOk: false,
+      showVersion: '',
+      showRun: '',
+      error: error instanceof Error ? error.message : 'SSH probe failed',
+    };
+  } finally {
+    conn.end();
+  }
+}
+
+/**
+ * Parse `show version` output from a Cisco IOS / IOS-XE device.
+ *
+ * Tested shapes:
+ *   - IOS 15.2 (vios_l2): "Cisco IOS Software, vios_l2 Software ... Version 15.2(...)
+ *     ... ROM: Bootstrap program is IOSv
+ *     ... <hostname> uptime is 1 hour, ..."
+ *   - IOS-XE 16/17: same layout plus a "Processor board ID XXXXX" line for
+ *     serial number, and a "cisco ISRXXXX" or "WS-..." model token.
+ *
+ * Returns at minimum `{ vendor: 'Cisco' }`. Other fields are populated when
+ * the regex matches. IOSv returns no serial (the line is absent).
+ */
+export function parseIosShowVersion(output: string): {
+  vendor: string;
+  hostname?: string;
+  model?: string;
+  version?: string;
+  serial?: string;
+} {
+  const parsed: { vendor: string; hostname?: string; model?: string; version?: string; serial?: string } = {
+    vendor: 'Cisco',
+  };
+
+  // Hostname — first token of "<hostname> uptime is ..." line.
+  // Skip "cisco" (appears as "cisco ISR4331 uptime is..." on physical IOS
+  // when no hostname is configured).
+  const hostnameMatch = output.match(/^(\S+)\s+uptime is/m);
+  if (hostnameMatch) {
+    const candidate = hostnameMatch[1];
+    if (!/^(System|Router|Switch|Building|Configuration|cisco|Cisco)$/i.test(candidate)) {
+      parsed.hostname = candidate;
+    }
+  }
+
+  // Version — "Version 15.2" or "Version 17.6.1" or "Version 15.5(3)M"
+  const versionMatch = output.match(/Version\s+([\d.()A-Za-z0-9:]+)/);
+  if (versionMatch) parsed.version = versionMatch[1];
+
+  // Model — for physical chassis: try the banner line (`Cisco IOS Software,
+  // C2900 Software (...)`). For IOSv (virtual switch): fall back to
+  // "Bootstrap program is IOSv".
+  const bannerLine = output
+    .split('\n')
+    .find((l) => /Cisco Internetwork Operating System|Cisco IOS Software/i.test(l));
+  if (bannerLine) {
+    const modelTok = bannerLine.match(/,\s+([A-Z][\w-]+)\s+Software\s+\(/);
+    if (modelTok) parsed.model = modelTok[1];
+  }
+  // Fall back to IOSv / virtual model if banner didn't yield a real model.
+  if (!parsed.model) {
+    const bootMatch = output.match(/Bootstrap program is (\S+)/);
+    if (bootMatch) parsed.model = bootMatch[1];
+  }
+
+  // Serial — physical devices have "Processor board ID XXX" or
+  // "System serial number: XXX".
+  const serialMatch = output.match(/Processor board ID\s+(\S+)/i);
+  if (serialMatch) parsed.serial = serialMatch[1];
+  if (!parsed.serial) {
+    const serialAlt = output.match(/System serial number[:\s]+(\S+)/i);
+    if (serialAlt) parsed.serial = serialAlt[1];
+  }
 
   return parsed;
 }

@@ -6,14 +6,24 @@ import {
 import { prisma } from '../lib/prisma.js';
 import { canonicalFloor, canonicalSite } from '../lib/deviceFloor.js';
 import { pingHost } from './ping.js';
-import { parseJuniperShowVersion, runLabSshProbe } from './labSsh.js';
+import { parseIosShowVersion, parseJuniperShowVersion, runIosxeSshProbe, runLabSshProbe } from './labSsh.js';
+import { probeIosHttpExecIdentity, probeIosxeRestIdentity } from './iosxeRest.js';
 import { probeJunosRestIdentity } from './junosRest.js';
+import { probeEosApiIdentity } from './eosApi.js';
 import { queueDeviceTabCollections } from './deviceTabCollection.js';
 
 const labSshEnabled = process.env.LAB_SSH_ENABLED === 'true';
 const labSshUser = process.env.LAB_SSH_USER ?? 'lab';
 const labSshPassword = process.env.LAB_SSH_PASSWORD ?? 'lab123';
 const labSshPort = Number(process.env.LAB_SSH_PORT ?? 22);
+
+// IOS SSH probe uses the IOSXE_API_* env vars (same creds as RESTCONF /
+// HTTP-exec) so a single `netconsole / Admin@123` account works against
+// the legacy IOS HTTP server, RESTCONF, AND SSH.
+const iosxeSshEnabled = process.env.IOSXE_SSH_ENABLED === 'true' || labSshEnabled;
+const iosxeSshUser = process.env.IOSXE_API_USER || process.env.LAB_SSH_USER || 'admin';
+const iosxeSshPassword = process.env.IOSXE_API_PASSWORD || process.env.LAB_SSH_PASSWORD || 'Admin@123';
+const iosxeSshPort = Number(process.env.IOSXE_API_SSH_PORT ?? labSshPort);
 
 export type DiscoveredFields = {
   name: string;
@@ -30,62 +40,129 @@ export async function probeDiscoveredHost(ip: string): Promise<{
   fields: DiscoveredFields | null;
   error?: string;
 }> {
-  const rest = await probeJunosRestIdentity(ip);
-  if (rest.ok && rest.fields) {
-    const hostname = rest.fields.hostname?.trim();
+  // Fan out across vendors in parallel. Each probe is gated by its own env
+  // var (JUNOS_REST_ENABLED / IOSXE_API_ENABLED / EOS_API_ENABLED) and
+  // returns ok=false immediately if disabled. Whichever probe returns a
+  // valid identity first wins — the other results are ignored.
+  //
+  // IOS fans out across RESTCONF + HTTP-server-exec in parallel because
+  // some IOS images have RESTCONF, some only have the legacy HTML exec
+  // endpoint, and some have neither (SSH fallback below). Whichever
+  // responds with valid identity wins.
+  const probes = await Promise.allSettled([
+    probeJunosRestIdentity(ip),
+    probeIosxeRestIdentity(ip),
+    probeIosHttpExecIdentity(ip),
+    probeEosApiIdentity(ip),
+  ]);
+
+  for (const outcome of probes) {
+    if (outcome.status !== 'fulfilled') continue;
+    const result = outcome.value;
+    if (!result.ok || !result.fields) continue;
+
+    const fields = result.fields;
+    const hostname = fields.hostname?.trim();
+    const vendor = fields.vendor || 'Unknown';
+    const lastOctet = ip.split('.').pop();
     return {
       sshOk: true,
       fields: {
-        name: hostname || `juniper-${ip.split('.').pop()}`,
-        vendor: rest.fields.vendor || 'Juniper',
-        model: rest.fields.model || 'Unknown',
-        version: rest.fields.version || '-',
-        serial: rest.fields.serial || `DISC-${ip.replace(/\./g, '')}`,
+        name: hostname || `${vendor.toLowerCase()}-${lastOctet}`,
+        vendor,
+        model: fields.model || 'Unknown',
+        version: fields.version || '-',
+        serial: fields.serial || `DISC-${ip.replace(/\./g, '')}`,
         description: hostname
-          ? `Hostname ${hostname} (Junos REST)`
-          : `Discovered via Junos REST (${ip})`,
-        showRun: rest.raw,
+          ? `Hostname ${hostname} (${vendor} API)`
+          : `Discovered via ${vendor} API (${ip})`,
       },
     };
   }
 
-  if (labSshEnabled) {
-    const ssh = await runLabSshProbe(ip, {
-      username: labSshUser,
-      password: labSshPassword,
-      port: labSshPort,
-    });
+  // RESTCONF/eAPI probes all failed (or were disabled). Fall back to SSH
+  // per-vendor. SSH probes run in parallel — first one to extract a
+  // hostname wins. Disabled when no SSH env flag is set so deployments
+  // without an SSH account on lab devices don't burn ~5s per host.
+  if (labSshEnabled || iosxeSshEnabled) {
+    const sshJobs: Array<Promise<{ vendor: string; sshOk: boolean; hostname?: string; model?: string; version?: string; serial?: string; showRun?: string; error?: string }>> = [];
 
-    if (!ssh.sshOk || !ssh.showVersion.trim()) {
+    if (labSshEnabled) {
+      sshJobs.push(
+        runLabSshProbe(ip, {
+          username: labSshUser,
+          password: labSshPassword,
+          port: labSshPort,
+        }).then((res) => {
+          if (!res.sshOk || !res.showVersion.trim()) {
+            return { vendor: 'Juniper', sshOk: false, error: res.error ?? 'SSH probe failed' };
+          }
+          const parsed = parseJuniperShowVersion(res.showVersion);
+          return { sshOk: true, ...parsed, showRun: res.showRun };
+        }),
+      );
+    }
+
+    if (iosxeSshEnabled) {
+      sshJobs.push(
+        runIosxeSshProbe(ip, {
+          username: iosxeSshUser,
+          password: iosxeSshPassword,
+          port: iosxeSshPort,
+        }).then((res) => {
+          if (!res.sshOk || !res.showVersion.trim()) {
+            return { vendor: 'Cisco', sshOk: false, error: res.error ?? 'SSH probe failed' };
+          }
+          const parsed = parseIosShowVersion(res.showVersion);
+          return { sshOk: true, ...parsed };
+        }),
+      );
+    }
+
+    const settled = await Promise.allSettled(sshJobs);
+    for (const outcome of settled) {
+      if (outcome.status !== 'fulfilled') continue;
+      const r = outcome.value;
+      if (!r.sshOk) continue;
+      const hostname = r.hostname?.trim();
+      const vendor = r.vendor || 'Unknown';
+      const lastOctet = ip.split('.').pop();
       return {
-        sshOk: false,
-        fields: null,
-        error: ssh.error ?? rest.error ?? 'SSH/REST probe failed',
+        sshOk: true,
+        fields: {
+          name: hostname || `${vendor.toLowerCase()}-${lastOctet}`,
+          vendor,
+          model: r.model || 'Unknown',
+          version: r.version || '-',
+          serial: r.serial || `DISC-${ip.replace(/\./g, '')}`,
+          description: hostname
+            ? `Hostname ${hostname} (${vendor} SSH)`
+            : `Discovered via ${vendor} SSH (${ip})`,
+          showRun: r.showRun,
+        },
       };
     }
 
-    const parsed = parseJuniperShowVersion(ssh.showVersion);
-    const hostname = parsed.hostname?.trim();
+    // Surface the SSH error so the user can see what happened.
+    const firstErr = settled.find((s) => s.status === 'fulfilled') as PromiseFulfilledResult<{ error?: string }> | undefined;
     return {
-      sshOk: true,
-      fields: {
-        name: hostname ?? `juniper-${ip.split('.').pop()}`,
-        vendor: parsed.vendor ?? 'Juniper',
-        model: parsed.model ?? 'Unknown',
-        version: parsed.version ?? '-',
-        serial: parsed.serial ?? `DISC-${ip.replace(/\./g, '')}`,
-        description: hostname
-          ? `Hostname ${hostname} (SSH)`
-          : `Discovered via lab SSH (${ip})`,
-        showRun: ssh.showRun,
-      },
+      sshOk: false,
+      fields: null,
+      error: firstErr?.value?.error ?? 'SSH probe failed for all vendors',
     };
   }
+
+  // Surface the first RESTCONF/eAPI error so the user can see why each
+  // vendor probe didn't recognise the host (auth fail vs. wrong port, etc.).
+  const errors = probes
+    .filter((p) => p.status === 'fulfilled')
+    .map((p) => (p as PromiseFulfilledResult<{ ok: boolean; error?: string }>).value.error)
+    .filter((e): e is string => typeof e === 'string' && e !== '');
 
   return {
     sshOk: false,
     fields: null,
-    error: rest.error ?? 'JUNOS REST/SSH chưa xác thực được thiết bị — không dùng dữ liệu stub',
+    error: errors[0] ?? 'No RESTCONF/eAPI responded for any enabled vendor',
   };
 }
 

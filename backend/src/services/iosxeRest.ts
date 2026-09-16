@@ -657,3 +657,238 @@ export function iosxeInterfaceConfigToText(tree: unknown, iface: string): string
   lines.push('!');
   return lines.join('\n');
 }
+
+/**
+ * Probe an IOS-XE device over RESTCONF to extract identity (hostname, vendor,
+ * model, version, serial). Used by the discovery scanner so that non-Juniper
+ * devices can be marked as `DISCOVERED` and then synced into inventory.
+ *
+ * Tries two YANG paths in order:
+ *   1. `/Cisco-IOS-XE-device-hardware-oper:device-hardware-data` — serial /
+ *      model / version (Cisco-specific, well-supported on IOS-XE 16+).
+ *   2. `/ietf-system:system` — hostname (RFC 7317 standardized).
+ *
+ * Either path may be missing on older images; we accept partial identity as
+ * long as at least one of hostname / serial / model is present.
+ *
+ * Gated on `IOSXE_API_ENABLED=true`. Returns ok=false immediately when the
+ * flag is off so the parallel fan-out in `discoveryScan.ts` can skip us.
+ */
+export async function probeIosxeRestIdentity(host: string): Promise<{
+  ok: boolean;
+  fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } | null;
+  raw?: string;
+  error?: string;
+}> {
+  if (!iosxeRestEnabled()) {
+    return { ok: false, fields: null, error: 'IOSXE_API_ENABLED=false' };
+  }
+
+  const fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } = {
+    vendor: 'Cisco',
+  };
+  const rawParts: string[] = [];
+
+  // Hardware YANG for serial / model / version
+  const hw = await rcGet(host, '/Cisco-IOS-XE-device-hardware-oper:device-hardware-data', 15000);
+  if (hw.raw) rawParts.push(hw.raw);
+  if (hw.ok && hw.payload && typeof hw.payload === 'object') {
+    const record = hw.payload as Record<string, unknown>;
+    // The response may be wrapped in the YANG namespace key or sit at the top
+    // level depending on the IOS-XE image.
+    let data: unknown = record['Cisco-IOS-XE-device-hardware-oper:device-hardware-data'] ?? record;
+    if (data && typeof data === 'object') {
+      const obj = data as Record<string, unknown>;
+      // Try several common shapes (device-hardware list, device-data list, or a single record).
+      const candidates: unknown[] = [];
+      if (Array.isArray(obj['device-hardware'])) candidates.push(...(obj['device-hardware'] as unknown[]));
+      else if (obj['device-hardware']) candidates.push(obj['device-hardware']);
+      if (Array.isArray(obj['device-data'])) candidates.push(...(obj['device-data'] as unknown[]));
+      else if (obj['device-data']) candidates.push(obj['device-data']);
+      if (candidates.length === 0) candidates.push(obj);
+
+      for (const entry of candidates) {
+        if (!entry || typeof entry !== 'object') continue;
+        const f = entry as Record<string, unknown>;
+        if (!fields.serial) {
+          const serial = f['device-serial-number'] ?? f['serial-number'] ?? f['serialNumber'];
+          if (serial) fields.serial = String(serial).trim();
+        }
+        if (!fields.version) {
+          const version = f['device-version'] ?? f['version'] ?? f['os-version'];
+          if (version) fields.version = String(version).trim();
+        }
+        if (!fields.model) {
+          const model = f['device-type'] ?? f['device-model'] ?? f['model'] ?? f['model-name'];
+          if (model) fields.model = String(model).trim();
+        }
+        if (fields.serial && fields.version && fields.model) break;
+      }
+    }
+  }
+
+  // ietf-system:system for hostname (RFC 7317)
+  const sys = await rcGet(host, '/ietf-system:system', 15000);
+  if (sys.raw) rawParts.push(sys.raw);
+  if (sys.ok && sys.payload && typeof sys.payload === 'object') {
+    const record = sys.payload as Record<string, unknown>;
+    let sysData: unknown = record['ietf-system:system'] ?? record;
+    if (sysData && typeof sysData === 'object') {
+      const hostname = (sysData as Record<string, unknown>)['hostname'];
+      if (typeof hostname === 'string') {
+        const trimmed = hostname.trim();
+        if (trimmed) fields.hostname = trimmed;
+      }
+    }
+  }
+
+  const ok = Boolean(fields.hostname || fields.serial || fields.model);
+  if (!ok) {
+    return { ok: false, fields: null, raw: rawParts.join('\n'), error: 'IOS-XE RESTCONF identity empty' };
+  }
+
+  return { ok: true, fields, raw: rawParts.join('\n') };
+}
+
+/**
+ * Probe a Cisco IOS / IOS-XE device over its legacy HTTPS server's exec
+ * endpoint to extract identity. Used as a fallback path when:
+ *
+ *   - RESTCONF is not enabled (older IOS 15.x without `restconf` config), OR
+ *   - RESTCONF responds but returns empty identity, OR
+ *   - The device is IOS classic (15.x), which has no RESTCONF/NETCONF at all.
+ *
+ * Endpoint: `GET https://<host>:<port>/level/15/exec/-/show/version` with
+ * HTTP Basic auth (level 15 / privileged exec). The IOS HTTP server returns
+ * an HTML page; the command output lives inside a single `<PRE>...</PRE>`
+ * block, which we extract and parse.
+ *
+ * Tested against IOS 15.2 vios_l2 (LAB-F3-AS-01 / 10.10.20.211) on
+ * 2026-09-16. The HTML has the structure:
+ *
+ *   <TITLE>LAB-F3-AS-01 /level/15/exec/-/show/version</TITLE>
+ *   ...
+ *   <PRE>
+ *   Cisco IOS Software, vios_l2 Software (vios_l2-ADVENTERPRISEK9-M), ...
+ *   Copyright (c) 1986-2020 by Cisco Systems, Inc.
+ *   ...
+ *   ROM: Bootstrap program is IOSv
+ *   LAB-F3-AS-01 uptime is 1 hour, 6 minutes
+ *   System returned to ROM by reload
+ *   System image file is "flash0:/vios_l2-adventerprisek9-m"
+ *   ...
+ *   </PRE>
+ *
+ * No RESTCONF is invoked. Works on IOS 12.x, 15.x, and IOS-XE 16/17
+ * whenever `ip http secure-server` is enabled. Gated on
+ * `IOSXE_API_ENABLED=true` (same env as RESTCONF — shares creds).
+ */
+export async function probeIosHttpExecIdentity(host: string): Promise<{
+  ok: boolean;
+  fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } | null;
+  raw?: string;
+  error?: string;
+}> {
+  if (!iosxeRestEnabled()) {
+    return { ok: false, fields: null, error: 'IOSXE_API_ENABLED=false' };
+  }
+
+  const cfg = iosxeConfig();
+  const url = `${cfg.scheme}://${host}:${cfg.port}/level/15/exec/-/show/version`;
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
+
+  let html: string;
+  try {
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        Accept: 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!resp.ok) {
+      return { ok: false, fields: null, error: `IOS HTTP exec HTTP ${resp.status}` };
+    }
+    html = await resp.text();
+  } catch (error) {
+    return {
+      ok: false,
+      fields: null,
+      error: error instanceof Error ? error.message : 'IOS HTTP exec failed',
+    };
+  }
+
+  // Extract the first <PRE>...</PRE> block — that holds the command output.
+  const preMatch = /<PRE>([\s\S]*?)<\/PRE>/i.exec(html);
+  if (!preMatch) {
+    return { ok: false, fields: null, raw: html.slice(0, 500), error: 'IOS HTTP exec: no <PRE> in response' };
+  }
+  const output = preMatch[1];
+
+  // The HTML <TITLE> reliably holds the hostname followed by the request path:
+  //   `<TITLE>LAB-F3-AS-01 /level/15/exec/-/show/version</TITLE>`
+  // This is more reliable than parsing the command output, which on some
+  // IOS versions starts with the platform token (`cisco ISR4331 uptime is...`)
+  // or lacks an `uptime is` line at all.
+  let hostnameFromTitle: string | undefined;
+  const titleMatch = /<TITLE>\s*([^<\s/][^<]*?)\s*\/level\/15\/exec/i.exec(html);
+  if (titleMatch) {
+    const candidate = titleMatch[1].trim();
+    if (candidate && !/^(System|Router|Switch|Building|Configuration|cisco|Cisco)$/i.test(candidate)) {
+      hostnameFromTitle = candidate;
+    }
+  }
+
+  const fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } = {
+    vendor: 'Cisco',
+  };
+
+  // Prefer TITLE hostname; fall back to "<host> uptime is" line.
+  if (hostnameFromTitle) {
+    fields.hostname = hostnameFromTitle;
+  } else {
+    const hostnameMatch = output.match(/^(\S+)\s+uptime is/m);
+    if (hostnameMatch) {
+      const candidate = hostnameMatch[1].trim();
+      if (candidate && !/^(System|Router|Switch|Building|Configuration|cisco|Cisco)$/i.test(candidate)) {
+        fields.hostname = candidate;
+      }
+    }
+  }
+
+  // Version — `Version 15.2` / `Version 17.6.1` / `Version 15.5(3)M`.
+  // Handle nested parens: "Version 15.2(20200924:215240)" should yield "15.2(20200924:215240)".
+  const versionMatch = output.match(/Version\s+([\d.()A-Za-z0-9:]+)/);
+  if (versionMatch) fields.version = versionMatch[1].trim();
+
+  // Model — try physical-chassis banner first (`Cisco IOS Software, C2900
+  // Software (...)`), then fall back to `Bootstrap program is <MODEL>`
+  // for IOSv / virtual images.
+  const bannerLine = output
+    .split('\n')
+    .find((l) => /Cisco Internetwork Operating System|Cisco IOS Software/i.test(l));
+  if (bannerLine) {
+    const modelTok = bannerLine.match(/,\s+([A-Z][\w-]+)\s+Software\s+\(/);
+    if (modelTok) fields.model = modelTok[1];
+  }
+  if (!fields.model) {
+    const bootMatch = output.match(/Bootstrap program is (\S+)/);
+    if (bootMatch) fields.model = bootMatch[1];
+  }
+
+  // Serial — physical devices only. IOSv has none.
+  const boardId = output.match(/Processor board ID\s+(\S+)/i);
+  if (boardId) fields.serial = boardId[1];
+  if (!fields.serial) {
+    const sysSerial = output.match(/System serial number[:\s]+(\S+)/i);
+    if (sysSerial) fields.serial = sysSerial[1];
+  }
+
+  const ok = Boolean(fields.hostname || fields.serial || fields.model);
+  if (!ok) {
+    return { ok: false, fields: null, raw: output, error: 'IOS HTTP exec: empty identity' };
+  }
+
+  return { ok: true, fields, raw: output };
+}
