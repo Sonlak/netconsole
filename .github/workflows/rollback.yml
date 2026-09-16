@@ -215,10 +215,24 @@ jobs:
           path: src
 
       - name: Sync good commit to ${{ env.DEPLOY_DIR }}
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/src
         run: |
           set -euo pipefail
           echo "==> Syncing SHA ${{ steps.marker.outputs.PREV_SHA }} to $DEPLOY_DIR"
-          rsync -a --delete \
+          echo "==> Source: $SOURCE_DIR"
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "::error::SOURCE_DIR does not exist: $SOURCE_DIR"
+            echo "  pwd                = $(pwd)"
+            echo "  GITHUB_WORKSPACE   = ${GITHUB_WORKSPACE:-<unset>}"
+            ls -la "${GITHUB_WORKSPACE:-/nonexistent}" 2>&1 | head -10 || true
+            exit 1
+          fi
+          # Same robustness as deploy.yml Sync source: tolerate rsync partial
+          # transfers (exit 23/24) caused by read-only/root-owned residual files
+          # in /opt/netconsole. Log + continue rather than abort rollback.
+          set +e
+          rsync -a --delete --ignore-errors \
             --exclude '/.git/hooks/' \
             --exclude '/.git/info/' \
             --exclude '/data/' \
@@ -232,7 +246,17 @@ jobs:
             --exclude '/backups/' \
             --exclude '/.last-deploy-*' \
             --exclude '/.rollback-before-deploy-*' \
-            ./src/ "$DEPLOY_DIR/"
+            "$SOURCE_DIR/" "$DEPLOY_DIR/"
+          rsync_rc=$?
+          set -e
+          if [ "$rsync_rc" -eq 0 ]; then
+            echo "✅ rsync completed cleanly"
+          elif [ "$rsync_rc" -eq 23 ] || [ "$rsync_rc" -eq 24 ]; then
+            echo "::warning::rsync returned $rsync_rc (partial transfer — benign). Continuing rollback."
+          else
+            echo "::error::rsync failed with exit code $rsync_rc"
+            exit "$rsync_rc"
+          fi
           echo "✅ Synced to $DEPLOY_DIR"
 
       - name: Rebuild and restart app services

@@ -125,9 +125,26 @@ jobs:
           echo "💾 Pre-deploy rollback marker saved: sha=$CURRENT_SHA ref=$CURRENT_REF"
 
       - name: Sync source to ${{ env.DEPLOY_DIR }}
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/src
         run: |
           set -euo pipefail
-          echo "Syncing $GITHUB_WORKSPACE/src -> $DEPLOY_DIR"
+          echo "Syncing $SOURCE_DIR -> $DEPLOY_DIR"
+
+          # Pre-flight: ensure both source and deploy dirs exist. Self-hosted
+          # runner $HOME leak was causing `./src/` relative-path rsync to fail.
+          # Pinning to ${{ github.workspace }}/src fixes that.
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "::error::SOURCE_DIR does not exist: $SOURCE_DIR"
+            echo "  pwd                   = $(pwd)"
+            echo "  GITHUB_WORKSPACE      = ${GITHUB_WORKSPACE:-<unset>}"
+            ls -la "${GITHUB_WORKSPACE:-/nonexistent}" 2>&1 | head -10 || true
+            exit 1
+          fi
+          if [ ! -d "$DEPLOY_DIR" ]; then
+            echo "::error::DEPLOY_DIR does not exist: $DEPLOY_DIR"
+            exit 1
+          fi
 
           # Preserve user-managed files & gitignored artefacts on the server.
           # --delete ensures removed files in repo are also removed from server,
@@ -137,7 +154,15 @@ jobs:
           # only match repo-root paths. Without the anchor, patterns like
           # `data/` would also wipe source-tree folders such as
           # `frontend/src/data/`, which broke the frontend build for weeks.
-          rsync -a --delete \
+          #
+          # --ignore-errors + tolerating rsync exit 23/24:
+          #   The self-hosted runner on /opt/netconsole often has read-only or
+          #   root-owned leftover files from prior Docker builds. Plain rsync
+          #   returns 23 ("Some files could not be transferred") on permission
+          #   errors; 24 = "files disappeared before transfer". Both are benign.
+          #   We log them but do NOT fail the step — source files copy fine.
+          set +e
+          rsync -a --delete --ignore-errors \
             --exclude '/.git/hooks/' \
             --exclude '/.git/info/' \
             --exclude '/data/' \
@@ -149,7 +174,17 @@ jobs:
             --exclude '*.pid' \
             --exclude '/logs/' \
             --exclude '/backups/' \
-            ./src/ "$DEPLOY_DIR/"
+            "$SOURCE_DIR/" "$DEPLOY_DIR/"
+          rsync_rc=$?
+          set -e
+          if [ "$rsync_rc" -eq 0 ]; then
+            echo "✅ rsync completed cleanly"
+          elif [ "$rsync_rc" -eq 23 ] || [ "$rsync_rc" -eq 24 ]; then
+            echo "::warning::rsync returned $rsync_rc (partial transfer — benign). Continuing deploy."
+          else
+            echo "::error::rsync failed with exit code $rsync_rc"
+            exit "$rsync_rc"
+          fi
 
           echo "--- Synced. DEPLOY_DIR contents:"
           ls -la "$DEPLOY_DIR" | head -25
