@@ -163,6 +163,41 @@ export function startTerminalWebSocket(httpServer: Server) {
             tryKeyboard: true,
             readyTimeout: 30000,
             keepaliveInterval: 30000,
+            // Enable legacy KEX/HMAC/cipher algorithms so the terminal works
+            // against old IOS / IOSv images (15.x) that only support
+            // diffie-hellman-group1-sha1, hmac-sha1, and aes*-cbc. Modern
+            // Juniper/Arista/NX-OS pick the newer algorithms first — these
+            // are just fallbacks for old peers. Verified 2026-09-16 against
+            // LAB-F3-AS-01 (10.10.20.211, IOS 15.2 vios_l2) which had been
+            // failing with "Incompatible ssh peer (no acceptable kex algorithm)"
+            // before this change. See gotcha #4 / 16 in docs.
+            algorithms: {
+              kex: [
+                'ecdh-sha2-nistp521',
+                'ecdh-sha2-nistp384',
+                'ecdh-sha2-nistp256',
+                'diffie-hellman-group-exchange-sha256',
+                'diffie-hellman-group14-sha256',
+                'diffie-hellman-group14-sha1',
+                'diffie-hellman-group1-sha1',  // legacy IOS 12.x / 15.x
+              ],
+              cipher: [
+                'aes128-ctr',
+                'aes192-ctr',
+                'aes256-ctr',
+                'aes128-cbc',
+                'aes192-cbc',
+                'aes256-cbc',
+                '3des-cbc',  // very old IOS
+              ],
+              hmac: [
+                'hmac-sha2-512',
+                'hmac-sha2-256',
+                'hmac-sha1',  // legacy IOS
+                'hmac-sha1-96',
+                'hmac-md5',   // very old IOS
+              ],
+            },
           };
 
           const ssh = new SSH2Client();
