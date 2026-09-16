@@ -168,6 +168,12 @@ def detect_vendor(device: DeviceInfo) -> str:
     if vendor in ("arista", "aristaeos", "eos"):
         return "eos"
     if vendor in ("cisco", "ciscoiosxe", "ios-xe", "iosxe", "catalyst"):
+        # Tiebreaker: model field distinguishes plain IOS (IOSv, vios_l2, ISR 800/880,
+        # C870) from IOS-XE (Catalyst 9000, CSR, ASR, ISR 4xxx). Some lab images
+        # return vendor='Cisco' for both — the model keyword is the only signal.
+        # Check plain-IOS keywords first (more specific) before falling through to 'iosxe'.
+        if any(k in model for k in ("vios", "iosv", "isr800", "isr880", "c870", "isr8")):
+            return "ios"
         return "iosxe"
     if vendor in ("cisconexus", "nexus", "nxos", "cisco-nx-os"):
         return "nxos"
