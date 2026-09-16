@@ -510,3 +510,75 @@ export async function fetchEosInterfaceList(host: string): Promise<{
 
   return { ok: true, interfaces, collectMs: Date.now() - started };
 }
+
+/**
+ * Probe an Arista EOS device over eAPI (JSON-RPC over HTTPS) to extract
+ * identity (hostname, vendor, model, version, serial). Used by the discovery
+ * scanner so Arista switches can be marked as `DISCOVERED` and then synced
+ * into inventory without going through the SSH job queue.
+ *
+ * Runs `show version` JSON and pulls `hostname`, `modelName`, `version`,
+ * `serialNumber`. Some EOS versions wrap the result in `{ output: {...} }`,
+ * some return the fields directly at the top level — we handle both.
+ *
+ * Gated on `EOS_API_ENABLED=true`. Returns ok=false immediately when the
+ * flag is off so the parallel fan-out in `discoveryScan.ts` can skip us.
+ */
+export async function probeEosApiIdentity(host: string): Promise<{
+  ok: boolean;
+  fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } | null;
+  raw?: string;
+  error?: string;
+}> {
+  if (!eosApiEnabled()) {
+    return { ok: false, fields: null, error: 'EOS_API_ENABLED=false' };
+  }
+
+  const result = await eosRpc(host, [{ cmd: 'show version', format: 'json' }]);
+  if (!result.ok) {
+    return { ok: false, fields: null, raw: result.raw, error: result.error ?? 'EOS eAPI failed' };
+  }
+
+  const rawParts = [result.raw ?? ''];
+  const arr = result.result ?? [];
+
+  // The eAPI JSON-RPC result is an array of one element per cmd. Some EOS
+  // versions wrap the show version payload in `{ output: {...} }`; others
+  // return the fields directly. Handle both.
+  let data: Record<string, unknown> | null = null;
+  if (arr.length > 0 && arr[0] && typeof arr[0] === 'object') {
+    const first = arr[0] as Record<string, unknown>;
+    if ('output' in first && first.output && typeof first.output === 'object') {
+      data = first.output as Record<string, unknown>;
+    } else {
+      data = first;
+    }
+  }
+
+  if (!data) {
+    return { ok: false, fields: null, raw: rawParts.join('\n'), error: 'EOS show version empty' };
+  }
+
+  const fields: { hostname?: string; vendor: string; model?: string; version?: string; serial?: string } = {
+    vendor: 'Arista',
+  };
+
+  const hostname = data['hostname'];
+  if (typeof hostname === 'string' && hostname.trim()) fields.hostname = hostname.trim();
+
+  const model = data['modelName'] ?? data['model'];
+  if (typeof model === 'string' && model.trim()) fields.model = model.trim();
+
+  const version = data['version'] ?? data['softwareImageVersion'];
+  if (typeof version === 'string' && version.trim()) fields.version = version.trim();
+
+  const serial = data['serialNumber'];
+  if (typeof serial === 'string' && serial.trim()) fields.serial = serial.trim();
+
+  const ok = Boolean(fields.hostname || fields.serial || fields.model);
+  if (!ok) {
+    return { ok: false, fields: null, raw: rawParts.join('\n'), error: 'EOS identity empty' };
+  }
+
+  return { ok: true, fields, raw: rawParts.join('\n') };
+}
