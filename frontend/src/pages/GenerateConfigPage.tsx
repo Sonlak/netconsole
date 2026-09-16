@@ -1436,6 +1436,18 @@ function TemplateTab() {
   const [formFilename, setFormFilename] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [uploadLoading, setUploadLoading] = useState(false);
+
+  // Allowed config-file extensions. Keep this list narrow: actual
+  // config files are plain text regardless of extension, so we only
+  // reject obvious junk (.exe, .pdf, etc) and feed the rest through
+  // the vendor-detection + render step.
+  const ALLOWED_EXTS = ['.txt', '.conf', '.cfg'] as const;
+  const MAX_UPLOAD_BYTES = 2 * 1024 * 1024; // 2 MB - vendor detection + render is O(n)
+  const allowedExtList = ALLOWED_EXTS.join(',');
+  // `accept` attribute: comma-separated extensions + matching MIME types
+  // so the OS file picker filters sensibly in Chrome / Edge / Firefox.
+  const acceptAttr = `${allowedExtList},text/plain,text/x-cisco-config,text/x-junos-config,application/octet-stream`;
 
   const loadTemplates = useCallback(async () => {
     setLoading(true);
@@ -1454,15 +1466,64 @@ function TemplateTab() {
     void loadTemplates();
   }, [loadTemplates]);
 
+  /**
+   * Pre-flight check on a picked file. Runs BEFORE Antd submits the
+   * upload, so we can short-circuit obvious bad picks (binary, wrong
+   * extension, >2MB) without ever calling the render endpoint.
+   *
+   * Returning `false` from a `beforeUpload` tells antd to drop the file
+   * and never call `customRequest`. Returning `Upload.LIST_IGNORE` is the
+   * idiomatic constant for the same thing (it also hides the file from
+   * the upload's file list).
+   */
+  const beforeUpload: UploadProps['beforeUpload'] = (file) => {
+    const f = file as File;
+    const name = (f.name || '').toLowerCase();
+    const dot = name.lastIndexOf('.');
+    const ext = dot >= 0 ? name.slice(dot) : '';
+    if (!ALLOWED_EXTS.includes(ext as (typeof ALLOWED_EXTS)[number])) {
+      message.error(`Unsupported file type "${ext || '(none)'}". Allowed: ${allowedExtList}`);
+      // Returning a rejected promise antd recognises as "blocked" --
+      // falls through to the same code path as the antd `accept` filter.
+      return Upload.LIST_IGNORE;
+    }
+    if (f.size > MAX_UPLOAD_BYTES) {
+      message.error(
+        `File too large (${(f.size / 1024).toFixed(0)} KB). Max ${MAX_UPLOAD_BYTES / 1024} KB.`,
+      );
+      return Upload.LIST_IGNORE;
+    }
+    // Returning true (or `undefined`) lets customRequest run.
+    return true;
+  };
+
   const handleUpload: UploadProps['customRequest'] = async (options) => {
     const { file, onSuccess, onError } = options;
     const txtFile = file as File;
+    setUploadLoading(true);
 
     try {
       const text = await txtFile.text();
+      // Guard against empty or binary-looking content. text() returns ''
+      // for truly empty files; for binary it returns replacement chars
+      // (U+FFFD) at a much higher rate than real configs do.
+      if (!text.trim()) {
+        message.error('File is empty - nothing to render');
+        onError?.(new Error('empty file'));
+        return;
+      }
+      const replacementRatio = (text.match(/\uFFFD/g)?.length ?? 0) / text.length;
+      if (replacementRatio > 0.01) {
+        message.error(
+          'File does not look like text - it may be binary. Pick a .txt/.conf/.cfg export from your device.',
+        );
+        onError?.(new Error('binary content'));
+        return;
+      }
+
       setFormFileContent(text);
       setFormFilename(txtFile.name);
-      
+
       // Auto-detect vendor and render preview
       const { previewRenderConfig } = await import('@/api/generateConfig');
       const result = await previewRenderConfig(text);
@@ -1470,21 +1531,54 @@ function TemplateTab() {
       setPreviewContent(result.rendered);
       setPreviewVendor(result.vendor);
       setPreviewModalOpen(true);
-      
+
+      message.success(`Loaded ${txtFile.name} - vendor detected: ${result.vendor}`);
       onSuccess?.({});
     } catch (err) {
-      onError?.(err as Error);
+      const detail = err instanceof Error ? err.message : 'Could not parse uploaded file';
+      message.error(detail);
+      onError?.(err instanceof Error ? err : new Error(detail));
+    } finally {
+      setUploadLoading(false);
     }
   };
 
-  const openCreateModal = () => {
+  /**
+   * Open the Create-Template modal.
+   *
+   * Two call sites:
+   * - "Create template manually" button → `keepFormState: false` (the
+   *   default). Resets every form field so the user starts blank.
+   * - "Use this config" inside the upload preview → `keepFormState: true`.
+   *   `handleUpload` already populated formContent / formFileContent /
+   *   formFilename from the picked file, and the user's intent is to
+   *   carry that content into the modal. Resetting would discard the
+   *   upload they just made — that was the bug fixed on 2026-09-16.
+   */
+  const openCreateModal = (options: { keepFormState?: boolean } = {}) => {
+    const { keepFormState = false } = options;
     setEditingTemplate(null);
-    setFormName('');
-    setFormDescription('');
-    setFormContent('');
-    setFormFileContent(null);
-    setFormFilename(null);
+    if (!keepFormState) {
+      setFormName('');
+      setFormDescription('');
+      setFormContent('');
+      setFormFileContent(null);
+      setFormFilename(null);
+    }
     setEditModalOpen(true);
+  };
+
+  /**
+   * Called from the upload-preview "Use this config" button.
+   * Closes the preview, then opens the Create modal WITHOUT touching
+   * the form state set by `handleUpload`. The modal will show:
+   * - formName / formDescription: empty (user fills these in)
+   * - formFilename: populated → renders the "Uploaded from: …" alert
+   * - formContent: populated → textarea shows the rendered config
+   */
+  const confirmUseUploadedConfig = () => {
+    setPreviewModalOpen(false);
+    openCreateModal({ keepFormState: true });
   };
 
   const openEditModal = (template: UserTemplate) => {
@@ -1578,20 +1672,27 @@ function TemplateTab() {
         title="Upload new template"
         extra={
           <Upload
-            accept=".txt,.conf,.cfg"
+            accept={acceptAttr}
             showUploadList={false}
+            beforeUpload={beforeUpload}
             customRequest={handleUpload}
           >
-            <Button icon={<UploadOutlined />}>Upload .txt file</Button>
+            <Button
+              icon={<UploadOutlined />}
+              loading={uploadLoading}
+            >
+              Upload config file
+            </Button>
           </Upload>
         }
       >
         <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-          Upload a configuration file (.txt, .conf, .cfg). The system will automatically
-          detect the vendor (Juniper/Cisco/Arista) and standardize the config format.
+          Upload a configuration file ({allowedExtList}, max 2 MB). The system will automatically
+          detect the vendor (Juniper/Cisco/Arista) and standardize the config format before
+          saving as a reusable template.
         </Typography.Paragraph>
         <Space style={{ marginTop: 8 }}>
-          <Button icon={<PlusOutlined />} onClick={openCreateModal}>
+          <Button icon={<PlusOutlined />} onClick={() => openCreateModal()}>
             Create template manually
           </Button>
         </Space>
@@ -1710,10 +1811,7 @@ function TemplateTab() {
             <Button
               type="primary"
               icon={<CloudUploadOutlined />}
-              onClick={() => {
-                setPreviewModalOpen(false);
-                openCreateModal();
-              }}
+              onClick={confirmUseUploadedConfig}
             >
               Use this config
             </Button>
