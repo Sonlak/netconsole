@@ -13,9 +13,6 @@ import { tryCreateDeviceJob } from '../services/deviceOperations.js';
 
 export const jobsRouter = Router();
 
-// ROLLBACK TEST v9: intentional type error to verify auto-rollback
-const testRollback9: string = 999;
-
 /**
  * Worker-only auth. Accepts a Bearer JWT signed with JWT_SECRET whose payload
  * has `role: "worker"`. Returns 401 otherwise.

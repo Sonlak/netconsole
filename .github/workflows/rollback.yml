@@ -66,8 +66,9 @@ env:
   DEPLOY_SERVICES: "backend worker frontend"
   # Last-resort fallback when ALL marker logic fails.
   # Update this when a new "known-good" is confirmed in production.
-  # Currently: 2026-09-15 20:48 "chore: revert v8 TS error - restore service"
-  FALLBACK_SHA: a905fdfb00b4a1fefce56e73fa7ecc0443906ec5
+  # Currently: 2026-09-16 08:20 "fix(rollback): use local file ops + FALLBACK_SHA"
+  # Verified working: Rollback #19 (commit 563f8a9 failed, rollback to 2341643 succeeded in 1m53s).
+  FALLBACK_SHA: 2341643b4e07b2f5d71282d07c421faf91b305a8
   FALLBACK_REF: main
 
 jobs:
