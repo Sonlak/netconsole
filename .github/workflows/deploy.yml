@@ -127,7 +127,13 @@ jobs:
       - name: Sync source to ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          echo "Syncing $GITHUB_WORKSPACE/src -> $DEPLOY_DIR"
+          # Pin working directory to the GitHub Actions checkout workspace.
+          # On the self-hosted runner $HOME leaks a Windows path (C:\Users\...)
+          # which breaks relative-path rsync. Using github.workspace explicitly
+          # avoids that.
+          WORKSPACE_DIR="${{ github.workspace }}"
+          cd "$WORKSPACE_DIR"
+          echo "Syncing $WORKSPACE_DIR/src -> $DEPLOY_DIR"
 
           # Preserve user-managed files & gitignored artefacts on the server.
           # --delete ensures removed files in repo are also removed from server,
