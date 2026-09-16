@@ -215,19 +215,9 @@ jobs:
           path: src
 
       - name: Sync good commit to ${{ env.DEPLOY_DIR }}
-        env:
-          SOURCE_DIR: ${{ github.workspace }}/src
         run: |
           set -euo pipefail
           echo "==> Syncing SHA ${{ steps.marker.outputs.PREV_SHA }} to $DEPLOY_DIR"
-          echo "==> Source: $SOURCE_DIR"
-          if [ ! -d "$SOURCE_DIR" ]; then
-            echo "❌ SOURCE_DIR does not exist: $SOURCE_DIR"
-            echo "--- pwd ---"; pwd
-            echo "--- GITHUB_WORKSPACE ---"; echo "${GITHUB_WORKSPACE:-<unset>}"
-            ls -la "${GITHUB_WORKSPACE:-/nonexistent}" 2>&1 | head -10
-            exit 1
-          fi
           rsync -a --delete \
             --exclude '/.git/hooks/' \
             --exclude '/.git/info/' \
@@ -242,7 +232,7 @@ jobs:
             --exclude '/backups/' \
             --exclude '/.last-deploy-*' \
             --exclude '/.rollback-before-deploy-*' \
-            "$SOURCE_DIR/" "$DEPLOY_DIR/"
+            ./src/ "$DEPLOY_DIR/"
           echo "✅ Synced to $DEPLOY_DIR"
 
       - name: Rebuild and restart app services

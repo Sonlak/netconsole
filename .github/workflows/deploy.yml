@@ -125,22 +125,9 @@ jobs:
           echo "💾 Pre-deploy rollback marker saved: sha=$CURRENT_SHA ref=$CURRENT_REF"
 
       - name: Sync source to ${{ env.DEPLOY_DIR }}
-        env:
-          SOURCE_DIR: ${{ github.workspace }}/src
         run: |
           set -euo pipefail
-          echo "Syncing $SOURCE_DIR -> $DEPLOY_DIR"
-          if [ ! -d "$SOURCE_DIR" ]; then
-            echo "❌ SOURCE_DIR does not exist: $SOURCE_DIR"
-            echo "--- pwd ---"; pwd
-            echo "--- github.workspace ---"; echo "${GITHUB_WORKSPACE:-<unset>}"
-            echo "--- ls github workspace ---"; ls -la "${GITHUB_WORKSPACE:-/nonexistent}" 2>&1 | head -10
-            exit 1
-          fi
-          if [ ! -d "$DEPLOY_DIR" ]; then
-            echo "❌ DEPLOY_DIR does not exist: $DEPLOY_DIR"
-            exit 1
-          fi
+          echo "Syncing $GITHUB_WORKSPACE/src -> $DEPLOY_DIR"
 
           # Preserve user-managed files & gitignored artefacts on the server.
           # --delete ensures removed files in repo are also removed from server,
@@ -162,7 +149,7 @@ jobs:
             --exclude '*.pid' \
             --exclude '/logs/' \
             --exclude '/backups/' \
-            "$SOURCE_DIR/" "$DEPLOY_DIR/"
+            ./src/ "$DEPLOY_DIR/"
 
           echo "--- Synced. DEPLOY_DIR contents:"
           ls -la "$DEPLOY_DIR" | head -25
