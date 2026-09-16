@@ -9,17 +9,16 @@
 #
 # TRIGGER CHAIN:
 #   Bad push → deploy.yml (fails) → triggers rollback.yml (from main branch)
-#   → reads marker from VPS → rebuilds good commit → service restored
+#   → resolves good commit → rebuilds → service restored
 #
-# MARKER LOGIC:
-#   deploy.yml saves .last-deploy-sha BEFORE deploying. If deploy succeeds,
-#   it updates .rollback-before-deploy-sha to the good SHA. If deploy fails,
-#   rollback.yml reads .rollback-before-deploy-sha (the good pre-deploy SHA).
-#
-# PRIORITIES:
-#   1. .rollback-before-deploy-sha — set by the PREVIOUS successful deploy
-#   2. .last-deploy-sha — current VPS HEAD (from .git/), fallback only
-#   3. git rev-parse HEAD — last resort, same as .last-deploy-sha
+# MARKER RESOLUTION (priority order, LOCAL ops — runner IS the VPS):
+#   The self-hosted runner runs on the VPS itself. Deploy steps already use
+#   `cat $DEPLOY_DIR/.last-deploy-sha` directly. The rollback follows the
+#   same pattern — no SSH, no vars, no external dependencies.
+#   1. .rollback-before-deploy-sha — anchor set by the PREVIOUS successful deploy
+#   2. .last-deploy-sha            — current VPS state
+#   3. git HEAD on /opt/netconsole  — fresh VPS, no marker yet
+#   4. FALLBACK_SHA (hardcoded)    — last resort when markers are corrupt
 #
 # SCHEMA DRIFT SAFETY (fixed 2026-09-15):
 #   The backend container now uses scripts/docker-start.sh, which runs
@@ -28,6 +27,12 @@
 #   service up — even when the rolled-back schema.prisma differs from the
 #   DB's current schema. Field-level API errors may occur until the next
 #   correct deploy, but the service is live and healthchecks pass.
+#
+# HISTORY (root cause of 5 consecutive silent fails on this step before 2026-09-16):
+#   Earlier revisions SSH'd from the runner to itself (vars.VPS_HOST) to read
+#   marker files. This fails when vars are unset OR when self-SSH lacks key
+#   auth — both happen in practice. Fix: read markers LOCALLY, same as
+#   deploy.yml does.
 # =============================================================================
 name: Rollback
 
@@ -37,8 +42,7 @@ on:
     types: [completed]
     branches: [main]
   # Allow manual rollback from GitHub Actions UI.
-  # Useful when the auto-rollback cannot reach the VPS (e.g. SSH auth issue,
-  # marker file missing) and ops needs to specify an exact known-good SHA.
+  # Useful when ops needs to roll back to an arbitrary known-good ref.
   workflow_dispatch:
     inputs:
       ref:
@@ -60,185 +64,146 @@ env:
   COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
   COMPOSE_PROJECT: netconsole
   DEPLOY_SERVICES: "backend worker frontend"
+  # Last-resort fallback when ALL marker logic fails.
+  # Update this when a new "known-good" is confirmed in production.
+  # Currently: 2026-09-15 20:48 "chore: revert v8 TS error - restore service"
+  FALLBACK_SHA: a905fdfb00b4a1fefce56e73fa7ecc0443906ec5
+  FALLBACK_REF: main
 
 jobs:
   rollback:
     name: Auto-rollback to last known-good
     runs-on: self-hosted
-    # Only trigger on failure of the Deploy workflow.
-    if: github.event.workflow_run.conclusion == 'failure'
+    # Run when:
+    #   - workflow_run trigger AND Deploy failed (auto path)
+    #   - OR workflow_dispatch (manual path — no workflow_run context exists)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure')
     timeout-minutes: 20
-    env:
-      # VPS connection details from repo vars. Empty if not configured --
-      # the marker step checks and exits with a useful error.
-      VPS_HOST: ${{ vars.VPS_HOST }}
-      VPS_USER: ${{ vars.VPS_USER }}
-      SSH_OPTS: -o ConnectTimeout=15 -o StrictHostKeyChecking=no -o BatchMode=yes
 
     steps:
       - name: Set up job
         run: |
           echo "## ⏪ Auto-rollback triggered by failed Deploy run"
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⏪ **Auto-rollback triggered** by failed Deploy run" >> $GITHUB_STEP_SUMMARY
+          echo "⏪ **Auto-rollback triggered**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Triggering run: [${{ github.event.workflow_run.name }} #${GITHUB_EVENT_WORKFLOW_RUN_ID}](https://github.com/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})" >> $GITHUB_STEP_SUMMARY
-          echo "Triggering commit: \`${{ github.event.workflow_run.head_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "Triggering run: [${{ github.event.workflow_run.name }} #${GITHUB_EVENT_WORKFLOW_RUN_ID}](https://github.com/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }})" >> $GITHUB_STEP_SUMMARY
+            echo "Triggering commit: \`${{ github.event.workflow_run.head_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Trigger: manual workflow_dispatch" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow file SHA:** \`${{ github.sha }}\` (rollback.yml is always read from main, never from failing commit)" >> $GITHUB_STEP_SUMMARY
 
       - name: Display rollback target info
         run: |
-          echo "==> Rollback target: ${{ env.DEPLOY_DIR }}"
+          echo "==> Rollback target: $DEPLOY_DIR"
           echo "==> This workflow file is from: ${{ github.ref }} (${{ github.sha }})"
-          echo "==> Workflow run: ${{ github.event.workflow_run.html_url }}"
+          echo "==> Runner hostname: $(hostname)"
+          echo "==> Working dir: $(pwd)"
 
-      # ── SSH + git access ──────────────────────────────────────────────────────
-      - name: Configure SSH known hosts + key
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ vars.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
-          ssh-keyscan -H github.com >> ~/.ssh/known_hosts 2>/dev/null || true
-          # Runner stores deploy key at ~runner/.ssh/id_ed25519
-          # Retry a few times in case runner is still spinning up from previous job.
-          for attempt in 1 2 3; do
-            if [ -f ~/.ssh/id_ed25519 ]; then
-              chmod 600 ~/.ssh/id_ed25519
-              echo "✅ SSH key found (~/.ssh/id_ed25519) on attempt $attempt"
-              break
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "  SSH key not ready (attempt $attempt/3), waiting 5s..."
-              sleep 5
-            fi
-          done
-
-      # Resolve rollback target.
+      # ── Resolve the good commit to roll back to ────────────────────────────────
       #
-      # WHY THIS STEP PREVIOUSLY FAILED (4 consecutive attempts: #6, #8, #11, #13):
-      #   Root cause: `${{ inputs.X }}` referenced INSIDE the `run:` script body
-      #   fails to render in `workflow_run` context (no `inputs` exists), which
-      #   GitHub Actions treats as a fatal template error → step exits in <1s
-      #   with NO log output. `vars.X || ''` similarly may fail in some
-      #   template renderers. The fix below:
-      #     1. ALL template refs go in step-level `env:` (not `run:` body).
-      #     2. Script body uses bash vars (${VAR}) only.
-      #     3. Inputs are read from $ROLLBACK_REF / $CLEAR_MARKERS env vars
-      #        (which render to '' when undefined).
-      #     4. Manual workflow_dispatch path uses bash check on $ROLLBACK_REF,
-      #        not on `${{ github.event_name }}`.
+      # Pure local file ops. No SSH, no vars, no external dependencies.
+      # The runner is the VPS — deploy.yml already proves direct file access works.
       - name: Read last known-good marker from VPS
         id: marker
         env:
-          # All template refs -- safe to render to '' when undefined.
           ROLLBACK_REF: ${{ inputs.ref }}
           CLEAR_MARKERS: ${{ inputs.clear_markers }}
-          VPS_HOST: ${{ vars.VPS_HOST }}
-          VPS_USER: ${{ vars.VPS_USER }}
-          DEPLOY_DIR: /opt/netconsole
         run: |
-          # No `set -e` -- we want every error to print.
-          # No `set -u` -- inputs may be empty.
-          # SSH_OPTS env from job-level.
+          set -uo pipefail
 
-          {
-            echo "==> Rollback context debug"
-            echo "  VPS_HOST             = '${VPS_HOST:-<empty>}'"
-            echo "  VPS_USER             = '${VPS_USER:-<empty>}'"
-            echo "  DEPLOY_DIR           = '${DEPLOY_DIR:-<empty>}'"
-            echo "  ROLLBACK_REF input   = '${ROLLBACK_REF:-<empty>}'"
-            echo "  CLEAR_MARKERS input  = '${CLEAR_MARKERS:-<empty>}'"
-          }
+          echo "==> Marker resolution context"
+          echo "  DEPLOY_DIR          = ${DEPLOY_DIR:-<empty>}"
+          echo "  Runner              = $(hostname)"
+          echo "  ROLLBACK_REF input  = '${ROLLBACK_REF:-<empty>}'"
+          echo "  CLEAR_MARKERS input = '${CLEAR_MARKERS:-<empty>}'"
+          echo "  FALLBACK_SHA        = ${FALLBACK_SHA:-<empty>}"
+          echo "  /opt/netconsole exists: $([ -d "$DEPLOY_DIR" ] && echo yes || echo no)"
 
-          if [ -z "${VPS_HOST:-}" ] || [ -z "${VPS_USER:-}" ]; then
-            echo "::error::VPS_HOST or VPS_USER is empty in this job context."
-            echo "::error::Manual recovery: trigger this workflow from the UI with ref=<known-good-sha> input."
-            exit 1
+          # Clear markers if requested (workflow_dispatch input)
+          if [ "${CLEAR_MARKERS:-}" = "true" ]; then
+            echo "==> Clearing local rollback markers as requested"
+            rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
+                  "$DEPLOY_DIR/.rollback-before-deploy-ref" \
+                  "$DEPLOY_DIR/.last-deploy-sha" \
+                  "$DEPLOY_DIR/.last-deploy-ref" || true
           fi
 
-          SSH_TARGET="${VPS_USER}@${VPS_HOST}"
-
-          # --- Path 1: manual workflow_dispatch with explicit ref ---
-          # Check the bash env var, not a template expression.
+          # --- Path 0: manual workflow_dispatch with explicit ref (highest priority) ---
           if [ -n "${ROLLBACK_REF:-}" ]; then
             echo "==> Manual rollback: using ref from input: $ROLLBACK_REF"
             PREV_SHA="$ROLLBACK_REF"
             PREV_REF="manual-dispatch"
+            PREV_SOURCE="workflow_dispatch input"
+            echo "✅ Resolved via $PREV_SOURCE"
             {
               echo "PREV_SHA=$PREV_SHA"
               echo "PREV_REF=$PREV_REF"
+              echo "PREV_SOURCE=$PREV_SOURCE"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if [ "${CLEAR_MARKERS:-}" = "true" ]; then
-            echo "==> Clearing VPS rollback markers as requested"
-            ssh $SSH_OPTS "$SSH_TARGET" \
-              'rm -f "$DEPLOY_DIR/.rollback-before-deploy-sha" \
-                     "$DEPLOY_DIR/.rollback-before-deploy-ref" \
-                     "$DEPLOY_DIR/.last-deploy-sha" \
-                     "$DEPLOY_DIR/.last-deploy-ref"' || true
-          fi
-
-          # --- Verify VPS is reachable ---
-          echo "==> Verifying SSH to $SSH_TARGET..."
-          if ! ssh $SSH_OPTS "$SSH_TARGET" 'mkdir -p "$DEPLOY_DIR" && echo "  SSH OK at $(date -u +%FT%TZ)"'; then
-            echo "::error::SSH to VPS failed. Cannot read rollback marker."
-            echo "::error::Manual recovery: trigger this workflow from the UI with ref=<known-good-sha> input."
-            exit 1
-          fi
-
           PREV_SHA=""
           PREV_REF=""
+          PREV_SOURCE=""
 
-          # Priority 1: rollback-before-deploy-sha
-          if ssh $SSH_OPTS "$SSH_TARGET" \
-                "[ -f \"\$DEPLOY_DIR/.rollback-before-deploy-sha\" ] && \
-                 [ -s \"\$DEPLOY_DIR/.rollback-before-deploy-sha\" ]"; then
-            PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
-              'cat "$DEPLOY_DIR/.rollback-before-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
-            PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
-              'cat "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
-            if [ -n "$PREV_SHA" ]; then
-              echo "✅ Using rollback-before-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
+          # --- Path 1: .rollback-before-deploy-sha (anchor set by previous good deploy) ---
+          if [ -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ] && [ -s "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+            PREV_SHA=$(tr -d '[:space:]' < "$DEPLOY_DIR/.rollback-before-deploy-sha")
+            PREV_REF=$(tr -d '[:space:]' < "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || echo "main")
+            PREV_SOURCE=".rollback-before-deploy-sha (local file)"
+          fi
+
+          # --- Path 2: .last-deploy-sha (current VPS state) ---
+          if [ -z "$PREV_SHA" ]; then
+            if [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
+              PREV_SHA=$(tr -d '[:space:]' < "$DEPLOY_DIR/.last-deploy-sha")
+              PREV_REF=$(tr -d '[:space:]' < "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null || echo "main")
+              PREV_SOURCE=".last-deploy-sha (local file)"
             fi
           fi
 
-          # Priority 2: last-deploy-sha
+          # --- Path 3: git HEAD on /opt/netconsole ---
           if [ -z "$PREV_SHA" ]; then
-            if ssh $SSH_OPTS "$SSH_TARGET" \
-                  "[ -f \"\$DEPLOY_DIR/.last-deploy-sha\" ] && \
-                   [ -s \"\$DEPLOY_DIR/.last-deploy-sha\" ]"; then
-              PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
-                'cat "$DEPLOY_DIR/.last-deploy-sha" 2>/dev/null | tr -d "[:space:]"')
-              PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
-                'cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null | tr -d "[:space:]"' || echo "unknown")
-              if [ -n "$PREV_SHA" ]; then
-                echo "✅ Using last-deploy marker: sha=$PREV_SHA ref=$PREV_REF"
-              fi
+            if [ -d "$DEPLOY_DIR/.git" ]; then
+              PREV_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "")
+              PREV_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+              PREV_SOURCE="git HEAD on /opt/netconsole"
             fi
           fi
 
-          # Priority 3: git HEAD on VPS (fresh VPS with no marker)
-          if [ -z "$PREV_SHA" ]; then
-            PREV_SHA=$(ssh $SSH_OPTS "$SSH_TARGET" \
-              'cd "$DEPLOY_DIR" && git rev-parse HEAD 2>/dev/null' || echo "")
-            PREV_REF=$(ssh $SSH_OPTS "$SSH_TARGET" \
-              'cd "$DEPLOY_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null' || echo "main")
-            if [ -n "$PREV_SHA" ]; then
-              echo "✅ Using VPS git HEAD: sha=$PREV_SHA ref=$PREV_REF"
+          # --- Path 4: hardcoded FALLBACK_SHA (last resort) ---
+          if [ -z "$PREV_SHA" ] || [ "$PREV_SHA" = "unknown" ]; then
+            if [ -n "${FALLBACK_SHA:-}" ]; then
+              PREV_SHA="$FALLBACK_SHA"
+              PREV_REF="${FALLBACK_REF:-main}"
+              PREV_SOURCE="hardcoded FALLBACK_SHA (markers missing/corrupt)"
+              echo "::warning::All marker sources failed; using hardcoded fallback. Update FALLBACK_SHA in rollback.yml if needed."
             fi
           fi
 
           if [ -z "$PREV_SHA" ]; then
-            echo "::error::No rollback marker found on VPS at $DEPLOY_DIR and git repo unavailable."
-            echo "::error::Re-run this workflow with workflow_dispatch and provide ref=<sha> input."
+            echo "::error::FATAL: no rollback target resolvable from any source (marker files, git, FALLBACK_SHA)."
+            echo "::error::This should never happen — FALLBACK_SHA is hardcoded in rollback.yml."
+            echo "::error::Check that the env: FALLBACK_SHA rendered correctly above."
             exit 1
           fi
+
+          echo "✅ Resolved rollback target:"
+          echo "    PREV_SHA    = $PREV_SHA"
+          echo "    PREV_REF    = $PREV_REF"
+          echo "    PREV_SOURCE = $PREV_SOURCE"
 
           {
             echo "PREV_SHA=$PREV_SHA"
             echo "PREV_REF=$PREV_REF"
+            echo "PREV_SOURCE=$PREV_SOURCE"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout previous (good) commit
@@ -272,17 +237,44 @@ jobs:
       - name: Rebuild and restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
-          set -euo pipefail
-          # Safe rebuild: use `up --build` directly without stop+rm.
-          # Compose recreates only containers whose image needs rebuilding.
-          # If build fails, old containers STAY RUNNING — service preserved.
+          set -uo pipefail
+          # Safe rebuild: try with --build first (the normal path). If the build
+          # itself fails (e.g. the previous SHA's code no longer builds), fall
+          # back to recreating containers from cached images without rebuilding.
+          # The cached image still has the OLD compiled binary — that's exactly
+          # what we want: code from the previous successful deploy, not the
+          # failing commit's code.
           #
           # The backend startup script (scripts/docker-start.sh) is resilient:
           # it never blocks container start even if prisma db push fails due
           # to schema drift between the rolled-back schema.prisma and the DB.
-          echo "==> Building + recreating containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-            up -d --build --no-deps $DEPLOY_SERVICES
+          echo "==> Building + recreating containers (attempt 1: with --build)..."
+          if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+               up -d --build --no-deps $DEPLOY_SERVICES; then
+            echo "✅ Build + recreate succeeded"
+            exit 0
+          fi
+
+          echo "::warning::Build failed — falling back to recreate from cached images"
+          echo "==> Attempt 2: recreate without --build (use cached image for the rolled-back SHA)"
+          if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+               up -d --no-deps $DEPLOY_SERVICES; then
+            echo "✅ Recreate from cached images succeeded"
+            exit 0
+          fi
+
+          echo "::warning::Recreate failed — trying compose restart as last resort"
+          echo "==> Attempt 3: restart existing containers (if any survived)"
+          if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+               restart $DEPLOY_SERVICES 2>&1; then
+            echo "✅ Restart succeeded"
+            exit 0
+          fi
+
+          echo "::error::All recovery attempts failed. Containers are down."
+          echo "::error::Manual fix: ssh to VPS and run 'cd /opt/netconsole && docker compose -p netconsole -f docker-compose.app.yml up -d --build'"
+          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps || true
+          exit 1
 
       - name: Health-check restored deploy
         run: |
@@ -308,18 +300,16 @@ jobs:
 
       - name: Update deploy marker after rollback
         run: |
-          set -euo pipefail
-          SSH_TARGET="${VPS_USER}@${VPS_HOST}"
-          ssh ${{ env.SSH_OPTS }} "$SSH_TARGET" \
-            'mkdir -p "$DEPLOY_DIR"
-             printf "%s\n" "$1" > "$DEPLOY_DIR/.last-deploy-sha"
-             printf "%s\n" "$2" > "$DEPLOY_DIR/.last-deploy-ref"
-             cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
-             cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"' \
-            _ \
-            "${{ steps.marker.outputs.PREV_SHA }}" \
-            "${{ steps.marker.outputs.PREV_REF }}"
-          echo "✅ Marker updated on VPS"
+          set -uo pipefail
+          # Pure local writes (runner IS the VPS — see deploy.yml for the same pattern).
+          mkdir -p "$DEPLOY_DIR"
+          printf '%s\n' "${{ steps.marker.outputs.PREV_SHA }}" > "$DEPLOY_DIR/.last-deploy-sha"
+          printf '%s\n' "${{ steps.marker.outputs.PREV_REF }}" > "$DEPLOY_DIR/.last-deploy-ref"
+          cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+          cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
+          echo "✅ Marker updated on VPS:"
+          echo "    .last-deploy-sha           = $(cat "$DEPLOY_DIR/.last-deploy-sha")"
+          echo "    .rollback-before-deploy-sha= $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
 
       - name: Final state after rollback
         working-directory: ${{ env.DEPLOY_DIR }}
@@ -327,7 +317,11 @@ jobs:
           echo "## ⏪ Auto-rollback complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Now running: \`${{ steps.marker.outputs.PREV_SHA }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "(was \`${{ steps.marker.outputs.PREV_REF }}\`, failed at \`${{ github.event.workflow_run.head_sha }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "Previous ref: \`${{ steps.marker.outputs.PREV_REF }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Marker source: \`${{ steps.marker.outputs.PREV_SOURCE }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "Failed commit (triggered rollback): \`${{ github.event.workflow_run.head_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Container status" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
