@@ -518,8 +518,9 @@ export async function fetchEosInterfaceList(host: string): Promise<{
  * into inventory without going through the SSH job queue.
  *
  * Runs `show version` JSON and pulls `hostname`, `modelName`, `version`,
- * `serialNumber`. Some EOS versions wrap the result in `{ output: {...} }`,
- * some return the fields directly at the top level — we handle both.
+ * `serialNumber`. If `hostname` is absent from `show version` (some EOS
+ * builds omit it) we fall back to `show hostname` which always returns a
+ * hostname string on any eAPI-enabled EOS version.
  *
  * Gated on `EOS_API_ENABLED=true`. Returns ok=false immediately when the
  * flag is off so the parallel fan-out in `discoveryScan.ts` can skip us.
@@ -564,7 +565,21 @@ export async function probeEosApiIdentity(host: string): Promise<{
   };
 
   const hostname = data['hostname'];
-  if (typeof hostname === 'string' && hostname.trim()) fields.hostname = hostname.trim();
+  if (typeof hostname === 'string' && hostname.trim()) {
+    fields.hostname = hostname.trim();
+  } else {
+    // Fallback: `show hostname` is guaranteed to return { hostname: "..." }
+    // on any EOS version with eAPI. Some EOS builds omit `hostname` from
+    // `show version` but always expose it via `show hostname`.
+    const hostnameResult = await eosRpc(host, [{ cmd: 'show hostname', format: 'json' }]);
+    if (hostnameResult.ok && hostnameResult.result && hostnameResult.result.length > 0) {
+      const hnData = hostnameResult.result[0] as Record<string, unknown>;
+      const hn = hnData['hostname'];
+      if (typeof hn === 'string' && hn.trim()) {
+        fields.hostname = hn.trim();
+      }
+    }
+  }
 
   const model = data['modelName'] ?? data['model'];
   if (typeof model === 'string' && model.trim()) fields.model = model.trim();
