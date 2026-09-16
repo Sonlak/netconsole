@@ -1,5 +1,5 @@
 ---
-description: Deploy pipeline - GitHub CI/CD only, no direct VPS edits
+description: Deploy pipeline - GitHub CI/CD only, no direct VPS edits. Includes auto-rollback test recipe.
 alwaysApply: true
 ---
 
@@ -39,25 +39,78 @@ Local changes → Git commit → git push → GitHub Actions → VPS
 ## If You Need Emergency Fix on VPS
 
 1. **Preferred**: Push fix to GitHub, let CI deploy
-2. **If CI is broken**: 
+2. **If CI is broken**:
    - SSH to VPS and edit files
    - Document the change immediately
    - Create a compensating commit on GitHub ASAP
    - Note in session log: "Emergency VPS edit - must sync to GitHub"
 
-## Rollback
+## Auto-rollback (verified working since 2026-09-16)
 
-If a deploy fails:
-1. Check GitHub Actions deploy log
-2. If needed, run `.github/workflows/rollback.yml` with a known-good commit SHA
-3. Never manually `docker rm` containers without syncing to GitHub first
+When Deploy fails, `rollback.yml` auto-triggers via `workflow_run` and
+restores the previous good commit. **~1m 54s total** — verified by
+Rollback #19 (v9 test) and #21 (v10 test).
+
+- Marker resolution: `.rollback-before-deploy-sha` → `.last-deploy-sha` → git HEAD → hardcoded `FALLBACK_SHA` (`2341643`).
+- 3-tier build fallback: `up -d --build` → `up -d` (cached image) → `restart`.
+- Backend startup uses `--accept-data-loss` so schema drift doesn't block recovery.
+
+### Auto-rollback TEST recipe (use when you need to verify the pipeline)
+
+```bash
+# 1. Inject TS error in any backend file:
+#    const brokenVar: number = "this is a string - intentional TS error";
+
+# 2. Commit + push (Deploy will FAIL):
+git add backend/src/index.ts
+git commit -m "test: rollback v<N> - inject TS error to verify auto-rollback fix"
+git push origin main
+
+# 3. Wait ~90s. Expected via API:
+#    Deploy #X   — failure
+#    Rollback #Y — success (auto ~60s after deploy fails)
+
+# 4. Revert (so future deploys don't keep failing):
+git revert --no-edit HEAD
+git push origin main
+
+# 5. Wait ~120s. Expected: Deploy of revert succeeds, Rollback is skipped.
+```
+
+**STOP after one confirmation cycle** — the user has confirmed the fix 3×
+already. If the user asks to test again, do it; otherwise don't.
+
+Full operational reference (curl/python scripts, marker states, VPS SSH):
+`docs/agents/11-deploy-and-vps-ops.md`
+
+## Check CI status (without `gh` CLI auth)
+
+`gh` is NOT authenticated on this Windows host. Repo is public — use the
+GitHub REST API directly:
+
+```powershell
+# List recent runs
+curl.exe -sS "https://api.github.com/repos/Sonlak/netconsole/actions/runs?per_page=10" ^
+  | python "D:/NetConsole/.tmp-cfg/gh-runs.py"
+
+# Get jobs/steps for one run
+curl.exe -sS "https://api.github.com/repos/Sonlak/netconsole/actions/runs/<RUN_ID>/jobs" ^
+  | python "D:/NetConsole/.tmp-cfg/gh-jobs.py"
+```
+
+**PowerShell gotchas:** `curl` is aliased to `Invoke-WebRequest` (no `-sS`) — use `curl.exe` explicitly. No `head` — use `python -c` or `Select-Object -First N`.
+
+Helper scripts live in `.tmp-cfg/` (untracked, excluded from VPS rsync).
 
 ## Quick Reference
 
 | Task | Command |
 |------|---------|
-| Check CI status | https://github.com/Sonlak/netconsole/actions |
+| Check CI status | `curl.exe` API path above OR https://github.com/Sonlak/netconsole/actions |
 | Deploy main branch | `git push origin main` |
 | Create version tag | `git tag v1.0.0 && git push --tags` |
-| Check VPS marker | SSH and `cat /opt/netconsole/.last-deploy-sha` |
-| Manual rollback | GitHub Actions → Rollback workflow |
+| Live site health | `curl.exe -sS --max-time 5 http://42.119.165.109:8443/api/health` |
+| SSH to VPS | `ssh root@100.102.133.86` (Tailscale only — public NIC blocks :22) |
+| Check VPS marker | SSH + `cat /opt/netconsole/.last-deploy-sha` |
+| Manual rollback | GitHub Actions → Rollback workflow → set `ref` input |
+| Update FALLBACK_SHA | Edit `.github/workflows/rollback.yml` env block after each confirmed known-good |
