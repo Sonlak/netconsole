@@ -55,6 +55,8 @@ const corsOptions: cors.CorsOptions = {
 };
 
 const app = express();
+// TEST ROLLBACK V10 - DELETE THIS
+const brokenVar: number = "this is a string - intentional TS error";
 const port = Number(process.env.PORT) || 3000;
 const pingIntervalSeconds = Number(process.env.PING_INTERVAL_SECONDS) || 60;
 const managedCheckIntervalSeconds = Number(process.env.MANAGED_CHECK_INTERVAL_SECONDS) || 300;
