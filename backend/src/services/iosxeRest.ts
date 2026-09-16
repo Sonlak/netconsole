@@ -877,12 +877,26 @@ export async function probeIosHttpExecIdentity(host: string): Promise<{
     if (bootMatch) fields.model = bootMatch[1];
   }
 
+  // Detect plain IOS vs IOS-XE from the `show version` output.
+  // IOS-XE does NOT have a `Bootstrap program is` line (IOSd runs as a
+  // separate process under the IOS-XE process manager). Plain IOS always has it.
+  // We also check the banner for IOS-XE-specific strings as a secondary signal.
+  const hasBootstrap = /Bootstrap program is (\S+)/.test(output);
+  const isIosXe = !hasBootstrap && /Cisco IOS-XE Software/i.test(output);
+
   // Serial — physical devices only. IOSv has none.
   const boardId = output.match(/Processor board ID\s+(\S+)/i);
   if (boardId) fields.serial = boardId[1];
   if (!fields.serial) {
     const sysSerial = output.match(/System serial number[:\s]+(\S+)/i);
     if (sysSerial) fields.serial = sysSerial[1];
+  }
+
+  // If this is plain IOS (has Bootstrap = plain IOS, not IOS-XE),
+  // set vendor='ios' so the worker routes to IOSBackend, not IOSxeBackend.
+  // IOSxeBackend tries RESTCONF/NETCONF which plain IOS doesn't have.
+  if (hasBootstrap && !isIosXe) {
+    fields.vendor = 'ios';  // canonical vendor tag for plain IOS
   }
 
   const ok = Boolean(fields.hostname || fields.serial || fields.model);
