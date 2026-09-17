@@ -113,7 +113,12 @@ function shortName(name: string, site: string): string {
 }
 
 function matchDevice(nodes: FabricNode[], token: string): FabricNode | null {
-  const key = token.replace(/^SW[-_]/i, '').replace(/_/g, '-').toUpperCase();
+  // LLDP TLVs may carry the device's FQDN (e.g. "LAB-F3-AS-02.lab.sacombank.com")
+  // when the IOS device has `ip domain-name lab.sacombank.com`. Strip everything
+  // after the first dot so the matcher compares against the bare hostname
+  // stored in our inventory (Device.name / Device.shortName).
+  const bare = (token || '').split('.', 1)[0];
+  const key = bare.replace(/^SW[-_]/i, '').replace(/_/g, '-').toUpperCase();
   const candidates = nodes.filter((node) => {
     const n = node.name.toUpperCase().replace(/_/g, '-');
     const short = node.shortName.toUpperCase().replace(/_/g, '-');
