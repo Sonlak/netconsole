@@ -992,7 +992,11 @@ def _parse_ios_lldp(output: str) -> list[dict[str, str]]:
     for m in _LLDP_ENTRY_RE.finditer(text):
         local_port = m.group("local") or ""
         chassis_id = m.group("chassis") or ""
-        remote_port = m.group("port") or ""
+        port_id = m.group("port") or ""
+        port_desc = (m.group("port_desc") or "").strip()
+        # Prefer the full Port Description (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5);
+        # fall back to Port ID when Description is absent.
+        remote_port = port_desc if port_desc else port_id
         remote_device = m.group("sysname") or chassis_id
         neighbors.append({
             "localPort": local_port,

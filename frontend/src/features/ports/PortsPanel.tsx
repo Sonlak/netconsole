@@ -246,7 +246,26 @@ export function PortsPanel({
       render: (_value, record) => record.accessVlan || '—',
     },
     { title: 'Address', dataIndex: 'address', width: 160, render: (value?: string) => (value ? <IpAddress value={value} /> : '—') },
-    { title: 'Description', dataIndex: 'description', ellipsis: true, render: (value?: string) => value || '—' },
+    {
+      title: 'Description',
+      dataIndex: 'description',
+      width: 240,
+      ellipsis: true,
+      render: (_value: string | undefined, record: DeviceInterface) => {
+        // Prefer the LLDP link name (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5) over
+        // the device-set interface description so fabric link names are visible.
+        const linkName = record.remotePort;
+        const ifaceDesc = record.description;
+        if (linkName) {
+          return (
+            <Tooltip title={linkName}>
+              <span>{linkName}</span>
+            </Tooltip>
+          );
+        }
+        return ifaceDesc || '—';
+      },
+    },
     {
       title: '',
       width: 140,

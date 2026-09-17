@@ -103,8 +103,57 @@ class GetInterfacesTask(BaseTask):
         interfaces_result = _backend(device).get_interfaces(device)
         # Collect LLDP neighbours (the ground-truth link map for fabric topology)
         lldp_result = _backend(device).get_lldp(device)
-        # Merge LLDP into the interfaces result so both flow through in one job
-        interfaces_result["lldpNeighbors"] = lldp_result.get("neighbors", [])
+        # Build a lookup: normalize LLDP localPort to a short key for matching.
+        # IOS: "Gi0/0" → "gi00"; IOS-XE: "Gi0/0/1" → "gi0001";
+        # Juniper: "ge-0/0/1" → "ge0001"; EOS: "Et1" → "et1".
+        neighbors = lldp_result.get("neighbors", [])
+
+        def _norm_key(port: str) -> str:
+            # Strip common type prefixes so abbreviated LLDP names match full
+            # interface names (e.g. "Gi0/0" ↔ "GigabitEthernet0/0").
+            p = port.lower()
+            for prefix in (
+                "gigabitethernet",
+                "fastethernet",
+                "ten gigabitethernet",
+                "tengigabitethernet",
+                "twentyfivegige",
+                "fiftygige",
+                "hundredgige",
+                "ethernet",
+                "loopback",
+                "port-channel",
+                "vlan",
+                "nve",
+                "management",
+                "service-engine",
+            ):
+                if p.startswith(prefix):
+                    p = p[len(prefix):]
+                    break
+            return p.replace("/", "").replace(".", "")
+
+        lldp_by_iface: dict[str, dict[str, str]] = {}
+        for n in neighbors:
+            local = n.get("localPort") or ""
+            key = _norm_key(local)
+            if key and key not in lldp_by_iface:
+                lldp_by_iface[key] = n
+
+        # Merge LLDP data into each interface row so the frontend can display
+        # the full link name (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5) without a
+        # separate join.
+        for iface in interfaces_result.get("interfaces", []):
+            name = iface.get("name") or ""
+            key = _norm_key(name)
+            n = lldp_by_iface.get(key)
+            if n:
+                iface["remoteDeviceId"] = n.get("remoteDeviceId", "")
+                iface["remotePort"] = n.get("remotePort", "")
+                iface["chassisId"] = n.get("chassisId", "")
+
+        # Keep the raw neighbours array too for callers that want it.
+        interfaces_result["lldpNeighbors"] = neighbors
         if lldp_result.get("implemented"):
             interfaces_result["lldpSource"] = lldp_result.get("source")
             interfaces_result["lldpMessage"] = lldp_result.get("message")

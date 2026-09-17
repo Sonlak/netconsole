@@ -8,6 +8,10 @@ export type DeviceInterface = {
   address?: string;
   mtu?: string;
   speed?: string;
+  /** LLDP neighbour on this port (merged at collection time) */
+  remoteDeviceId?: string;
+  remotePort?: string;
+  chassisId?: string;
 };
 
 export type InterfaceDeviceOption = {
