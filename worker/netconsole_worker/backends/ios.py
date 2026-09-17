@@ -420,13 +420,18 @@ class IOSBackend(DeviceBackend):
                 "source": None,
                 "message": "IOS_HTTP enabled=false",
             }
+        # `show interfaces description` returns the FULL configured
+        # description (no fixed-width column truncation), unlike
+        # `show interfaces status` whose "Name" column truncates at
+        # ~20 chars. The Ports panel needs the full link label
+        # (e.g. "LINK_TO_SW-F6-DS-01_ge-0/0/5"), so prefer this command.
         try:
-            output = self._exec(device, "show interfaces status", timeout=30)
-            interfaces = _parse_ios_interfaces_status(output)
+            output = self._exec(device, "show interfaces description", timeout=30)
+            interfaces = _parse_ios_interfaces_description(output)
             return {
                 "implemented": True,
                 "source": "ios-http",
-                "command": "show interfaces status",
+                "command": "show interfaces description",
                 "interfaces": interfaces,
                 "message": f"IOS HTTP interfaces OK ({len(interfaces)} ports)",
                 "raw": output,
@@ -826,14 +831,77 @@ _STATUS_MAP: dict[str, str] = {
 }
 
 
-def _parse_ios_interfaces_status(output: str) -> list[dict[str, Any]]:
-    """Parse `show interfaces status` text output.
+def _parse_ios_interfaces_description(output: str) -> list[dict[str, Any]]:
+    """Parse `show interfaces description` text output.
 
-    The output columns are:
-      Port  Name  Status  Vlan  Duplex  Speed  Type
-    Columns are separated by 2+ spaces so the description column can be
-    empty (no description) or contain spaces (human-typed description).
+    Output format (full-description column, no truncation):
+
+        Interface                      Status         Protocol Description
+        Gi0/0                          up             up       LINK_TO_SW-F6-DS-01_ge-0/0/5
+        Gi0/1                          up             up       LINK_TO_SW-F6-DS-02_ge-0/0/5
+        Gi0/2                          up             up       VPC
+        Gi0/3                          up             up
+        ...
+        Vl10                           up             up
+
+    Columns are whitespace-separated; the description is everything after
+    the third token (may contain spaces and underscores).
+
+    Status values are normalized via ``_STATUS_MAP``; "Administratively
+    down" / "admindown" maps to ``"down"`` as on a real IOS box.
     """
+    interfaces: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        s = line.strip()
+        if not s:
+            continue
+        # Skip header row ("Interface Status Protocol Description") and
+        # any echo line that begins with the device prompt + '#'.
+        low = s.lower()
+        if low.startswith("interface") and "status" in low and "protocol" in low:
+            continue
+        if "#" in s.split(" ", 1)[0]:
+            # Matches "<hostname>#" prompts (e.g. "LAB-F3-AS-01#") — always
+            # skip these echo lines.
+            continue
+        if low.startswith("command completed") or low.startswith("command was"):
+            continue
+
+        parts = line.split()
+        if len(parts) < 3:
+            # Need at least name + admin + oper status.
+            continue
+
+        name = parts[0]
+        admin_raw = parts[1]
+        oper_raw = parts[2]
+        # Description is everything after the third token; may be empty
+        # for un-described interfaces (the column itself is just absent).
+        desc = " ".join(parts[3:]).strip()
+
+        # Normalize admin/oper status. IOS prints "up"/"down"/"admin down"
+        # etc. for both columns here.
+        admin_status = _STATUS_MAP.get(admin_raw.lower(), admin_raw.lower())
+        oper_status = _STATUS_MAP.get(oper_raw.lower(), oper_raw.lower())
+        if admin_status == "unknown":
+            # Tolerate upstream IOS variants: keep raw value lowercased.
+            admin_status = admin_raw.lower() or "unknown"
+        if oper_status == "unknown":
+            oper_status = oper_raw.lower() or "unknown"
+
+        interfaces.append({
+            "name": name,
+            "adminStatus": admin_status,
+            "operStatus": oper_status,
+            "description": desc,
+            "mode": "",
+            "accessVlan": "",
+            "address": "",
+            "mtu": "",
+            "speed": "",
+        })
+    return interfaces
     interfaces: list[dict[str, Any]] = []
     lines = output.splitlines()
     started = False
@@ -969,12 +1037,18 @@ def _parse_ios_uptime(output: str) -> dict[str, Any]:
 #   Holdtime:       120
 #   Capability:     Bridge, Router
 _LLDP_ENTRY_RE = re.compile(
-    r"Local Interface:\s*(?P<local>\S+)"
-    r".*?Chassis ID:\s*(?P<chassis>\S+)"
-    r".*?Port ID:\s*(?P<port>\S+)"
-    r"(?:.*?Port Description:\s*(?P<port_desc>.*?))?"
-    r"(?:.*?System Name:\s*(?P<sysname>\S+))?",
-    re.DOTALL,
+    # IOS uses the short form ("Local Intf", "Chassis id", "Port id");
+    # IOS-XE and other vendors use the long form ("Local Intf/erface",
+    # "Chassis ID", "Port ID"). Accept both, case-insensitive.
+    r"Local\s+Intf(?:erface)?\s*:\s*(?P<local>\S+)"
+    r".*?Chassis\s+id\s*:\s*(?P<chassis>\S+)"
+    r".*?Port\s+id\s*:\s*(?P<port>\S+)"
+    # Port Description may include spaces (e.g. "uplink to core"); stop
+    # when we reach the "System Name" field (or end of input). Negative
+    # lookahead prevents the lazy match from terminating too early.
+    r"(?:.*?Port\s+Description\s*:\s*(?P<port_desc>(?:(?!System\s+Name).)+))?"
+    r"(?:.*?System\s+Name\s*:\s*(?P<sysname>\S+))?",
+    re.DOTALL | re.IGNORECASE,
 )
 
 
