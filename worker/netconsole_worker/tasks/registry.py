@@ -150,6 +150,7 @@ class GetInterfacesTask(BaseTask):
             if n:
                 iface["remoteDeviceId"] = n.get("remoteDeviceId", "")
                 iface["remotePort"] = n.get("remotePort", "")
+                iface["portDescription"] = n.get("portDescription", "")
                 iface["chassisId"] = n.get("chassisId", "")
 
         # Keep the raw neighbours array too for callers that want it.

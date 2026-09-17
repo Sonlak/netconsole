@@ -115,24 +115,85 @@ def parse_junos_lldp_neighbors_xml(raw: str) -> list[dict[str, str]]:
 def parse_ios_lldp_neighbors(output: str) -> list[dict[str, str]]:
     """Parse Cisco IOS/IOS-XE `show lldp neighbors` text output.
 
-    Uses position-based parsing: tokens[0]=Device ID, [1]=Local Intf,
-    [2]=Hold-time, [3..-2]=Capability/Platform (optional), [-1]=Port ID.
+    Uses fixed-width column parsing so that descriptions containing spaces
+    (e.g. "LINK TO SW F3 AS 01") do not bleed into the Port ID column.
+    The header line defines the column boundaries; each data line is sliced
+    using those boundaries.
+
+    Header format:
+        Device ID    Local Intf   Hold-time  Capability  Platform  Port ID
     """
     entries: list[dict[str, str]] = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("Device ID") or stripped.startswith("Total"):
+
+    # Find the header line to determine column boundaries.
+    # "Device ID" and "Port ID" are always present; "Local Intf" may be
+    # abbreviated as "Local Interface" depending on terminal width.
+    header_line: str | None = None
+    for raw in output.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("Device ID") or stripped.startswith("Device-id"):
+            header_line = raw.rstrip()
+            break
+
+    if header_line is None:
+        # Fallback: try token-based for very short outputs
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Device ID") or stripped.startswith("Total"):
+                continue
+            tokens = stripped.split()
+            if len(tokens) < 4:
+                continue
+            entries.append({
+                "localPort": tokens[1],
+                "remoteDeviceId": tokens[0],
+                "remotePort": tokens[-1],
+                "chassisId": "",
+            })
+        return entries
+
+    # Build column slice boundaries from the header.
+    # Each column starts at the position of its header word.
+    header_upper = header_line.upper()
+
+    def col_start(keyword: str) -> int:
+        idx = header_upper.find(keyword)
+        return idx if idx != -1 else -1
+
+    dev_start = col_start("DEVICE ID")
+    intf_start = col_start("LOCAL INT")  # "LOCAL INT" matches both "Local Intf" and "Local Interface"
+    port_start = col_start("PORT ID")
+
+    if dev_start == -1 or intf_start == -1 or port_start == -1:
+        # Malformed header — bail with fallback
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Device ID") or stripped.startswith("Total"):
+                continue
+            tokens = stripped.split()
+            if len(tokens) < 4:
+                continue
+            entries.append({
+                "localPort": tokens[1],
+                "remoteDeviceId": tokens[0],
+                "remotePort": tokens[-1],
+                "chassisId": "",
+            })
+        return entries
+
+    for raw in output.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.strip().startswith("Device ID") or line.strip().startswith("Total"):
             continue
-        tokens = stripped.split()
-        # Minimum: Device ID, Local Intf, Hold-time, Port ID (4 tokens)
-        if len(tokens) < 4:
+        # Slice columns using header-defined positions.
+        # Device ID: from dev_start to intf_start (trim trailing spaces).
+        device_id = line[dev_start:intf_start].strip()
+        # Local Intf: from intf_start to port_start.
+        local_iface = line[intf_start:port_start].strip()
+        # Port ID: from port_start to end of line.
+        remote_port = line[port_start:].strip()
+        if not device_id or not local_iface or not remote_port:
             continue
-        # Port ID is always the last non-empty token
-        remote_port = tokens[-1]
-        # Device ID is always the first token
-        device_id = tokens[0]
-        # Local Intf is the second token
-        local_iface = tokens[1]
         entries.append({
             "localPort": local_iface,
             "remoteDeviceId": device_id,

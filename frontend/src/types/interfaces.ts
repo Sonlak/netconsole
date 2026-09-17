@@ -10,7 +10,10 @@ export type DeviceInterface = {
   speed?: string;
   /** LLDP neighbour on this port (merged at collection time) */
   remoteDeviceId?: string;
+  /** Canonical port ID from LLDP Port ID TLV (e.g. "GigabitEthernet1") */
   remotePort?: string;
+  /** Human-written Port Description from LLDP TLV (e.g. "LINK_TO_SW-F6-DS-01_ge-0/0/5") */
+  portDescription?: string;
   chassisId?: string;
 };
 

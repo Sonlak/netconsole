@@ -252,9 +252,10 @@ export function PortsPanel({
       width: 240,
       ellipsis: true,
       render: (_value: string | undefined, record: DeviceInterface) => {
-        // Prefer the LLDP link name (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5) over
-        // the device-set interface description so fabric link names are visible.
-        const linkName = record.remotePort;
+        // Prefer the LLDP Port Description (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5)
+        // over the device-set interface description so fabric link names are visible.
+        const portDesc = (record as DeviceInterface & { portDescription?: string }).portDescription;
+        const linkName = portDesc || record.remotePort;
         const ifaceDesc = record.description;
         if (linkName) {
           return (

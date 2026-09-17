@@ -898,7 +898,12 @@ class IOSxeBackend(DeviceBackend):
         }
 
     def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:
-        """Collect LLDP neighbours via SSH CLI `show lldp neighbors`.
+        """Collect LLDP neighbours via SSH CLI `show lldp neighbors detail`.
+
+        We use `show lldp neighbors detail` (not the brief `show lldp neighbors`)
+        so that Port ID and Port Description are on separate lines — avoiding the
+        brief output's column-blob problem when the remote description contains
+        spaces (e.g. "LINK TO SW F3 AS 01").
 
         Cisco IOS-XE does not expose a stable RESTCONF YANG model for LLDP,
         so SSH CLI is the only reliable path.
@@ -916,7 +921,7 @@ class IOSxeBackend(DeviceBackend):
             username=self.config.ssh_user,
             password=self.config.ssh_password,
             port=self.config.ssh_port,
-            command="show lldp neighbors",
+            command="show lldp neighbors detail",
             timeout=20,
         )
         if not ssh_result["sshOk"]:
@@ -927,13 +932,13 @@ class IOSxeBackend(DeviceBackend):
                 "message": f"LLDP SSH failed: {ssh_result['error']}",
             }
 
-        from netconsole_worker.parsers.show_lldp_neighbors import parse_ios_lldp_neighbors
+        from netconsole_worker.backends.ios import _parse_ios_lldp
 
-        neighbors = parse_ios_lldp_neighbors(ssh_result["output"] or "")
+        neighbors = _parse_ios_lldp(ssh_result["output"] or "")
         return {
             "implemented": True,
             "source": "ssh-cli",
-            "command": "show lldp neighbors",
+            "command": "show lldp neighbors detail",
             "neighbors": neighbors,
             "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
             "raw": ssh_result["output"],
