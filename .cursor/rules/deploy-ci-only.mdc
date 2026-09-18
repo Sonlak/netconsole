@@ -110,7 +110,7 @@ Helper scripts live in `.tmp-cfg/` (untracked, excluded from VPS rsync).
 | Deploy main branch | `git push origin main` |
 | Create version tag | `git tag v1.0.0 && git push --tags` |
 | Live site health | `curl.exe -sS --max-time 5 http://42.119.165.109:8443/api/health` |
-| SSH to VPS | `ssh root@100.102.133.86` (Tailscale only — public NIC blocks :22) |
+| SSH to VPS | `ssh sonnx@100.102.133.86` (Tailscale only — public NIC blocks :22) |
 | Check VPS marker | SSH + `cat /opt/netconsole/.last-deploy-sha` |
 | Manual rollback | GitHub Actions → Rollback workflow → set `ref` input |
 | Update FALLBACK_SHA | Edit `.github/workflows/rollback.yml` env block after each confirmed known-good |

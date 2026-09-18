@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import time
 from ipaddress import ip_address
 from typing import Any
 
@@ -46,6 +47,53 @@ def _creds(config: Any) -> dict[str, Any]:
 # Examples: GigabitEthernet0/0/1, TenGigabitEthernet1/1/1, FastEthernet0/1.
 _IFACE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9/.:-]{0,63}$")
 _PROTECTED_PREFIXES = ("Loopback", "Tunnel", "Port-channel", "Vlan", "BDI")
+
+# Per-device RESTCONF capability cache. Some IOS-XE lab images
+# (csr1000v 17.x, Virtual XE Software) ship an nginx/openresty front-end
+# on port 443 that 404s every RESTCONF path, even though SSH and CLI
+# work fine. Once we detect that pattern on a device, skip RESTCONF for
+# subsequent calls on the same IP — saves ~1.5-2s of TLS handshake per
+# ARP/MAC sweep that would otherwise 404.
+#
+# Format: {device_ip: {"restconf_ok": bool, "checked_at": epoch_seconds}}
+# Cache is in-process (per worker); restarts force a re-probe. We only
+# cache the "RESTCONF broken" direction (404/501/connect failures) — a
+# successful RESTCONF probe is NOT cached so a transient success still
+# re-checks on the next call (cheap, ~10 ms).
+_RESTCONF_CAP_CACHE: dict[str, dict[str, Any]] = {}
+_RESTCONF_CAP_TTL_SEC = 24 * 3600  # 24h, in case the device gets re-imaged
+_RESTCONF_CAP_BROKEN_ERRORS = (
+    "RESTCONF HTTP 404",
+    "RESTCONF HTTP 501",
+)
+
+
+def _is_restconf_known_broken(device_ip: str) -> bool:
+    entry = _RESTCONF_CAP_CACHE.get(device_ip)
+    if not entry:
+        return False
+    if entry.get("restconf_ok") is True:
+        return False
+    age = time.time() - float(entry.get("checked_at", 0))
+    return age < _RESTCONF_CAP_TTL_SEC
+
+
+def _mark_restconf_broken(device_ip: str, error: str) -> None:
+    """Mark RESTCONF as broken for `device_ip` so the next call skips it.
+
+    Only marks when `error` looks like a structural failure (404/501 or
+    a connection-level refusal) — NOT a transient timeout, which we
+    still want to retry on the next call.
+    """
+    if not any(marker in error for marker in _RESTCONF_CAP_BROKEN_ERRORS):
+        return
+    if "connect" in error.lower() or "refused" in error.lower():
+        return
+    _RESTCONF_CAP_CACHE[device_ip] = {
+        "restconf_ok": False,
+        "checked_at": time.time(),
+        "error": error,
+    }
 
 
 def _validate_iface(iface: str) -> str:
@@ -210,8 +258,11 @@ class IOSxeBackend(DeviceBackend):
         #   1. GET /native/interface          → basic interface info (name, desc, MTU)
         #   2. GET /native/interface/<type>=<name> for each interface → switchport config
         # This two-pass approach is required to get switchport mode + VLAN data.
+        #
+        # See `_is_restconf_known_broken` for why we sometimes skip RESTCONF
+        # entirely on lab images that ship nginx/openresty on :443.
         rest_error: str | None = None
-        if self.config.iosxe.enabled:
+        if self.config.iosxe.enabled and not _is_restconf_known_broken(device.ip):
             r = self._rc_get(device, "/Cisco-IOS-XE-native:native/interface")
             if r["ok"]:
                 basic_interfaces = _parse_iosxe_interfaces(r["payload"])
@@ -229,6 +280,7 @@ class IOSxeBackend(DeviceBackend):
                 rest_error = "RESTCONF returned no interfaces"
             else:
                 rest_error = r["error"]
+                _mark_restconf_broken(device.ip, rest_error)
 
         if self.config.ssh_enabled:
             fb = self._ssh_fallback(device, "show interfaces", None)
@@ -249,14 +301,17 @@ class IOSxeBackend(DeviceBackend):
             else:
                 ssh_error = fb["error"] or "SSH failed"
         else:
-            ssh_error = None
+            ssh_error = "Lab SSH disabled"
 
+        # Surface BOTH errors when both RESTCONF and SSH failed.
+        combined = "; ".join(filter(None, [rest_error, ssh_error]))
         return {
             "implemented": False,
             "interfaces": [],
             "source": None,
-            "message": rest_error or ssh_error or "Enable IOSXE_API or LAB_SSH",
+            "message": combined or "Enable IOSXE_API or LAB_SSH",
             "restError": rest_error,
+            "sshError": ssh_error,
         }
 
     def _fetch_iosxe_switchports(
@@ -345,8 +400,14 @@ class IOSxeBackend(DeviceBackend):
         # Note: `Cisco-IOS-XE-arp-oper:arp-data` can be empty on some lab images
         # even when the ARP table is populated. Fall back to SSH CLI if RESTCONF
         # returns no entries.
+        #
+        # Capability cache: if a previous call saw RESTCONF return 404/501
+        # for ANY path on this device (typical of csr1000v 17.x lab images
+        # that ship nginx/openresty on port 443), skip the RESTCONF probe
+        # entirely and go straight to SSH. Saves ~1.5-2s of TLS handshake
+        # per sweep on those devices.
         rest_error: str | None = None
-        if self.config.iosxe.enabled:
+        if self.config.iosxe.enabled and not _is_restconf_known_broken(device.ip):
             r = self._rc_get(device, "/Cisco-IOS-XE-arp-oper:arp-data")
             if r["ok"]:
                 entries = _parse_iosxe_arp(r["payload"])
@@ -359,6 +420,7 @@ class IOSxeBackend(DeviceBackend):
                     "restError": rest_error,
                 }
             rest_error = r["error"]
+            _mark_restconf_broken(device.ip, rest_error)
 
         if self.config.ssh_enabled:
             fb = self._ssh_fallback(device, "show ip arp", parse_cisco_arp_table)
@@ -374,14 +436,18 @@ class IOSxeBackend(DeviceBackend):
                 }
             ssh_error = fb["error"] or "SSH failed"
         else:
-            ssh_error = None
+            ssh_error = "Lab SSH disabled"
 
+        # Both RESTCONF and SSH failed — surface BOTH errors so the user
+        # can tell whether to fix the device, the network, or credentials.
+        combined = "; ".join(filter(None, [rest_error, ssh_error]))
         return {
             "implemented": False,
             "entries": [],
             "source": None,
-            "message": rest_error or ssh_error or "Enable IOSXE_API or LAB_SSH",
+            "message": combined or "Enable IOSXE_API or LAB_SSH",
             "restError": rest_error,
+            "sshError": ssh_error,
         }
 
     def get_mac(self, device: DeviceInfo) -> dict[str, Any]:
@@ -434,7 +500,7 @@ class IOSxeBackend(DeviceBackend):
         # The frontend Config Studio can still display it. Fall back to SSH CLI
         # when RESTCONF is unavailable or when CLI text is needed.
         rest_error: str | None = None
-        if self.config.iosxe.enabled:
+        if self.config.iosxe.enabled and not _is_restconf_known_broken(device.ip):
             r = self._rc_get(device, "/Cisco-IOS-XE-native:native?depth=unbounded")
             if r["ok"]:
                 return {
@@ -446,6 +512,7 @@ class IOSxeBackend(DeviceBackend):
                     "restError": rest_error,
                 }
             rest_error = r["error"]
+            _mark_restconf_broken(device.ip, rest_error)
 
         if self.config.ssh_enabled:
             ssh_result = run_ssh_command(
