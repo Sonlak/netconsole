@@ -28,6 +28,73 @@ import { prisma } from '../lib/prisma.js';
 import type { Request } from 'express';
 
 const TIMEOUT_MS = 180000; // 3 minutes idle timeout
+const SHELL_OPEN_TIMEOUT_MS = parseInt(
+  process.env.SHELL_OPEN_TIMEOUT_MS || '15000',
+  10,
+);
+// Per-user and global limits protect the backend container from runaway
+// terminals (and from a sync-throw bug in ssh2 that crashed the whole
+// process when a device dropped the SSH connection mid-handshake — see
+// session log 2026-09-18). Both are env-overridable so prod can tune
+// up without a code change.
+const MAX_TERMINALS_PER_USER = parseInt(
+  process.env.MAX_TERMINALS_PER_USER || '5',
+  10,
+);
+const MAX_TERMINALS_GLOBAL = parseInt(
+  process.env.MAX_TERMINALS_GLOBAL || '30',
+  10,
+);
+
+// Tracks active SSH terminal sessions across all WebSocket connections
+// so we can enforce the per-user and global caps. Map is keyed by
+// userId and decremented on every disconnect/cleanup.
+const activeTerminalsByUser = new Map<string, number>();
+let activeTerminalsGlobal = 0;
+
+function acquireTerminalSlot(userId: string): { ok: true } | { ok: false; reason: string } {
+  const perUser = activeTerminalsByUser.get(userId) || 0;
+  if (perUser >= MAX_TERMINALS_PER_USER) {
+    return {
+      ok: false,
+      reason: `Too many active terminals for this user (max ${MAX_TERMINALS_PER_USER}). Close one before opening another.`,
+    };
+  }
+  if (activeTerminalsGlobal >= MAX_TERMINALS_GLOBAL) {
+    return {
+      ok: false,
+      reason: `Server is at capacity (${activeTerminalsGlobal}/${MAX_TERMINALS_GLOBAL} active terminals). Try again in a moment.`,
+    };
+  }
+  activeTerminalsByUser.set(userId, perUser + 1);
+  activeTerminalsGlobal++;
+  return { ok: true };
+}
+
+function releaseTerminalSlot(userId: string): void {
+  const perUser = activeTerminalsByUser.get(userId) || 0;
+  if (perUser <= 1) {
+    activeTerminalsByUser.delete(userId);
+  } else {
+    activeTerminalsByUser.set(userId, perUser - 1);
+  }
+  if (activeTerminalsGlobal > 0) activeTerminalsGlobal--;
+}
+
+// Safety net: ssh2 sometimes throws synchronously from
+// Client.shell()/connect() when the underlying socket is torn down
+// mid-handshake (verified 2026-09-18: backend crashed twice in 3 min
+// when a lab device dropped SSH right after banner). Without these
+// handlers a single bad device takes the whole API down. We log
+// loudly but do NOT exit — each per-session handler is responsible
+// for closing its own WebSocket.
+process.on('uncaughtException', (err: Error) => {
+  console.error('[uncaughtException] survived:', err?.message || err);
+});
+process.on('unhandledRejection', (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error('[unhandledRejection] survived:', msg);
+});
 
 interface ClientMessage {
   type: 'connect' | 'input' | 'resize' | 'disconnect';
@@ -47,6 +114,7 @@ interface AuthenticatedWebSocket extends WebSocket {
   idleTimer?: NodeJS.Timeout;
   _ssh?: SSH2Client;
   _stream?: unknown;
+  _released?: boolean; // marks terminal-slot released, prevents double-release
 }
 
 // Send helper — casts to any to satisfy TS strict mode on ws types
@@ -101,6 +169,13 @@ export function startTerminalWebSocket(httpServer: Server) {
       if (ws._ssh) {
         try { (ws._ssh as SSH2Client).end(); } catch { /* ignore */ }
       }
+      // Free the terminal slot so the next session can be opened.
+      // Guard with sessionId so we only release once per connect —
+      // disconnect/disconnect-from-server both call cleanup.
+      if (ws.sessionId && !ws._released) {
+        ws._released = true;
+        releaseTerminalSlot(ws.userId!);
+      }
     };
 
     const resetIdleTimer = () => {
@@ -126,6 +201,16 @@ export function startTerminalWebSocket(httpServer: Server) {
         case 'connect': {
           if (!msg.deviceIp) {
             send(ws, { type: 'error', message: 'Missing deviceIp' });
+            return;
+          }
+
+          // Enforce per-user and global session caps before we open any
+          // SSH socket. Without this, a single admin opening many tabs
+          // could exhaust the container's ephemeral ports / FDs / memory.
+          const slot = acquireTerminalSlot(ws.userId!);
+          if (!slot.ok) {
+            send(ws, { type: 'error', message: slot.reason });
+            close(ws);
             return;
           }
 
@@ -203,6 +288,18 @@ export function startTerminalWebSocket(httpServer: Server) {
           const ssh = new SSH2Client();
           ws._ssh = ssh;
 
+          // Watchdog: if the shell channel never opens within the
+          // timeout (e.g. device accepted SSH then hung), kill the
+          // connection instead of letting the session leak forever.
+          let shellOpened = false;
+          const shellOpenTimer = setTimeout(() => {
+            if (shellOpened) return;
+            console.error(`[terminal] Session ${session.id}: shell open timed out after ${SHELL_OPEN_TIMEOUT_MS}ms`);
+            send(ws, { type: 'error', message: 'Shell open timed out' });
+            try { ssh.end(); } catch { /* ignore */ }
+            close(ws);
+          }, SHELL_OPEN_TIMEOUT_MS);
+
           // Handle keyboard-interactive auth (used by Juniper/cRPD for password prompts)
           // Some devices send multiple prompts - handle them all
           ssh.on('keyboard-interactive', (name, instr, lang, prompts, finish) => {
@@ -216,27 +313,40 @@ export function startTerminalWebSocket(httpServer: Server) {
             console.log(`[terminal] Session ${session.id}: SSH connected, opening shell immediately`);
             send(ws, { type: 'ready' });
 
-            // Try with PTY first, then retry without PTY if it fails
+            // Try with PTY first, then retry without PTY if it fails.
+            // CRITICAL: ssh.shell() can THROW SYNCHRONOUSLY (not via
+            // the callback) when the underlying client has already
+            // closed — verified 2026-09-18: a lab device dropped SSH
+            // right after the banner, ssh.shell() threw `Not connected`
+            // from inside Client.shell(), and the whole backend Node
+            // process died (uncaughtException). Wrap in try-catch and
+            // fall through to the error path so the WebSocket closes
+            // cleanly instead of crashing the API.
             const tryOpenShell = (termType: string, withPty: boolean) => {
               const options: Record<string, unknown> = { term: termType, cols: 80, rows: 24 };
               if (withPty) {
                 options.modes = {};
               }
               console.log(`[terminal] Session ${session.id}: opening shell (pty=${withPty}, term=${termType})`);
-              ssh.shell(options, (err, stream) => {
-                if (err) {
-                  console.error(`[terminal] Session ${session.id}: shell (pty=${withPty}) error:`, err.message);
-                  // If PTY failed, try without PTY
-                  if (withPty) {
-                    console.log(`[terminal] Session ${session.id}: retrying without PTY`);
-                    tryOpenShell(termType, false);
+              let invokedCallback = false;
+              try {
+                ssh.shell(options, (err, stream) => {
+                  invokedCallback = true;
+                  clearTimeout(shellOpenTimer);
+                  if (err) {
+                    console.error(`[terminal] Session ${session.id}: shell (pty=${withPty}) error:`, err.message);
+                    // If PTY failed, try without PTY
+                    if (withPty) {
+                      console.log(`[terminal] Session ${session.id}: retrying without PTY`);
+                      tryOpenShell(termType, false);
+                      return;
+                    }
+                    send(ws, { type: 'error', message: `Shell error: ${err.message}` });
+                    close(ws);
                     return;
                   }
-                  send(ws, { type: 'error', message: `Shell error: ${err.message}` });
-                  close(ws);
-                  return;
-                }
-                console.log(`[terminal] Session ${session.id}: shell opened`);
+                  console.log(`[terminal] Session ${session.id}: shell opened`);
+                  shellOpened = true;
 
                 stream.on('data', (data: Buffer) => {
                   const text = data.toString();
@@ -254,7 +364,30 @@ export function startTerminalWebSocket(httpServer: Server) {
                 });
 
                 ws._stream = stream;
-              });
+                });
+              } catch (syncErr: unknown) {
+                if (invokedCallback) {
+                  // The error already went through the callback path.
+                  return;
+                }
+                const msg = syncErr instanceof Error ? syncErr.message : String(syncErr);
+                console.error(`[terminal] Session ${session.id}: shell() threw synchronously: ${msg}`);
+                clearTimeout(shellOpenTimer);
+                // Same recovery logic as the callback's error path:
+                // try without PTY once, then give up.
+                if (withPty) {
+                  console.log(`[terminal] Session ${session.id}: retrying without PTY (sync throw)`);
+                    try {
+                      tryOpenShell(termType, false);
+                    } catch {
+                      send(ws, { type: 'error', message: `Shell error: ${msg}` });
+                      close(ws);
+                    }
+                    return;
+                }
+                send(ws, { type: 'error', message: `Shell error: ${msg}` });
+                close(ws);
+              }
             };
             tryOpenShell('xterm-256color', true);
           });
@@ -285,10 +418,21 @@ export function startTerminalWebSocket(httpServer: Server) {
 
           ssh.on('close', () => {
             console.log(`[terminal] Session ${session.id}: SSH closed unexpectedly`);
+            clearTimeout(shellOpenTimer);
             send(ws, { type: 'closed' });
           });
 
-          ssh.connect(sshConfig);
+          // ssh.connect() can also throw synchronously on bad config
+          // or a DNS failure — wrap defensively.
+          try {
+            ssh.connect(sshConfig);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            console.error(`[terminal] Session ${session.id}: ssh.connect() threw: ${msg}`);
+            clearTimeout(shellOpenTimer);
+            send(ws, { type: 'error', message: `SSH connect failed: ${msg}` });
+            close(ws);
+          }
           break;
         }
 

@@ -145,7 +145,7 @@ Public NIC (`ens33`) blocks port 22 (firewalld inactive, raw iptables).
 SSH only via Tailscale:
 
 ```powershell
-ssh root@100.102.133.86
+ssh sonnx@100.102.133.86
 ```
 
 Once on VPS:

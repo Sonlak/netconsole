@@ -181,6 +181,16 @@ services:
       # Docker doesn't install a DNAT rule for UDP and the host kernel
       # silently drops the packet after the socket bind check.
       - "1514:1514/udp"
+    # Resource cap (added 2026-09-18). Backend holds long-lived SSH
+    # sockets for every interactive terminal session (one per WS
+    # connection) — without a cap, a runaway admin or memory leak can
+    # starve Postgres / Kea / worker on the same VPS. cpus=1.5 still
+    # leaves headroom for collect jobs; 1g memory is ~5× the measured
+    # peak (229MiB during ARP collect). Tuned via deploy.yml restart
+    # if real workload pushes past these limits.
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: '1.5'
 
   worker:
     build:
