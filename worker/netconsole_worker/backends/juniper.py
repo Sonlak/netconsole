@@ -203,7 +203,7 @@ class JuniperBackend(DeviceBackend):
             else:
                 rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if self.config.ssh_enabled and rest_error:
+        if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show interfaces terse"
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -262,7 +262,7 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if self.config.ssh_enabled and rest_error:
+        if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show arp"
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -294,7 +294,7 @@ class JuniperBackend(DeviceBackend):
             "implemented": False,
             "entries": [],
             "source": None,
-            "message": rest_error or "ARP collection disabled (enable JUNOS_REST or LAB_SSH)",
+            "message": rest_error or "ARP collection disabled (enable JUNOS_REST; set JUNOS_SSH_FALLBACK=true for SSH fallback)",
             "restError": rest_error,
         }
 
@@ -318,7 +318,7 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rest_result["error"] or "Junos REST request failed"
 
-        if self.config.ssh_enabled and rest_error:
+        if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show ethernet-switching table"
             ssh_result = run_ssh_command(
                 host=device.ip,
@@ -350,7 +350,7 @@ class JuniperBackend(DeviceBackend):
             "implemented": False,
             "entries": [],
             "source": None,
-            "message": rest_error or "MAC collection disabled (enable JUNOS_REST or LAB_SSH)",
+            "message": rest_error or "MAC collection disabled (enable JUNOS_REST; set JUNOS_SSH_FALLBACK=true for SSH fallback)",
             "restError": rest_error,
         }
 
@@ -380,7 +380,7 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rest_result["error"] or "Junos REST get-configuration failed"
 
-        if self.config.ssh_enabled and rest_error:
+        if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             ssh_result = run_ssh_command(
                 host=device.ip,
                 username=self.config.ssh_user,

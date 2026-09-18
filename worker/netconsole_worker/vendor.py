@@ -75,6 +75,15 @@ class BackendConfig:
     ssh_port: int = 22
     ssh_enabled: bool = False
 
+    # When True, the Juniper backend may try SSH CLI as a last-resort
+    # fallback when RESTCONF fails. Default False: lab Junos RESTCONF is
+    # the canonical path; SSH fallback masks pool/handshake bugs and
+    # silently doubles per-call cost (TCP+TLS+Basic auth each time).
+    # IOS-XE / EOS backends keep their SSH fallback — for those vendors
+    # SSH is sometimes the ONLY path that returns the data (gotcha #14
+    # for IOS-XE on 17.x lab images).
+    junos_ssh_fallback: bool = False
+
     @classmethod
     def from_settings(cls) -> "BackendConfig":
         from netconsole_worker.config import settings
@@ -82,6 +91,7 @@ class BackendConfig:
         return cls(
             junos_netconf_ssh=settings.junos_netconf_ssh_enabled,
             junos_netconf_ssh_port=settings.junos_netconf_ssh_port,
+            junos_ssh_fallback=settings.junos_ssh_fallback,
             juniper=VendorConfig(
                 enabled=settings.junos_rest_enabled,
                 scheme=settings.junos_rest_scheme,

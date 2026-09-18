@@ -88,6 +88,21 @@ class JunosRESTPool:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    # Minimum seconds between alive checks for a given pool entry.
+    # We piggyback on the existing RPC traffic: as long as an entry was used
+    # within this window, it MUST have completed a request successfully
+    # (otherwise the caller would have called `invalidate()` on it). So we
+    # can skip the GET /rpc ping and trust the existing socket.
+    #
+    # Why this matters: lab bridge spikes 5-20s and the worker hits every
+    # device every 5 min (Tier-B). Without this gate, every borrow pays a
+    # 0.5-5s GET /rpc round-trip even when the socket is hot. Worse, when
+    # the alive check itself times out, the pool evicts the entry AND the
+    # caller does another 5s connect on top — turning a 50ms RPC into a
+    # 10s hang. Verified on F6-CORE-01 (10.10.20.102): the GET /rpc ping
+    # on cold cache times out ~5s before the real RPC runs.
+    _ALIVE_CHECK_MIN_INTERVAL_SEC = 30.0
+
     def borrow(
         self,
         host: str,
@@ -102,9 +117,24 @@ class JunosRESTPool:
         with self._lock:
             entry = self._pool.get(key)
             if entry is not None:
-                # Quick alive-check: send a tiny request. If the underlying
-                # socket is closed by the lab firewall, is_active() lies and
-                # we get a blank output on the next real command.
+                age_since_use = time.monotonic() - entry.last_used
+                if age_since_use < self._ALIVE_CHECK_MIN_INTERVAL_SEC:
+                    # Hot entry — trust it. The previous caller either
+                    # succeeded (in which case the socket is fine) or
+                    # called invalidate() on failure (which removed the
+                    # entry from the pool). There's no third state that
+                    # would leave a dead socket sitting in the pool.
+                    entry.use_count += 1
+                    entry.last_used = time.monotonic()
+                    self.stats["borrows"] += 1
+                    self.stats["reuses"] += 1
+                    return entry.client
+                # Cold entry (>30s idle) — do a lightweight ping to
+                # confirm the socket is still good before reusing it.
+                # The lab firewall sometimes silently drops idle HTTP/1.1
+                # sockets (RST sent only on next request). A 405 from
+                # Junos /rpc still means the socket is alive (the GET is
+                # rejected at the application layer).
                 try:
                     entry.client.get(
                         f"{scheme}://{host}:{port}/rpc",

@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     junos_rest_user: str = ""
     junos_rest_password: str = ""
 
+    # Juniper SSH CLI fallback for ARP/MAC/interfaces/config reads.
+    # Default OFF — RESTCONF is the canonical path on lab cRPD sims, and
+    # adding SSH as a fallback masks RESTCONF pool/flakiness bugs and
+    # silently halves throughput (one TCP+TLS handshake per call instead
+    # of zero). Set JUNOS_SSH_FALLBACK=true only when RESTCONF is broken
+    # on a particular image AND you've already debugged why.
+    junos_ssh_fallback: bool = False
+
     # Arista EOS — eAPI JSON-RPC.
     eos_api_enabled: bool = False
     eos_api_scheme: str = "https"
