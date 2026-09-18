@@ -273,28 +273,58 @@ def _fetch_with_retry(
     host: str,
     rpc: str,
     *,
-    username: str,
-    password: str,
-    scheme: str,
-    port: int,
-    verify_tls: bool,
-    timeout: float,
     client: httpx.Client,
+    username: str | None = None,
+    password: str | None = None,
+    scheme: str | None = None,
+    port: int | None = None,
+    verify_tls: bool | None = None,
+    timeout: float | None = None,
+    accept: str | None = None,
+    body: str | None = None,
+    params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Call fetch_junos_rpc once; retry on transient timeout/connect errors.
 
     Junos sim and lab bridge can spike to 30-40 s latency on a single RPC.
     A quick retry cheaply papers over the spike without raising the timeout so
     much that genuine dead devices block the worker.
+
+    Accepts **kwargs forwarded to fetch_junos_rpc so this helper works for
+    both GET-style RPCs (`fetch_arp_table`, `fetch_ethernet_switching_table`)
+    and POST-style RPCs (`fetch_configuration` with body=...). The caller
+    is responsible for managing `client` (typically via `JunosRESTPool`).
+
+    Pre-condition: `client` is non-None — callers should `pool.borrow(...)`
+    first. We do NOT close the client here (the pool reuses it).
     """
+    import time as _time
+
+    if client is None:
+        # Defensive — old callers may have invoked this without a pooled
+        # client. Fall through to one-shot mode; we just lose the pooling
+        # benefit for that call.
+        logger.warning(
+            "junos %s: _fetch_with_retry called without a pooled client; "
+            "transient-error retries will reopen a new socket each attempt",
+            host,
+        )
+
     attempts = 3
     last: dict[str, Any] | None = None
     for i in range(attempts):
         result = fetch_junos_rpc(
             host, rpc,
-            username=username, password=password,
-            scheme=scheme, port=port, verify_tls=verify_tls,
-            timeout=timeout, client=client,
+            username=username or "",
+            password=password or "",
+            scheme=scheme or "http",
+            port=port or 8443,
+            verify_tls=bool(verify_tls),
+            timeout=timeout or 20.0,
+            accept=accept or "application/xml",
+            body=body,
+            params=params,
+            client=client,
         )
         if result["ok"]:
             return result
@@ -307,8 +337,6 @@ def _fetch_with_retry(
         if not transient:
             return result
         if i < attempts - 1:
-            import time as _time
-
             _time.sleep(1.0 * (i + 1))  # 1 s, 2 s backoff (was 0.5 s)
     return last if last else {"ok": False, "error": "unknown"}
 
@@ -461,22 +489,26 @@ def fetch_interface_configuration(
     verify_tls: bool = False,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
+    """Scoped <get-configuration> for one interface. Pool + retry."""
     from netconsole_worker.parsers.interface_set import split_interface, xml_escape
 
     physical, _unit = split_interface(iface)
     name = xml_escape(physical)
-    return post_junos_rpc(
-        host,
-        (
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, "",  # RPC name is unused when body is set; pass empty.
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout,
+        accept="application/xml",
+        body=(
             '<get-configuration format="set"><configuration><interfaces><interface>'
             f"<name>{name}</name></interface></interfaces></configuration></get-configuration>"
         ),
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
     )
 
 
@@ -490,15 +522,19 @@ def fetch_interfaces_set_config(
     verify_tls: bool = False,
     timeout: float = 20.0,
 ) -> dict[str, Any]:
-    return post_junos_rpc(
-        host,
-        '<get-configuration format="set"><configuration><interfaces/></configuration></get-configuration>',
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
+    """Full <get-configuration> for the interfaces stanza. Pool + retry."""
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, "",
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
         timeout=timeout,
+        accept="application/xml",
+        body='<get-configuration format="set"><configuration><interfaces/></configuration></get-configuration>',
     )
 
 
@@ -831,16 +867,25 @@ def fetch_ethernet_switching_table(
     verify_tls: bool = False,
     timeout: float = 20.0,
 ) -> dict[str, Any]:
-    return fetch_junos_rpc(
-        host,
-        RPC_MAC_TABLE,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    """Fetch MAC table via Junos RESTCONF.
+
+    Uses `JunosRESTPool` so the TCP+TLS+Basic-auth handshake is reused across
+    consecutive MAC collects on the same device. Without the pool, every
+    call opens a fresh socket and a single 5-20 s lab-bridge spike would
+    surface as a missing MAC row (the user has been seeing this as
+    "lúc được lúc không" — empty entries on some sweeps). `_fetch_with_retry`
+    papers over transient spikes with 1 s / 2 s backoff (3 attempts total).
+    """
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_MAC_TABLE,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
     )
 
 
@@ -854,16 +899,18 @@ def fetch_arp_table(
     verify_tls: bool = False,
     timeout: float = 20.0,
 ) -> dict[str, Any]:
-    return fetch_junos_rpc(
-        host,
-        RPC_ARP_TABLE,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    """Fetch ARP table via Junos RESTCONF. See fetch_ethernet_switching_table
+    for the rationale behind pool + retry."""
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_ARP_TABLE,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
     )
 
 
@@ -877,16 +924,18 @@ def fetch_interface_information(
     verify_tls: bool = False,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    return fetch_junos_rpc(
-        host,
-        RPC_INTERFACE_INFO,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    """Fetch interface information via Junos RESTCONF. See
+    fetch_ethernet_switching_table for the rationale behind pool + retry."""
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_INTERFACE_INFO,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
         params={"terse": ""},
     )
 
@@ -901,16 +950,18 @@ def fetch_vlan_information(
     verify_tls: bool = False,
     timeout: float = 20.0,
 ) -> dict[str, Any]:
-    return fetch_junos_rpc(
-        host,
-        RPC_VLAN_INFO,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    """Fetch VLAN information via Junos RESTCONF. See
+    fetch_ethernet_switching_table for the rationale behind pool + retry."""
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_VLAN_INFO,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
     )
 
 
@@ -925,20 +976,23 @@ def fetch_log_information(
     timeout: float = 30.0,
     filename: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch `show log messages` (or a specific log filename) via RESTCONF."""
+    """Fetch `show log messages` (or a specific log filename) via RESTCONF.
+
+    Pool + retry, same as the other read helpers.
+    """
     params: dict[str, str] = {}
     if filename:
         params["filename"] = filename
-    return fetch_junos_rpc(
-        host,
-        RPC_LOG_INFORMATION,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_LOG_INFORMATION,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
         params=params or None,
     )
 
@@ -953,16 +1007,21 @@ def fetch_configuration(
     verify_tls: bool = False,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    return fetch_junos_rpc(
-        host,
-        RPC_CONFIGURATION,
-        username=username,
-        password=password,
-        scheme=scheme,
-        port=port,
-        verify_tls=verify_tls,
-        timeout=timeout,
-        accept="application/xml",
+    """Fetch running config via RESTCONF (POST <get-configuration>).
+
+    Pool + retry, same as the other read helpers. The POST body is passed
+    through `body=` to `_fetch_with_retry`.
+    """
+    pool = get_rest_pool()
+    client = pool.borrow(
+        host, port, username, password, scheme, verify_tls, timeout=timeout
+    )
+    return _fetch_with_retry(
+        host, RPC_CONFIGURATION,
+        client=client,
+        username=username, password=password,
+        scheme=scheme, port=port, verify_tls=verify_tls,
+        timeout=timeout, accept="application/xml",
         body='<get-configuration format="set"/>',
     )
 
