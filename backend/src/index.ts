@@ -19,6 +19,7 @@ import { scheduleConfigCollection } from './services/deviceTabCollection.js';
 import { scheduleLogsCollection } from './services/logs.js';
 import { scheduleJobWatchdog } from './services/jobWatchdog.js';
 import { startLogRetentionCleanup } from './services/logRetention.js';
+import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
@@ -66,6 +67,7 @@ const configCollectIntervalSeconds = Number(process.env.CONFIG_COLLECT_INTERVAL_
 const logsCollectIntervalSeconds = Number(process.env.LOGS_COLLECT_INTERVAL_SECONDS) || 0;
 const syslogUdpPort = Number(process.env.SYSLOG_UDP_PORT) || 1514;
 const logRetentionDays = Number(process.env.LOG_RETENTION_DAYS) || 30;
+const jobRetentionDays = Number(process.env.JOB_RETENTION_DAYS) || 30;
 
 // Graceful shutdown support
 let isShuttingDown = false;
@@ -86,6 +88,12 @@ const httpServer = app.listen(port, () => {
   if (logRetentionDays > 0) {
     startLogRetentionCleanup(logRetentionDays);
     console.log(`Log retention cleanup enabled (keep ${logRetentionDays} days)`);
+  }
+
+  // Job retention cleanup — prerequisite for Tier-B 5-minute collect intervals
+  if (jobRetentionDays > 0) {
+    startJobRetentionCleanup(jobRetentionDays);
+    console.log(`Job retention cleanup enabled (keep ${jobRetentionDays} days, terminal rows only)`);
   }
 
   scheduleDevicePing(pingIntervalSeconds);
@@ -157,6 +165,7 @@ app.get('/api/health', (_req, res) => {
     configCollectIntervalSeconds,
     logsCollectIntervalSeconds,
     logRetentionDays,
+    jobRetentionDays,
     syslogUdpPort,
     keaApiUrl: process.env.KEA_API_URL || null,
   });
