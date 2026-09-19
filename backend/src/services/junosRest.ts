@@ -374,13 +374,69 @@ function parseMacEntryBlock(xml: string): JunosMacEntry | null {
 }
 
 function parseMacTableXml(xml: string): JunosMacEntry[] {
-  const blocks = xmlChildrenOf(xml, 'ethernet-switching-table-information');
+  // The Junos `get-ethernet-switching-table-information` RPC returns an
+  // envelope that varies between Junos versions and routing-instance
+  // scopes (default-switch vs bridge-domains). The old parser looked
+  // for a hardcoded `ethernet-switching-table-information` parent tag,
+  // which matched NOTHING in modern Junos 20+ responses — the actual
+  // root is `<l2ng-l2ald-rtb-macdb>`, with VLAN groups under
+  // `<l2ng-l2ald-mac-entry-vlan>` and individual entries under
+  // `<l2ng-mac-entry>`. Verified 2026-09-19 against LAB-F2-AS-01
+  // (10.10.20.221, 3 MAC entries) and LAB-F6-CORE-01 (10.10.20.102,
+  // L3-only, 0 entries — see also the `l3Only` flag in the message).
+  //
+  // Walk every element recursively. When we encounter a node whose
+  // local child tag is `l2ng-l2-mac-address`, lift its sibling fields
+  // (interface, vlan, flags) into a JunosMacEntry. VLAN id is
+  // inherited from the nearest ancestor `<l2ng-l2-vlan-id>` (matches
+  // how the worker parser builds entries — see
+  // worker/netconsole_worker/parsers/mac_table_rpc.py::_walk_xml).
+  const blocks = xmlChildrenOf(xml, 'l2ng-l2ald-rtb-macdb');
   const entries: JunosMacEntry[] = [];
   for (const block of blocks) {
-    const entry = parseMacEntryBlock(block);
-    if (entry) entries.push(entry);
+    walkMacEntries(block, '-', entries);
   }
   return entries;
+}
+
+function walkMacEntries(xml: string, inheritedVlan: string, entries: JunosMacEntry[]): void {
+  const vlanHere = xmlChildText(xml, 'l2ng-l2-vlan-id') || inheritedVlan;
+  const mac = normalizeMac(xmlChildText(xml, 'l2ng-l2-mac-address', 'mac-address', 'mac'));
+  if (mac) {
+    const interface_ = xmlChildText(
+      xml,
+      'l2ng-l2-mac-logical-interface',
+      'mac-logical-interface',
+      'interface-name',
+      'interface',
+    ) || '-';
+    const flagsRaw = xmlChildText(
+      xml,
+      'l2ng-l2-mac-flags',
+      'l2ng-l2-mac-entry-flags',
+      'mac-flags',
+      'mac-type',
+    ) || 'D';
+    const flags = flagsRaw.slice(0, 8);
+    const sessId = xmlChildText(xml, 'l2ng-l2-mac-sequence-number', 'sess-id') || '0';
+    const vlan = vlanHere || xmlChildText(xml, 'l2ng-l2-mac-vlan-name', 'mac-vlan', 'vlan') || '-';
+    entries.push({
+      mac,
+      vlan,
+      tag: '-',
+      interface: interface_,
+      flags,
+      type: flagToType(flags),
+      sessId,
+    });
+  }
+  // Recurse into direct children (only same level — avoids re-walking
+  // already-consumed siblings within the same block).
+  const childRe = /<([\w:-]+(?::[\w:-]+)?)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = childRe.exec(xml)) !== null) {
+    walkMacEntries(m[0], vlanHere, entries);
+  }
 }
 
 // ----------------------------------------------------------------
