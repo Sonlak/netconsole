@@ -45,17 +45,17 @@ const RETENTION_HOURS = Math.max(
   1,
 );
 const PARALLEL_DEVICES = Math.max(Number(process.env.INTERFACE_COUNTERS_PARALLEL ?? 4), 1);
-const LAB_SSH_USER = process.env.LAB_SSH_USER ?? 'netconsole';
-const LAB_SSH_PASSWORD = process.env.LAB_SSH_PASSWORD ?? 'Admin@123';
-const LAB_SSH_PORT = Number.parseInt(process.env.LAB_SSH_PORT ?? '22', 10);
-const JUNOS_SSH_PORT = Number.parseInt(process.env.JUNOS_SSH_PORT ?? '22', 10);
+export const LAB_SSH_USER = process.env.LAB_SSH_USER ?? 'netconsole';
+export const LAB_SSH_PASSWORD = process.env.LAB_SSH_PASSWORD ?? 'Admin@123';
+export const LAB_SSH_PORT = Number.parseInt(process.env.LAB_SSH_PORT ?? '22', 10);
+export const JUNOS_SSH_PORT = Number.parseInt(process.env.JUNOS_SSH_PORT ?? '22', 10);
+export const JUNOS_API_USER = process.env.JUNOS_API_USER ?? 'netconsole';
+export const JUNOS_API_PASSWORD = process.env.JUNOS_API_PASSWORD ?? 'Admin@123';
 const IOSXE_API_USER = process.env.IOSXE_API_USER ?? LAB_SSH_USER;
 const IOSXE_API_PASSWORD = process.env.IOSXE_API_PASSWORD ?? LAB_SSH_PASSWORD;
 const IOSXE_API_SCHEME = process.env.IOSXE_API_SCHEME ?? 'https';
 const IOSXE_API_PORT = Number(process.env.IOSXE_API_PORT ?? 443);
 const IOSXE_API_ENABLED = process.env.IOSXE_API_ENABLED === 'true';
-const JUNOS_API_USER = process.env.JUNOS_REST_USER ?? LAB_SSH_USER;
-const JUNOS_API_PASSWORD = process.env.JUNOS_REST_PASSWORD ?? LAB_SSH_PASSWORD;
 const JUNOS_API_SCHEME = process.env.JUNOS_REST_SCHEME ?? 'https';
 const JUNOS_API_PORT = Number(process.env.JUNOS_REST_PORT ?? 3443);
 const JUNOS_API_ENABLED = process.env.JUNOS_REST_ENABLED === 'true';
@@ -411,23 +411,68 @@ function parseIosxeCounters(payload: unknown): InterfaceCounters[] {
 async function fetchIosSshCounters(host: string): Promise<FetchResult> {
   const started = Date.now();
   try {
-    const result = await runIosxeSshCommand(host, 'show interfaces', {
+    // IOS 15.x `show interfaces` is prose-heavy and the output-bytes line
+    // sometimes scrolls off if terminal width is narrow. The tabular
+    // `show interfaces counters` form has the same numbers in a fixed
+    // column layout that's far easier to parse and survives paging.
+    // Falls back to `show interfaces` if counters view isn't supported
+    // (very old IOS, sub-images).
+    let result = await runIosxeSshCommand(host, 'show interfaces counters', {
       port: LAB_SSH_PORT,
       username: LAB_SSH_USER,
       password: LAB_SSH_PASSWORD,
       timeoutMs: 30000,
     });
+    let parsed: InterfaceCounters[] = [];
+    let source: FetchResult['source'] = 'ios-ssh';
+    if (result.ok) {
+      parsed = parseIosCountersTabular(result.output);
+      // `show interfaces counters` doesn't include inErrors/outErrors/inCRC;
+      // run `show interfaces` in parallel for those fields, then merge.
+      if (parsed.length > 0) {
+        const prose = await runIosxeSshCommand(host, 'show interfaces', {
+          port: LAB_SSH_PORT,
+          username: LAB_SSH_USER,
+          password: LAB_SSH_PASSWORD,
+          timeoutMs: 30000,
+        });
+        if (prose.ok) {
+          const proseIfaces = parseIosCountersProse(prose.output);
+          // merge by interface name
+          const byName = new Map(proseIfaces.map((p) => [p.name, p]));
+          for (const row of parsed) {
+            const p = byName.get(row.name);
+            if (!p) continue;
+            if (p.inErrors != null) row.inErrors = p.inErrors;
+            if (p.outErrors != null) row.outErrors = p.outErrors;
+            if (p.inCrcErrors != null) row.inCrcErrors = p.inCrcErrors;
+            if (p.inDiscards != null) row.inDiscards = p.inDiscards;
+            if (p.outDiscards != null) row.outDiscards = p.outDiscards;
+          }
+        }
+      }
+    } else {
+      // tabular command failed — fall back to prose.
+      result = await runIosxeSshCommand(host, 'show interfaces', {
+        port: LAB_SSH_PORT,
+        username: LAB_SSH_USER,
+        password: LAB_SSH_PASSWORD,
+        timeoutMs: 30000,
+      });
+      if (result.ok) {
+        parsed = parseIosCountersProse(result.output);
+      }
+    }
     if (!result.ok) {
       return {
         ok: false,
-        source: 'ios-ssh',
+        source,
         interfaces: [],
         collectMs: Date.now() - started,
         error: result.error ?? 'SSH failed',
       };
     }
-    const interfaces = parseIosCounters(result.output);
-    return { ok: true, source: 'ios-ssh', interfaces, collectMs: Date.now() - started };
+    return { ok: true, source, interfaces: parsed, collectMs: Date.now() - started };
   } catch (err) {
     return {
       ok: false,
@@ -439,25 +484,110 @@ async function fetchIosSshCounters(host: string): Promise<FetchResult> {
   }
 }
 
-// `show interfaces` block parser. Output format per interface on IOS 15.x:
+// `show interfaces counters` parser. Output layout (IOS 15.x):
 //
-//   GigabitEthernet0/1 is up, line protocol is up
-//     Hardware is Gigabit Ethernet, address is aabb.cc00.0101 (bia aabb.cc00.0101)
-//     MTU 1500 bytes, BW 1000000 Kbit/sec, DLY 10 usec, ...
-//     5 minute input rate 0 bits/sec, 0 packets/sec
-//     5 minute output rate 0 bits/sec, 0 packets/sec
-//          3 packets input, 256 bytes, 0 no buffer
-//          Received 0 broadcasts (0 multicasts)
-//          0 runts, 0 giants, 0 throttles
-//          0 input errors, 0 CRC, 0 frame, 0 overrun, 0 ignored
-//          0 output errors, 0 collisions, 0 interface resets
-//          0 unknown protocol drops
-//          0 output bytes (0 0 bits)
-//   ...
-function parseIosCounters(output: string): InterfaceCounters[] {
+//   Port            InOctets      InUcastPkts   InMcastPkts   InBcastPkts   OutOctets      OutUcastPkts  OutMcastPkts  OutBcastPkts
+//   Gi0/0           13181538      12345         0             0             26962490       23456         0             0
+//   Gi0/1                  0           0         0             0                    0            0         0             0
+//
+// Notes:
+// - The column order is fixed but the separator is whitespace, not pipes.
+// - IOS sometimes prints an additional "InErrors OutErrors ..." row when
+//   error counters are present; we ignore that block (handled by prose
+//   parser) and only take octets/packets from this view.
+// - The interface name appears in short form (Gi0/0, Te0/1/0, Fa0/0).
+//   Expand to the long form (GigabitEthernet0/0) to match what the
+//   RESTCONF/Junos collectors return.
+function parseIosCountersTabular(output: string): InterfaceCounters[] {
   const out: InterfaceCounters[] = [];
   if (!output) return out;
-  // Split output into per-interface blocks. Header line is "<Iface> is up|down|admin down, line protocol is...".
+  const lines = output.split(/\r?\n/);
+  // Find the header row that contains both "InOctets" and "OutOctets".
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/\bInOctets\b/i.test(l) && /\bOutOctets\b/i.test(l)) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) return out;
+  const header = lines[headerIdx].trim().split(/\s+/);
+  const colIdx = (name: string) => header.findIndex((h) => h.toLowerCase() === name.toLowerCase());
+  const inOctCol = colIdx('InOctets');
+  const outOctCol = colIdx('OutOctets');
+  const inUcastCol = colIdx('InUcastPkts');
+  const outUcastCol = colIdx('OutUcastPkts');
+  const inBcastCol = colIdx('InBcastPkts');
+  const outBcastCol = colIdx('OutBcastPkts');
+  if (inOctCol < 0 || outOctCol < 0) return out;
+  const shortToLong = (s: string): string => {
+    // IOS short names: Gi -> GigabitEthernet, Te -> TenGigabitEthernet,
+    // Fa -> FastEthernet, Et -> Ethernet.
+    const m = s.match(/^(Gi|Te|Fa|Et)(\d.*)$/i);
+    if (!m) return s;
+    const prefix: Record<string, string> = {
+      Gi: 'GigabitEthernet',
+      Te: 'TenGigabitEthernet',
+      Fa: 'FastEthernet',
+      Et: 'Ethernet',
+    };
+    return (prefix[m[1][0].toUpperCase() + m[1][1].toLowerCase()] ?? m[1]) + m[2];
+  };
+  const num = (s: string): bigint => BigInt(s.replace(/[,\s]/g, ''));
+  // Sum broadcast and unicast to get a total packet count. Some IOS
+  // versions omit multicast from the table; the prose path can fill
+  // in for that, but for the chart the unicast+broadcast sum is good
+  // enough.
+  const sumPkts = (row: string[]): bigint | undefined => {
+    const cols = [inUcastCol, inBcastCol, outUcastCol, outBcastCol];
+    if (cols.some((c) => c < 0)) return undefined;
+    const inU = row[inUcastCol] ?? '0';
+    const inB = row[inBcastCol] ?? '0';
+    const outU = row[outUcastCol] ?? '0';
+    const outB = row[outBcastCol] ?? '0';
+    return num(inU) + num(inB) + num(outU) + num(outB);
+  };
+  const perIfaceTotalPkts = new Map<string, { in: bigint; out: bigint }>();
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (!l) continue;
+    // Stop on second header (e.g. "Port InErrors OutErrors ...")
+    if (/^Port\b/i.test(l) && /\bInOctets\b/i.test(l)) break;
+    const cols = l.split(/\s+/);
+    if (cols.length < header.length) continue;
+    const raw = cols[0];
+    // Skip "Port" pseudo-row.
+    if (!raw || raw.toLowerCase() === 'port') continue;
+    const name = shortToLong(raw);
+    const inOct = num(cols[inOctCol]);
+    const outOct = num(cols[outOctCol]);
+    // Total pkts
+    let inPkts: bigint | undefined;
+    let outPkts: bigint | undefined;
+    if (inUcastCol >= 0 && inBcastCol >= 0) {
+      inPkts = num(cols[inUcastCol]) + num(cols[inBcastCol]);
+    }
+    if (outUcastCol >= 0 && outBcastCol >= 0) {
+      outPkts = num(cols[outUcastCol]) + num(cols[outBcastCol]);
+    }
+    out.push({
+      name,
+      inOctets: inOct,
+      outOctets: outOct,
+      inPackets: inPkts,
+      outPackets: outPkts,
+    });
+  }
+  return out;
+}
+
+// Old prose parser — kept for the secondary call from
+// `fetchIosSshCounters` so we can harvest inErrors/outErrors/inCrcErrors
+// that `show interfaces counters` doesn't show.
+function parseIosCountersProse(output: string): InterfaceCounters[] {
+  const out: InterfaceCounters[] = [];
+  if (!output) return out;
   const lines = output.split('\n');
   let current: InterfaceCounters | null = null;
   let inOctets: bigint | undefined;
@@ -484,13 +614,18 @@ function parseIosCounters(output: string): InterfaceCounters[] {
     inOctets = outOctets = inPackets = outPackets = undefined;
   };
   const headerRe = /^([A-Za-z][\w./-]+)\s+is\s+(up|down|administratively down|admin down)/i;
-  // IOS `show interfaces` counters are prefixed with 5 spaces (header) and
-  // counted in columns 0+ for nested lines. We only need a handful of lines.
   const pktRe = /^\s*(\d+)\s+packets?\s+input.*?(\d+)\s+bytes?/i;
   const octetInputRe = /^\s*(\d+)\s+input bytes\b/i;
   const octetOutputRe = /^\s*(\d+)\s+output bytes\b/i;
+  // IOS sometimes prints the OUTPUT side first as "X packets output, Y bytes":
+  //   12345 packets output, 2345678 bytes, 0 underruns
+  const pktOutRe = /^\s*(\d+)\s+packets?\s+output.*?(\d+)\s+bytes?/i;
   const errRe = /^\s*(\d+)\s+input errors.*?\b(\d+)\s+CRC\b/i;
   const outErrRe = /^\s*(\d+)\s+output errors\b/i;
+  // discards often appear as "0 input packets dropped" or on the queue line.
+  const dropRe = /^\s*(\d+)\s+(?:input\s+)?packets?\s+dropped\b/i;
+  const dropOutRe = /^\s*(\d+)\s+output\s+packets?\s+dropped\b/i;
+  const totalOutDropsRe = /Total output drops:\s*(\d+)/i;
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -517,8 +652,12 @@ function parseIosCounters(output: string): InterfaceCounters[] {
       outOctets = bigFromText(ooRe[1]);
       continue;
     }
-    // Some IOS versions count "0 packets input, 25 bytes, 0 no buffer" but
-    // also a separate line "Received X broadcasts ..." — we don't read those.
+    const pmOut = pktOutRe.exec(trimmed);
+    if (pmOut) {
+      outPackets = BigInt(pmOut[1]);
+      outOctets = bigFromText(pmOut[2]);
+      continue;
+    }
     const erRe = errRe.exec(trimmed);
     if (erRe) {
       current.inErrors = BigInt(erRe[1]);
@@ -528,6 +667,21 @@ function parseIosCounters(output: string): InterfaceCounters[] {
     const oeRe = outErrRe.exec(trimmed);
     if (oeRe) {
       current.outErrors = BigInt(oeRe[1]);
+      continue;
+    }
+    const drIn = dropRe.exec(trimmed);
+    if (drIn) {
+      current.inDiscards = BigInt(drIn[1]);
+      continue;
+    }
+    const drOut = dropOutRe.exec(trimmed);
+    if (drOut) {
+      current.outDiscards = BigInt(drOut[1]);
+      continue;
+    }
+    const totDrops = totalOutDropsRe.exec(trimmed);
+    if (totDrops) {
+      current.outDiscards = BigInt(totDrops[1]);
       continue;
     }
   }
@@ -1030,4 +1184,4 @@ export const interfaceCounterConfig = {
 };
 
 // Default-config helpers exported for tests.
-export const __test = { fetchInterfaceCounters, parseJunosTrafficStats, parseEosCounters, parseIosxeCounters, parseIosCounters, toJsonSafe };
+export const __test = { fetchInterfaceCounters, parseJunosTrafficStats, parseEosCounters, parseIosxeCounters, parseIosCountersTabular, parseIosCountersProse, toJsonSafe };

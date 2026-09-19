@@ -1,10 +1,18 @@
 import { Router } from 'express';
+import { prisma } from '../lib/prisma.js';
 import { authMiddleware } from '../middleware/auth.js';
 import {
   getDeviceCounterHistory,
   getLatestCounters,
   pollDeviceCounters,
+  JUNOS_SSH_PORT,
+  JUNOS_API_USER,
+  JUNOS_API_PASSWORD,
+  LAB_SSH_PORT,
+  LAB_SSH_USER,
+  LAB_SSH_PASSWORD,
 } from '../services/interfaceCounters.js';
+import { runIosxeSshCommand } from '../services/labSsh.js';
 
 export const interfaceCountersRouter = Router({ mergeParams: true });
 
@@ -68,5 +76,43 @@ interfaceCountersRouter.post('/:deviceId/interface-counters/refresh', async (req
     sampleCount: r.sampleCount,
     source: r.source,
     collectMs: r.collectMs,
+  });
+});
+
+// POST /api/devices/:deviceId/interface-counters/debug-ssh
+//   Returns the raw SSH output for vendor parsing (no DB insert). Used by
+//   agents to debug "parser missed a line" without redeploying — gated by
+//   DEBUG_COUNTERS=1 env var so it never leaks raw device output in prod.
+interfaceCountersRouter.post('/:deviceId/interface-counters/debug-ssh', async (req, res) => {
+  if (process.env.DEBUG_COUNTERS !== '1') {
+    res.status(404).end();
+    return;
+  }
+  const deviceId = String(req.params.deviceId);
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    res.status(404).json({ error: 'Device not found' });
+    return;
+  }
+  const vendor = (device.vendor ?? '').toLowerCase();
+  const cmd = vendor === 'juniper'
+    ? 'show interfaces extensive'
+    : vendor === 'arista'
+      ? 'show interfaces counters'
+      : 'show interfaces';
+  const port = vendor === 'juniper' ? JUNOS_SSH_PORT : LAB_SSH_PORT;
+  const user = vendor === 'juniper' ? JUNOS_API_USER : LAB_SSH_USER;
+  const pass = vendor === 'juniper' ? JUNOS_API_PASSWORD : LAB_SSH_PASSWORD;
+  const result = await runIosxeSshCommand(device.ip, cmd, {
+    port,
+    username: user,
+    password: pass,
+    timeoutMs: 30000,
+  });
+  res.json({
+    ok: result.ok,
+    cmd,
+    output: result.output,
+    error: result.error,
   });
 });
