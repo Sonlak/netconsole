@@ -280,6 +280,21 @@ export async function collectMacForDevice(
   if (vendor === 'juniper') {
     const rest = await fetchMacTable(device.ip);
     if (rest.ok) {
+      // Empty MAC table on Juniper typically means the device is a pure L3
+      // router (no `family ethernet-switching` on any interface). The RPC
+      // returns an empty `<l2ng-l2ald-rtb-macdb></l2ng-l2ald-rtb-macdb>`
+      // envelope in that case. Surface that in the message so admins
+      // don't think the collector is broken (verified 2026-09-19 against
+      // LAB-F6-CORE-01 / 10.10.20.102 which has only `family inet`
+      // interfaces — see running config). On L2 devices with VLANs the
+      // RPC returns at least one `<l2ng-l2ald-mac-entry-vlan>` block.
+      const l3Only = rest.entries.length === 0 && /<l2ng-l2ald-rtb-macdb>\s*<\/l2ng-l2ald-rtb-macdb>/.test(rest.raw ?? '');
+      const baseMsg = `Collected MAC table from ${device.name} via REST`;
+      const message = l3Only
+        ? `${baseMsg} (empty — device appears to be L3-only; no ethernet-switching interfaces configured)`
+        : rest.entries.length === 0
+        ? `${baseMsg} (no MAC entries learned yet)`
+        : baseMsg;
       const job = await prisma.job.create({
         data: {
           deviceId: device.id,
@@ -292,12 +307,15 @@ export async function collectMacForDevice(
             source: 'junos-rest',
             entries: rest.entries,
             command: 'get-ethernet-switching-table-information',
-            message: `Collected MAC table from ${device.name} via REST`,
+            message,
             collectMs: rest.collectMs,
+            // Hint for the UI to render an L3-only banner instead of
+            // the generic "no entries" empty state.
+            ...(l3Only ? { l3Only: true } : {}),
           } as object,
         },
       });
-      console.log(`[mac] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.entries.length} entries)`);
+      console.log(`[mac] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.entries.length} entries${l3Only ? ', L3-only' : ''})`);
       return { job, queued: false };
     }
     console.warn(`[mac] ${device.ip} REST failed (${rest.error}), falling back to job queue`);

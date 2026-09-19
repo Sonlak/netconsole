@@ -462,6 +462,7 @@ export async function fetchMacTable(host: string): Promise<{
   ok: boolean;
   entries: JunosMacEntry[];
   collectMs: number;
+  raw?: string; // raw XML body — caller may inspect for L3-only detection
   error?: string;
 }> {
   if (!restEnabled()) {
@@ -477,7 +478,7 @@ export async function fetchMacTable(host: string): Promise<{
     return { ok: false, entries: [], collectMs: Date.now() - started, error: 'Empty MAC response' };
   }
   const entries = parseMacTableXml(xml);
-  return { ok: true, entries, collectMs: Date.now() - started };
+  return { ok: true, entries, collectMs: Date.now() - started, raw: xml };
 }
 
 export async function fetchInterfaceList(host: string): Promise<{

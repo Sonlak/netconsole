@@ -303,10 +303,20 @@ function DeviceNetworkTable({ deviceId, kind }: { deviceId: string; kind: 'arp' 
         }
       >
         {entries.length === 0 ? (
-          <EmptyState
-            title={`No ${kind.toUpperCase()} entries`}
-            description="Entries are collected after sync and on a schedule. Collect now if the table is still empty."
-          />
+          (payload?.data as Record<string, unknown> | undefined)?.l3Only ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="This device has no MAC table"
+              description="The Juniper REST RPC returned an empty switching-MAC envelope, which means the device is configured as a pure L3 router (no `family ethernet-switching` interfaces, no VLANs). ARP learning works on L3 interfaces; MAC learning does not. This is correct device behaviour — the MAC table is empty by design."
+            />
+          ) : (
+            <EmptyState
+              title={`No ${kind.toUpperCase()} entries`}
+              description="Entries are collected after sync and on a schedule. Collect now if the table is still empty."
+            />
+          )
         ) : (
           <Table
             rowKey={(row, index) => `${row.mac}-${row.ip ?? row.interface}-${index}`}
