@@ -252,10 +252,25 @@ export function startTerminalWebSocket(httpServer: Server) {
             // against old IOS / IOSv images (15.x) that only support
             // diffie-hellman-group1-sha1, hmac-sha1, and aes*-cbc. Modern
             // Juniper/Arista/NX-OS pick the newer algorithms first — these
-            // are just fallbacks for old peers. Verified 2026-09-16 against
-            // LAB-F3-AS-01 (10.10.20.211, IOS 15.2 vios_l2) which had been
-            // failing with "Incompatible ssh peer (no acceptable kex algorithm)"
-            // before this change. See gotcha #4 / 16 in docs.
+            // are just fallbacks for old peers.
+            //
+            // 2026-09-19: extended the MAC list with the *-etm@openssh.com
+            // variants (`encrypt-then-MAC` from RFC 4344 / OpenSSH). The
+            // Cisco IOS-XE 17.x Virtual XE image on LAB-F3-AS-02 only
+            // advertises these ETM MACs as its C->S preference, plus
+            // hmac-sha2-256/512 as fallback. ssh2's default list omits the
+            // ETM variants, so KEX failed with `Handshake failed: no
+            // matching C->S MAC`. Verified 2026-09-19 against
+            // 10.10.20.212 (IOS-XE 17.16.1a Virtual XE Software) — server
+            // advertised (hmac-sha2-256, hmac-sha2-512, hmac-sha2-256-etm,
+            // hmac-sha2-512-etm, hmac-sha1, hmac-md5, hmac-sha1-96,
+            // hmac-md5-96) and selected hmac-sha2-256-etm via paramiko
+            // (which has the ETM variants on by default). See gotcha #14
+            // (was terminal-only, no IOSv/IOS-XE variant before).
+            //
+            // Same rationale for the cipher list — Cisco IOS-XE 17.x and
+            // NX-OS 9.x advertise aes*-gcm@openssh.com as preference and
+            // we still need aes-cbc for older IOS peers.
             algorithms: {
               kex: [
                 'ecdh-sha2-nistp521',
@@ -270,17 +285,26 @@ export function startTerminalWebSocket(httpServer: Server) {
                 'aes128-ctr',
                 'aes192-ctr',
                 'aes256-ctr',
+                'aes128-gcm@openssh.com',  // IOS-XE 17.x preference
+                'aes256-gcm@openssh.com',  // NX-OS 9.x preference
                 'aes128-cbc',
                 'aes192-cbc',
                 'aes256-cbc',
                 '3des-cbc',  // very old IOS
               ],
               hmac: [
+                // ETM variants preferred by Cisco IOS-XE 17.x / NX-OS 9.x.
+                // Putting them first so ssh2 picks them in KEXINIT
+                // preference order without an extra round-trip.
+                'hmac-sha2-512-etm@openssh.com',
+                'hmac-sha2-256-etm@openssh.com',
+                'hmac-sha1-etm@openssh.com',
                 'hmac-sha2-512',
                 'hmac-sha2-256',
-                'hmac-sha1',  // legacy IOS
+                'hmac-sha1',
                 'hmac-sha1-96',
                 'hmac-md5',   // very old IOS
+                'hmac-md5-96',
               ],
             },
           };
