@@ -20,6 +20,16 @@ import { Client, type Algorithms, type Channel } from 'ssh2';
  *   serverHostKey: ssh-rsa
  *   cipher:        aes256-ctr (and lower)
  *   hmac:          hmac-sha1  (and lower)
+ *
+ * Verified algos for IOS-XE 17.x Virtual XE on LAB-F3-AS-02 / 10.10.20.212
+ * (see terminal.ts for the original capture): server advertises
+ *   hmac: hmac-sha2-256-etm@openssh.com, hmac-sha2-512-etm@openssh.com,
+ *         hmac-sha2-256, hmac-sha2-512, hmac-sha1, hmac-md5, hmac-sha1-96,
+ *         hmac-md5-96
+ * KEX fails with "no matching C->S MAC" if the etm variants are missing,
+ * because the server selects them first and ssh2's preference list doesn't
+ * include them by default. Same for AES-GCM ciphers preferred by IOS-XE
+ * 17.x and NX-OS 9.x.
  */
 const SSH_ALGORITHMS = {
   kex: [
@@ -46,12 +56,17 @@ const SSH_ALGORITHMS = {
     'aes256-ctr',
     'aes192-ctr',
     'aes128-ctr',
+    'aes128-gcm@openssh.com',
+    'aes256-gcm@openssh.com',
     'aes256-cbc',
     'aes192-cbc',
     'aes128-cbc',
     '3des-cbc',
   ],
   hmac: [
+    'hmac-sha2-512-etm@openssh.com',
+    'hmac-sha2-256-etm@openssh.com',
+    'hmac-sha1-etm@openssh.com',
     'hmac-sha2-512',
     'hmac-sha2-256',
     'hmac-sha1',
