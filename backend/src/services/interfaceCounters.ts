@@ -547,10 +547,12 @@ async function fetchInterfaceCounters(device: Device): Promise<FetchResult> {
     // RPC), fall back to SSH `show interfaces statistics` which on cRPD proxies
     // /proc/net/dev.
     const r = await fetchJunosCounters(device.ip);
-    if (r.ok && r.source !== 'junos-rest-no-counters') return r;
+    const gotCounters = r.interfaces.some((i) => i.inOctets != null || i.outOctets != null);
+    if (r.ok && gotCounters) return r;
+    console.warn(`[counters] Junos RPC for ${device.ip} returned ${r.interfaces.length} ifaces but no traffic-statistics; falling back to SSH`);
     const ssh = await fetchJunosSshCounters(device.ip);
     if (ssh.ok) return ssh;
-    // Either way, return what we have. UI will flag the no-counters case.
+    // SSH also failed — return RESTCONF result so the UI can show what we have.
     return r.ok ? { ...r, error: ssh.error ?? r.error } : ssh;
   }
   if (vendor === 'arista') return fetchEosCounters(device.ip);
