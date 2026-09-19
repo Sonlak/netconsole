@@ -48,6 +48,7 @@ const PARALLEL_DEVICES = Math.max(Number(process.env.INTERFACE_COUNTERS_PARALLEL
 const LAB_SSH_USER = process.env.LAB_SSH_USER ?? 'netconsole';
 const LAB_SSH_PASSWORD = process.env.LAB_SSH_PASSWORD ?? 'Admin@123';
 const LAB_SSH_PORT = Number.parseInt(process.env.LAB_SSH_PORT ?? '22', 10);
+const JUNOS_SSH_PORT = Number.parseInt(process.env.JUNOS_SSH_PORT ?? '22', 10);
 const IOSXE_API_USER = process.env.IOSXE_API_USER ?? LAB_SSH_USER;
 const IOSXE_API_PASSWORD = process.env.IOSXE_API_PASSWORD ?? LAB_SSH_PASSWORD;
 const IOSXE_API_SCHEME = process.env.IOSXE_API_SCHEME ?? 'https';
@@ -148,26 +149,7 @@ async function fetchJunosCounters(host: string): Promise<FetchResult> {
       return { ok: false, source: 'junos-rest', interfaces: [], error: 'Junos RPC error', collectMs: collectMs() };
     }
     const interfaces = parseJunosTrafficStats(raw);
-    // 2026-09-19: cRPD's RESTCONF RPC often returns no <traffic-statistics>
-    // (no data-plane counters exposed). To make the chart not lie, surface
-    // that fact instead of silently dropping to null. We persist whatever
-    // non-null bytes/packets/errors we DID parse, but the UI flags the
-    // truth — `source: junos-rest-no-counters` means "the device answered,
-    // counters just weren't in the RPC envelope".
-    let source: FetchResult['source'] = 'junos-rest';
-    if (interfaces.length > 0 && interfaces.every((i) => i.inOctets == null && i.outOctets == null)) {
-      source = 'junos-rest-no-counters';
-      console.warn(`[counters] Junos RPC for ${host} returned ${interfaces.length} ifaces but NO traffic-statistics (cRPD likely). Falling back to SSH 'show interfaces statistics'.`);
-      // Fallback: pull counters via SSH CLI. SSH on cRPD returns real Linux
-      // /proc/net/dev bytes which the data-plane DOES track even when the
-      // RESTCONF RPC omits the block.
-      const ssh = await fetchJunosSshCounters(host);
-      if (ssh.ok && ssh.interfaces.length > 0) {
-        return { ...ssh, collectMs: collectMs() };
-      }
-      return { ok: true, source, interfaces, collectMs: collectMs() };
-    }
-    return { ok: true, source, interfaces, collectMs: collectMs() };
+    return { ok: true, source: 'junos-rest', interfaces, collectMs: collectMs() };
   } catch (err) {
     return {
       ok: false,
@@ -559,51 +541,136 @@ function parseIosCounters(output: string): InterfaceCounters[] {
 
 async function fetchInterfaceCounters(device: Device): Promise<FetchResult> {
   const vendor = (device.vendor ?? '').toLowerCase();
-  if (vendor === 'juniper') return fetchJunosCounters(device.ip);
+  if (vendor === 'juniper') {
+    // Try RESTCONF first (fast, structured). If it answers but emits no
+    // <traffic-statistics> (cRPD has no data-plane counters on its RESTCONF
+    // RPC), fall back to SSH `show interfaces statistics` which on cRPD proxies
+    // /proc/net/dev.
+    const r = await fetchJunosCounters(device.ip);
+    if (r.ok && r.source !== 'junos-rest-no-counters') return r;
+    const ssh = await fetchJunosSshCounters(device.ip);
+    if (ssh.ok) return ssh;
+    // Either way, return what we have. UI will flag the no-counters case.
+    return r.ok ? { ...r, error: ssh.error ?? r.error } : ssh;
+  }
   if (vendor === 'arista') return fetchEosCounters(device.ip);
   if (vendor === 'ios') return fetchIosSshCounters(device.ip);
   // Default + 'cisco' (IOS-XE): try RESTCONF first (matches operational data
-  // path on IOS-XE 16+/17.x), fall back to SSH `show interfaces` if RESTCONF
-  // returns 4xx/5xx/timeout. Note (gotcha #14): RESTCONF on IOS-XE 17.x is
-  // documented as unreliable, so the SSH fallback is the durable path for
-  // lab devices regardless.
+  // path on IOS-XE 16+/17.x), fall back to SSH `show interfaces statistics`
+  // if RESTCONF returns 4xx/5xx/timeout. Note (gotcha #14): RESTCONF on
+  // IOS-XE 17.x is documented as unreliable, so the SSH fallback is the
+  // durable path for lab devices regardless.
   const rest = await fetchIosxeCounters(device.ip);
   if (rest.ok) return rest;
   console.warn(`[counters] IOS-XE RESTCONF failed for ${device.ip} (${rest.error}); falling back to SSH`);
   const ssh = await fetchIosSshCounters(device.ip);
   if (ssh.ok) return ssh;
-  // Both failed — surface the more actionable of the two. RESTCONF usually
-  // returns 404 when the operational container isn't advertised; prefer SSH
-  // error message because that's the primary path on lab F3-AS-01.
   return { ...ssh, error: `restconf: ${rest.error ?? '?'}; ssh: ${ssh.error ?? '?'}` };
 }
 
-// Best-effort Junos SSH fallback for cRPD devices whose RESTCONF RPC
-// silently omits <traffic-statistics>. cRPD exposes its data-plane via
-// Linux — counters live in /proc/net/dev. `show interfaces statistics`
-// on the CLI is the simplest portable hook; on real Junos it returns
-// the same XML the RESTCONF form does, so we only fall through to
-// `parseJunosTrafficStats` for the response.
-//
-// Implementation note: we don't actually have a backend SSH client today,
-// so this function delegates to the worker via the existing job queue when
-// `IOSXE_API_ENABLED`/`JUNOS_REST_ENABLED` isn't sufficient. Until that
-// wiring is added, callers log the failure and continue with what they
-// already had. Kept here so the surface area matches the other vendors
-// and the switch from RESTCONF->SSH is a one-line change later.
+// cRPD exposes Linux /proc/net/dev counters via SSH `show interfaces statistics`.
+// On real Junos this command returns the same data as the RESTCONF detail
+// form, so this path is universally valid -- it just takes longer than RESTCONF.
 async function fetchJunosSshCounters(host: string): Promise<FetchResult> {
   const started = Date.now();
   const collectMs = () => Date.now() - started;
-  // TODO: wire sshClient.ts / paramiko into a back-end SSH pool so this
-  // path actually runs `show interfaces statistics` against cRPD. Until
-  // then, we surface "ssh unsupported" honestly rather than fake it.
-  return {
-    ok: false,
-    source: 'junos-ssh',
-    interfaces: [],
-    error: 'Junos SSH fallback not yet wired on backend',
-    collectMs: collectMs(),
+  try {
+    const result = await runIosxeSshCommand(host, 'show interfaces statistics', {
+      port: JUNOS_SSH_PORT,
+      username: JUNOS_API_USER,
+      password: JUNOS_API_PASSWORD,
+      timeoutMs: 30000,
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        source: 'junos-ssh',
+        interfaces: [],
+        collectMs: collectMs(),
+        error: result.error ?? 'Junos SSH failed',
+      };
+    }
+    const interfaces = parseJunosCliStats(result.output);
+    return { ok: true, source: 'junos-ssh', interfaces, collectMs: collectMs() };
+  } catch (err) {
+    return {
+      ok: false,
+      source: 'junos-ssh',
+      interfaces: [],
+      collectMs: collectMs(),
+      error: err instanceof Error ? err.message : 'Junos SSH failed',
+    };
+  }
+}
+
+// Parse `show interfaces statistics` from Junos / cRPD. Format per iface:
+//
+//   Logical interface ge-0/0/0.0 (Index 70) (SNMP ifIndex 521)
+//     Input packets: 12345
+//     Output packets: 67890
+//     Input bytes:   1234567
+//     Output bytes:  2345678
+//     Input errors:  0
+//     Output errors: 0
+//     Input discards: 0
+//     Output discards:0
+//
+// `show interfaces extensive` is the XML form; SSH returns text.
+// Note: cRPD returns numeric zero values without padding; the regex below
+// tolerates both "  12345" and "12345" forms.
+function parseJunosCliStats(output: string): InterfaceCounters[] {
+  const out: InterfaceCounters[] = [];
+  if (!output) return out;
+  const lines = output.split(/\r?\n/);
+  const ifaceRe = /^\s*(?:Logical interface|Physical interface)\s+([\w./-]+)/i;
+  // capture interface name with optional .0 suffix; strip the logical unit
+  const nameRe = /^([a-zA-Z][\w/-]+?)(?:\.\d+)?$/;
+  const numRe = (key: string) => new RegExp(`^\\s*${key}\\s*:?\\s*(\\d+)`, 'i');
+  const fieldMap: Array<[keyof InterfaceCounters, RegExp]> = [
+    ['inPackets', numRe('Input packets')],
+    ['outPackets', numRe('Output packets')],
+    ['inOctets', numRe('Input bytes(?:\\(48\\))?')],
+    ['outOctets', numRe('Output bytes(?:\\(48\\))?')],
+    ['inErrors', numRe('Input errors')],
+    ['outErrors', numRe('Output errors')],
+    ['inDiscards', numRe('Input discards')],
+    ['outDiscards', numRe('Output discards')],
+  ];
+  let current: InterfaceCounters | null = null;
+  const flush = () => {
+    if (current) out.push(current);
+    current = null;
   };
+  for (const raw of lines) {
+    const line = raw.replace(/\u0000/g, ''); // strip stray NULs from cRPD
+    const header = ifaceRe.exec(line);
+    if (header) {
+      flush();
+      // Junos CLI uses "ge-0/0/0" or "ge-0/0/0.0" (logical). Keep just the
+      // physical name to match the RESTCONF parser.
+      const raw = header[1].trim();
+      const phys = (raw.match(nameRe)?.[1] ?? raw).replace(/\.\d+$/, '');
+      current = { name: phys };
+      continue;
+    }
+    if (!current) continue;
+    for (const [k, re] of fieldMap) {
+      if (current[k] !== undefined) continue;
+      const m = re.exec(line);
+      if (m) {
+        try {
+          (current as Record<string, unknown>)[k] = BigInt(m[1]);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  flush();
+  // Drop interfaces we never saw octets for -- a "Logical interface"
+  // header with no counters below means SSH returned the header but the
+  // counter lines were filtered out (e.g. internal-only interface).
+  return out.filter((i) => i.inOctets !== undefined || i.outOctets !== undefined);
 }
 
 // ---------------------------------------------------------------------------
