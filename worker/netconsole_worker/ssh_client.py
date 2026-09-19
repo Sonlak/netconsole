@@ -240,6 +240,54 @@ def _exec_on(
     return output, err_text, exit_status
 
 
+def _is_resource_shortage(exc: BaseException) -> bool:
+    """Return True if `exc` looks like Cisco IOS-XE rejecting an SSH
+    channel open because its NETCONF/SSH subsystem is busy.
+
+    Symptom A (verified 2026-09-19 against LAB-F3-AS-02 / 10.10.20.212):
+        paramiko.transport: Secsh channel 1 open FAILED: : Resource shortage
+        -> paramiko.ChannelException(code, 'Resource shortage') raised from
+           client.exec_command()
+        -> run_ssh_command surfaces it to the worker as a successful job with
+           result.implemented=false and message="ChannelException(...,
+           'Resource shortage')". UI then shows "Lab integration unavailable".
+
+    Symptom B (same device, same session, sibling of A):
+        stdio.read() raises EOFError mid-read after the device drops the
+        channel silently. str(EOFError()) is the empty string, so without
+        retry the UI shows the bare "Lab integration unavailable" with no
+        description. Same root cause — the IOS-XE 17.x SSH subsystem is
+        transiently busy and drops the channel instead of answering.
+
+    Root cause: IOS-XE 17.x shares the SSH subsystem with NETCONF. When the
+    device is busy (e.g. another collection cycle is opening channels
+    concurrently) the SSH server returns SSH_OPEN_RESOURCE_SHORTAGE on
+    `channel open` (A) or simply closes the channel mid-read (B). The
+    transport itself is fine — it's a transient device resource event,
+    NOT a corrupted connection.
+
+    Action: caller should NOT invalidate the pool entry, just back off and
+    retry the channel open. Without this, every concurrent MAC sweep on the
+    device loses a noticeable fraction of jobs to a perfectly-recoverable
+    error.
+    """
+    import paramiko
+
+    if isinstance(exc, paramiko.ChannelException):
+        text = (getattr(exc, "text", "") or str(exc) or "").lower()
+        if "resource shortage" in text or "resource_shortage" in text:
+            return True
+    if isinstance(exc, EOFError):
+        # Empty EOFError mid-channel-read on IOS-XE 17.x = the same device-
+        # busy event as Resource shortage. The transport is still healthy,
+        # so we retry without invalidating the pool entry.
+        return True
+    # Fall back to substring match against the str repr — covers older
+    # paramiko versions that wrap the ChannelException differently.
+    s = str(exc).lower()
+    return "resource shortage" in s or "channelexception" in s and "shortage" in s
+
+
 def run_ssh_command(
     host: str,
     username: str,
@@ -255,37 +303,22 @@ def run_ssh_command(
     If the pooled connection's transport has been closed by the server
     (common on Cisco IOS-XE after an exec completes), the pool entry is
     invalidated and a fresh connection is opened and retried transparently.
+
+    Transient `Resource shortage` channel-open failures (Cisco IOS-XE
+    NETCONF/SSH subsystem busy) are retried with exponential backoff
+    WITHOUT invalidating the pool entry — the transport is still healthy.
     """
     pool = get_pool()
     entry = pool.borrow(host, port, username, password, timeout=timeout)
-    try:
-        output, err_text, exit_status = _exec_on(entry.client, command, timeout, input_text)
-    except Exception as exc:  # noqa: BLE001 - lab boundary
-        # ALWAYS drop the poisoned pooled entry, then decide whether to retry
-        # on a brand-new connection. Without this, a half-dead transport
-        # would block every subsequent job on the same (host, port, user).
-        pool.invalidate(host, port, username)
-        import paramiko
-        if isinstance(exc, paramiko.ssh_exception.SSHException) and (
-            "not active" in str(exc) or "Channel closed" in str(exc)
-        ):
-            import logging
-            log = logging.getLogger(__name__)
-            log.debug("transport died on %s, retrying with fresh connection", host)
-            # pool.borrow opens a new connection if needed; wrap in try so a
-            # second connect failure returns a clear error instead of leaking
-            # the AttributeError we used to get from a missing _create_conn.
-            try:
-                fresh_entry = pool.borrow(host, port, username, password, timeout=timeout)
-            except Exception as conn_exc:  # noqa: BLE001
-                return {"sshOk": False, "output": "", "error": f"retry connect failed: {conn_exc}"}
-            try:
-                output, err_text, exit_status = _exec_on(
-                    fresh_entry.client, command, timeout, input_text
-                )
-            except Exception as exc2:  # noqa: BLE001
-                pool.invalidate(host, port, username)
-                return {"sshOk": False, "output": "", "error": str(exc2)}
+    # Retry budget for transient device-side resource shortage. Tuned to
+    # 3 attempts × (0.3s + 0.6s + 1.2s) = ~2.1s of total wait, which keeps
+    # the job within the worker watchdog (45s) while letting the device
+    # recover from a brief NETCONF subsystem stall.
+    backoff_schedule = (0.3, 0.6, 1.2)
+    last_exc: BaseException | None = None
+    for attempt in range(1 + len(backoff_schedule)):
+        try:
+            output, err_text, exit_status = _exec_on(entry.client, command, timeout, input_text)
             pool.release(host, port, username)
             if exit_status != 0:
                 return {
@@ -293,23 +326,82 @@ def run_ssh_command(
                     "output": output,
                     "error": err_text.strip() or f"SSH command exited with status {exit_status}",
                 }
-            return {"sshOk": True, "output": output if output else err_text}
-        return {"sshOk": False, "output": "", "error": str(exc)}
+            return {
+                "sshOk": True,
+                "output": output if output else err_text,
+                "error": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - lab boundary
+            last_exc = exc
+            if _is_resource_shortage(exc) and attempt < len(backoff_schedule):
+                # Transient — the device is briefly out of SSH channels.
+                # Keep the pooled transport alive (it's not the culprit) and
+                # try again after a short backoff. Total wait per attempt:
+                # backoff_schedule[attempt] seconds (0.3, 0.6, 1.2).
+                import logging
+                log = logging.getLogger(__name__)
+                delay = backoff_schedule[attempt]
+                log.warning(
+                    "SSH channel open rejected by %s (%s); retrying in %.1fs (attempt %d/%d)",
+                    host, exc, delay, attempt + 1, 1 + len(backoff_schedule),
+                )
+                import time as _time
+                _time.sleep(delay)
+                continue
 
-    pool.release(host, port, username)
+            # Non-transient error (or final attempt exhausted). Drop the
+            # pool entry — for "Channel closed" / "not active" the transport
+            # really is dead; for Resource shortage after retries we still
+            # bail out cleanly.
+            pool.invalidate(host, port, username)
+            import paramiko
+            if isinstance(exc, paramiko.ssh_exception.SSHException) and (
+                "not active" in str(exc) or "Channel closed" in str(exc)
+            ):
+                import logging
+                log = logging.getLogger(__name__)
+                log.debug("transport died on %s, retrying with fresh connection", host)
+                # pool.borrow opens a new connection if needed; wrap in try so a
+                # second connect failure returns a clear error instead of leaking
+                # the AttributeError we used to get from a missing _create_conn.
+                try:
+                    fresh_entry = pool.borrow(host, port, username, password, timeout=timeout)
+                except Exception as conn_exc:  # noqa: BLE001
+                    return {"sshOk": False, "output": "", "error": f"retry connect failed: {conn_exc}"}
+                try:
+                    output, err_text, exit_status = _exec_on(
+                        fresh_entry.client, command, timeout, input_text
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    pool.invalidate(host, port, username)
+                    return {"sshOk": False, "output": "", "error": str(exc2)}
+                pool.release(host, port, username)
+                if exit_status != 0:
+                    return {
+                        "sshOk": False,
+                        "output": output,
+                        "error": err_text.strip() or f"SSH command exited with status {exit_status}",
+                    }
+                return {"sshOk": True, "output": output if output else err_text}
+            # Resource shortage after retries exhausted — return a clear,
+            # human-readable message instead of the raw ncclient-style repr.
+            if _is_resource_shortage(exc):
+                return {
+                    "sshOk": False,
+                    "output": "",
+                    "error": (
+                        f"IOS-XE SSH channel open failed: device returned "
+                        f"'Resource shortage' after {1 + len(backoff_schedule)} attempts. "
+                        f"NETCONF/SSH subsystem busy; retry on the next collection cycle."
+                    ),
+                }
+            return {"sshOk": False, "output": "", "error": str(exc)}
 
-    if exit_status != 0:
-        return {
-            "sshOk": False,
-            "output": output,
-            "error": err_text.strip() or f"SSH command exited with status {exit_status}",
-        }
-
-    return {
-        "sshOk": True,
-        "output": output if output else err_text,
-        "error": None,
-    }
+    # All retries exhausted — last_exc is guaranteed set in this branch
+    # because the loop runs at least one iteration that only exits via the
+    # except path when an exception is raised.
+    assert last_exc is not None
+    return {"sshOk": False, "output": "", "error": str(last_exc)}
 
 
 def run_junos_commands(
