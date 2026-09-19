@@ -4,9 +4,7 @@ We can't easily reproduce the paramiko ChannelException in CI, so we
 patch _exec_on with a function that raises on the first N calls and
 succeeds afterwards.
 """
-import sys
 import time
-import types
 import unittest
 from unittest.mock import patch
 
