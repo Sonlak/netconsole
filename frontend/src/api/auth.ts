@@ -1,3 +1,5 @@
+import { broadcastLogout } from '../lib/refreshCoordinator';
+
 const API_BASE = '/api/auth';
 
 export interface LoginRequest {
@@ -168,6 +170,8 @@ export async function refreshTokens(): Promise<RefreshResponse> {
 
 // POST /api/auth/logout — revoke the refresh token server-side. Best
 // effort: if it fails (e.g. already offline) we still clear local auth.
+// Also broadcasts a logout event to other tabs so they clear their
+// local session too (see frontend/src/lib/refreshCoordinator.ts).
 export async function logout(): Promise<void> {
   const refresh = getRefreshToken();
   try {
@@ -183,6 +187,7 @@ export async function logout(): Promise<void> {
     // either way.
   }
   clearAllAuth();
+  broadcastLogout();
 }
 
 // Token storage helpers

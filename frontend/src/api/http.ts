@@ -1,4 +1,5 @@
-import { authHeaders, refreshTokens, clearAllAuth } from './auth';
+import { coordinatedRefresh, broadcastAuthCleared } from '../lib/refreshCoordinator';
+import { authHeaders, clearAllAuth } from './auth';
 import { DeviceBusyError } from '../lib/errors';
 
 export class UnauthorizedError extends Error {
@@ -9,16 +10,18 @@ export class UnauthorizedError extends Error {
 }
 
 // Single-flight refresh: when multiple API calls hit a 401 at the same
-// time, only one POST /api/auth/refresh is in-flight; everyone else
-// waits for its result. Prevents the thundering herd of concurrent
-// refresh calls that would otherwise each consume one refresh token.
+// time, only one POST /api/auth/refresh is in-flight within THIS tab.
+// Cross-tab coordination (so only one tab per browser refreshes, not
+// just one call per tab) lives in frontend/src/lib/refreshCoordinator.ts.
+// Together the two layers prevent the "two tabs hit 401 simultaneously
+// -> second one triggers replay_detected -> all tabs logged out" trap.
 let refreshInFlight: Promise<void> | null = null;
 
 async function doRefresh(): Promise<void> {
-  const result = await refreshTokens();
-  // refreshTokens() already updates localStorage on success. Touch the
-  // var to keep linters happy and to make the success path explicit.
-  void result;
+  // coordinatedRefresh() handles leader election across tabs, only the
+  // elected leader POSTs /api/auth/refresh, and the result is broadcast
+  // via BroadcastChannel to every other tab. Throws on any failure.
+  await coordinatedRefresh();
 }
 
 export async function handleResponse<T>(response: Response): Promise<T> {
@@ -36,6 +39,12 @@ export async function handleResponse<T>(response: Response): Promise<T> {
             if (code === 'replay_detected') {
               console.warn('[auth] refresh replay detected — clearing local session');
             }
+            // Push the "auth is dead" event to every other tab so they
+            // clear their localStorage instead of trying their own
+            // refresh (which would also hit replay_detected and waste a
+            // POST). broadcastAuthCleared() is best-effort — no-op if
+            // BroadcastChannel is unavailable.
+            broadcastAuthCleared();
             clearAllAuth();
           } finally {
             // Allow the next batch of 401s to attempt a fresh refresh.
@@ -114,6 +123,11 @@ export async function authJsonFetch<T>(url: string, options: RequestInit = {}): 
             if (code === 'replay_detected') {
               console.warn('[auth] refresh replay detected — clearing local session');
             }
+            // Push the "auth is dead" event to every other tab so they
+            // clear their localStorage instead of trying their own
+            // refresh (which would also hit replay_detected and waste a
+            // POST). See matching block in handleResponse above.
+            broadcastAuthCleared();
             clearAllAuth();
           } finally {
             refreshInFlight = null;
