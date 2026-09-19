@@ -106,23 +106,68 @@ async function fetchJunosCounters(host: string): Promise<FetchResult> {
   const url = `${cfg.scheme}://${host}:${cfg.port}/rpc/get-interface-information`;
   const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
   try {
-    // GET form (matches the interfaces.ts collector). No terse=<terse/> flag
-    // either — that would strip counters — and no <statistics/> flag (that's
-    // for aggregate system-wide stats).
-    const resp = await fetch(url, {
+    // GET first (matches interfaces.ts / callRpc pattern). If response is
+    // empty/terse, fall back to POST with `<detail/>` which is the canonical
+    // RPC form for traffic-statistics per Junos docs.
+    let resp = await fetch(url, {
       method: 'GET',
       headers: { Authorization: `Basic ${auth}`, Accept: 'application/xml' },
       signal: AbortSignal.timeout(20000),
     });
-    const raw = await resp.text();
-    if (!resp.ok) {
+    let raw = await resp.text();
+    let usedPost = false;
+    // If the body has no traffic-statistics at all, try POST <detail/>.
+    // cRPD (and some Junos versions) only emit counters when the RPC
+    // explicitly asks for the detail view.
+    if (resp.ok && !/<(?:\w+:)?traffic-statistics/i.test(raw)) {
+      const postResp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          Accept: 'application/xml',
+          'Content-Type': 'application/xml',
+        },
+        body: '<get-interface-information><detail/></get-interface-information>',
+        signal: AbortSignal.timeout(20000),
+      });
+      const postRaw = await postResp.text();
+      if (postResp.ok && /<(?:\w+:)?traffic-statistics/i.test(postRaw)) {
+        raw = postRaw;
+        usedPost = true;
+      } else if (postResp.ok && postRaw.length > raw.length) {
+        // Keep the longer response if neither had stats -- preserves the
+        // most-detailed output for the warning path below.
+        raw = postRaw;
+        usedPost = true;
+      }
+    }
+    if (!resp.ok && !(usedPost && raw)) {
       return { ok: false, source: 'junos-rest', interfaces: [], error: `HTTP ${resp.status}`, collectMs: collectMs() };
     }
     if (/xnm:error|<error-message>|<rpc-reply[^>]*>\s*<xnm:error/i.test(raw)) {
       return { ok: false, source: 'junos-rest', interfaces: [], error: 'Junos RPC error', collectMs: collectMs() };
     }
     const interfaces = parseJunosTrafficStats(raw);
-    return { ok: true, source: 'junos-rest', interfaces, collectMs: collectMs() };
+    // 2026-09-19: cRPD's RESTCONF RPC often returns no <traffic-statistics>
+    // (no data-plane counters exposed). To make the chart not lie, surface
+    // that fact instead of silently dropping to null. We persist whatever
+    // non-null bytes/packets/errors we DID parse, but the UI flags the
+    // truth — `source: junos-rest-no-counters` means "the device answered,
+    // counters just weren't in the RPC envelope".
+    let source: FetchResult['source'] = 'junos-rest';
+    if (interfaces.length > 0 && interfaces.every((i) => i.inOctets == null && i.outOctets == null)) {
+      source = 'junos-rest-no-counters';
+      console.warn(`[counters] Junos RPC for ${host} returned ${interfaces.length} ifaces but NO traffic-statistics (cRPD likely). Falling back to SSH 'show interfaces statistics'.`);
+      // Fallback: pull counters via SSH CLI. SSH on cRPD returns real Linux
+      // /proc/net/dev bytes which the data-plane DOES track even when the
+      // RESTCONF RPC omits the block.
+      const ssh = await fetchJunosSshCounters(host);
+      if (ssh.ok && ssh.interfaces.length > 0) {
+        return { ...ssh, collectMs: collectMs() };
+      }
+      return { ok: true, source, interfaces, collectMs: collectMs() };
+    }
+    return { ok: true, source, interfaces, collectMs: collectMs() };
   } catch (err) {
     return {
       ok: false,
@@ -134,7 +179,7 @@ async function fetchJunosCounters(host: string): Promise<FetchResult> {
   }
 }
 
-const _PHYS_IFACE_RE = /<physical-interface>([\s\S]*?)<\/physical-interface>/g;
+const _PHYS_IFACE_RE = /<(?:\w+:)?physical-interface>([\s\S]*?)<\/(?:\w+:)?physical-interface>/g;
 
 function parseJunosTrafficStats(xml: string): InterfaceCounters[] {
   const out: InterfaceCounters[] = [];
@@ -145,22 +190,23 @@ function parseJunosTrafficStats(xml: string): InterfaceCounters[] {
     const block = match[1];
     const name = jcTag(block, 'name');
     if (!name) continue;
-    // Junos returns stats nested in <traffic-statistics>. Some images split
-    // into <input-statistics>/<output-statistics>. Try the unified block first.
+    // Some Junos versions split counters into input-/output-statistics; the
+    // newer detail form nests them under a unified <traffic-statistics>.
+    // Try unified first, then concat the split form.
     const stats =
       jcBlock(block, 'traffic-statistics') ||
       `${jcBlock(block, 'input-statistics')}\n${jcBlock(block, 'output-statistics')}`;
     if (!stats) continue;
     out.push({
       name,
-      inOctets: jcNum(stats, 'input-octets'),
-      outOctets: jcNum(stats, 'output-octets'),
+      inOctets: jcNum(stats, 'input-octets') ?? jcNum(stats, 'input-bytes'),
+      outOctets: jcNum(stats, 'output-octets') ?? jcNum(stats, 'output-bytes'),
       inPackets: jcNum(stats, 'input-packets'),
       outPackets: jcNum(stats, 'output-packets'),
       inErrors: jcNum(stats, 'input-errors'),
       outErrors: jcNum(stats, 'output-errors'),
-      inDiscards: jcNum(stats, 'input-drops'),
-      outDiscards: jcNum(stats, 'output-drops'),
+      inDiscards: jcNum(stats, 'input-drops') ?? jcNum(stats, 'input-discards'),
+      outDiscards: jcNum(stats, 'output-drops') ?? jcNum(stats, 'output-discards'),
       inCrcErrors: jcNum(stats, 'input-crc-errors'),
     });
   }
@@ -168,13 +214,13 @@ function parseJunosTrafficStats(xml: string): InterfaceCounters[] {
 }
 
 function jcBlock(xml: string, tag: string): string {
-  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i').exec(xml);
-  return m?.[1] ?? '';
+  const re = new RegExp(`<(?:\w+:)?${tag}>([\\s\\S]*?)</(?:\w+:)?${tag}>`, 'i');
+  return re.exec(xml)?.[1] ?? '';
 }
 
 function jcTag(xml: string, tag: string): string {
-  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i').exec(xml);
-  return m?.[1]?.trim() ?? '';
+  const re = new RegExp(`<(?:\w+:)?${tag}>([\\s\\S]*?)</(?:\w+:)?${tag}>`, 'i');
+  return re.exec(xml)?.[1]?.trim() ?? '';
 }
 
 function jcNum(xml: string, tag: string): bigint | undefined {
@@ -530,6 +576,34 @@ async function fetchInterfaceCounters(device: Device): Promise<FetchResult> {
   // returns 404 when the operational container isn't advertised; prefer SSH
   // error message because that's the primary path on lab F3-AS-01.
   return { ...ssh, error: `restconf: ${rest.error ?? '?'}; ssh: ${ssh.error ?? '?'}` };
+}
+
+// Best-effort Junos SSH fallback for cRPD devices whose RESTCONF RPC
+// silently omits <traffic-statistics>. cRPD exposes its data-plane via
+// Linux — counters live in /proc/net/dev. `show interfaces statistics`
+// on the CLI is the simplest portable hook; on real Junos it returns
+// the same XML the RESTCONF form does, so we only fall through to
+// `parseJunosTrafficStats` for the response.
+//
+// Implementation note: we don't actually have a backend SSH client today,
+// so this function delegates to the worker via the existing job queue when
+// `IOSXE_API_ENABLED`/`JUNOS_REST_ENABLED` isn't sufficient. Until that
+// wiring is added, callers log the failure and continue with what they
+// already had. Kept here so the surface area matches the other vendors
+// and the switch from RESTCONF->SSH is a one-line change later.
+async function fetchJunosSshCounters(host: string): Promise<FetchResult> {
+  const started = Date.now();
+  const collectMs = () => Date.now() - started;
+  // TODO: wire sshClient.ts / paramiko into a back-end SSH pool so this
+  // path actually runs `show interfaces statistics` against cRPD. Until
+  // then, we surface "ssh unsupported" honestly rather than fake it.
+  return {
+    ok: false,
+    source: 'junos-ssh',
+    interfaces: [],
+    error: 'Junos SSH fallback not yet wired on backend',
+    collectMs: collectMs(),
+  };
 }
 
 // ---------------------------------------------------------------------------
