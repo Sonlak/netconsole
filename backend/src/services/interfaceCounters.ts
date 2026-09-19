@@ -97,29 +97,28 @@ async function fetchJunosCounters(host: string): Promise<FetchResult> {
   if (!JUNOS_API_ENABLED) {
     return { ok: false, source: 'junos-rest', interfaces: [], error: 'JUNOS_REST_ENABLED=false', collectMs: collectMs() };
   }
-  const url = `${JUNOS_API_SCHEME}://${host}:${JUNOS_API_PORT}/rpc/get-interface-information`;
-  const auth = Buffer.from(`${JUNOS_API_USER}:${JUNOS_API_PASSWORD}`).toString('base64');
+  // Use the same GET-RPC pattern as interfaces.ts / callRpc() in junosRest.ts.
+  // Tested 2026-09-19: returning 0 interfaces from this path means either the
+  // RPC name is wrong OR the device returned an error envelope instead of the
+  // interface-information payload. The `[junosRest] pullJunosConfig` path uses
+  // GET /rpc/<rpc> with no body, so we follow that.
+  const cfg = { scheme: JUNOS_API_SCHEME, port: JUNOS_API_PORT, username: JUNOS_API_USER, password: JUNOS_API_PASSWORD };
+  const url = `${cfg.scheme}://${host}:${cfg.port}/rpc/get-interface-information`;
+  const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
   try {
+    // GET form (matches the interfaces.ts collector). No terse=<terse/> flag
+    // either — that would strip counters — and no <statistics/> flag (that's
+    // for aggregate system-wide stats).
     const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: 'application/xml',
-        'Content-Type': 'application/xml',
-      },
-      // Force *detailed* output so we get <traffic-statistics>. Omitting
-      // `<terse/>` returns the full info per interface; terse strips counters.
-      // NOTE: do NOT add a <statistics/> flag here — that requests aggregate
-      // system-wide statistics, not per-interface. Detailed output already
-      // embeds <traffic-statistics><input-octets>... per interface.
-      body: '<get-interface-information xmlns="http://xml.juniper.net/junos/release/junos-interface"/>',
+      method: 'GET',
+      headers: { Authorization: `Basic ${auth}`, Accept: 'application/xml' },
       signal: AbortSignal.timeout(20000),
     });
     const raw = await resp.text();
     if (!resp.ok) {
       return { ok: false, source: 'junos-rest', interfaces: [], error: `HTTP ${resp.status}`, collectMs: collectMs() };
     }
-    if (/xnm:error|<error-message>/.test(raw)) {
+    if (/xnm:error|<error-message>|<rpc-reply[^>]*>\s*<xnm:error/i.test(raw)) {
       return { ok: false, source: 'junos-rest', interfaces: [], error: 'Junos RPC error', collectMs: collectMs() };
     }
     const interfaces = parseJunosTrafficStats(raw);
@@ -244,34 +243,55 @@ function parseEosCounters(result: unknown[]): InterfaceCounters[] {
   if (!result.length) return [];
   const first = result[0] as Record<string, unknown> | undefined;
   if (!first) return [];
-  // eAPI returns either { output: {...} } (text wrapper) or the raw tree.
-  const data = ('output' in first && typeof first.output === 'object'
-    ? (first.output as Record<string, unknown>)
-    : first) as Record<string, unknown>;
+  // EOS eAPI returns either { output: { Ethernet1: {...}, Ethernet2: {...} } }
+  // (newer) or the interface map directly (older). Handle both. Also the map
+  // may live under .interfaces.* (eos-switch version).
   const out: InterfaceCounters[] = [];
+
+  // Try `output.{iface}` (newer EOS 4.22+)
+  let data: Record<string, unknown> | undefined;
+  if ('output' in first && first.output && typeof first.output === 'object') {
+    data = (first as Record<string, unknown>).output as Record<string, unknown>;
+  } else if ('interfaces' in first && typeof first.interfaces === 'object') {
+    data = (first as Record<string, unknown>).interfaces as Record<string, unknown>;
+  } else {
+    // Might BE the interface map directly (first = { Ethernet1: {...} })
+    data = first;
+  }
+
+  if (!data) return out;
+
   for (const [name, body] of Object.entries(data)) {
     if (!body || typeof body !== 'object') continue;
     const b = body as Record<string, unknown>;
     // Skip non-interface entries (e.g. "summary")
-    if (name === 'summary' || !('inOctets' in b || 'outOctets' in b || 'rxData' in b)) continue;
-    const get = (k: string): bigint | undefined => {
-      const v = b[k];
+    if (name === 'summary') continue;
+    // If this value itself contains another level of nesting (older EOS style:
+    // { Ethernet1: { interfaceCounters: { inOctets, ... } } }), descend.
+    let flat: Record<string, unknown> = b;
+    if ('interfaceCounters' in b && b.interfaceCounters && typeof b.interfaceCounters === 'object') {
+      flat = b.interfaceCounters as Record<string, unknown>;
+    } else if ('count' in b && 'fields' in b && typeof b.fields === 'object') {
+      flat = (b as Record<string, unknown>).fields as Record<string, unknown>;
+    }
+    if (!('inOctets' in flat || 'outOctets' in flat || 'rxData' in flat || 'txData' in flat)) continue;
+    const num = (v: unknown): bigint | undefined => {
       if (v === undefined || v === null) return undefined;
-      const n = Number(v);
-      return Number.isFinite(n) ? BigInt(Math.trunc(n)) : undefined;
+      const n = typeof v === 'string' ? Number(v) : (v as number);
+      if (!Number.isFinite(n)) return undefined;
+      return BigInt(Math.trunc(n));
     };
     out.push({
       name,
-      // EOS counters use both `inOctets` (newer) and `rxData` (older).
-      inOctets: get('inOctets') ?? get('rxData'),
-      outOctets: get('outOctets') ?? get('txData'),
-      inPackets: get('inUcastPkts') ?? get('rxPackets'),
-      outPackets: get('outUcastPkts') ?? get('txPackets'),
-      inErrors: get('inErrors') ?? get('totalInErrors'),
-      outErrors: get('outErrors') ?? get('totalOutErrors'),
-      inDiscards: get('inDiscards') ?? get('rxErrors'),
-      outDiscards: get('outDiscards') ?? get('txErrors'),
-      inCrcErrors: get('inCrcErrors'),
+      inOctets: num(flat.inOctets) ?? num(flat.rxData),
+      outOctets: num(flat.outOctets) ?? num(flat.txData),
+      inPackets: num(flat.inUcastPkts) ?? num(flat.rxPackets) ?? num(flat.inPkts),
+      outPackets: num(flat.outUcastPkts) ?? num(flat.txPackets) ?? num(flat.outPkts),
+      inErrors: num(flat.inErrors) ?? num(flat.totalInErrors),
+      outErrors: num(flat.outErrors) ?? num(flat.totalOutErrors),
+      inDiscards: num(flat.inDiscards) ?? num(flat.rxErrors) ?? num(flat.inDropped),
+      outDiscards: num(flat.outDiscards) ?? num(flat.txErrors) ?? num(flat.outDropped),
+      inCrcErrors: num(flat.inCrcErrors),
     });
   }
   return out;
@@ -496,11 +516,20 @@ async function fetchInterfaceCounters(device: Device): Promise<FetchResult> {
   if (vendor === 'juniper') return fetchJunosCounters(device.ip);
   if (vendor === 'arista') return fetchEosCounters(device.ip);
   if (vendor === 'ios') return fetchIosSshCounters(device.ip);
-  // Default + 'cisco' (IOS-XE): use RESTCONF state. Plain 'cisco' from
-  // old strings happens to land here too — RESTCONF will fail early when
-  // the device is plain IOS 15.x without HTTP/RESTCONF, and the caller
-  // logs the failure.
-  return fetchIosxeCounters(device.ip);
+  // Default + 'cisco' (IOS-XE): try RESTCONF first (matches operational data
+  // path on IOS-XE 16+/17.x), fall back to SSH `show interfaces` if RESTCONF
+  // returns 4xx/5xx/timeout. Note (gotcha #14): RESTCONF on IOS-XE 17.x is
+  // documented as unreliable, so the SSH fallback is the durable path for
+  // lab devices regardless.
+  const rest = await fetchIosxeCounters(device.ip);
+  if (rest.ok) return rest;
+  console.warn(`[counters] IOS-XE RESTCONF failed for ${device.ip} (${rest.error}); falling back to SSH`);
+  const ssh = await fetchIosSshCounters(device.ip);
+  if (ssh.ok) return ssh;
+  // Both failed — surface the more actionable of the two. RESTCONF usually
+  // returns 404 when the operational container isn't advertised; prefer SSH
+  // error message because that's the primary path on lab F3-AS-01.
+  return { ...ssh, error: `restconf: ${rest.error ?? '?'}; ssh: ${ssh.error ?? '?'}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -753,57 +782,40 @@ function deriveRate(prev: string | null, curr: string | null, dtMs: number): num
   return bits / dtSec;
 }
 
-/** Most recent single sample per interface (latest cumulative counters). */
+/** Most recent single sample per interface (latest cumulative counters).
+ *
+ * Implementation note (2026-09-19):
+ *   First attempt used `prisma.$queryRaw` with `DISTINCT ON (interface_name)`,
+ *   but Express returned 500 on `/latest` — the throw appeared to come from
+ *   how Prisma materialised the BigInt column into a JS value when the table
+ *   is empty. We use a tiny `findMany` + Map dedup instead; cheaper to reason
+ *   about, no DB-specific syntax, no risk of doing the BigInt dance twice.
+ */
 export async function getLatestCounters(deviceId: string): Promise<{
   deviceId: string;
   capturedAt: string | null;
   interfaces: Array<CounterSampleJson & { deviceId: string }>;
 }> {
-  // Pull the most recent capturedAt per interface in one query.
-  // Postgres window function: DISTINCT ON (the cheapest path with Prisma).
-  const rows = await prisma.$queryRaw<Array<{
-    id: string;
-    device_id: string;
-    interface_name: string;
-    source: string;
-    captured_at: Date;
-    in_octets: bigint | null;
-    out_octets: bigint | null;
-    in_packets: bigint | null;
-    out_packets: bigint | null;
-    in_errors: bigint | null;
-    out_errors: bigint | null;
-    in_discards: bigint | null;
-    out_discards: bigint | null;
-    in_crc_errors: bigint | null;
-  }>>`
-    SELECT DISTINCT ON (interface_name)
-      id, device_id, interface_name, source, captured_at,
-      in_octets, out_octets, in_packets, out_packets,
-      in_errors, out_errors, in_discards, out_discards, in_crc_errors
-    FROM "InterfaceCounterSample"
-    WHERE device_id = ${deviceId}::uuid
-    ORDER BY interface_name, captured_at DESC
-  `;
-  const interfaces = rows.map((r) => sampleToJson({
-    id: r.id,
-    deviceId: r.device_id,
-    interfaceName: r.interface_name,
-    source: r.source,
-    capturedAt: r.captured_at,
-    inOctets: r.in_octets,
-    outOctets: r.out_octets,
-    inPackets: r.in_packets,
-    outPackets: r.out_packets,
-    inErrors: r.in_errors,
-    outErrors: r.out_errors,
-    inDiscards: r.in_discards,
-    outDiscards: r.out_discards,
-    inCrcErrors: r.in_crc_errors,
-  } as Parameters<typeof sampleToJson>[0]));
+  const rows = await prisma.interfaceCounterSample.findMany({
+    where: { deviceId },
+    orderBy: [{ interfaceName: 'asc' }, { capturedAt: 'desc' }],
+    take: 1000,
+  });
+  const latest = new Map<string, typeof rows[number]>();
+  for (const row of rows) {
+    // First row per interfaceName wins because we sort capturedAt DESC.
+    if (!latest.has(row.interfaceName)) latest.set(row.interfaceName, row);
+  }
+  const interfaces: Array<CounterSampleJson & { deviceId: string }> = [];
+  let mostRecent: Date | null = null;
+  for (const row of latest.values()) {
+    const json = sampleToJson(row);
+    interfaces.push({ ...json, deviceId: row.deviceId });
+    if (!mostRecent || row.capturedAt > mostRecent) mostRecent = row.capturedAt;
+  }
   return {
     deviceId,
-    capturedAt: interfaces[0]?.capturedAt ?? null,
+    capturedAt: mostRecent ? mostRecent.toISOString() : null,
     interfaces,
   };
 }
