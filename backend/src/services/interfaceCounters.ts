@@ -410,69 +410,59 @@ function parseIosxeCounters(payload: unknown): InterfaceCounters[] {
 
 async function fetchIosSshCounters(host: string): Promise<FetchResult> {
   const started = Date.now();
+  const sshOpts = {
+    port: LAB_SSH_PORT,
+    username: LAB_SSH_USER,
+    password: LAB_SSH_PASSWORD,
+    timeoutMs: 30000,
+  } as const;
+  // Primary: prose `show interfaces` — every IOS version supports it and it
+  // has both directions in one block. Secondary: `show interfaces counters`
+  // for tabular octets which the prose parser sometimes misses when the
+  // terminal width truncates output-bytes lines.
+  //
+  // We run prose FIRST (because `show interfaces` always returns the input/
+  // output packets line that the chart needs to compute rate), then use
+  // tabular only to fill in any octets the prose parser left undefined.
   try {
-    // IOS 15.x `show interfaces` is prose-heavy and the output-bytes line
-    // sometimes scrolls off if terminal width is narrow. The tabular
-    // `show interfaces counters` form has the same numbers in a fixed
-    // column layout that's far easier to parse and survives paging.
-    // Falls back to `show interfaces` if counters view isn't supported
-    // (very old IOS, sub-images).
-    let result = await runIosxeSshCommand(host, 'show interfaces counters', {
-      port: LAB_SSH_PORT,
-      username: LAB_SSH_USER,
-      password: LAB_SSH_PASSWORD,
-      timeoutMs: 30000,
-    });
+    const prose = await runIosxeSshCommand(host, 'show interfaces', sshOpts);
     let parsed: InterfaceCounters[] = [];
-    let source: FetchResult['source'] = 'ios-ssh';
-    if (result.ok) {
-      parsed = parseIosCountersTabular(result.output);
-      // `show interfaces counters` doesn't include inErrors/outErrors/inCRC;
-      // run `show interfaces` in parallel for those fields, then merge.
-      if (parsed.length > 0) {
-        const prose = await runIosxeSshCommand(host, 'show interfaces', {
-          port: LAB_SSH_PORT,
-          username: LAB_SSH_USER,
-          password: LAB_SSH_PASSWORD,
-          timeoutMs: 30000,
-        });
-        if (prose.ok) {
-          const proseIfaces = parseIosCountersProse(prose.output);
-          // merge by interface name
-          const byName = new Map(proseIfaces.map((p) => [p.name, p]));
-          for (const row of parsed) {
-            const p = byName.get(row.name);
-            if (!p) continue;
-            if (p.inErrors != null) row.inErrors = p.inErrors;
-            if (p.outErrors != null) row.outErrors = p.outErrors;
-            if (p.inCrcErrors != null) row.inCrcErrors = p.inCrcErrors;
-            if (p.inDiscards != null) row.inDiscards = p.inDiscards;
-            if (p.outDiscards != null) row.outDiscards = p.outDiscards;
-          }
-        }
-      }
+    if (prose.ok) {
+      parsed = parseIosCountersProse(prose.output);
     } else {
-      // tabular command failed — fall back to prose.
-      result = await runIosxeSshCommand(host, 'show interfaces', {
-        port: LAB_SSH_PORT,
-        username: LAB_SSH_USER,
-        password: LAB_SSH_PASSWORD,
-        timeoutMs: 30000,
-      });
-      if (result.ok) {
-        parsed = parseIosCountersProse(result.output);
-      }
-    }
-    if (!result.ok) {
+      // Both SSH attempts fall through if the first errors. Surface the
+      // error at the end so the operator sees why.
       return {
         ok: false,
-        source,
+        source: 'ios-ssh',
         interfaces: [],
         collectMs: Date.now() - started,
-        error: result.error ?? 'SSH failed',
+        error: prose.error ?? 'SSH failed',
       };
     }
-    return { ok: true, source, interfaces: parsed, collectMs: Date.now() - started };
+
+    // If prose missed any octets/packets, try tabular to fill them. This
+    // happens on vios_l2 when `show interfaces` omits the "X output bytes"
+    // line because there's been zero traffic on that interface.
+    const needsFill = parsed.some(
+      (p) => p.inOctets == null || p.outOctets == null,
+    );
+    if (needsFill) {
+      const tabular = await runIosxeSshCommand(host, 'show interfaces counters', sshOpts);
+      if (tabular.ok) {
+        const tabRows = parseIosCountersTabular(tabular.output);
+        const byName = new Map(tabRows.map((t) => [t.name, t]));
+        for (const row of parsed) {
+          const t = byName.get(row.name);
+          if (!t) continue;
+          if (row.inOctets == null) row.inOctets = t.inOctets;
+          if (row.outOctets == null) row.outOctets = t.outOctets;
+          if (row.inPackets == null) row.inPackets = t.inPackets;
+          if (row.outPackets == null) row.outPackets = t.outPackets;
+        }
+      }
+    }
+    return { ok: true, source: 'ios-ssh', interfaces: parsed, collectMs: Date.now() - started };
   } catch (err) {
     return {
       ok: false,
