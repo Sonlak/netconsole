@@ -18,6 +18,7 @@ import { scheduleInterfacesCollection } from './services/interfaces.js';
 import { scheduleConfigCollection } from './services/deviceTabCollection.js';
 import { scheduleLogsCollection } from './services/logs.js';
 import { scheduleJobWatchdog } from './services/jobWatchdog.js';
+import { scheduleInterfaceCounterPoll, interfaceCounterConfig, interfaceCounterFeatureEnabled } from './services/interfaceCounters.js';
 import { startLogRetentionCleanup } from './services/logRetention.js';
 import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
@@ -30,6 +31,7 @@ import { authRouter } from './routes/auth.js';
 import { auditLogRouter } from './routes/auditLog.js';
 import { searchRouter } from './routes/search.js';
 import { terminalRouter } from './routes/terminal.js';
+import { interfaceCountersRouter } from './routes/interfaceCounters.js';
 import { startTerminalWebSocket } from './websocket/terminal.js';
 import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
@@ -116,6 +118,14 @@ const httpServer = app.listen(port, () => {
   }
   scheduleJobWatchdog(30);
   console.log('Job watchdog enabled (reclaim stale RUNNING every 30s)');
+
+  if (interfaceCounterFeatureEnabled()) {
+    scheduleInterfaceCounterPoll(interfaceCounterConfig.pollIntervalSeconds);
+    console.log(`Interface counter auto-poll enabled (every ${interfaceCounterConfig.pollIntervalSeconds}s, retain ${interfaceCounterConfig.retentionHours}h)`);
+  } else {
+    console.log('Interface counter auto-poll disabled (INTERFACE_COUNTERS_ENABLED=false)');
+  }
+
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
 
   // Start WebSocket terminal server
@@ -150,6 +160,7 @@ app.get('/api/health', (_req, res) => {
       'mac-addresses',
       'arp-addresses',
       'interfaces',
+      'interface-counters',
       'fabric',
       'dhcp',
       'generate-config',
@@ -194,6 +205,7 @@ app.use('/api/jobs', authMiddleware, moderateRateLimit, jobsRouter);
 app.use('/api/audit-log', authMiddleware, strictRateLimit, auditLogRouter);
 app.use('/api/search', authMiddleware, strictRateLimit, searchRouter);
 app.use('/api/terminal', authMiddleware, strictRateLimit, terminalRouter);
+app.use('/api/devices', authMiddleware, moderateRateLimit, interfaceCountersRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {

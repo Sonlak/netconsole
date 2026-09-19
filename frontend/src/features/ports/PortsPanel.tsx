@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  BarChartOutlined,
   CodeOutlined,
   CloudDownloadOutlined,
   PlayCircleOutlined,
@@ -20,6 +21,7 @@ import { IpAddress, MonoValue } from '@/components/display/MonoValue';
 import { linkStatusMeta } from '@/design/status';
 import { DeviceBusyError, toError } from '@/lib/errors';
 import { tablePagination, tableScroll } from '@/lib/table';
+import { PortStatsDrawer } from '@/features/ports/PortStatsDrawer';
 import type { DeviceInterface, InterfaceAction } from '@/types/interfaces';
 import { JOB_TYPE_LABELS } from '@/types/job';
 
@@ -100,6 +102,7 @@ export function PortsPanel({
   const [confirm, setConfirm] = useState<{ action: InterfaceAction; iface: string; vlan?: string } | null>(
     null,
   );
+  const [statsIface, setStatsIface] = useState<string | null>(null);
 
   const actionLabels: Record<InterfaceAction, string> = {
     shut: 'Shut',
@@ -269,7 +272,7 @@ export function PortsPanel({
     },
     {
       title: '',
-      width: 140,
+      width: 180,
       align: 'right',
       render: (_value, record) => {
         const busy = pending?.startsWith(`${record.name}:`);
@@ -324,6 +327,15 @@ export function PortsPanel({
                 disabled={busy}
                 loading={pending === `${record.name}:show-run`}
                 onClick={() => void runAction('show-run', record.name)}
+              />
+            </Tooltip>
+            <Tooltip title="Stats / errors">
+              <Button
+                type="text"
+                aria-label={`Show stats for ${record.name}`}
+                icon={<BarChartOutlined />}
+                data-testid={`port-stats-${record.name}`}
+                onClick={() => setStatsIface(record.name)}
               />
             </Tooltip>
           </Space>
@@ -427,6 +439,12 @@ export function PortsPanel({
         <Typography.Paragraph type="secondary">Access ports (L2) only.</Typography.Paragraph>
         <Input type="number" min={1} max={4094} value={vlanValue} onChange={(event) => setVlanValue(event.target.value)} />
       </Modal>
+      <PortStatsDrawer
+        deviceId={deviceId}
+        interfaceName={statsIface}
+        open={Boolean(statsIface)}
+        onClose={() => setStatsIface(null)}
+      />
     </>
   );
 }

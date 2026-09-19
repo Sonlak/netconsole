@@ -75,8 +75,41 @@ model Device {
   jobs               Job[]
   savedConfig        DeviceSavedConfig?
   logs               DeviceLog[]
+  // Append-only time series of interface counters (octets + errors).
+  // Stored as cumulative 64-bit counters; the API computes in/out bps
+  // by dividing the delta between two consecutive samples by the elapsed
+  // time. BigInt columns because counters easily exceed 2^32 on busy uplinks.
+  counterSamples     InterfaceCounterSample[]
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
+}
+
+// One row per polled (device, interface, timestamp). Keeps raw counters so
+// the bandwidth rate chart can be re-derived at any time without losing
+// precision. Retention cleanup (see jobRetention.ts pattern) caps the table
+// at ~24h or N rows, whichever fires first — defined in service code.
+model InterfaceCounterSample {
+  id            String   @id @default(uuid())
+  deviceId      String
+  device        Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  interfaceName String
+  // Cumulative counters (raw from device). Nullable when a vendor/RPC path
+  // can't supply the field — we still persist what we have.
+  inOctets      BigInt?
+  outOctets     BigInt?
+  inPackets     BigInt?
+  outPackets    BigInt?
+  inErrors      BigInt?
+  outErrors     BigInt?
+  inDiscards    BigInt?
+  outDiscards   BigInt?
+  inCrcErrors   BigInt?
+  // Tag the source so we can debug a misbehaving fetcher later.
+  source        String
+  capturedAt    DateTime @default(now())
+
+  @@index([deviceId, interfaceName, capturedAt])
+  @@index([capturedAt])
 }
 
 model Job {
