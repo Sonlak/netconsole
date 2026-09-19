@@ -56,6 +56,8 @@ const SSH_ALGORITHMS = {
     'hmac-sha2-256',
     'hmac-sha1',
     'hmac-sha1-96',
+    'hmac-md5',
+    'hmac-md5-96',
   ],
 } satisfies Algorithms;
 
