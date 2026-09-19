@@ -577,7 +577,7 @@ async function fetchJunosSshCounters(host: string): Promise<FetchResult> {
   const started = Date.now();
   const collectMs = () => Date.now() - started;
   try {
-    const result = await runIosxeSshCommand(host, 'show interfaces statistics', {
+    const result = await runIosxeSshCommand(host, 'show interfaces extensive', {
       port: JUNOS_SSH_PORT,
       username: JUNOS_API_USER,
       password: JUNOS_API_PASSWORD,
@@ -605,63 +605,92 @@ async function fetchJunosSshCounters(host: string): Promise<FetchResult> {
   }
 }
 
-// Parse `show interfaces statistics` from Junos / cRPD. Format per iface:
+// Parse `show interfaces extensive` from Junos / cRPD. Header lines:
 //
-//   Logical interface ge-0/0/0.0 (Index 70) (SNMP ifIndex 521)
-//     Input packets: 12345
-//     Output packets: 67890
-//     Input bytes:   1234567
-//     Output bytes:  2345678
-//     Input errors:  0
-//     Output errors: 0
-//     Input discards: 0
-//     Output discards:0
+//   Physical interface: ge-0/0/0, Enabled, Physical link is Up
+// or:
+//   Logical interface: ge-0/0/0.0 (Index 70) (SNMP ifIndex 521)
 //
-// `show interfaces extensive` is the XML form; SSH returns text.
-// Note: cRPD returns numeric zero values without padding; the regex below
-// tolerates both "  12345" and "12345" forms.
+// Below the header, look for:
+//   Traffic statistics:
+//    Input  bytes  :              1234567                    56 bps
+//    Output bytes  :              2345678                    78 bps
+//    Input  packets:                  123
+//    Output packets:                  456
+//    Input  errors:                     0
+//    Output errors:                     0
+//    Input  drops :                     0
+//    Output drops :                     0
+//
+// cRPD's "Traffic statistics:" section is identical to real Junos;
+// the regex tolerates any spacing and the optional ":   56 bps" rate tail.
 function parseJunosCliStats(output: string): InterfaceCounters[] {
   const out: InterfaceCounters[] = [];
   if (!output) return out;
   const lines = output.split(/\r?\n/);
   const ifaceRe = /^\s*(?:Logical interface|Physical interface)\s+([\w./-]+)/i;
-  // capture interface name with optional .0 suffix; strip the logical unit
   const nameRe = /^([a-zA-Z][\w/-]+?)(?:\.\d+)?$/;
-  const numRe = (key: string) => new RegExp(`^\\s*${key}\\s*:?\\s*(\\d+)`, 'i');
+  // `Traffic statistics:` opens the counter block for the current interface.
+  // Below it, look for "<Input|Output> <label>:" lines. Real Junos uses
+  // "Input  bytes  :" (multiple spaces); cRPD uses "Input bytes:".
+  const statLineRe = (label: string) =>
+    new RegExp(`^\\s*(?:Input|Output)\\s+${label}\\s*:\\s*([\\d,]+)`, 'i');
   const fieldMap: Array<[keyof InterfaceCounters, RegExp]> = [
-    ['inPackets', numRe('Input packets')],
-    ['outPackets', numRe('Output packets')],
-    ['inOctets', numRe('Input bytes(?:\\(48\\))?')],
-    ['outOctets', numRe('Output bytes(?:\\(48\\))?')],
-    ['inErrors', numRe('Input errors')],
-    ['outErrors', numRe('Output errors')],
-    ['inDiscards', numRe('Input discards')],
-    ['outDiscards', numRe('Output discards')],
+    ['inPackets', statLineRe('packets')],
+    ['outPackets', statLineRe('packets')], // same line; picked below by side
+    ['inOctets', statLineRe('bytes')],
+    ['outOctets', statLineRe('bytes')],
+    ['inErrors', statLineRe('errors')],
+    ['outErrors', statLineRe('errors')],
+    ['inDiscards', statLineRe('drops')],
+    ['outDiscards', statLineRe('drops')],
   ];
   let current: InterfaceCounters | null = null;
+  let inTrafficBlock = false;
   const flush = () => {
     if (current) out.push(current);
     current = null;
+    inTrafficBlock = false;
   };
+  // The regex above matches Input|Output symmetrically, so we need a side
+  // discriminator per match. Detect by stripping the matched label and
+  // checking the leading word.
+  const sideOf = (line: string): 'in' | 'out' => (/^\s*Output\b/i.test(line) ? 'out' : 'in');
+  const num = (s: string): bigint => BigInt(s.replace(/[,\s]/g, ''));
   for (const raw of lines) {
     const line = raw.replace(/\u0000/g, ''); // strip stray NULs from cRPD
     const header = ifaceRe.exec(line);
     if (header) {
       flush();
-      // Junos CLI uses "ge-0/0/0" or "ge-0/0/0.0" (logical). Keep just the
-      // physical name to match the RESTCONF parser.
-      const raw = header[1].trim();
-      const phys = (raw.match(nameRe)?.[1] ?? raw).replace(/\.\d+$/, '');
+      const phys = (header[1].match(nameRe)?.[1] ?? header[1]).replace(/\.\d+$/, '');
       current = { name: phys };
       continue;
     }
     if (!current) continue;
+    if (/^\s*Traffic statistics\s*:/i.test(line)) {
+      inTrafficBlock = true;
+      continue;
+    }
+    // End the traffic block when we hit another section header.
+    if (inTrafficBlock && /^\s*(?:Logical interface|Physical interface|Protocol|Device flags|Input \w+ \(|Local:|Destination:|Interface flags|Generation|Route|Encapsulation)/i.test(line)) {
+      inTrafficBlock = false;
+    }
+    if (!inTrafficBlock) continue;
     for (const [k, re] of fieldMap) {
-      if (current[k] !== undefined) continue;
       const m = re.exec(line);
-      if (m) {
+      if (!m) continue;
+      const side = sideOf(line);
+      const isIn = side === 'in';
+      const targetKey = (
+        (k === 'inOctets' && isIn) || (k === 'outOctets' && !isIn) ? (isIn ? 'inOctets' : 'outOctets') :
+        (k === 'inPackets' && isIn) || (k === 'outPackets' && !isIn) ? (isIn ? 'inPackets' : 'outPackets') :
+        (k === 'inErrors' && isIn) || (k === 'outErrors' && !isIn) ? (isIn ? 'inErrors' : 'outErrors') :
+        (k === 'inDiscards' && isIn) || (k === 'outDiscards' && !isIn) ? (isIn ? 'inDiscards' : 'outDiscards') :
+        null
+      );
+      if (targetKey && current[targetKey as keyof InterfaceCounters] === undefined) {
         try {
-          (current as Record<string, unknown>)[k] = BigInt(m[1]);
+          (current as Record<string, unknown>)[targetKey] = num(m[1]);
         } catch {
           /* ignore */
         }
@@ -669,9 +698,6 @@ function parseJunosCliStats(output: string): InterfaceCounters[] {
     }
   }
   flush();
-  // Drop interfaces we never saw octets for -- a "Logical interface"
-  // header with no counters below means SSH returned the header but the
-  // counter lines were filtered out (e.g. internal-only interface).
   return out.filter((i) => i.inOctets !== undefined || i.outOctets !== undefined);
 }
 
