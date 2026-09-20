@@ -54,6 +54,31 @@ export function formatBytes(octets: string | number | null | undefined): string 
 }
 
 /**
+ * Estimate nominal port speed in bps from a Juniper/EOS/Cisco interface name.
+ * Used as a fallback when the backend doesn't populate the `speed` field
+ * (it returns '' for IOS-XE REST and Junos REST).
+ *
+ * Convention (standard across Juniper / Cisco / Arista naming):
+ *   ge-   → 1 Gbps   (GigabitEthernet)
+ *   xe-   → 10 Gbps  (TenGigabitEthernet)
+ *   et-   → 40 Gbps  (FortyGigabitEthernet)
+ *   em-   → 1 Gbps   (Embedded Management)
+ *   fxp0  → 1 Gbps   (Management)
+ *   me0   → 1 Gbps   (Management)
+ *   ae    → null     (Aggregated Ethernet — child links determine speed)
+ *   vlan, lo, irb → null (virtual — no physical speed)
+ */
+export function inferSpeedBps(ifaceName: string | null | undefined): number | null {
+  if (!ifaceName) return null;
+  const n = ifaceName.toLowerCase();
+  if (n.startsWith('ge') || n.startsWith('em') || n.startsWith('fxp') || n.startsWith('me')) return 1_000_000_000;
+  if (n.startsWith('xe')) return 10_000_000_000;
+  if (n.startsWith('et')) return 40_000_000_000;
+  if (n.startsWith('ae')) return null; // aggregated — no fixed speed without child info
+  return null; // vlan, lo0, irb, etc.
+}
+
+/**
  * Parse a vendor interface speed string into bits-per-second.
  *
  * Examples:
@@ -64,19 +89,20 @@ export function formatBytes(octets: string | number | null | undefined): string 
  *   "100M"      -> 100_000_000
  *   "auto"      -> null (no fixed speed)
  *
- * Returns null when we cannot confidently convert — callers should hide
- * the utilization gauge rather than display garbage.
+ * Falls back to `inferSpeedBps(name)` when the raw string is empty or
+ * unparseable. Returns null when neither the string nor the name prefix
+ * yields a confident estimate.
  */
-export function parseSpeedBps(raw: string | null | undefined): number | null {
-  if (!raw) return null;
+export function parseSpeedBps(raw: string | null | undefined, ifaceName?: string | null): number | null {
+  if (!raw) return inferSpeedBps(ifaceName);
   const s = String(raw).trim().toLowerCase();
-  if (!s || s === 'auto' || s === 'auto-negotiate' || s === 'autoneg') return null;
+  if (!s || s === 'auto' || s === 'auto-negotiate' || s === 'autoneg') return inferSpeedBps(ifaceName);
   // "1G" / "10G" / "100M"
   const short = /^(\d+(?:\.\d+)?)\s*([kmg])b?$/.exec(s);
   if (short) {
     const n = Number(short[1]);
     const unit = short[2];
-    if (!Number.isFinite(n)) return null;
+    if (!Number.isFinite(n)) return inferSpeedBps(ifaceName);
     if (unit === 'g') return Math.round(n * 1_000_000_000);
     if (unit === 'm') return Math.round(n * 1_000_000);
     if (unit === 'k') return Math.round(n * 1_000);
@@ -86,7 +112,7 @@ export function parseSpeedBps(raw: string | null | undefined): number | null {
   if (long) {
     const n = Number(long[1]);
     const unit = long[2] ?? '';
-    if (!Number.isFinite(n)) return null;
+    if (!Number.isFinite(n)) return inferSpeedBps(ifaceName);
     if (unit === 'g') return Math.round(n * 1_000_000_000);
     if (unit === 'm') return Math.round(n * 1_000_000);
     if (unit === 'k') return Math.round(n * 1_000);
@@ -98,12 +124,12 @@ export function parseSpeedBps(raw: string | null | undefined): number | null {
   if (base) {
     const n = Number(base[1]);
     const unit = (base[2] ?? '').toLowerCase();
-    if (!Number.isFinite(n)) return null;
+    if (!Number.isFinite(n)) return inferSpeedBps(ifaceName);
     if (unit === 'g') return Math.round(n * 1_000_000_000);
     if (unit === 'm') return Math.round(n * 1_000_000);
     if (unit === 'k') return Math.round(n * 1_000);
   }
-  return null;
+  return inferSpeedBps(ifaceName);
 }
 
 /**

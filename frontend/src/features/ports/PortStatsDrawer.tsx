@@ -100,7 +100,7 @@ export function PortStatsDrawer({
   const [error, setError] = useState<string | null>(null);
 
   const interfaceName = iface?.name ?? null;
-  const speedBps = useMemo(() => parseSpeedBps(iface?.speed), [iface?.speed]);
+  const speedBps = useMemo(() => parseSpeedBps(iface?.speed, iface?.name), [iface?.speed, iface?.name]);
 
   const load = useCallback(async () => {
     if (!interfaceName) return;
@@ -416,7 +416,13 @@ function UtilizationCard({
           </svg>
           <div className="nc-port-util-center">
             <span className="nc-port-util-pct">{speedBps ? `${worst.toFixed(1)}%` : '—'}</span>
-            <span className="nc-port-util-pct-label">{ifaceSpeedLabel ?? 'speed ?'}</span>
+            <span className="nc-port-util-pct-label">
+              {ifaceSpeedLabel
+                ? ifaceSpeedLabel
+                : speedBps
+                  ? `${(speedBps / 1_000_000_000).toFixed(0)} Gbps`
+                  : 'speed ?'}
+            </span>
           </div>
         </div>
         <div className="nc-port-util-detail">
