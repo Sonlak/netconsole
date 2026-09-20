@@ -54,28 +54,84 @@ export function formatBytes(octets: string | number | null | undefined): string 
 }
 
 /**
- * Estimate nominal port speed in bps from a Juniper/EOS/Cisco interface name.
+ * Estimate nominal port speed in bps from a Juniper / IOS-XE / EOS interface name.
  * Used as a fallback when the backend doesn't populate the `speed` field
  * (it returns '' for IOS-XE REST and Junos REST).
  *
- * Convention (standard across Juniper / Cisco / Arista naming):
- *   ge-   → 1 Gbps   (GigabitEthernet)
- *   xe-   → 10 Gbps  (TenGigabitEthernet)
- *   et-   → 40 Gbps  (FortyGigabitEthernet)
- *   em-   → 1 Gbps   (Embedded Management)
- *   fxp0  → 1 Gbps   (Management)
- *   me0   → 1 Gbps   (Management)
- *   ae    → null     (Aggregated Ethernet — child links determine speed)
- *   vlan, lo, irb → null (virtual — no physical speed)
+ * Vendor-specific conventions:
+ *
+ * **Juniper Junos** — prefix with hyphen
+ *   ge-       → 1 Gbps   (Gigabit Ethernet)
+ *   xe-       → 10 Gbps  (10-Gigabit Ethernet)
+ *   et-       → 40 Gbps  (40-Gigabit Ethernet)
+ *   em-, fxp*, me* → 1 Gbps (Management)
+ *   ae*, vlan*, lo*, irb* → null (no physical speed)
+ *
+ * **Cisco IOS-XE / IOS-XR** — full name or short alias
+ *   GigabitEthernet    / Gi → 1 Gbps
+ *   TenGigabitEthernet / Te → 10 Gbps
+ *   TwentyFiveGigE     / Twe → 25 Gbps
+ *   FortyGigabitEthernet / Fo → 40 Gbps
+ *   HundredGigE        / Hu → 100 Gbps
+ *   FourHundredGigE    / Fou → 400 Gbps
+ *   AppGigabitEthernet → 1 Gbps
+ *   Loopback, Vlan, Port-channel, Bundle-Ether → null
+ *
+ * **Arista EOS** — generic name, but Management has known speed
+ *   Management / Ma1* → 1 Gbps
+ *   Loopback, Port-Channel, Ethernet*, Vxlan → null
+ *   (Ethernet* speed is hardware-dependent per platform — leave to backend
+ *    bandwidth field if it is actually populated.)
+ *
+ * Returns null when no rule matches — caller renders "—" instead of a guess.
  */
+const SPEED_RULES: ReadonlyArray<[RegExp, number | null]> = [
+  // ------ Juniper: must come before Cisco "ge" since Juniper names start "ge-" ------
+  [/^ge-/, 1_000_000_000],
+  [/^xe-/, 10_000_000_000],
+  [/^et-/, 40_000_000_000],
+  [/^em[\d/:.]/, 1_000_000_000],       // Embedded Management — no hyphen
+  [/^fxp[\d/:.]/, 1_000_000_000],      // Management — no hyphen
+  [/^me[\d/:.]/, 1_000_000_000],       // Management — no hyphen
+
+  // ------ Cisco IOS-XE / IOS-XR: full long names ------
+  [/^gigabit[e]?thernet/, 1_000_000_000],
+  [/^appgigabit[e]?thernet/, 1_000_000_000],
+  [/^tengig(abit[e]?)?[e]?therne?t?/, 10_000_000_000],
+  [/^twentyfivegig[e]?/, 25_000_000_000],
+  [/^fortygig(abit[e]?)?[e]?therne?t?/, 40_000_000_000],
+  [/^hundredgig[e]?/, 100_000_000_000],
+  [/^fourhundredgig[e]?/, 400_000_000_000],
+  // Cisco short form — anchored to start, must be a complete token (word boundary)
+  [/^gi[\d/:.]/, 1_000_000_000],
+  [/^te[\d/:.]/, 10_000_000_000],
+  [/^twe[\d/:.]/, 25_000_000_000],
+  [/^fo[\d/:.]/, 40_000_000_000],
+  [/^hu[\d/:.]/, 100_000_000_000],
+  [/^fou[\d/:.]/, 400_000_000_000],
+
+  // ------ Arista EOS ------
+  [/^ma(nagement)?[\d/:.]/, 1_000_000_000],
+
+  // ------ Skip: virtual / aggregated (no nominal speed) ------
+  [/^vlan/, null],
+  [/^loopback/, null],
+  [/^lo[\d/:.]/, null],
+  [/^irb/, null],
+  [/^ae\d/, null],                // Juniper aggregated
+  [/^port-?channel/, null],      // Cisco / IOS-XE
+  [/^po\d/, null],               // EOS / NX-OS short for port-channel
+  [/^bundle-?ether/, null],      // IOS-XR
+  [/^vxlan/, null],              // EOS
+];
+
 export function inferSpeedBps(ifaceName: string | null | undefined): number | null {
   if (!ifaceName) return null;
   const n = ifaceName.toLowerCase();
-  if (n.startsWith('ge') || n.startsWith('em') || n.startsWith('fxp') || n.startsWith('me')) return 1_000_000_000;
-  if (n.startsWith('xe')) return 10_000_000_000;
-  if (n.startsWith('et')) return 40_000_000_000;
-  if (n.startsWith('ae')) return null; // aggregated — no fixed speed without child info
-  return null; // vlan, lo0, irb, etc.
+  for (const [re, bps] of SPEED_RULES) {
+    if (re.test(n)) return bps;
+  }
+  return null;
 }
 
 /**
@@ -118,6 +174,14 @@ export function parseSpeedBps(raw: string | null | undefined, ifaceName?: string
     if (unit === 'k') return Math.round(n * 1_000);
     if (unit === 't') return Math.round(n * 1_000_000_000_000);
     return Math.round(n);
+  }
+  // Plain integer (no unit) — per RFC 7224 (ietf-interfaces YANG), `bandwidth`
+  // is reported in bits per second. EOS populates this field directly.
+  // Examples: "1000000000" (1G) / "10000000000" (10G) / "40000000000" (40G).
+  const numeric = /^\d+$/.exec(s);
+  if (numeric) {
+    const n = Number(s);
+    if (Number.isFinite(n) && n >= 0) return Math.round(n);
   }
   // "1000baseT" / "10GBase-LR" / "10GigabitEthernet" — best-effort
   const base = /^(\d+(?:\.\d+)?)\s*(g|m|k)?(?:base|bit|bits)?/i.exec(s);
