@@ -1,0 +1,511 @@
+/* Port stats drawer — visual polish for PortStatsDrawer.tsx.
+ *
+ * Layered on top of AntD tokens (var(--nc-*)) so it follows light/dark.
+ * Goal: same visual weight as Grafana / Datadog port widgets without
+ * pulling in a chart library.
+ */
+
+.nc-port-drawer .ant-drawer-body {
+  padding: 16px 20px 24px;
+  background: var(--nc-bg);
+}
+
+/* ---------- Header strip ------------------------------------------------- */
+
+.nc-port-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--nc-border-subtle);
+  border-radius: 10px;
+  background: var(--nc-surface);
+  margin-bottom: 16px;
+}
+
+.nc-port-header-name {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 200px;
+}
+
+.nc-port-header-name .nc-port-ifname {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--nc-text);
+  line-height: 1.1;
+}
+
+.nc-port-header-name .nc-port-ifmeta {
+  font-size: 12px;
+  color: var(--nc-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nc-port-header-name .nc-port-ifmeta .nc-port-ifmeta-dot {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--nc-text-muted);
+  display: inline-block;
+}
+
+.nc-port-header-context {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.nc-port-header-context .nc-port-context-title {
+  font-size: 13px;
+  color: var(--nc-text);
+  font-weight: 500;
+}
+
+.nc-port-header-context .nc-port-context-sub {
+  font-size: 11.5px;
+  color: var(--nc-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nc-port-header-context .nc-port-context-sub .ant-tag {
+  margin: 0;
+  line-height: 18px;
+  padding: 0 6px;
+  font-size: 10.5px;
+}
+
+.nc-port-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nc-port-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(5, 150, 105, 0.12);
+  color: var(--nc-success);
+  border: 1px solid rgba(5, 150, 105, 0.30);
+}
+
+.nc-port-live-pill.is-idle {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--nc-text-muted);
+  border-color: rgba(148, 163, 184, 0.30);
+}
+
+.nc-port-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  position: relative;
+}
+
+.nc-port-live-pill:not(.is-idle) .nc-port-live-dot::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.6;
+  animation: nc-port-pulse 1.6s ease-out infinite;
+}
+
+@keyframes nc-port-pulse {
+  0%   { transform: scale(0.6); opacity: 0.7; }
+  80%  { transform: scale(2.0); opacity: 0; }
+  100% { transform: scale(2.0); opacity: 0; }
+}
+
+/* ---------- Tabs strip --------------------------------------------------- */
+
+.nc-port-tabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.nc-port-tabs .nc-port-range {
+  margin-left: auto;
+}
+
+/* ---------- KPI hero row ------------------------------------------------- */
+
+.nc-port-kpi-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.1fr) 1fr 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 900px) {
+  .nc-port-kpi-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.nc-port-kpi {
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border-subtle);
+  border-radius: 10px;
+  padding: 12px 14px;
+  position: relative;
+  overflow: hidden;
+}
+
+.nc-port-kpi-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--nc-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nc-port-kpi-value {
+  margin-top: 6px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.nc-port-kpi-value .nc-port-kpi-number {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--nc-text);
+  line-height: 1.1;
+}
+
+.nc-port-kpi-value .nc-port-kpi-unit {
+  font-size: 12px;
+  color: var(--nc-text-secondary);
+}
+
+.nc-port-kpi-foot {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--nc-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nc-port-kpi-spark {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  opacity: 0.85;
+}
+
+.nc-port-kpi.is-in .nc-port-kpi-number { color: var(--nc-success); }
+.nc-port-kpi.is-out .nc-port-kpi-number { color: var(--nc-accent); }
+
+/* Utilization gauge */
+.nc-port-util {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.nc-port-util-ring {
+  position: relative;
+  width: 60px;
+  height: 60px;
+}
+
+.nc-port-util-ring svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.nc-port-util-ring .nc-port-util-track {
+  stroke: rgba(148, 163, 184, 0.18);
+  fill: none;
+}
+
+.nc-port-util-ring .nc-port-util-arc {
+  fill: none;
+  stroke-width: 6;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+  transition: stroke-dashoffset 240ms ease-out, stroke 240ms ease-out;
+}
+
+.nc-port-util-ring .nc-port-util-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+
+.nc-port-util-ring .nc-port-util-pct {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--nc-text);
+}
+
+.nc-port-util-ring .nc-port-util-pct-label {
+  font-size: 9px;
+  color: var(--nc-text-muted);
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+  text-transform: uppercase;
+}
+
+.nc-port-util-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.nc-port-util-row {
+  display: grid;
+  grid-template-columns: 32px 1fr 56px;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.nc-port-util-row .nc-port-util-label {
+  color: var(--nc-text-secondary);
+  font-weight: 500;
+}
+
+.nc-port-util-row .nc-port-util-bar {
+  height: 6px;
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.nc-port-util-row .nc-port-util-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 240ms ease-out;
+}
+
+.nc-port-util-row .nc-port-util-pct {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--nc-text);
+  text-align: right;
+}
+
+/* ---------- Chart wrapper ------------------------------------------------ */
+
+.nc-port-chart-card {
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border-subtle);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+
+.nc-port-chart-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.nc-port-chart-card-head .nc-port-chart-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--nc-text-secondary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.nc-port-chart-card-head .nc-port-chart-sub {
+  font-size: 11.5px;
+  color: var(--nc-text-muted);
+}
+
+/* ---------- BandwidthChart extras --------------------------------------- */
+
+.nc-bandwidth-chart {
+  display: block;
+  width: 100%;
+  user-select: none;
+}
+
+.nc-bandwidth-tooltip {
+  position: absolute;
+  top: 36px;
+  pointer-events: none;
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--nc-text);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.10);
+  z-index: 2;
+  min-width: 150px;
+}
+
+.nc-bandwidth-tooltip-time {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--nc-text-muted);
+  margin-bottom: 4px;
+}
+
+.nc-bandwidth-tooltip-row {
+  display: grid;
+  grid-template-columns: 12px 28px 1fr;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+}
+
+.nc-bandwidth-tooltip-row .nc-bandwidth-tooltip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.nc-bandwidth-tooltip-row strong {
+  text-align: right;
+  font-weight: 600;
+}
+
+.nc-bandwidth-chart-empty {
+  background: var(--nc-surface);
+  border: 1px dashed var(--nc-border-subtle);
+  border-radius: 10px;
+}
+
+/* ---------- Errors card grid -------------------------------------------- */
+
+.nc-port-errors-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.nc-port-error-card {
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border-subtle);
+  border-radius: 8px;
+  padding: 10px 12px;
+  position: relative;
+  overflow: hidden;
+}
+
+.nc-port-error-card.tone-error {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: linear-gradient(180deg, rgba(220, 38, 38, 0.04), transparent);
+}
+
+.nc-port-error-card.tone-warning {
+  border-color: rgba(217, 119, 6, 0.35);
+  background: linear-gradient(180deg, rgba(217, 119, 6, 0.04), transparent);
+}
+
+.nc-port-error-card.tone-success {
+  border-color: rgba(5, 150, 105, 0.25);
+}
+
+.nc-port-error-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--nc-text-muted);
+}
+
+.nc-port-error-card-value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--nc-text);
+  margin-top: 4px;
+  line-height: 1.1;
+}
+
+.nc-port-error-card-value.tone-error   { color: var(--nc-error); }
+.nc-port-error-card-value.tone-warning { color: var(--nc-warning); }
+.nc-port-error-card-value.tone-success { color: var(--nc-success); }
+
+.nc-port-error-card-bar {
+  margin-top: 6px;
+  height: 4px;
+  background: rgba(148, 163, 184, 0.18);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.nc-port-error-card-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 240ms ease-out;
+}
+
+.nc-port-error-card-bar-fill.tone-error   { background: var(--nc-error); }
+.nc-port-error-card-bar-fill.tone-warning { background: var(--nc-warning); }
+.nc-port-error-card-bar-fill.tone-success { background: var(--nc-success); }
+
+.nc-port-error-card-foot {
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: var(--nc-text-muted);
+}
+
+/* ---------- Error log/dump panel ---------------------------------------- */
+
+.nc-port-error-detail {
+  background: var(--nc-surface);
+  border: 1px solid var(--nc-border-subtle);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.nc-port-error-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.nc-port-error-detail-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--nc-text-secondary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}

@@ -102,7 +102,7 @@ export function PortsPanel({
   const [confirm, setConfirm] = useState<{ action: InterfaceAction; iface: string; vlan?: string } | null>(
     null,
   );
-  const [statsIface, setStatsIface] = useState<string | null>(null);
+  const [statsIface, setStatsIface] = useState<DeviceInterface | null>(null);
 
   const actionLabels: Record<InterfaceAction, string> = {
     shut: 'Shut',
@@ -329,13 +329,13 @@ export function PortsPanel({
                 onClick={() => void runAction('show-run', record.name)}
               />
             </Tooltip>
-            <Tooltip title="Stats / errors">
+            <Tooltip title="Bandwidth / errors / utilization">
               <Button
                 type="text"
                 aria-label={`Show stats for ${record.name}`}
                 icon={<BarChartOutlined />}
                 data-testid={`port-stats-${record.name}`}
-                onClick={() => setStatsIface(record.name)}
+                onClick={() => setStatsIface(record)}
               />
             </Tooltip>
           </Space>
@@ -441,7 +441,9 @@ export function PortsPanel({
       </Modal>
       <PortStatsDrawer
         deviceId={deviceId}
-        interfaceName={statsIface}
+        deviceName={deviceName}
+        deviceIp={deviceIp}
+        iface={statsIface}
         open={Boolean(statsIface)}
         onClose={() => setStatsIface(null)}
       />
