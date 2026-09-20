@@ -134,6 +134,116 @@ export function inferSpeedBps(ifaceName: string | null | undefined): number | nu
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Vendor interface-name variants
+//
+// The counter collector stores the long form (GigabitEthernet0/0) while the
+// device-interface table may surface the short form (Gi0/0). Same physical
+// port, different stored names. Frontend callers usually pass in whatever
+// the device-interface table returned; backend counter queries need to hit
+// every equivalent canonical form so the lookup is spelling-agnostic.
+//
+// Mirrors `expandIfaceVariants` in `backend/src/services/interfaceCounters.ts`.
+// Keep both sides in sync if you add new prefixes here.
+// ---------------------------------------------------------------------------
+export const IFACE_SHORT_TO_LONG: Readonly<Record<string, string>> = Object.freeze({
+  gi: 'GigabitEthernet',
+  te: 'TenGigabitEthernet',
+  fa: 'FastEthernet',
+  et: 'Ethernet',
+  tw: 'TwoGigabitEthernet',
+  twe: 'TwentyFiveGigE',
+  fo: 'FortyGigabitEthernet',
+  hu: 'HundredGigE',
+  fou: 'FourHundredGigE',
+  po: 'Port-channel',
+});
+
+export const IFACE_LONG_TO_SHORT: Readonly<Record<string, string>> = Object.freeze({
+  gigabitethernet: 'Gi',
+  tengigabitethernet: 'Te',
+  fastethernet: 'Fa',
+  ethernet: 'Et',
+  twogigabitethernet: 'Tw',
+  twentyfivegige: 'Twe',
+  fortygigabitethernet: 'Fo',
+  hundredgige: 'Hu',
+  fourhundredgige: 'Fou',
+  'port-channel': 'Po',
+});
+
+/**
+ * Return every canonical spelling of a vendor interface name. The first
+ * element is always the input as-given. Useful when comparing an interface
+ * string that came from one source (e.g. device-interface table) against
+ * rows that came from another (e.g. counter history).
+ *
+ * Examples:
+ *   "Gi0/0"               → ["Gi0/0", "GigabitEthernet0/0"]
+ *   "GigabitEthernet0/0"  → ["GigabitEthernet0/0", "Gi0/0"]
+ *   "ge-0/0/0"            → ["ge-0/0/0"]              (Junos — no rewrite)
+ *   "et-0/0/0"            → ["et-0/0/0"]              (Junos — no rewrite)
+ *   "Et1"                 → ["Et1", "Ethernet1"]      (EOS short → long)
+ */
+export function expandIfaceVariants(name: string | null | undefined): string[] {
+  if (!name) return [];
+  const trimmed = String(name).trim();
+  if (!trimmed) return [];
+  const out = new Set<string>([trimmed]);
+  const lower = trimmed.toLowerCase();
+
+  // Short → long only when next char is digit — keeps Junos `et-`/`ge-`
+  // out of the rewrite path.
+  for (const [short, long] of Object.entries(IFACE_SHORT_TO_LONG)) {
+    if (lower.startsWith(short) && trimmed.length > short.length) {
+      const next = trimmed[short.length];
+      if (next && /\d/.test(next)) {
+        out.add(long + trimmed.slice(short.length));
+        break;
+      }
+    }
+  }
+
+  // Long → short (case-insensitive prefix match).
+  for (const [long, short] of Object.entries(IFACE_LONG_TO_SHORT)) {
+    if (lower.startsWith(long) && trimmed.length > long.length) {
+      out.add(short + trimmed.slice(long.length));
+      break;
+    }
+  }
+
+  return Array.from(out);
+}
+
+/**
+ * True if `a` and `b` resolve to the same physical interface (accounting
+ * for short/long Cisco form differences, case-insensitive on vendor names,
+ * trailing subif .N suffixes normalised).
+ */
+export function samePhysicalIface(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const av = expandIfaceVariants(a);
+  return av.includes(b);
+}
+
+/**
+ * Pick the first matching interface name from a list, treating
+ * short/long Cisco spellings as equal.
+ */
+export function findMatchingIface<T extends { interfaceName?: string | null }>(
+  rows: T[] | null | undefined,
+  name: string | null | undefined,
+): T | null {
+  if (!rows || !name) return null;
+  const variants = new Set(expandIfaceVariants(name));
+  for (const row of rows) {
+    const candidate = row.interfaceName;
+    if (candidate && variants.has(candidate)) return row;
+  }
+  return null;
+}
+
 /**
  * Parse a vendor interface speed string into bits-per-second.
  *

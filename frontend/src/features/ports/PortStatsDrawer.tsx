@@ -56,6 +56,7 @@ import { linkStatusMeta } from '@/design/status';
 import type { DeviceInterface } from '@/types/interfaces';
 import {
   errorCountTone,
+  findMatchingIface,
   formatBps,
   formatBytes,
   formatRelative,
@@ -109,7 +110,7 @@ export function PortStatsDrawer({
     try {
       const [hist, lat] = await Promise.all([
         fetchCounterHistory(deviceId, { interfaceName, sinceMinutes: range }),
-        fetchLatestCounters(deviceId).then((r) => r.interfaces.find((s) => s.interfaceName === interfaceName) ?? null),
+        fetchLatestCounters(deviceId).then((r) => findMatchingIface(r.interfaces, interfaceName)),
       ]);
       setHistory(hist);
       setLatest(lat);
@@ -129,7 +130,7 @@ export function PortStatsDrawer({
 
   const rates = useMemo(() => {
     if (!history) return [];
-    const found = history.interfaces.find((i) => i.interfaceName === interfaceName);
+    const found = findMatchingIface(history.interfaces, interfaceName);
     return found?.rates ?? [];
   }, [history, interfaceName]);
 

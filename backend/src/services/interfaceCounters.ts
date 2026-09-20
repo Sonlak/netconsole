@@ -1009,6 +1009,79 @@ export type InterfaceCounterHistory = {
   rates: Array<{ t: string; inBps: number | null; outBps: number | null }>;
 };
 
+// ---------------------------------------------------------------------------
+// Interface-name canonicalization
+//
+// IOSv's `show interfaces` parser returns long form (GigabitEthernet0/0)
+// but the LLDP merge path may surface short form (Gi0/0) on the device
+// interface table. Two storage paths = two different stored names for the
+// same physical port. To keep the query layer agnostic to the spelling the
+// caller picked, expand any vendor interface name into every equivalent
+// canonical form before hitting Prisma.
+//
+// Rules: Cisco short prefix must be followed by a digit so `et-0/0/0` (Junos)
+// doesn't get mistakenly rewritten to `Ethernet-0/0/0`.
+//
+// Note: this helper is also exported so the frontend can produce the same
+// variant list and match responses reliably.
+export const IFACE_SHORT_TO_LONG: Readonly<Record<string, string>> = Object.freeze({
+  gi: 'GigabitEthernet',
+  te: 'TenGigabitEthernet',
+  fa: 'FastEthernet',
+  et: 'Ethernet',
+  tw: 'TwoGigabitEthernet',
+  twe: 'TwentyFiveGigE',
+  fo: 'FortyGigabitEthernet',
+  hu: 'HundredGigE',
+  fou: 'FourHundredGigE',
+  po: 'Port-channel',
+});
+
+// Long → short, used to canonicalize when a device returns the long name
+// and we want to look it up by short name (or vice-versa).
+export const IFACE_LONG_TO_SHORT: Readonly<Record<string, string>> = Object.freeze({
+  gigabitethernet: 'Gi',
+  tengigabitethernet: 'Te',
+  fastethernet: 'Fa',
+  ethernet: 'Et',
+  twogigabitethernet: 'Tw',
+  twentyfivegige: 'Twe',
+  fortygigabitethernet: 'Fo',
+  hundredgige: 'Hu',
+  fourhundredgige: 'Fou',
+  'port-channel': 'Po',
+});
+
+export function expandIfaceVariants(name: string | null | undefined): string[] {
+  if (!name) return [];
+  const trimmed = String(name).trim();
+  if (!trimmed) return [];
+  const out = new Set<string>([trimmed]);
+  const lower = trimmed.toLowerCase();
+
+  // Short → long (only when followed by digit — keeps Junos `et-`/`ge-`
+  // out of the rewrite path).
+  for (const [short, long] of Object.entries(IFACE_SHORT_TO_LONG)) {
+    if (lower.startsWith(short) && lower.length > short.length) {
+      const next = trimmed[short.length];
+      if (next && /\d/.test(next)) {
+        out.add(long + trimmed.slice(short.length));
+        break;
+      }
+    }
+  }
+
+  // Long → short (case-insensitive prefix match).
+  for (const [long, short] of Object.entries(IFACE_LONG_TO_SHORT)) {
+    if (lower.startsWith(long) && lower.length > long.length) {
+      out.add(short + trimmed.slice(long.length));
+      break;
+    }
+  }
+
+  return Array.from(out);
+}
+
 /**
  * Returns up to `limit` most recent samples per interface for the device,
  * with derived per-interval in/out bps rates. Default 60 minutes is enough
@@ -1022,10 +1095,19 @@ export async function getDeviceCounterHistory(
   const since = new Date(Date.now() - sinceMinutes * 60_000);
   const limit = options.limit ?? 600;
 
+  // Expand short/long variants so callers can query by either form. The
+  // counter collector stores long form (GigabitEthernet0/0) while the
+  // device-interface table may show short form (Gi0/0) — both should hit.
+  const interfaceVariants = options.interfaceName
+    ? expandIfaceVariants(options.interfaceName)
+    : [];
+
   const where: Prisma.InterfaceCounterSampleWhereInput = {
     deviceId,
     capturedAt: { gte: since },
-    ...(options.interfaceName ? { interfaceName: options.interfaceName } : {}),
+    ...(interfaceVariants.length
+      ? { interfaceName: { in: interfaceVariants } }
+      : {}),
   };
 
   const rows = await prisma.interfaceCounterSample.findMany({

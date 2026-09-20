@@ -104,34 +104,50 @@ class GetInterfacesTask(BaseTask):
         # Collect LLDP neighbours (the ground-truth link map for fabric topology)
         lldp_result = _backend(device).get_lldp(device)
         # Build a lookup: normalize LLDP localPort to a short key for matching.
-        # IOS: "Gi0/0" → "gi00"; IOS-XE: "Gi0/0/1" → "gi0001";
-        # Juniper: "ge-0/0/1" → "ge0001"; EOS: "Et1" → "et1".
+        # IOS: "Gi0/0" → "00"; IOS-XE: "Gi0/0/1" → "0001";
+        # Juniper: "ge-0/0/1" → "ge-0001"; EOS: "Et1" → "1".
+        # Both sides (LLDP localPort and interface name) pass through the same
+        # `_norm_key` so abbreviated names ("Gi") match long names
+        # ("GigabitEthernet") without needing a second join.
         neighbors = lldp_result.get("neighbors", [])
 
+        # Order matters: long-form prefixes first so "GigabitEthernet0/0"
+        # doesn't fall into the short-form "gi" branch by accident.
+        _LONG_PREFIXES = (
+            "gigabitethernet",
+            "fastethernet",
+            "ten gigabitethernet",
+            "tengigabitethernet",
+            "twentyfivegige",
+            "fortygigabitethernet",
+            "fiftygige",
+            "hundredgige",
+            "ethernet",
+            "loopback",
+            "port-channel",
+            "vlan",
+            "nve",
+            "management",
+            "service-engine",
+        )
+        # Cisco IOS short forms — only matched when followed by a digit, so
+        # Junos `et-0/0/0` doesn't get rewritten to `Ethernet-0/0/0`.
+        _SHORT_PREFIXES = ("gi", "te", "fa", "et", "tw", "twe", "fo", "hu", "fou", "po")
+
         def _norm_key(port: str) -> str:
-            # Strip common type prefixes so abbreviated LLDP names match full
-            # interface names (e.g. "Gi0/0" ↔ "GigabitEthernet0/0").
             p = port.lower()
-            for prefix in (
-                "gigabitethernet",
-                "fastethernet",
-                "ten gigabitethernet",
-                "tengigabitethernet",
-                "twentyfivegige",
-                "fiftygige",
-                "hundredgige",
-                "ethernet",
-                "loopback",
-                "port-channel",
-                "vlan",
-                "nve",
-                "management",
-                "service-engine",
-            ):
+            stripped = False
+            for prefix in _LONG_PREFIXES:
                 if p.startswith(prefix):
                     p = p[len(prefix):]
+                    stripped = True
                     break
-            return p.replace("/", "").replace(".", "")
+            if not stripped:
+                for prefix in _SHORT_PREFIXES:
+                    if p.startswith(prefix) and len(p) > len(prefix) and p[len(prefix)].isdigit():
+                        p = p[len(prefix):]
+                        break
+            return p.replace("/", "").replace(".", "").replace("-", "")
 
         lldp_by_iface: dict[str, dict[str, str]] = {}
         for n in neighbors:
