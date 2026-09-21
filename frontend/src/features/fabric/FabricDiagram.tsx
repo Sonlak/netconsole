@@ -934,67 +934,77 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       }
     }
 
-    // Step 2: assign a port index for every (node, side).
-    //   - On the source side, ports are filled in the order returned by
-    //     linksBySource (already sorted by target X). Leftmost source
-    //     port → leftmost target.
-    //   - On the target side, ports are filled in the order returned by
-    //     linksByTarget (sorted by source X). Leftmost target port ←
-    //     leftmost source.
-    const linksBySource: Record<string, FabricLink[]> = {};
-    const linksByTarget: Record<string, FabricLink[]> = {};
-    for (const link of links) {
-      (linksBySource[link.fromDeviceId] ||= []).push(link);
-      (linksByTarget[link.toDeviceId]   ||= []).push(link);
-    }
-    for (const srcId in linksBySource) {
-      linksBySource[srcId].sort((a, b) => {
-        const aBox = idx[a.toDeviceId]?.box;
-        const bBox = idx[b.toDeviceId]?.box;
-        if (!aBox || !bBox) return 0;
-        return aBox.x - bBox.x;
-      });
-    }
-    for (const tgtId in linksByTarget) {
-      linksByTarget[tgtId].sort((a, b) => {
-        const aBox = idx[a.fromDeviceId]?.box;
-        const bBox = idx[b.fromDeviceId]?.box;
-        if (!aBox || !bBox) return 0;
-        return aBox.x - bBox.x;
-      });
-    }
-
-    // Step 3: port count per (node, side). Two passes — first count,
-    // then assign index by walking each source's sorted list once.
+    // Step 2: build a UNIFIED port index for every (node, side).
+    // ----------------------------------------------------------------------------
+    // Every link incident on (node, side) — outgoing OR incoming — shares the
+    // same port-index space on that side. Sorting by the OTHER endpoint's
+    // X position keeps port assignment deterministic regardless of how the
+    // backend decided to store link direction (fromId/toId is arbitrary once
+    // a link is dedup-merged).
+    //
+    // Why unified? A DS bottom port has BOTH:
+    //   - 3 outgoing trunk links (DS→F1, DS→F2, DS→F3) carried in
+    //     linksBySource[DS-id]
+    //   - 1 incoming trunk link (F4→DS) carried in linksByTarget[DS-id]
+    // The previous code split port indexing between source/target lists, so
+    // the F1 outgoing link got idx=0 from the source-list AND the F4 incoming
+    // link got idx=0 from the target-list → both rendered at the same X
+    // pixel → two lines visually emerged from the same stub. Unifying means
+    // F4 sorts before F1 in DS bottom (F4 is at floor column 0 with the
+    // smallest X), gets idx=0, and F1/F2/F3 take idx=1/2/3 — 4 distinct
+    // visible lines instead of 3.
+    // ----------------------------------------------------------------------------
     type PortMap = Record<string, Record<Anchor, number>>;
+    type PortIdxMap = Record<string, Record<Anchor, Map<string, number>>>;
     const portCount: PortMap = {};
+    const portIdx: PortIdxMap = {};
+    const ANCHORS: Anchor[] = ['left', 'right', 'top', 'bottom'];
     for (const item of layout.positioned) {
       portCount[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
+      portIdx[item.node.id] = { left: new Map(), right: new Map(), top: new Map(), bottom: new Map() };
     }
+
+    // First pass: count ports per (node, side) AND register each link id
+    // in the unified per-side incident map (idx will be assigned in pass 2).
     for (const link of links) {
       const info = stubs[link.id];
       if (!info) continue;
       portCount[link.fromDeviceId][info.fromSide]++;
       portCount[link.toDeviceId][info.toSide]++;
+      portIdx[link.fromDeviceId][info.fromSide].set(link.id, 0);
+      portIdx[link.toDeviceId][info.toSide].set(link.id, 0);
     }
 
-    // Step 4: build edges
-    const sourceCursor: Record<string, Record<Anchor, number>> = {};
-    const targetCursor: Record<string, Record<Anchor, number>> = {};
+    // Second pass: sort incident links per (node, side) by the OTHER
+    // endpoint's box.x, then assign sequential port idx 0..N-1.
     for (const item of layout.positioned) {
-      sourceCursor[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
-      targetCursor[item.node.id] = { left: 0, right: 0, top: 0, bottom: 0 };
+      const nodeId = item.node.id;
+      for (const side of ANCHORS) {
+        const map = portIdx[nodeId][side];
+        if (map.size === 0) continue;
+        const incident = [...map.entries()].map(([id, _]) => id);
+        incident.sort((aid, bid) => {
+          const aLink = links.find((l) => l.id === aid);
+          const bLink = links.find((l) => l.id === bid);
+          if (!aLink || !bLink) return 0;
+          // Other endpoint: if `node` is the source of link, other = toId.
+          // Otherwise (node is the target), other = fromId.
+          const aOtherId = aLink.fromDeviceId === nodeId ? aLink.toDeviceId : aLink.fromDeviceId;
+          const bOtherId = bLink.fromDeviceId === nodeId ? bLink.toDeviceId : bLink.fromDeviceId;
+          const aBox = idx[aOtherId]?.box;
+          const bBox = idx[bOtherId]?.box;
+          if (!aBox || !bBox) return 0;
+          return aBox.x - bBox.x;
+        });
+        incident.forEach((id, i) => map.set(id, i));
+      }
     }
 
-    function sourcePortIdx(link: FabricLink, side: Anchor): number {
-      const list = (linksBySource[link.fromDeviceId] || []).filter((l) => stubs[l.id]?.fromSide === side);
-      return list.indexOf(link);
-    }
-    function targetPortIdx(link: FabricLink, side: Anchor): number {
-      const list = (linksByTarget[link.toDeviceId] || []).filter((l) => stubs[l.id]?.toSide === side);
-      return list.indexOf(link);
+    function portIndex(link: FabricLink, nodeId: string, side: Anchor): number {
+      return portIdx[nodeId]?.[side]?.get(link.id) ?? 0;
     }
 
+    // Step 3 (legacy): build edges using the unified port index.
     const edgeList: EdgePath[] = [];
     for (const link of links) {
       const a = idx[link.fromDeviceId];
@@ -1002,8 +1012,8 @@ export function FabricDiagram({ nodes, links }: { nodes: FabricNode[]; links: Fa
       if (!a || !b) continue;
       const info = stubs[link.id]!;
 
-      const fromIdx = sourcePortIdx(link, info.fromSide);
-      const toIdx   = targetPortIdx(link, info.toSide);
+      const fromIdx = portIndex(link, link.fromDeviceId, info.fromSide);
+      const toIdx   = portIndex(link, link.toDeviceId,   info.toSide);
       const fromTotal = portCount[link.fromDeviceId][info.fromSide];
       const toTotal   = portCount[link.toDeviceId][info.toSide];
 
