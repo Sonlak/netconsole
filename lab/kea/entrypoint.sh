@@ -58,7 +58,7 @@ sed \
 
 # DHCP replies are unicast to relay giaddr. Skip when DHCP_RELAY_VIA is empty.
 RELAY_VIA="${DHCP_RELAY_VIA-172.30.0.13}"
-RELAY_NETS="${DHCP_RELAY_NETS:-10.1.201.0/24 10.1.202.0/24 10.1.203.0/24}"
+RELAY_NETS="${DHCP_RELAY_NETS:-10.1.201.0/24 10.1.202.0/24 10.1.203.0/24 10.1.204.0/24}"
 if [[ -n "${RELAY_VIA}" ]]; then
   for net in ${RELAY_NETS}; do
     ip route replace "$net" via "$RELAY_VIA" 2>/dev/null || true

@@ -101,6 +101,20 @@
           "name": "Tang-03 VLAN203",
           "gateway": "10.1.203.254"
         }
+      },
+      {
+        "id": 204,
+        "subnet": "10.1.204.0/24",
+        "pools": [{ "pool": "10.1.204.10 - 10.1.204.199" }],
+        "option-data": [
+          { "name": "routers", "data": "10.1.204.254" }
+        ],
+        "user-context": {
+          "site": "LAB",
+          "vlan": 204,
+          "name": "Tang-04 VLAN204",
+          "gateway": "10.1.204.254"
+        }
       }
     ],
     "loggers": [
