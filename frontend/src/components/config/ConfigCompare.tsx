@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, Space, Typography, Empty, Select, DatePicker } from 'antd';
+import { Button, Space, Typography, Empty, Select, DatePicker, Tag } from 'antd';
 import dayjs from 'dayjs';
 import relativeTime from 'dayjs/plugin/relativeTime';
 import type { SavedConfigEntry } from '@/api/configCompare';
@@ -24,12 +24,91 @@ const C = {
   removedText: '#f87171',
   lineNum: '#3a4556',
   accent: '#60a5fa',
+  // Entry type colours
+  applyBg: '#1a2d1a',
+  applyBorder: '#2d5a2d',
+  applyText: '#86efac',
+  snapshotBg: '#1e2530',
+  snapshotBorder: '#2a3444',
+  snapshotText: '#9ca3af',
 } as const;
 
 interface ConfigCompareProps {
   deviceId: string;
   currentConfig: string;
 }
+
+// ── Entry type badge ─────────────────────────────────────────────────────────
+function EntryBadge({ entry }: { entry: SavedConfigEntry }) {
+  if (entry.entryType === 'apply') {
+    // Show who applied + source
+    const userLabel = entry.username ?? 'system';
+    const sourceLabel = entry.source
+      ? SOURCE_LABELS[entry.source] ?? entry.source
+      : null;
+    return (
+      <Space size={4}>
+        <Tag
+          color="green"
+          style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}
+        >
+          web apply
+        </Tag>
+        <Typography.Text style={{ color: C.applyText, fontSize: 11 }}>
+          {userLabel}
+        </Typography.Text>
+        {sourceLabel && (
+          <Typography.Text style={{ color: C.textMuted, fontSize: 10 }}>
+            via {sourceLabel}
+          </Typography.Text>
+        )}
+        {entry.configRole && (
+          <Typography.Text style={{ color: C.textMuted, fontSize: 10 }}>
+            [{entry.configRole}]
+          </Typography.Text>
+        )}
+      </Space>
+    );
+  }
+  // Snapshot: show CLI/scheduler indicator
+  const isCli = entry.username === null;
+  return (
+    <Space size={4}>
+      <Tag
+        style={{
+          margin: 0,
+          fontSize: 10,
+          lineHeight: '16px',
+          padding: '0 4px',
+          background: C.snapshotBg,
+          borderColor: C.snapshotBorder,
+          color: C.snapshotText,
+        }}
+      >
+        periodic snapshot
+      </Tag>
+      {isCli ? (
+        <Typography.Text style={{ color: C.textMuted, fontSize: 11 }}>
+          CLI/scheduler
+        </Typography.Text>
+      ) : (
+        <Typography.Text style={{ color: C.snapshotText, fontSize: 11 }}>
+          {entry.username}
+        </Typography.Text>
+      )}
+    </Space>
+  );
+}
+
+const SOURCE_LABELS: Record<string, string> = {
+  'eos-api': 'EOS eAPI',
+  'ssh-cli': 'EOS SSH CLI',
+  'junos-rest': 'Junos REST',
+  'junos-netconf': 'Junos NETCONF',
+  'nxos-api': 'NX-OS API',
+  'iosxe-restconf': 'IOS-XE RESTCONF',
+  'iosxe-ssh': 'IOS-XE SSH',
+};
 
 // ── Diff computation (LCS) ────────────────────────────────────────────────────
 type DiffLine = { type: 'unchanged' | 'removed' | 'added'; content: string; leftLine: number; rightLine: number };
@@ -65,8 +144,8 @@ function computeDiff(leftLines: string[], rightLines: string[]): DiffLine[] {
 }
 
 // ── Split view (synchronized) ────────────────────────────────────────────────
-function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
-  leftLines: string[]; rightLines: string[]; leftLabel: string; rightLabel: string;
+function SplitView({ leftLines, rightLines, leftLabel, rightLabel, rightEntry }: {
+  leftLines: string[]; rightLines: string[]; leftLabel: string; rightLabel: string; rightEntry?: SavedConfigEntry;
 }) {
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
@@ -84,7 +163,7 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
   const maxLines = Math.max(leftLines.length, rightLines.length);
 
   return (
-    <div style={{ display: 'flex', height: 'calc(100vh - 340px)', minHeight: 400 }}>
+    <div style={{ display: 'flex', height: 'calc(100vh - 360px)', minHeight: 400 }}>
       {/* Left = current running config */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', borderRight: `1px solid ${C.border}` }}>
         <div style={{
@@ -115,10 +194,15 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
       {/* Right = old config */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
         <div style={{
-          padding: '6px 12px', background: C.panel, borderBottom: `1px solid ${C.border}`,
-          fontSize: 11, color: C.accent, fontWeight: 600, flexShrink: 0,
+          padding: '6px 12px', background: rightEntry?.entryType === 'apply' ? C.applyBg : C.panel,
+          borderBottom: `1px solid ${rightEntry?.entryType === 'apply' ? C.applyBorder : C.border}`,
+          fontSize: 11, color: rightEntry?.entryType === 'apply' ? C.applyText : C.accent, fontWeight: 600, flexShrink: 0,
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-        }} title={rightLabel}>{rightLabel}</div>
+          display: 'flex', flexDirection: 'column', gap: 2,
+        }}>
+          <span title={rightLabel}>{rightLabel}</span>
+          {rightEntry && <EntryBadge entry={rightEntry} />}
+        </div>
         <div ref={rightRef} onScroll={() => sync('right')} style={{ flex: 1, overflowY: 'auto', background: C.bg }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
             <tbody>
@@ -143,28 +227,40 @@ function SplitView({ leftLines, rightLines, leftLabel, rightLabel }: {
 }
 
 // ── Unified view ─────────────────────────────────────────────────────────────
-function UnifiedView({ diffLines, leftLabel, rightLabel }: {
-  diffLines: DiffLine[]; leftLabel: string; rightLabel: string;
+function UnifiedView({ diffLines, leftLabel, rightLabel, rightEntry }: {
+  diffLines: DiffLine[]; leftLabel: string; rightLabel: string; rightEntry?: SavedConfigEntry;
 }) {
   const stats = {
     added: diffLines.filter(l => l.type === 'added').length,
     removed: diffLines.filter(l => l.type === 'removed').length,
   };
   const containerRef = useRef<HTMLDivElement>(null);
+  const isApply = rightEntry?.entryType === 'apply';
 
   return (
     <div style={{ border: `1px solid ${C.border}`, borderRadius: 4, overflow: 'hidden' }}>
       <div style={{
-        display: 'flex', gap: 16, padding: '6px 12px',
-        background: C.panel, borderBottom: `1px solid ${C.border}`, fontSize: 12, flexShrink: 0,
+        display: 'flex', gap: 16, padding: '6px 12px', alignItems: 'center',
+        background: isApply ? C.applyBg : C.panel,
+        borderBottom: `1px solid ${isApply ? C.applyBorder : C.border}`,
+        fontSize: 12, flexShrink: 0, flexWrap: 'wrap',
       }}>
         <Typography.Text style={{ color: C.addedText }}>+{stats.added} dòng thêm</Typography.Text>
         <Typography.Text style={{ color: C.removedText }}>−{stats.removed} dòng bớt</Typography.Text>
-        <Typography.Text style={{ color: C.textMuted }}>{leftLabel}</Typography.Text>
-        <Typography.Text type="secondary" style={{ color: C.textMuted, marginLeft: 'auto' }}>← {rightLabel}</Typography.Text>
+        <Typography.Text style={{ color: isApply ? C.applyText : C.textMuted, fontSize: 11 }}>
+          {leftLabel}
+        </Typography.Text>
+        <Typography.Text type="secondary" style={{ color: C.textMuted, marginLeft: 'auto' }}>
+          ← {rightLabel}
+        </Typography.Text>
+        {rightEntry && (
+          <div style={{ marginLeft: 8 }}>
+            <EntryBadge entry={rightEntry} />
+          </div>
+        )}
       </div>
       <div ref={containerRef} style={{
-        maxHeight: 'calc(100vh - 400px)', overflowY: 'auto',
+        maxHeight: 'calc(100vh - 420px)', overflowY: 'auto',
         fontFamily: '"JetBrains Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.6, background: C.bg,
       }}>
         <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
@@ -277,15 +373,29 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
           />
           <Select
             size="small"
-            style={{ minWidth: 320 }}
+            style={{ minWidth: 360 }}
             value={selectedOldId || filteredHistory[0]?.id}
             onChange={(v) => setSelectedOldId(v)}
             options={filteredHistory.map((h) => ({
               value: h.id,
               label: (
-                <Typography.Text style={{ fontSize: 12, color: C.text }}>
-                  {dayjs(h.timestamp).format('DD/MM/YYYY HH:mm')} · {h.role} · {h.content.split('\n').length}L dòng
-                </Typography.Text>
+                <Space size={4}>
+                  <Typography.Text style={{ fontSize: 12, color: h.entryType === 'apply' ? C.applyText : C.text }}>
+                    {dayjs(h.timestamp).format('DD/MM/YYYY HH:mm')}
+                  </Typography.Text>
+                  <Tag
+                    color={h.entryType === 'apply' ? 'green' : 'default'}
+                    style={{ margin: 0, fontSize: 10, lineHeight: '16px', padding: '0 4px' }}
+                  >
+                    {h.entryType === 'apply' ? 'apply' : 'snapshot'}
+                  </Tag>
+                  <Typography.Text style={{ fontSize: 11, color: C.textMuted }}>
+                    {h.username ?? 'CLI/scheduler'}
+                  </Typography.Text>
+                  <Typography.Text style={{ fontSize: 10, color: C.textMuted }}>
+                    · {h.content.split('\n').length}L
+                  </Typography.Text>
+                </Space>
               ),
             }))}
           />
@@ -301,9 +411,20 @@ export function ConfigCompare({ deviceId, currentConfig }: ConfigCompareProps) {
       </div>
 
       {viewMode === 'split' ? (
-        <SplitView leftLines={leftLines} rightLines={rightLines} leftLabel={leftLabel} rightLabel={rightLabel} />
+        <SplitView
+          leftLines={leftLines}
+          rightLines={rightLines}
+          leftLabel={leftLabel}
+          rightLabel={rightLabel}
+          rightEntry={selectedOld}
+        />
       ) : (
-        <UnifiedView diffLines={diffLines} leftLabel={leftLabel} rightLabel={rightLabel} />
+        <UnifiedView
+          diffLines={diffLines}
+          leftLabel={leftLabel}
+          rightLabel={rightLabel}
+          rightEntry={selectedOld}
+        />
       )}
     </div>
   );

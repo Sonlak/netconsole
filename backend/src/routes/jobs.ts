@@ -259,6 +259,56 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
       }
     }
 
+    // ── ConfigAuditLog: record every successful APPLY_CONFIG so the
+    // compare/history page can show WHO applied WHAT WHEN and whether the
+    // change came from the web (real userId) or is a periodic snapshot.
+    if (
+      job.type === JobType.APPLY_CONFIG &&
+      job.status === JobStatus.SUCCESS &&
+      job.deviceId
+    ) {
+      try {
+        const payload = (job.payload ?? {}) as {
+          config?: string;
+          role?: string;
+        };
+        const result = (job.result ?? {}) as {
+          config?: string;
+          commands?: string[];
+          source?: string;
+          message?: string;
+        };
+        const appliedConfig = payload.config ?? result.config ?? '';
+        const lineCount = Array.isArray(result.commands)
+          ? result.commands.length
+          : appliedConfig.split('\n').length;
+
+        await prisma.configAuditLog.upsert({
+          where: { jobId: job.id },
+          create: {
+            deviceId: job.deviceId,
+            jobId: job.id,
+            userId: job.createdById ?? null,
+            username: job.createdBy?.username ?? null,
+            configRole: payload.role ?? null,
+            config: appliedConfig,
+            lineCount,
+            source: result.source ?? null,
+            message: result.message ?? null,
+          },
+          update: {
+            config: appliedConfig,
+            lineCount,
+            source: result.source ?? null,
+            message: result.message ?? null,
+          },
+        });
+      } catch (auditError) {
+        // Non-fatal: audit failure must not fail the job completion
+        console.error('[audit] ConfigAuditLog write failed', auditError);
+      }
+    }
+
     res.json({ job, device, persistedLogs });
     if (job.type === JobType.GET_INTERFACES) invalidateFabricCache();
   } catch {

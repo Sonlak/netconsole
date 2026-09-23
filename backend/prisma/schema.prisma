@@ -375,6 +375,33 @@ model AuditLog {
   @@index([createdAt])
 }
 
+// ConfigAuditLog – append-only log of every successful APPLY_CONFIG job.
+// Records WHO applied WHAT WHEN so the compare/history page can show
+// a full audit trail, including whether the change came from the web UI
+// (job had a real userId) or was a scheduled collection (worker-only).
+model ConfigAuditLog {
+  id          String   @id @default(uuid())
+  deviceId    String
+  jobId       String   @unique  // one audit row per APPLY_CONFIG job
+  // The user who triggered the job. Null = scheduler/worker (CLI change).
+  userId      String?
+  username    String?
+  // The role that was applied (core/dist/access/custom/template-xxx)
+  configRole  String?
+  // Full config content that was applied (the `config` field from payload)
+  config      String
+  // Count of individual command lines (from the `commands` result array)
+  lineCount   Int      @default(0)
+  // Which API path was used (eos-api / ssh-cli / junos-rest / nxos-api / etc.)
+  source      String?
+  // Human-readable summary of what happened
+  message     String?
+  createdAt   DateTime @default(now())
+
+  @@index([deviceId, createdAt])
+  @@index([deviceId])
+}
+
 // Long-lived refresh token. Access tokens (15 min) are issued alongside a
 // refresh token (30 d); the frontend calls POST /api/auth/refresh to mint
 // a new access token without asking the user for their password.
