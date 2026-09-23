@@ -186,19 +186,27 @@ class InterfaceActionTask(BaseTask):
         iface = str(payload.get("interface") or "").strip()
         vlan = payload.get("vlan")
         description = payload.get("description")
-        # When description="" (empty string from frontend), treat as remove.
-        # This avoids the need for a separate action when clearing a description.
+
+        # Treat empty-string or null description as "remove". The frontend
+        # sends description="" when the user clears the field, and may
+        # omit the field entirely (description=None) when the user didn't
+        # touch it. Both should map to a remove-description action so the
+        # UI text "Clear the field to remove it" actually removes.
+        #
+        # Pre-fix bug: when the backend dropped the description field
+        # entirely (see parseInterfaceActionPayload in interfaces.ts),
+        # every set-description silently turned into a remove, which
+        # made "type anything" still wipe the description.
         effective_action = action
         effective_description: str | None = None
         if action == "set-description":
-            # Frontend sends description=None when field is empty (field absent from
-            # JSON). Treat that as remove-description. Empty string "" means the
-            # user wants to set an empty description (vendor backend decides).
-            if description is not None:
+            if isinstance(description, str) and description.strip():
                 effective_description = description
             else:
-                effective_description = None
+                # Empty string or null → remove
                 effective_action = "remove-description"
+                effective_description = None
+
         return _backend(device).interface_action(
             device,
             action=effective_action,

@@ -39,10 +39,29 @@ export function parseInterfaceActionPayload(body: unknown): InterfaceActionPaylo
     return null;
   }
 
+  // Extract `description` field. Accepts:
+  //   - string (will be passed through to the worker; trimmed)
+  //   - null  (no description; worker treats as remove for set-description)
+  //   - undefined (field absent from JSON; same as null)
+  //
+  // Without this fix the backend silently dropped the description and the
+  // worker saw `description = None`, which made every set-description turn
+  // into remove-description. (See InterfaceActionTask in registry.py for the
+  // worker-side handling.)
+  let description: string | undefined;
+  if (typeof value.description === 'string') {
+    description = value.description.trim();
+  } else if (value.description === null) {
+    description = undefined;
+  }
+
   return {
     action: action as InterfaceAction,
     interface: iface.trim(),
     ...(vlan ? { vlan } : {}),
+    ...(action === 'set-description' || action === 'remove-description'
+      ? { description: description ?? '' }
+      : {}),
   };
 }
 

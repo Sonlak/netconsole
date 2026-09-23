@@ -539,7 +539,6 @@ class JuniperBackend(DeviceBackend):
 
         if action in {"shut", "set-access-vlan"} and is_protected_interface(iface):
             raise RuntimeError(f"Refusing {action} on management/internal interface {iface}")
-            raise RuntimeError(f"Refusing {action} on management/internal interface {iface}")
 
         rest_error: str | None = None
         netconf_error: str | None = None
