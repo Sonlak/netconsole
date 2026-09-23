@@ -25,6 +25,7 @@ from netconsole_worker.ssh_client import (
     netconf_get_interface_config,
     netconf_interface_action,
     netconf_set_access_vlan,
+    netconf_set_description,
     run_ssh_command,
     run_ssh_commands_session,
 )
@@ -796,6 +797,7 @@ class IOSxeBackend(DeviceBackend):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
         try:
             iface = _validate_iface(iface)
@@ -816,6 +818,7 @@ class IOSxeBackend(DeviceBackend):
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
+                    "description": None,
                     "commands": [],
                     "outputs": [],
                     "message": backend_result.get("message", f"Interface {iface} show-run OK"),
@@ -829,7 +832,7 @@ class IOSxeBackend(DeviceBackend):
                 backend_result.get("error", ""),
             )
 
-        if action in ("shut", "no-shut", "set-access-vlan", "show-run"):
+        if action in ("shut", "no-shut", "set-access-vlan", "set-description", "remove-description", "show-run"):
             # NETCONF primary (gotcha #14). Reliable, atomic, structured
             # output for show-run. SSH remains the fallback path.
             nc_result = None
@@ -864,6 +867,16 @@ class IOSxeBackend(DeviceBackend):
                     port=830,
                     timeout=30,
                 )
+            elif action in ("set-description", "remove-description"):
+                nc_result = netconf_set_description(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    iface_name=iface,
+                    description=description,
+                    port=830,
+                    timeout=30,
+                )
 
             if nc_result and nc_result.get("ok"):
                 # Build a uniform success envelope so the frontend doesn't
@@ -881,6 +894,7 @@ class IOSxeBackend(DeviceBackend):
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
+                    "description": nc_result.get("description") if action in ("set-description", "remove-description") else None,
                     "commands": [],
                     "outputs": [],
                     "message": nc_result.get("message", f"Interface action {action} OK on {iface}"),
@@ -923,6 +937,22 @@ class IOSxeBackend(DeviceBackend):
             commands = [
                 f"show running-config interface {iface} | no-more",
             ]
+        elif action == "set-description":
+            if description is None:
+                raise RuntimeError("set-description requires a description argument")
+            commands = [
+                "configure terminal",
+                f"interface {iface}",
+                f"description {description}",
+                "end",
+            ]
+        elif action == "remove-description":
+            commands = [
+                "configure terminal",
+                f"interface {iface}",
+                "no description",
+                "end",
+            ]
         else:
             raise RuntimeError(f"Unsupported interface action for IOS-XE: {action}")
 
@@ -956,6 +986,7 @@ class IOSxeBackend(DeviceBackend):
             "action": action,
             "interface": iface,
             "vlan": vlan or None,
+            "description": description if action in ("set-description", "remove-description") else None,
             "commands": commands,
             "outputs": outputs,
             "message": f"Interface action {action} OK on {iface}",

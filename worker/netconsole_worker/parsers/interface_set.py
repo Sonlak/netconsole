@@ -154,7 +154,12 @@ def filter_interface_set_lines(config: str, iface: str) -> str:
     return "\n".join(lines).strip()
 
 
-def commands_for_action(action: str, iface: str, vlan: str = "") -> list[str]:
+def _escape_junos(value: str) -> str:
+    """Wrap value in double-quotes for Junos set command, escaping embedded double-quotes."""
+    return '"' + value.replace('"', '\\"') + '"'
+
+
+def commands_for_action(action: str, iface: str, vlan: str = "", description: str = "") -> list[str]:
     physical, unit = split_interface(iface)
     if action == "shut":
         if unit:
@@ -174,4 +179,16 @@ def commands_for_action(action: str, iface: str, vlan: str = "") -> list[str]:
             f"set {target} interface-mode access",
             f"set {target} vlan members {vlan}",
         ]
+    if action == "set-description":
+        if not description:
+            raise ValueError("set-description requires a description argument")
+        physical2, _unit2 = split_interface(iface)
+        if unit:
+            return [f"set interfaces {physical2} unit {unit} description {_escape_junos(description)}"]
+        return [f"set interfaces {physical2} description {_escape_junos(description)}"]
+    if action == "remove-description":
+        physical2, _unit2 = split_interface(iface)
+        if unit:
+            return [f"delete interfaces {physical2} unit {unit} description"]
+        return [f"delete interfaces {physical2} description"]
     raise ValueError(f"Unsupported interface action: {action}")

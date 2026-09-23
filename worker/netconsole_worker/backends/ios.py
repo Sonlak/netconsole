@@ -743,6 +743,7 @@ class IOSBackend(DeviceBackend):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
         if not self._config.ios_http.enabled:
             raise RuntimeError("IOS_HTTP enabled=false")
@@ -760,6 +761,7 @@ class IOSBackend(DeviceBackend):
                 "action": action,
                 "interface": iface,
                 "vlan": vlan or None,
+                "description": None,
                 "commands": [cmd],
                 "outputs": [{"command": cmd, "output": output}],
                 "message": f"show-run for {iface} OK",
@@ -782,6 +784,18 @@ class IOSBackend(DeviceBackend):
                 "switchport mode access",
                 f"switchport access vlan {vlan}",
             ]
+        elif action == "set-description":
+            if description is None:
+                raise RuntimeError("set-description requires a description argument")
+            commands = [
+                f"interface {iface}",
+                f"description {description}",
+            ]
+        elif action == "remove-description":
+            commands = [
+                f"interface {iface}",
+                "no description",
+            ]
         else:
             raise RuntimeError(f"Unsupported interface action for IOS: {action}")
 
@@ -793,6 +807,7 @@ class IOSBackend(DeviceBackend):
             "action": action,
             "interface": iface,
             "vlan": vlan or None,
+            "description": description if action in ("set-description", "remove-description") else None,
             "commands": commands,
             "outputs": [{"command": "conf t + commands", "output": output}],
             "message": f"Interface {action} OK on {iface}",

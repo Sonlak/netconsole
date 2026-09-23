@@ -84,8 +84,9 @@ class DeviceBackend(ABC):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
-        """shut / no-shut / show-run / set-access-vlan on a single interface."""
+        """shut / no-shut / show-run / set-access-vlan / set-description on a single interface."""
 
     @abstractmethod
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:

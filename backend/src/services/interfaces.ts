@@ -7,15 +7,16 @@ import { fetchInterfaceList, fetchConfigurationSet, fetchVlanInformation, parseV
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
 import { fetchEosInterfaceList } from './eosApi.js';
 
-export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
+export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan' | 'set-description' | 'remove-description';
 
 export type InterfaceActionPayload = {
   action: InterfaceAction;
   interface: string;
   vlan?: string;
+  description?: string;
 };
 
-const ACTION_VALUES: InterfaceAction[] = ['shut', 'no-shut', 'show-run', 'set-access-vlan'];
+const ACTION_VALUES: InterfaceAction[] = ['shut', 'no-shut', 'show-run', 'set-access-vlan', 'set-description', 'remove-description'];
 
 export function parseInterfaceActionPayload(body: unknown): InterfaceActionPayload | null {
   if (!body || typeof body !== 'object') {

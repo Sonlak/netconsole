@@ -43,10 +43,11 @@ export type InterfaceInventoryResponse = {
   source: string | null;
 };
 
-export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan';
+export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan' | 'set-description' | 'remove-description';
 
 export type InterfaceActionRequest = {
   action: InterfaceAction;
   interface: string;
   vlan?: string;
+  description?: string;
 };

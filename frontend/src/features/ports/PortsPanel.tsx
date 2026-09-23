@@ -3,6 +3,7 @@ import {
   BarChartOutlined,
   CodeOutlined,
   CloudDownloadOutlined,
+  EditOutlined,
   PlayCircleOutlined,
   PoweroffOutlined,
   SwapOutlined,
@@ -102,12 +103,17 @@ export function PortsPanel({
   const [confirm, setConfirm] = useState<{ action: InterfaceAction; iface: string; vlan?: string } | null>(
     null,
   );
+  const [descOpen, setDescOpen] = useState(false);
+  const [descIface, setDescIface] = useState<string | null>(null);
+  const [descValue, setDescValue] = useState('');
   const [statsIface, setStatsIface] = useState<DeviceInterface | null>(null);
 
   const actionLabels: Record<InterfaceAction, string> = {
     shut: 'Shut',
     'no-shut': 'No shut',
     'set-access-vlan': 'Set access VLAN',
+    'set-description': 'Set description',
+    'remove-description': 'Remove description',
     'show-run': 'Show run',
   };
 
@@ -157,11 +163,11 @@ export function PortsPanel({
     setConfirm({ action, iface, vlan });
   };
 
-  const runAction = async (action: InterfaceAction, iface: string, vlan?: string) => {
+  const runAction = async (action: InterfaceAction, iface: string, vlan?: string, description?: string) => {
     const key = `${iface}:${action}`;
     setPending(key);
     try {
-      const { job } = await runInterfaceAction(deviceId, { action, interface: iface, vlan });
+      const { job } = await runInterfaceAction(deviceId, { action, interface: iface, vlan, description });
       message.loading({ content: `Committing ${action} on ${iface}…`, key, duration: 0 });
       const finished = await waitForJob(job.id, { timeoutMs: 90000, pollIntervalMs: 300 });
       if (finished.status === 'FAILED') throw new Error(finished.error || `${action} failed`);
@@ -171,6 +177,7 @@ export function PortsPanel({
         config?: string;
         adminStatus?: string;
         accessVlan?: string;
+        description?: string;
         outputs?: { command: string; output: string }[];
       };
       if (result.implemented === false) throw new Error(result.message || `${action} failed`);
@@ -192,6 +199,9 @@ export function PortsPanel({
                   ...(result.adminStatus ? { adminStatus: result.adminStatus } : {}),
                   ...(action === 'shut' ? { operStatus: 'down' } : {}),
                   ...(result.accessVlan ? { accessVlan: result.accessVlan } : {}),
+                  ...(result.description !== undefined
+                    ? { description: result.description === null ? '' : result.description }
+                    : {}),
                 }
               : row,
           ),
@@ -319,6 +329,20 @@ export function PortsPanel({
                 />
               </Tooltip>
             ) : null}
+            <Tooltip title="Edit description">
+              <Button
+                type="text"
+                aria-label={`Edit description ${record.name}`}
+                icon={<EditOutlined />}
+                disabled={!canMutate || busy}
+                loading={pending === `${record.name}:set-description` || pending === `${record.name}:remove-description`}
+                onClick={() => {
+                  setDescIface(record.name);
+                  setDescValue(record.description || '');
+                  setDescOpen(true);
+                }}
+              />
+            </Tooltip>
             <Tooltip title="Show run">
               <Button
                 type="text"
@@ -438,6 +462,34 @@ export function PortsPanel({
       >
         <Typography.Paragraph type="secondary">Access ports (L2) only.</Typography.Paragraph>
         <Input type="number" min={1} max={4094} value={vlanValue} onChange={(event) => setVlanValue(event.target.value)} />
+      </Modal>
+      <Modal
+        open={descOpen}
+        title={descIface ? `Description · ${descIface}` : 'Description'}
+        onCancel={() => setDescOpen(false)}
+        okText="Apply"
+        confirmLoading={Boolean(pending?.endsWith(':set-description'))}
+        onOk={() => {
+          if (!descIface) return Promise.reject();
+          const trimmed = descValue.trim();
+          if (!trimmed) {
+            // Remove description if field is cleared
+            return runAction('remove-description', descIface, undefined, undefined).then(() => setDescOpen(false));
+          }
+          return runAction('set-description', descIface, undefined, trimmed).then(() => setDescOpen(false));
+        }}
+      >
+        <Typography.Paragraph type="secondary">
+          Sets the interface description on the live device. Clear the field to remove it.
+        </Typography.Paragraph>
+        <Input.TextArea
+          rows={3}
+          value={descValue}
+          placeholder="e.g. uplink-to-core, access-floor-3, trunk-vlan100"
+          onChange={(e) => setDescValue(e.target.value)}
+          maxLength={200}
+          showCount
+        />
       </Modal>
       <PortStatsDrawer
         deviceId={deviceId}

@@ -630,6 +630,7 @@ class EOSBackend(DeviceBackend):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
         commands: list[str] = []
         if action == "shut":
@@ -644,6 +645,24 @@ class EOSBackend(DeviceBackend):
                 "configure terminal",
                 f"interface {iface}",
                 f"switchport access vlan {vlan}",
+                "end",
+            ]
+        elif action == "set-description":
+            if description is None:
+                raise RuntimeError("set-description requires a description argument")
+            commands = [
+                "enable",
+                "configure terminal",
+                f"interface {iface}",
+                f"description {description}",
+                "end",
+            ]
+        elif action == "remove-description":
+            commands = [
+                "enable",
+                "configure terminal",
+                f"interface {iface}",
+                "no description",
                 "end",
             ]
         elif action == "show-run":
@@ -671,6 +690,7 @@ class EOSBackend(DeviceBackend):
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
+                    "description": description if action in ("set-description", "remove-description") else None,
                     "commands": commands,
                     "message": f"Interface action {action} OK on {iface}",
                     "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
@@ -714,6 +734,7 @@ class EOSBackend(DeviceBackend):
                 "action": action,
                 "interface": iface,
                 "vlan": vlan or None,
+                "description": description if action in ("set-description", "remove-description") else None,
                 "commands": commands,
                 "outputs": outputs,
                 "message": f"Interface action {action} OK on {iface}",

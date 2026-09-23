@@ -185,11 +185,13 @@ class InterfaceActionTask(BaseTask):
         action = str(payload.get("action") or "").strip()
         iface = str(payload.get("interface") or "").strip()
         vlan = payload.get("vlan")
+        description = payload.get("description")
         return _backend(device).interface_action(
             device,
             action=action,
             iface=iface,
             vlan=str(vlan) if vlan is not None else None,
+            description=str(description) if description is not None else None,
         )
 
 

@@ -524,6 +524,7 @@ class JuniperBackend(DeviceBackend):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
         if not action or not iface:
             return {
@@ -537,6 +538,7 @@ class JuniperBackend(DeviceBackend):
             raise RuntimeError(str(exc)) from exc
 
         if action in {"shut", "set-access-vlan"} and is_protected_interface(iface):
+            raise RuntimeError(f"Refusing {action} on management/internal interface {iface}")
             raise RuntimeError(f"Refusing {action} on management/internal interface {iface}")
 
         rest_error: str | None = None
@@ -650,9 +652,9 @@ class JuniperBackend(DeviceBackend):
                 "raw": compact_raw(filtered.get("raw") or ""),
             }
 
-        if action in {"shut", "no-shut", "set-access-vlan"}:
+        if action in {"shut", "no-shut", "set-access-vlan", "set-description", "remove-description"}:
             try:
-                commands = commands_for_action(action, iface, vlan or "")
+                commands = commands_for_action(action, iface, vlan or "", description or "")
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 
@@ -688,6 +690,7 @@ class JuniperBackend(DeviceBackend):
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
+                    "description": description if action in ("set-description", "remove-description") else None,
                     "commands": commands,
                     "message": f"Interface action {action} OK on {iface}",
                     "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
@@ -715,6 +718,8 @@ class JuniperBackend(DeviceBackend):
             commands = [f"show configuration interfaces {iface}"]
         elif action == "set-access-vlan":
             commands = commands_for_action(action, iface, vlan or "")
+        elif action == "set-description" or action == "remove-description":
+            commands = commands_for_action(action, iface, "", description or "")
         else:
             raise RuntimeError(f"Unsupported interface action: {action}")
 
@@ -745,6 +750,7 @@ class JuniperBackend(DeviceBackend):
             "action": action,
             "interface": iface,
             "vlan": vlan or None,
+            "description": description if action in ("set-description", "remove-description") else None,
             "commands": commands,
             "outputs": outputs,
             "config": outputs[-1]["output"] if action == "show-run" and outputs else None,

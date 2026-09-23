@@ -774,6 +774,114 @@ def netconf_interface_action(
             pass
 
 
+def netconf_set_description(
+    host: str,
+    username: str,
+    password: str,
+    iface_name: str,
+    description: str | None,  # None = delete/remove description
+    port: int = 830,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Set or remove interface description via NETCONF on Cisco IOS-XE.
+
+    description != None → set description via merge
+    description == None  → remove description via delete
+    """
+    from lxml import etree
+    from ncclient import manager
+
+    iface_type, short_name = _iface_split(iface_name)
+
+    if description is not None:
+        # Escape XML special chars in the description text
+        safe_desc = (
+            description
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        desc_xml = f"<description>{safe_desc}</description>"
+        op = "merge"
+    else:
+        desc_xml = '<description nc:operation="delete"/>'
+        op = "delete"
+
+    config_xml = (
+        f'<nc:edit-config xmlns:nc="{_NS_NC}">'
+        '<nc:target><nc:running/></nc:target>'
+        '<nc:config>'
+        f'<native xmlns="{_NS_NATIVE}">'
+        f'<interface>'
+        f'<{iface_type}>'
+        f'<name>{short_name}</name>'
+        f'{desc_xml}'
+        f'</{iface_type}>'
+        f'</interface>'
+        '</native>'
+        '</nc:config>'
+        '</nc:edit-config>'
+    )
+
+    try:
+        conn = manager.connect(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            hostkey_verify=False,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"NETCONF connect failed: {exc}"}
+
+    try:
+        rpc = etree.fromstring(config_xml.encode())
+        result = conn.dispatch(rpc)
+
+        errors = getattr(result, "errors", []) or []
+        if errors:
+            err = errors[0]
+            err_tag = getattr(err, "tag", None) or ""
+            err_msg = (
+                getattr(err, "message", None)
+                or getattr(err, "severity", None)
+                or str(err)
+            )
+            # "data-missing" on delete = description didn't exist → OK
+            if err_tag == "data-missing":
+                return {
+                    "ok": True,
+                    "action": "remove-description",
+                    "interface": iface_name,
+                    "description": None,
+                    "message": f"Interface {iface_name} description already absent",
+                }
+            return {"ok": False, "error": f"NETCONF [{err_tag}]: {err_msg}"}
+
+        if getattr(result, "ok", False):
+            return {
+                "ok": True,
+                "action": "set-description" if description is not None else "remove-description",
+                "interface": iface_name,
+                "description": description,
+                "message": f"Interface {iface_name} description set via NETCONF OK",
+            }
+
+        raw = getattr(result, "xml", None) or str(result)
+        return {"ok": False, "error": f"Unexpected NETCONF reply: {raw[:200]}"}
+
+    except Exception as exc:
+        return {"ok": False, "error": f"NETCONF error: {exc}"}
+    finally:
+        try:
+            conn.close_session()
+        except Exception:
+            pass
+
+
 def netconf_set_access_vlan(
     host: str,
     username: str,

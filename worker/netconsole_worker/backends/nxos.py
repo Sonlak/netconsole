@@ -424,6 +424,7 @@ class NxosBackend(DeviceBackend):
         action: str,
         iface: str,
         vlan: str | None,
+        description: str | None,
     ) -> dict[str, Any]:
         try:
             iface = _validate_iface(iface)
@@ -445,6 +446,12 @@ class NxosBackend(DeviceBackend):
                 f"switchport access vlan {vlan}",
                 "end",
             ]
+        elif action == "set-description":
+            if description is None:
+                raise RuntimeError("set-description requires a description argument")
+            commands = ["config t", f"interface {iface}", f"description {description}", "end"]
+        elif action == "remove-description":
+            commands = ["config t", f"interface {iface}", "no description", "end"]
         elif action == "show-run":
             commands = [f"show running-config interface {iface}"]
         else:
@@ -467,6 +474,7 @@ class NxosBackend(DeviceBackend):
                     "action": action,
                     "interface": iface,
                     "vlan": vlan or None,
+                    "description": description if action in ("set-description", "remove-description") else None,
                     "commands": commands,
                     "message": f"Interface action {action} OK on {iface}",
                     "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
@@ -498,6 +506,7 @@ class NxosBackend(DeviceBackend):
                 "action": action,
                 "interface": iface,
                 "vlan": vlan or None,
+                "description": description if action in ("set-description", "remove-description") else None,
                 "commands": commands,
                 "outputs": outputs,
                 "message": f"Interface action {action} OK on {iface}",
