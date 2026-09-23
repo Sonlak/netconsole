@@ -355,15 +355,19 @@ def run_ssh_command(
             # bail out cleanly.
             pool.invalidate(host, port, username)
             import paramiko
-            if isinstance(exc, paramiko.ssh_exception.SSHException) and (
-                "not active" in str(exc) or "Channel closed" in str(exc)
-            ):
+            # Retry with a fresh connection when the transport is dead or the
+            # session is invalid.  These messages all mean "the underlying SSH
+            # transport is gone" — a fresh connect fixes it.
+            # - "SSH session not active"     → exec_command on inactive transport
+            # - "No existing session"        → auth / channel on inactive transport
+            # - "Channel closed"             → channel already closed
+            # - "Error reading SSH protocol banner" / "Connection reset by peer"
+            #   also indicate a dead transport; catch-all on SSHException covers
+            #   those since they all inherit from SSHException.
+            if isinstance(exc, paramiko.ssh_exception.SSHException):
                 import logging
                 log = logging.getLogger(__name__)
-                log.debug("transport died on %s, retrying with fresh connection", host)
-                # pool.borrow opens a new connection if needed; wrap in try so a
-                # second connect failure returns a clear error instead of leaking
-                # the AttributeError we used to get from a missing _create_conn.
+                log.debug("SSHException on %s (%s), retrying with fresh connection", host, exc)
                 try:
                     fresh_entry = pool.borrow(host, port, username, password, timeout=timeout)
                 except Exception as conn_exc:  # noqa: BLE001
