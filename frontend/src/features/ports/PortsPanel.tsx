@@ -472,11 +472,8 @@ export function PortsPanel({
         onOk={() => {
           if (!descIface) return Promise.reject();
           const trimmed = descValue.trim();
-          if (!trimmed) {
-            // Remove description if field is cleared
-            return runAction('remove-description', descIface, undefined, undefined).then(() => setDescOpen(false));
-          }
-          return runAction('set-description', descIface, undefined, trimmed).then(() => setDescOpen(false));
+          // Always include description in body (empty string = remove)
+          return runAction('set-description', descIface, undefined, trimmed || '').then(() => setDescOpen(false));
         }}
       >
         <Typography.Paragraph type="secondary">

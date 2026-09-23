@@ -180,7 +180,7 @@ def commands_for_action(action: str, iface: str, vlan: str = "", description: st
             f"set {target} vlan members {vlan}",
         ]
     if action == "set-description":
-        if not description:
+        if description is None:
             raise ValueError("set-description requires a description argument")
         physical2, _unit2 = split_interface(iface)
         if unit:

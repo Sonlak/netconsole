@@ -186,12 +186,25 @@ class InterfaceActionTask(BaseTask):
         iface = str(payload.get("interface") or "").strip()
         vlan = payload.get("vlan")
         description = payload.get("description")
+        # When description="" (empty string from frontend), treat as remove.
+        # This avoids the need for a separate action when clearing a description.
+        effective_action = action
+        effective_description: str | None = None
+        if action == "set-description":
+            # Frontend sends description=None when field is empty (field absent from
+            # JSON). Treat that as remove-description. Empty string "" means the
+            # user wants to set an empty description (vendor backend decides).
+            if description is not None:
+                effective_description = description
+            else:
+                effective_description = None
+                effective_action = "remove-description"
         return _backend(device).interface_action(
             device,
-            action=action,
+            action=effective_action,
             iface=iface,
             vlan=str(vlan) if vlan is not None else None,
-            description=str(description) if description is not None else None,
+            description=effective_description,
         )
 
 
