@@ -215,10 +215,18 @@ export async function collectArpForDevice(
 
   const vendor = (device.vendor ?? '').toLowerCase();
 
-  // Juniper: try REST first
+  // Juniper: try REST first. Only short-circuit to SUCCESS when the parser
+  // actually extracted entries. If RESTCONF returned 200 but the regex
+  // parser returned 0 entries (cRPD / stripped Junos variants may emit a
+  // slightly different XML structure that the regex doesn't match), the
+  // job MUST fall through to the worker — otherwise the new "successful"
+  // job with `entries: []` will overwrite the previous real ARP data in
+  // the inventory query (DISTINCT ON picks it as latest by updatedAt).
+  // User-visible symptom: clicking "Collect" causes the ARP tab to go
+  // blank even though the previous successful collect had data.
   if (vendor === 'juniper') {
     const rest = await fetchArpTable(device.ip);
-    if (rest.ok) {
+    if (rest.ok && rest.entries.length > 0) {
       const job = await prisma.job.create({
         data: {
           deviceId: device.id,
@@ -239,8 +247,15 @@ export async function collectArpForDevice(
       console.log(`[arp] ${device.ip} collected via REST in ${rest.collectMs}ms (${rest.entries.length} entries)`);
       return { job, queued: false };
     }
-    // REST failed — fall through to job queue so worker can retry
-    console.warn(`[arp] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+    if (rest.ok && rest.entries.length === 0) {
+      // RESTCONF succeeded but parser returned 0 — fall through to worker.
+      console.warn(
+        `[arp] ${device.ip} REST returned 0 entries (parser empty); falling back to worker (SSH)`,
+      );
+    } else {
+      // REST failed outright.
+      console.warn(`[arp] ${device.ip} REST failed (${rest.error}), falling back to job queue`);
+    }
   }
 
   // IOS-XE: try RESTCONF (YANG ARP is often empty on lab images)

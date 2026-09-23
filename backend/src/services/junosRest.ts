@@ -317,14 +317,144 @@ function parseArpEntryBlock(xml: string): JunosArpEntry | null {
   return { ip, mac, hostname, interface: interface_, flags };
 }
 
+// Top-level XML tag walker with depth tracking.
+//
+// The old `xmlChildrenOf` used a regex with a negative lookahead that
+// compared the closing tag against `\1` (the opening tag name). The
+// regex treated `</arp-table-entry-flags>` as a prefix match of
+// `</arp-table-entry>`, so as soon as the parser hit the inner
+// `<arp-table-entry-flags>` (which Junos RESTCONF nests inside every
+// entry), the lookahead failed and the parent regex never advanced.
+// Symptom: cRPD / Junos RESTCONF responses returned 0 entries even
+// though they contained valid data.
+//
+// Walk the parent block manually with depth tracking so nested
+// similarly-named elements (e.g. `<arp-table-entry-flags>`) are ignored.
+function xmlBlockRange(text: string, tag: string): [number, number] | null {
+  const openRe = new RegExp(`<${tag}\\b[^>]*>`, 'i');
+  const closeRe = new RegExp(`</${tag}\\s*>`, 'i');
+  const openMatch = openRe.exec(text);
+  if (!openMatch) return null;
+  const start = openMatch.index;
+  const closeMatch = closeRe.exec(text.slice(start + openMatch[0].length));
+  if (!closeMatch) return null;
+  return [start, start + openMatch[0].length + closeMatch.index + closeMatch[0].length];
+}
+
+function findChildBlocks(xml: string, parentTag: string, childTag: string): string[] {
+  const range = xmlBlockRange(xml, parentTag);
+  if (!range) return [];
+  const inner = xml.slice(range[0], range[1]);
+
+  const childOpenRe = new RegExp(`<${childTag}\\b[^>]*>`, 'gi');
+  const blocks: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = childOpenRe.exec(inner)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    // Depth-tracking close find — ignore nested <childTag-...> blocks
+    const tagPrefix = childTag;
+    const closeRe = new RegExp(`</${tagPrefix}(\\s[\\s\\S]*)?>`, 'gi');
+    const nestedOpenRe = new RegExp(`<${tagPrefix}\\b[^>]*>`, 'gi');
+    let depth = 1;
+    let cursor = end;
+    while (depth > 0) {
+      closeRe.lastIndex = cursor;
+      const close = closeRe.exec(inner);
+      if (!close) break;
+      // Count any nested opens of the SAME tag (followed by non-name char)
+      // between cursor and the close position.
+      nestedOpenRe.lastIndex = cursor;
+      let nextOpen: RegExpExecArray | null;
+      let additional = 0;
+      while ((nextOpen = nestedOpenRe.exec(inner)) !== null && nextOpen.index < close.index) {
+        // Skip if it's actually the closing of a longer-named nested tag
+        // like <arp-table-entry-flags> being re-scanned here. The
+        // nestedOpenRe matches `childTag\b`, so `<arp-table-entry-flags>`
+        // will be matched because of the `\b` (boundary). To avoid that,
+        // re-check the tag is exactly childTag (no dash after).
+        const afterTag = inner[nextOpen.index + match[0].length - 1] === '>' ? '' :
+          inner.slice(nextOpen.index + 1, nextOpen.index + childTag.length + 1);
+        if (afterTag === childTag) {
+          additional++;
+        }
+      }
+      depth += additional;
+      depth -= 1;
+      cursor = close.index + close[0].length;
+      if (depth === 0) {
+        blocks.push(inner.slice(start, cursor));
+        childOpenRe.lastIndex = cursor;
+        break;
+      }
+    }
+  }
+  return blocks;
+}
+
 function parseArpTableXml(xml: string): JunosArpEntry[] {
-  const blocks = xmlChildrenOf(xml, 'arp-table-information');
+  const blocks = findChildBlocks(xml, 'arp-table-information', 'arp-table-entry');
   const entries: JunosArpEntry[] = [];
   for (const block of blocks) {
     const entry = parseArpEntryBlock(block);
     if (entry) entries.push(entry);
   }
   return entries;
+}
+
+// Junos RESTCONF (and the NetConsole lab simulator at
+// `lab/juniper-sim/junos_rest_server.py`) responds with **JSON** in the
+// `{"arp-table-information":{"arp-table-entry":[...]}}` shape — but the
+// historical Junos REST API also returns XML for the same RPC. The old
+// code only handled XML, so any cRPD / simulator / Junos REST endpoint
+// that answered JSON produced 0 entries and silently overwrote the
+// inventory's last good ARP job with an empty SUCCESS row (the user-
+// visible symptom: clicking "Collect" blanks the ARP tab).
+//
+// Mirror the worker's `parsers/arp_table_rpc.py::_walk_json` so both
+// formats are supported in the backend's RESTCONF fast-path.
+
+function walkJsonArp(node: unknown, out: JunosArpEntry[]): void {
+  if (Array.isArray(node)) {
+    for (const item of node) walkJsonArp(item, out);
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  const obj = node as Record<string, unknown>;
+  const macRaw = junosText(obj['mac-address'] ?? obj['mac']);
+  const mac = normalizeMac(macRaw);
+  const ip = junosText(obj['ip-address'] ?? obj['ip'] ?? obj['address']);
+  if (mac && ip && !isLoopbackOrLinkLocal(ip)) {
+    const interface_ =
+      junosText(obj['interface-name'] ?? obj['interface'] ?? obj['logical-interface']) || '-';
+    const flags = junosText(obj['arp-flags'] ?? obj['flags']) || 'none';
+    const hostname = junosText(obj['hostname'] ?? obj['name']) || ip;
+    out.push({ ip, mac, hostname, interface: interface_, flags });
+  }
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') walkJsonArp(v, out);
+  }
+}
+
+function parseArpTableJson(text: string): JunosArpEntry[] {
+  const entries: JunosArpEntry[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return entries;
+  }
+  walkJsonArp(parsed, entries);
+  return entries;
+}
+
+function parseArpTable(text: string): JunosArpEntry[] {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return parseArpTableJson(trimmed);
+  }
+  return parseArpTableXml(trimmed);
 }
 
 // ----------------------------------------------------------------
@@ -511,7 +641,7 @@ export async function fetchArpTable(host: string): Promise<{
   if (!xml) {
     return { ok: false, entries: [], collectMs: Date.now() - started, error: 'Empty ARP response' };
   }
-  const entries = parseArpTableXml(xml);
+  const entries = parseArpTable(xml);
   return { ok: true, entries, collectMs: Date.now() - started };
 }
 
