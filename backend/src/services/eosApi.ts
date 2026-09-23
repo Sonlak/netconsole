@@ -289,29 +289,24 @@ function parseEosDescriptions(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   if (!text) return out;
 
-  // EOS outputs a fixed-width table:
-  //   Interface                 Status         Protocol           Description
-  //   Et1                      up             up                 LINK_TO_LAB-F6-DS-01
-  //   Et2                      up             up                 uplink to core switch
-  //   Et3                      up             up
+  // EOS `show interfaces description` outputs a tab-delimited table:
+  //   Interface<TAB>Status<TAB>Protocol<TAB>Description<TAB>RemotePort
+  //   Management1<TAB>up<TAB>up<TAB><TAB>Ethernet523
+  //   Ethernet2<TAB>up<TAB>up<TAB>access<TAB>LINK_TO_VPC5_eth0
   //
-  // Column positions (0-indexed):
-  //   Interface : chars 0-23
-  //   Status    : chars 24-31
-  //   Protocol  : chars 32-39
-  //   Description: chars 40+ (may be empty, may contain spaces)
-  //
-  // Using fixed-width slicing is more reliable than split() because the
-  // description itself may contain spaces (e.g. "uplink to core"),
-  // which would cause split() to miss tokens after the first space.
+  // We split by '\t' (not fixed-width) so description and remote-port are
+  // correctly isolated. The description field (index 3) may be empty;
+  // we only record entries that have a non-empty local description.
   for (const line of text.split('\n')) {
     if (!line.trim() || line.trim().toLowerCase().startsWith('interface')) continue;
-    const rawName = line.slice(0, 24).trim();
+    const cols = line.split('\t');
+    if (cols.length < 1) continue;
+    const rawName = cols[0].trim();
     if (!rawName) continue;
     const longName = eosShortToLong(rawName);
-    // Skip non-physical interface names (unless they look like real ports)
     if (!longName.match(/^(Ethernet|Port-Channel|Management|Vxlan|Loopback|Et|Po|Ma|Vx|Lo)/i)) continue;
-    const rawDesc = line.length > 40 ? line.slice(40).trim() : '';
+    // Index 3 = local Description (may be empty)
+    const rawDesc = cols.length > 3 ? (cols[3] ?? '').trim() : '';
     if (rawDesc) out[longName] = rawDesc;
   }
   return out;
