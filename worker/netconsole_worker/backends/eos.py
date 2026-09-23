@@ -27,7 +27,7 @@ from netconsole_worker.http_pool import get_http_pool
 from netconsole_worker.models import DeviceInfo
 from netconsole_worker.parsers.junos_leaf import normalize_mac
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table  # reused for text fallback
-from netconsole_worker.parsers.show_interfaces import parse_interfaces_terse  # reused for text fallback
+from netconsole_worker.parsers.show_interfaces import _keep, parse_interfaces_terse  # reused for text fallback
 from netconsole_worker.parsers.show_mac_table import parse_juniper_mac_table  # reused
 from netconsole_worker.probe import probe_rest_or_netconf, probe_ssh
 from netconsole_worker.ssh_client import run_ssh_command
