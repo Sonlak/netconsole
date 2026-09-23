@@ -1087,21 +1087,14 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
 def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
     """Parse `show interfaces description` text output.
 
-    EOS outputs a fixed-width table:
-        Interface                 Status         Protocol           Description
-        Et1                      up             up                 LINK_TO_LAB-F6-DS-01
-        Et2                      up             up                 uplink to core switch
-        Et3                      up             up
+    EOS eAPI text output is tab-delimited:
+        Interface<TAB>Status<TAB>Protocol<TAB>Description<TAB>RemotePort
+        Et1<TAB>up<TAB>up<TAB>LINK_TO_LAB-F6-DS-01<TAB>Ethernet23
 
-    Column positions (1-indexed in CLI output):
-      Interface : chars 0-23   (right-padded with spaces)
-      Status    : chars 24-31
-      Protocol  : chars 32-39
-      Description: chars 40+  (right-padded, but may be empty)
-
-    Using fixed-width slicing is more reliable than str.split() because
-    the description itself may contain spaces (e.g. "uplink to core"),
-    which would cause split() to miss tokens after the first space.
+    We split by '\t' so the description field (index 3) and remote-port
+    field (index 4) are correctly isolated. Fixed-width slicing
+    (line[40:]) misreads the remote-port as the local description when
+    the interface name is shorter than 40 chars (e.g. "Et1" vs "Ethernet23").
     """
     out: dict[str, str] = {}
     if not text:
@@ -1110,16 +1103,17 @@ def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
         stripped = line.strip()
         if not stripped or stripped.lower().startswith("interface"):
             continue
-        # Fixed-width columns: interface(0-23), status(24-31), proto(32-39), desc(40+)
-        raw_name = line[0:24].rstrip()
+        cols = stripped.split("\t")
+        if len(cols) < 1:
+            continue
+        raw_name = cols[0].strip()
         if not raw_name:
             continue
         name = _eos_short_to_long_iface(raw_name)
-        # Only process lines that look like real interface rows (short name or long)
         if not _keep(name) and not name.startswith("irb.") and not name.startswith("Lo"):
             continue
-        # Description starts at char 40. Strip leading spaces, then trailing whitespace.
-        raw_desc = line[40:].strip() if len(line) > 40 else ""
+        # Index 3 = local Description (may be empty). Index 4 = RemotePort.
+        raw_desc = cols[3].strip() if len(cols) > 3 else ""
         if raw_desc:
             out[name] = raw_desc
     return out
