@@ -5,12 +5,20 @@ import { prisma } from '../lib/prisma.js';
 // overrides are applied in `reclaimStaleJobs` so we can give Junos
 // cRPD sim more headroom (its first commit RPC can spike to 30s on a
 // cold session) while keeping tight bounds on fast read jobs.
+//
+// MANAGED_CHECK baseline is 180s instead of the usual 120s because
+// the Juniper probe_identity chain historically included a NETCONF
+// uptime fetch (20s timeout). The chain was refactored to a single
+// 5s transport on 2026-09-23 (see backends/juniper.py::probe_identity)
+// but we keep the 180s floor so a slow network or a hung worker
+// thread still gets reclaimed within a sane window without the
+// watchdog killing legitimate jobs.
 const STALE_MS: Partial<Record<JobType, number>> = {
   GET_INTERFACES: 120_000,
   GET_MAC: 120_000,
   GET_ARP: 120_000,
   GET_CONFIG: 120_000,
-  MANAGED_CHECK: 120_000,
+  MANAGED_CHECK: 180_000,
   CONNECT_TEST: 120_000,
   DISCOVERY_PROBE: 120_000,
   INTERFACE_ACTION: 120_000,
@@ -28,10 +36,14 @@ const STALE_MS: Partial<Record<JobType, number>> = {
 // INTERFACE_ACTION (shut/no-shut/set-access-vlan/show-run) can take up
 // to 90s per transport (NETCONF SSH load+commit, gotcha #15) plus 30s
 // for a cold-session spike, so Juniper gets +120s extra (240s total).
+// MANAGED_CHECK gets +60s headroom for Juniper on top of its 180s
+// floor — covers the (now-rare) NETCONF uptime fetch + cold SSH
+// handshake combination.
 const VENDOR_EXTRA_MS: Partial<Record<JobType, number>> = {
   APPLY_CONFIG: 60_000,
   ROLLBACK_CONFIG: 60_000,
   INTERFACE_ACTION: 120_000,
+  MANAGED_CHECK: 60_000,
 };
 
 const DEFAULT_STALE_MS = 120_000;

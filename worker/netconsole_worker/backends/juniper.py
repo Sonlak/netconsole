@@ -807,18 +807,26 @@ class JuniperBackend(DeviceBackend):
 
         parsed: dict[str, Any] = {"vendor": "Juniper"}
 
-        # Fetch uptime via NETCONF-over-SSH (port 830) when available.
-        # NETCONF SSH is preferred over RESTCONF for uptime (more reliable).
-        # Fallback chain: NETCONF SSH -> RESTCONF -> CLI SSH.
-        # CLI fallback adds one auth.log line per call at 5-min intervals —
-        # acceptable for lab use but RESTCONF is preferred when available.
-        if self.config.junos_netconf_ssh:
+        # Fetch uptime via the BEST available transport based on the TCP
+        # probe results above. Critical: do NOT chain transports — a full
+        # NETCONF (20s) + RESTCONF (30s) + CLI (15s) chain was burning 65s
+        # on every managed check, which made user-facing clicks feel hung
+        # and pushed jobs close to the 120s watchdog limit. Instead:
+        #   - Pick one transport, try it once with a tight 5s budget.
+        #   - If it fails, skip uptime. The TCP `checks` (ping/ssh/rest)
+        #     are still authoritative for the MANAGED gate; parsed.uptimeSeconds
+        #     just stays stale until the next successful probe.
+        uptime_fetched = False
+        uptime_timeout_s = 5.0
+
+        if self.config.junos_netconf_ssh and netconf_open:
+            # Preferred: NETCONF-over-SSH on the port we already confirmed open.
             uptime = nc_fetch_system_uptime(
                 device.ip,
                 username=self.config.ssh_user,
                 password=self.config.ssh_password,
                 port=self.config.junos_netconf_ssh_port,
-                timeout=20.0,
+                timeout=uptime_timeout_s,
             )
             if uptime["ok"]:
                 parsed.update({
@@ -828,62 +836,9 @@ class JuniperBackend(DeviceBackend):
                     ).items()
                     if v
                 })
-            elif restconf_open and self.config.juniper.enabled:
-                # NETCONF failed but RESTCONF port is open — try RESTCONF for uptime.
-                rest_result = fetch_junos_rpc(
-                    device.ip,
-                    "get-system-uptime-information",
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    scheme=self.config.juniper.scheme,
-                    port=self.config.juniper.port,
-                    verify_tls=self.config.juniper.verify_tls,
-                    timeout=30.0,
-                )
-                if rest_result.get("ok"):
-                    parsed.update({
-                        k: v
-                        for k, v in parse_system_uptime(
-                            rest_result.get("payload") or rest_result.get("raw") or ""
-                        ).items()
-                        if v
-                    })
-                elif self.config.ssh_enabled:
-                    # RESTCONF also failed — try CLI as last resort.
-                    uptime_cli = nc_fetch_system_uptime_cli(
-                        device.ip,
-                        username=self.config.ssh_user,
-                        password=self.config.ssh_password,
-                        port=22,
-                        timeout=15.0,
-                    )
-                    if uptime_cli["ok"]:
-                        parsed.update({
-                            k: v
-                            for k, v in parse_system_uptime_cli(
-                                uptime_cli["raw"]
-                            ).items()
-                            if v
-                        })
-            elif self.config.ssh_enabled:
-                # No RESTCONF configured — try CLI directly.
-                uptime_cli = nc_fetch_system_uptime_cli(
-                    device.ip,
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    port=22,
-                    timeout=15.0,
-                )
-                if uptime_cli["ok"]:
-                    parsed.update({
-                        k: v
-                        for k, v in parse_system_uptime_cli(
-                            uptime_cli["raw"]
-                        ).items()
-                        if v
-                    })
+                uptime_fetched = True
         elif restconf_open and self.config.juniper.enabled:
-            # No NETCONF SSH configured but RESTCONF is available.
+            # Fallback: RESTCONF on the port we already confirmed open.
             rest_result = fetch_junos_rpc(
                 device.ip,
                 "get-system-uptime-information",
@@ -892,7 +847,7 @@ class JuniperBackend(DeviceBackend):
                 scheme=self.config.juniper.scheme,
                 port=self.config.juniper.port,
                 verify_tls=self.config.juniper.verify_tls,
-                timeout=30.0,
+                timeout=uptime_timeout_s,
             )
             if rest_result.get("ok"):
                 parsed.update({
@@ -902,31 +857,15 @@ class JuniperBackend(DeviceBackend):
                     ).items()
                     if v
                 })
-            elif self.config.ssh_enabled:
-                # RESTCONF failed — try CLI as last resort.
-                uptime_cli = nc_fetch_system_uptime_cli(
-                    device.ip,
-                    username=self.config.ssh_user,
-                    password=self.config.ssh_password,
-                    port=22,
-                    timeout=15.0,
-                )
-                if uptime_cli["ok"]:
-                    parsed.update({
-                        k: v
-                        for k, v in parse_system_uptime_cli(
-                            uptime_cli["raw"]
-                        ).items()
-                        if v
-                    })
+                uptime_fetched = True
         elif self.config.ssh_enabled and ssh_open:
-            # No API configured — try CLI directly.
+            # Last resort: SSH CLI on port 22 (already confirmed open).
             uptime_cli = nc_fetch_system_uptime_cli(
                 device.ip,
                 username=self.config.ssh_user,
                 password=self.config.ssh_password,
                 port=22,
-                timeout=15.0,
+                timeout=uptime_timeout_s,
             )
             if uptime_cli["ok"]:
                 parsed.update({
@@ -936,6 +875,12 @@ class JuniperBackend(DeviceBackend):
                     ).items()
                     if v
                 })
+                uptime_fetched = True
+
+        if not uptime_fetched and api_open:
+            # Append a hint to the message so operators can tell uptime
+            # is stale vs. API completely down. Doesn't affect the gate.
+            message = message + " (uptime fetch skipped: no responsive transport)"
 
         return {
             "checks": {

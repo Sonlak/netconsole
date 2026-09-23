@@ -121,7 +121,14 @@ services:
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
       PING_INTERVAL_SECONDS: 60
       PING_TIMEOUT_MS: 3000
-      MANAGED_CHECK_INTERVAL_SECONDS: 600
+      # Managed check every 3 min (was 10 min). The previous 600s value
+      # was fine when the probe did heavy SSH + RESTCONF fetches, but the
+      # TCP-only probe (worker/netconsole_worker/probe.py) is now ~2-5s
+      # per device. 3 min keeps the REST/NETCONF flag fresh without
+      # burning auth.log. Offline→online recovery is now also covered
+      # by an immediate MANAGED_CHECK trigger in devicePing.ts (no need
+      # to wait for this scheduler tick).
+      MANAGED_CHECK_INTERVAL_SECONDS: 180
       MAC_COLLECT_INTERVAL_SECONDS: 300
       ARP_COLLECT_INTERVAL_SECONDS: 300
       INTERFACES_COLLECT_INTERVAL_SECONDS: 600

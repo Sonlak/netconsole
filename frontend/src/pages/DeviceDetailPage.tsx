@@ -656,7 +656,14 @@ export default function DeviceDetailPage() {
     try {
       const result = await checkManagedDevice(id);
       if (result.job?.id) {
-        const job = await waitForJob(result.job.id, { timeoutMs: 45000 });
+        // 90s upper bound — Junos cRPD uptime fetch (NETCONF SSH) can
+        // legitimately take ~30s on cold sessions, and the watchdog now
+        // allows up to 240s for Juniper MANAGED_CHECK. If we time out at
+        // 45s the user sees "Job wait timeout" while the job is still
+        // making real progress, which is misleading. After the timeout
+        // we still fall back to `fetchDeviceById` to refresh the page
+        // from the last persisted device row.
+        const job = await waitForJob(result.job.id, { timeoutMs: 90000 });
         setDevice(await fetchDeviceById(id));
         if (job.status === 'SUCCESS') message.success('Managed check OK');
         else message.error(job.error ?? 'Managed check failed');
@@ -665,8 +672,21 @@ export default function DeviceDetailPage() {
         message.warning('Ping failed — device OFFLINE');
       }
     } catch (cause) {
-      if (cause instanceof JobWaitTimeoutError) message.warning(cause.message);
-      else message.error(cause instanceof Error ? cause.message : 'Managed check failed');
+      if (cause instanceof JobWaitTimeoutError) {
+        // Job is still running on the worker; refresh the page anyway so
+        // the user sees the latest persisted checks (TCP probe writes
+        // pingChecks before uptime fetch).
+        try {
+          setDevice(await fetchDeviceById(id));
+        } catch {
+          /* best-effort */
+        }
+        message.warning(
+          'Managed check is still running on the worker (showing latest state).',
+        );
+      } else {
+        message.error(cause instanceof Error ? cause.message : 'Managed check failed');
+      }
     } finally {
       setCheckingManaged(false);
     }

@@ -1,6 +1,7 @@
-import { DeviceStatus } from '@prisma/client';
+import { DeviceStatus, JobType } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { pingHost } from './ping.js';
+import { tryCreateDeviceJob } from './deviceOperations.js';
 
 export type DevicePingOutcome = {
   deviceId: string;
@@ -10,6 +11,7 @@ export type DevicePingOutcome = {
   status: DeviceStatus;
   skipped: boolean;
   reason?: string;
+  managedCheckQueued?: boolean;
 };
 
 export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingOutcome> {
@@ -30,6 +32,7 @@ export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingO
     };
   }
 
+  const previousStatus = device.status;
   const ping = await pingHost(device.ip);
   // Status logic:
   //   - If ping fails → OFFLINE
@@ -61,6 +64,42 @@ export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingO
     },
   });
 
+  // Recover hook: when a device transitions OFFLINE/UNKNOWN → ONLINE, the
+  // managedChecks row is stale (the previous probe found no API ports
+  // reachable) so the REST/NETCONF tag in the UI stays red until the next
+  // MANAGED_CHECK scheduler tick (default 600s — way too slow for the
+  // "device came back online, why is REST still red?" UX complaint).
+  //
+  // Trigger an urgent MANAGED_CHECK job right now so the TCP probe
+  // runs within ~1s of the ping recovery. `tryCreateDeviceJob` returns
+  // `busy` if there's already an inflight job for this device — that's
+  // fine, we don't want to double-queue; the inflight one will update
+  // the flags too.
+  let managedCheckQueued = false;
+  if (
+    ping.alive &&
+    (previousStatus === DeviceStatus.OFFLINE || previousStatus === DeviceStatus.UNKNOWN) &&
+    nextStatus === DeviceStatus.ONLINE
+  ) {
+    try {
+      const outcome = await prisma.$transaction(async (tx) =>
+        tryCreateDeviceJob(tx, device.id, JobType.MANAGED_CHECK, null),
+      );
+      if (outcome.kind === 'created') {
+        managedCheckQueued = true;
+        console.log(
+          `[ping] ${device.name} recovered OFFLINE→ONLINE, queued MANAGED_CHECK ${outcome.job.id}`,
+        );
+      } else {
+        console.log(
+          `[ping] ${device.name} recovered OFFLINE→ONLINE, MANAGED_CHECK skipped: ${outcome.error.code}`,
+        );
+      }
+    } catch (err) {
+      console.error(`[ping] failed to queue MANAGED_CHECK for ${device.name}:`, err);
+    }
+  }
+
   return {
     deviceId: device.id,
     ip: device.ip,
@@ -68,6 +107,7 @@ export async function pingAndUpdateDevice(deviceId: string): Promise<DevicePingO
     latencyMs: ping.latencyMs,
     status: nextStatus,
     skipped: false,
+    managedCheckQueued,
   };
 }
 
