@@ -802,10 +802,8 @@ def netconf_set_description(
             .replace(">", "&gt;")
         )
         desc_xml = f"<description>{safe_desc}</description>"
-        op = "merge"
     else:
         desc_xml = '<description nc:operation="delete"/>'
-        op = "delete"
 
     config_xml = (
         f'<nc:edit-config xmlns:nc="{_NS_NC}">'
