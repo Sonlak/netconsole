@@ -289,16 +289,30 @@ function parseEosDescriptions(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   if (!text) return out;
 
+  // EOS outputs a fixed-width table:
+  //   Interface                 Status         Protocol           Description
+  //   Et1                      up             up                 LINK_TO_LAB-F6-DS-01
+  //   Et2                      up             up                 uplink to core switch
+  //   Et3                      up             up
+  //
+  // Column positions (0-indexed):
+  //   Interface : chars 0-23
+  //   Status    : chars 24-31
+  //   Protocol  : chars 32-39
+  //   Description: chars 40+ (may be empty, may contain spaces)
+  //
+  // Using fixed-width slicing is more reliable than split() because the
+  // description itself may contain spaces (e.g. "uplink to core"),
+  // which would cause split() to miss tokens after the first space.
   for (const line of text.split('\n')) {
-    const stripped = line.trim();
-    if (!stripped || stripped.toLowerCase().startsWith('interface')) continue;
-    // Format: Et1  up  up  LINK_TO_FOO
-    const parts = stripped.split(/\s+/);
-    if (parts.length < 4) continue;
-    const shortName = parts[0];
-    const longName = eosShortToLong(shortName);
-    const desc = parts.slice(3).join(' ').trim();
-    if (desc) out[longName] = desc;
+    if (!line.trim() || line.trim().toLowerCase().startsWith('interface')) continue;
+    const rawName = line.slice(0, 24).trim();
+    if (!rawName) continue;
+    const longName = eosShortToLong(rawName);
+    // Skip non-physical interface names (unless they look like real ports)
+    if (!longName.match(/^(Ethernet|Port-Channel|Management|Vxlan|Loopback|Et|Po|Ma|Vx|Lo)/i)) continue;
+    const rawDesc = line.length > 40 ? line.slice(40).trim() : '';
+    if (rawDesc) out[longName] = rawDesc;
   }
   return out;
 }
@@ -484,11 +498,17 @@ export async function fetchEosInterfaceList(host: string): Promise<{
 
   // Step 2: Get descriptions via text (JSON description is often empty on EOS 4.28+)
   const descResult = await eosRpc(host, [{ cmd: 'show interfaces description', format: 'text' }]);
-  if (descResult.ok && descResult.raw) {
-    const descByName = parseEosDescriptions(descResult.raw);
-    for (const iface of interfaces) {
-      const desc = descByName[iface.name];
-      if (desc && !iface.description) iface.description = desc;
+  if (descResult.ok && descResult.result) {
+    const arr = descResult.result;
+    const text = Array.isArray(arr) && arr.length > 0 && (arr[0] as Record<string, unknown>)?.output
+      ? String((arr[0] as Record<string, unknown>).output)
+      : '';
+    if (text) {
+      const descByName = parseEosDescriptions(text);
+      for (const iface of interfaces) {
+        const desc = descByName[iface.name];
+        if (desc && !iface.description) iface.description = desc;
+      }
     }
   }
 
@@ -501,8 +521,12 @@ export async function fetchEosInterfaceList(host: string): Promise<{
   } else {
     // Fallback to text format if JSON fails
     console.warn(`[eosApi] switchport JSON fetch failed for ${host}:`, swResult.error, "Trying text format...");
-    if (swResult.raw) {
-      const switchport = parseEosSwitchport(swResult.raw);
+    const swTextArr = swResult.result;
+    const swText = Array.isArray(swTextArr) && swTextArr.length > 0 && (swTextArr[0] as Record<string, unknown>)?.output
+      ? String((swTextArr[0] as Record<string, unknown>).output)
+      : '';
+    if (swText) {
+      const switchport = parseEosSwitchport(swText);
       console.log(`[eosApi] parsed TEXT switchport for ${host}:`, JSON.stringify(switchport).substring(0, 1500));
       mergeEosSwitchport(interfaces, switchport);
     }

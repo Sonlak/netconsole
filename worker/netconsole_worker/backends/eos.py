@@ -1087,43 +1087,41 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
 def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
     """Parse `show interfaces description` text output.
 
-    EOS text output looks like:
+    EOS outputs a fixed-width table:
+        Interface                 Status         Protocol           Description
+        Et1                      up             up                 LINK_TO_LAB-F6-DS-01
+        Et2                      up             up                 uplink to core switch
+        Et3                      up             up
 
-        Interface                      Status         Protocol           Description
-        Et1                            up             up                 LINK_TO_LAB-F6-DS-01_ge-0/0/1
-        Et2                            up             up                 LINK_TO_VPC5_eth0
-        ...
+    Column positions (1-indexed in CLI output):
+      Interface : chars 0-23   (right-padded with spaces)
+      Status    : chars 24-31
+      Protocol  : chars 32-39
+      Description: chars 40+  (right-padded, but may be empty)
 
-    We extract the last whitespace-delimited column on each line as the
-    description. Interface names appear in column 1; everything after the
-    third column is the description (which may contain spaces and
-    underscores). The header line is skipped.
-
-    Output keys are the full `Ethernet1` / `Port-Channel1` / `Management1`
-    form so they match the keys produced by `_parse_eos_interfaces` —
-    `show interfaces` JSON always uses the long form, while
-    `show interfaces description` text uses the short form.
+    Using fixed-width slicing is more reliable than str.split() because
+    the description itself may contain spaces (e.g. "uplink to core"),
+    which would cause split() to miss tokens after the first space.
     """
     out: dict[str, str] = {}
     if not text:
         return out
     for line in text.splitlines():
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("interface"):
             continue
-        # Header line: starts with "Interface" (and usually contains "Status")
-        if line.lstrip().lower().startswith("interface"):
+        # Fixed-width columns: interface(0-23), status(24-31), proto(32-39), desc(40+)
+        raw_name = line[0:24].rstrip()
+        if not raw_name:
             continue
-        # `*` prefixes indicate an administratively down interface in
-        # some EOS versions — strip it before tokenising.
-        stripped = line.lstrip().lstrip("*").rstrip()
-        parts = stripped.split()
-        if len(parts) < 4:
-            # No description column present on this line.
+        name = _eos_short_to_long_iface(raw_name)
+        # Only process lines that look like real interface rows (short name or long)
+        if not _keep(name) and not name.startswith("irb.") and not name.startswith("Lo"):
             continue
-        name = _eos_short_to_long_iface(parts[0])
-        desc = " ".join(parts[3:]).strip()
-        if desc:
-            out[name] = desc
+        # Description starts at char 40. Strip leading spaces, then trailing whitespace.
+        raw_desc = line[40:].strip() if len(line) > 40 else ""
+        if raw_desc:
+            out[name] = raw_desc
     return out
 
 
