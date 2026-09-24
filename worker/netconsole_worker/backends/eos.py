@@ -1167,12 +1167,16 @@ def _eos_short_to_long_iface(name: str) -> str:
 def _merge_eos_descriptions(interfaces: list[dict[str, Any]], desc_by_name: dict[str, str]) -> None:
     """Fill `description` on each interface row from `desc_by_name`.
 
-    Mutates `interfaces` in place. We only overwrite an existing
-    description if the new value is non-empty AND the existing value
-    is empty/None — `show interfaces` JSON occasionally carries a
-    description string on newer EOS versions, and we don't want to
-    lose that when `show interfaces description` happens to be
-    unavailable for some reason.
+    The text-mode `show interfaces description` command is the ground-truth source
+    of the human-typed description on EOS 4.28+ (the JSON `show interfaces`
+    description field is unreliable — it can be empty, stale, or missing on
+    newer EOS versions). We always prefer the text-derived value when available,
+    overwriting any existing value (including stale cached strings like a
+    remote-port name that bled into the description field on a previous run).
+
+    The previous behaviour (`if not old_desc`) skipped the merge when the JSON
+    already held a value, so periodic jobs kept stale description values that
+    manual collect correctly replaced.
     """
     for iface in interfaces:
         if not isinstance(iface, dict):
@@ -1181,10 +1185,7 @@ def _merge_eos_descriptions(interfaces: list[dict[str, Any]], desc_by_name: dict
         if not name:
             continue
         new_desc = desc_by_name.get(name)
-        if not new_desc:
-            continue
-        old_desc = str(iface.get("description") or "").strip()
-        if not old_desc:
+        if new_desc:
             iface["description"] = new_desc
 
 

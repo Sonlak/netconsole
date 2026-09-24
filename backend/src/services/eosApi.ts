@@ -506,9 +506,14 @@ export async function fetchEosInterfaceList(host: string): Promise<{
       : '';
     if (text) {
       const descByName = parseEosDescriptions(text);
+      // Always prefer the text-derived description. The `show interfaces`
+      // JSON description field is unreliable on EOS 4.28+ (can be empty or
+      // stale). The previous `!iface.description` guard meant periodic jobs
+      // never updated a stale cached value from a previous run, while manual
+      // collect happened to succeed only because the job row was fresh.
       for (const iface of interfaces) {
         const desc = descByName[iface.name];
-        if (desc && !iface.description) iface.description = desc;
+        if (desc) iface.description = desc;
       }
     }
   }
