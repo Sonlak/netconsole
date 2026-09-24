@@ -270,20 +270,24 @@ export function PortsPanel({
       dataIndex: 'description',
       width: 240,
       ellipsis: true,
-      render: (_value: string | undefined, record: DeviceInterface) => {
-        // Prefer the LLDP Port Description (e.g. LINK_TO_SW-F6-DS-01_ge-0/0/5)
-        // over the device-set interface description so fabric link names are visible.
-        const portDesc = (record as DeviceInterface & { portDescription?: string }).portDescription;
-        const linkName = portDesc || record.remotePort;
-        const ifaceDesc = record.description;
-        if (linkName) {
-          return (
-            <Tooltip title={linkName}>
-              <span>{linkName}</span>
-            </Tooltip>
-          );
-        }
-        return ifaceDesc || '—';
+      render: (value: string | undefined) => {
+        // Show the device-typed description only. The previous render showed
+        // `portDescription || remotePort` first, which leaked the LLDP
+        // remote-port name (e.g. `Ethernet523`) into the Description column
+        // whenever the device description was empty — looking like
+        // `description=Ethernet523` on Management1 even though the user
+        // never typed that.
+        //
+        // LLDP-derived link names belong in their own column (see the
+        // fabric diagram), not here. The Description column reflects what
+        // the operator typed on the device.
+        const trimmed = (value ?? '').trim();
+        if (!trimmed) return <Typography.Text type="secondary">—</Typography.Text>;
+        return (
+          <Tooltip title={trimmed}>
+            <span>{trimmed}</span>
+          </Tooltip>
+        );
       },
     },
     {
