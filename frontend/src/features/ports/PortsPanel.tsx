@@ -213,7 +213,15 @@ export function PortsPanel({
           ),
         );
         message.success(`${action} ${iface} committed`);
-        void load({ silent: true });
+        // Run a fresh collect instead of a silent re-fetch. INTERFACE_ACTION
+        // doesn't update the cached GET_INTERFACES row on its own, so a
+        // silent load after the action would overwrite the freshly-updated
+        // row above (description / adminStatus / accessVlan) with the stale
+        // cache. The collect forces the backend to write a SUCCESS
+        // GET_INTERFACES job so the next render reflects the change on the
+        // device. Juniper via RESTCONF is ~2-5s; Arista eAPI <1s; IOS-XE
+        // NETCONF ~1-2s.
+        void load({ collect: true });
         return;
       }
       const inventory = await fetchDeviceInterfaces(deviceId);
