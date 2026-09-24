@@ -95,6 +95,27 @@ def parse_switching_mode_from_set(config: str) -> dict[str, dict[str, str]]:
 
 
 def apply_switching_modes(interfaces: list[dict[str, str]], modes: dict[str, dict[str, str]]) -> None:
+    """Merge `interface-mode` / `vlan members` from `display set` config.
+
+    The VLAN member parser (`apply_vlan_membership`) already populated
+    `accessVlan` with the formatted "VLAN201 (201), VLAN202 (202), ..." list
+    when the device's `get-vlan-information` returned those members. We
+    don't want to overwrite that with the literal `vlan members all` /
+    `vlan members VLAN201` config string — the formatted list is more
+    informative and matches what the user sees in the CLI.
+
+    Rules:
+    - mode="trunk" + members="all" → keep existing accessVlan (from VLAN
+      membership parser) if it looks like a list; otherwise set "all".
+    - mode="trunk" + members="<expr>" → use members only when there is
+      no existing list-style accessVlan (single-member case).
+    - mode="access" + members="<expr>" → keep existing accessVlan (the
+      formatted "VLAN204 (204)") if already populated, else use members.
+
+    See `docs/sessions/2026-09-24.md` for the user-visible bug this fixes
+    (vQFX xe-0/0/0 on F4-AS-01 showed `accessVlan=all` even though the
+    device reported members VLAN201,202,203,204,default).
+    """
     for iface in interfaces:
         name = physical_interface_name(iface.get("name") or "")
         info = modes.get(name)
@@ -105,11 +126,24 @@ def apply_switching_modes(interfaces: list[dict[str, str]], modes: dict[str, dic
             continue
         mode = (info.get("mode") or "").lower()
         members = (info.get("members") or "").strip()
+        existing = (iface.get("accessVlan") or "").strip()
         if mode in {"trunk", "access"}:
             iface["mode"] = mode
+
         if mode == "trunk":
-            iface["accessVlan"] = "all" if members.lower() == "all" else (members or iface.get("accessVlan") or "")
-        elif mode == "access" and members and not iface.get("accessVlan"):
+            # If existing accessVlan already shows a list of VLANs (from
+            # the membership parser), keep it. The literal "all" / "1-4094"
+            # from the config is less informative than the device's actual
+            # member list.
+            if existing and ("," in existing or re.search(r"\(\d+\)", existing)):
+                # already formatted — leave as is
+                pass
+            elif members.lower() == "all":
+                iface["accessVlan"] = "all"
+            elif members:
+                iface["accessVlan"] = members
+            # else: keep whatever was there (might be empty)
+        elif mode == "access" and members and not existing:
             iface["accessVlan"] = members
 
 

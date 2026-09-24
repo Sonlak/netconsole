@@ -357,13 +357,19 @@ function parseEosSwitchportJson(result: unknown[]): Record<string, { mode: strin
       entry.mode = mode;
     }
     
-    // Set access VLAN
-    if (typeof accessVlanId === 'number' && accessVlanId > 1) {
+    // Set access VLAN (always capture, including VLAN 1 — the default).
+    // We previously skipped VLAN 1 here (`> 1`) under the (wrong) assumption
+    // that "VLAN 1 = default = uninteresting". That hid the access VLAN on
+    // any port sitting on the default VLAN — e.g. Ethernet5-8 on F1-AS-01.
+    // Real device reports `accessVlanId=1` for those ports; the parser was
+    // dropping the field and the Ports panel showed them as "VLAN —".
+    if (typeof accessVlanId === 'number' && accessVlanId >= 1) {
       entry.accessVlan = String(accessVlanId);
     }
-    
-    // Set trunk VLANs
-    if (trunkAllowedVlans && trunkAllowedVlans !== '1') {
+
+    // Set trunk VLANs (always capture; the parser caller decides if "ALL"
+    // / "1" is informative enough to overwrite an existing accessVlan)
+    if (trunkAllowedVlans) {
       entry.trunkVlans = trunkAllowedVlans;
     }
     

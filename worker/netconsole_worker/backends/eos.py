@@ -1239,12 +1239,19 @@ def _parse_eos_switchport_json(result: list[dict[str, Any]]) -> dict[str, dict[s
         if mode in ("access", "trunk"):
             entry["mode"] = mode
         
-        # Set access VLAN (only if > 1)
-        if isinstance(access_vlan_id, int) and access_vlan_id > 1:
+        # Set access VLAN (always capture, including VLAN 1 — the
+        # default. We used to skip VLAN 1 here (`> 1`) on the theory that
+        # "VLAN 1 = default = uninteresting". But the user wants to see the
+        # full switchport table on the Ports UI, including access ports
+        # sitting on the default VLAN. Ethernet5-8 on F1-AS-01 are exactly
+        # this case — `show interfaces switchport` returns
+        # `accessVlanId=1` for those ports but the parser was dropping
+        # the field, so the UI showed them as "mode=access, VLAN=—".)
+        if isinstance(access_vlan_id, int) and access_vlan_id >= 1:
             entry["accessVlan"] = str(access_vlan_id)
-        
+
         # Set trunk VLANs
-        if trunk_allowed and trunk_allowed != "1":
+        if trunk_allowed:
             entry["trunkVlans"] = trunk_allowed
         
         # Only add if we have some data
@@ -1314,7 +1321,7 @@ def _parse_eos_switchport_text(text: str) -> dict[str, dict[str, str]]:
         # Trunking VLANs Allowed
         if line.lower().startswith("trunking vlans allowed:"):
             vlans = line.split(":", 1)[1].strip()
-            if vlans:  # Always capture, even if just "1" — trunk needs to show allowed VLANs
+            if vlans:
                 current["trunkVlans"] = vlans
             continue
 
@@ -1344,10 +1351,13 @@ def _merge_eos_switchport(
 ) -> None:
     """Fill mode/accessVlan on each interface row from switchport data.
 
-    Mutates `interfaces` in place. We only set mode if we have a clear
-    Access/Trunk signal; we only set accessVlan if non-default (>1).
-    Trunk VLANs are stored in accessVlan as a comma-separated string
-    so the frontend can render them.
+    Mutates `interfaces` in place. We always set mode + accessVlan if the
+    device returned a clear signal — including VLAN 1 on access ports (a
+    deliberate change from the previous "skip VLAN 1" behaviour, which
+    hid access VLAN info on ports sitting on the default VLAN).
+
+    Trunk ports: accessVlan gets the trunk's allowed VLAN list (or "ALL").
+    Access ports: accessVlan gets the access VLAN id, including 1.
     """
     for iface in interfaces:
         if not isinstance(iface, dict):
