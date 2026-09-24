@@ -55,13 +55,19 @@ function looksLikeTrunk(iface: DeviceInterface): boolean {
 }
 
 function supportsAccessVlan(iface: DeviceInterface): boolean {
+  // True for L2 access ports that can be switched to a single VLAN.
+  // The check is keyed off the parsed switchport metadata (mode, address,
+  // description) — NOT off the interface-name prefix. Filtering by
+  // `name.startsWith('xe-')` / `name.startsWith('et-')` / `name.includes('ae')`
+  // used to be here, but that hid the button on every vQFX / MX / EX access
+  // port (they're all `xe-…`, `et-…`, or `aeN`). The intent was to skip L3
+  // uplinks on those boxes, but `iface.address` below already rejects any
+  // port with an IP, which is the actual L3 signal.
   const mode = (iface.mode || '').toLowerCase();
   const description = (iface.description || '').toLowerCase();
-  const name = (iface.name || '').toLowerCase();
   if (mode === 'inet' || mode === 'l3' || mode === 'routed') return false;
   if (looksLikeTrunk(iface)) return false;
   if (description.includes('mgmt')) return false;
-  if (name.startsWith('xe-') || name.startsWith('et-') || name.includes('ae')) return false;
   if (iface.address) return false;
   return mode === 'access' || mode === 'eth-switch' || !mode;
 }
