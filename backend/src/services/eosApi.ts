@@ -289,24 +289,28 @@ function parseEosDescriptions(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   if (!text) return out;
 
-  // EOS `show interfaces description` outputs a tab-delimited table:
-  //   Interface<TAB>Status<TAB>Protocol<TAB>Description<TAB>RemotePort
-  //   Management1<TAB>up<TAB>up<TAB><TAB>Ethernet523
-  //   Ethernet2<TAB>up<TAB>up<TAB>access<TAB>LINK_TO_VPC5_eth0
+  // EOS 4.28+ emits `show interfaces description` with **space-padded
+  // columns** (NOT tab-delimited) on the eAPI path:
+  //   Interface                      Status         Protocol           Description
+  //   Et1                            up             up                 LINK_TO_LAB-F6-DS-01_ge-0/0/1
+  //   Et2                            up             up                 LINK_TO_VPC
   //
-  // We split by '\t' (not fixed-width) so description and remote-port are
-  // correctly isolated. The description field (index 3) may be empty;
-  // we only record entries that have a non-empty local description.
+  // We split on 2+ spaces (the column gutter) and trim each cell. The
+  // previous tab-split returned a single-column row, so the description
+  // field always came back empty and the Ports panel showed nothing.
   for (const line of text.split('\n')) {
     if (!line.trim() || line.trim().toLowerCase().startsWith('interface')) continue;
-    const cols = line.split('\t');
-    if (cols.length < 1) continue;
-    const rawName = cols[0].trim();
+    const cols = line
+      .split('  ')
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0);
+    if (cols.length < 4) continue;
+    const rawName = cols[0];
     if (!rawName) continue;
     const longName = eosShortToLong(rawName);
     if (!longName.match(/^(Ethernet|Port-Channel|Management|Vxlan|Loopback|Et|Po|Ma|Vx|Lo)/i)) continue;
-    // Index 3 = local Description (may be empty)
-    const rawDesc = cols.length > 3 ? (cols[3] ?? '').trim() : '';
+    // cols[3] = local Description (may be empty)
+    const rawDesc = cols.length > 3 ? cols[3] : '';
     if (rawDesc) out[longName] = rawDesc;
   }
   return out;

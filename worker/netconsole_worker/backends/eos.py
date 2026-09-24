@@ -1108,14 +1108,17 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
 def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
     """Parse `show interfaces description` text output.
 
-    EOS eAPI text output is tab-delimited:
-        Interface<TAB>Status<TAB>Protocol<TAB>Description<TAB>RemotePort
-        Et1<TAB>up<TAB>up<TAB>LINK_TO_LAB-F6-DS-01<TAB>Ethernet23
+    EOS 4.28+ emits this command with **space-padded columns** (not tab-
+    separated) on the eAPI path:
+        Interface                      Status         Protocol           Description
+        Et1                            up             up                 LINK_TO_LAB-F6-DS-01_ge-0/0/1
+        Et2                            up             up                 LINK_TO_VPC
 
-    We split by '\t' so the description field (index 3) and remote-port
-    field (index 4) are correctly isolated. Fixed-width slicing
-    (line[40:]) misreads the remote-port as the local description when
-    the interface name is shorter than 40 chars (e.g. "Et1" vs "Ethernet23").
+    We split on 2+ spaces (column gutter) instead of `\\t`, and trim each
+    column. The previous tab-split left us with a single-column row and
+    every description came back empty, so the LLDP-derived `remotePort`
+    was the only thing the Ports panel could show for interfaces whose
+    typed description was blank.
     """
     out: dict[str, str] = {}
     if not text:
@@ -1124,17 +1127,19 @@ def _parse_eos_descriptions_text(text: str) -> dict[str, str]:
         stripped = line.strip()
         if not stripped or stripped.lower().startswith("interface"):
             continue
-        cols = stripped.split("\t")
-        if len(cols) < 1:
+        cols = [c.strip() for c in stripped.split("  ") if c.strip()]
+        if len(cols) < 4:
+            # Not enough columns to contain a description; skip.
             continue
-        raw_name = cols[0].strip()
+        raw_name = cols[0]
         if not raw_name:
             continue
         name = _eos_short_to_long_iface(raw_name)
-        if not _keep(name) and not name.startswith("irb.") and not name.startswith("Lo"):
-            continue
-        # Index 3 = local Description (may be empty). Index 4 = RemotePort.
-        raw_desc = cols[3].strip() if len(cols) > 3 else ""
+        # Index 3 = local Description (may be empty). The old parser looked
+        # at cols[4] for this (assuming a RemotePort column) which doesn't
+        # exist in this format — that pulled the neighbour port string into
+        # the description and made it look typed.
+        raw_desc = cols[3]
         if raw_desc:
             out[name] = raw_desc
     return out
