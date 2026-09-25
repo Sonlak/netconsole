@@ -349,6 +349,9 @@ export async function getFabricTopology(site?: string) {
    * Remote device matching uses `matchDevice()` — same logic as description
    * parsing, so "LAB-F1-DS01" in LLDP matches the device with `shortName="DS01"`.
    */
+  /** LLDP local interface is authoritative for each device's end of a link. */
+  const lldpLocalPorts = new Map<string, string>();
+
   for (const node of nodes) {
     const job = latest.get(node.id);
     const payload = (job?.result ?? null) as JobPayload | null;
@@ -359,9 +362,10 @@ export async function getFabricTopology(site?: string) {
       const localPort = (n.localPort || '').trim();
       if (!localPort) continue;
 
-      // Try to match the remote device by hostname
+      // Keep the local LLDP interface keyed by device and matched peer.
       const peer = matchDevice(nodes, n.remoteDeviceId);
       if (!peer || peer.id === node.id) continue;
+      lldpLocalPorts.set(`${node.id}:${peer.id}`, localPort);
 
       const remotePort = normalizeLldpPort(n.remotePort);
       const id = linkId(node.id, localPort, peer.id, remotePort);
@@ -381,7 +385,7 @@ export async function getFabricTopology(site?: string) {
           toDeviceId: to.id,
           toName: to.shortName,
           toPort,
-          kind: 'uplink',   // LLDP links default to uplink; role-pair override refines
+          kind: 'uplink',
           note: `LLDP: ${n.remoteDeviceId}`,
           mode: '',
           operStatus: '',
@@ -389,7 +393,6 @@ export async function getFabricTopology(site?: string) {
         continue;
       }
 
-      // LLDP localPort is authoritative for this node's end of the link.
       if (from.id === node.id) existing.fromPort = localPort;
       else existing.toPort = localPort;
       if (remotePort) {
@@ -400,6 +403,15 @@ export async function getFabricTopology(site?: string) {
         existing.note = `LLDP: ${n.remoteDeviceId}`;
       }
     }
+  }
+
+  // Description strings can contain stale/manual Junos names (ge- vs xe-).
+  // Replace each endpoint with the localPort reported by that endpoint's LLDP.
+  for (const link of merged.values()) {
+    const fromLocal = lldpLocalPorts.get(`${link.fromDeviceId}:${link.toDeviceId}`);
+    const toLocal = lldpLocalPorts.get(`${link.toDeviceId}:${link.fromDeviceId}`);
+    if (fromLocal) link.fromPort = fromLocal;
+    if (toLocal) link.toPort = toLocal;
   }
 
   /**
