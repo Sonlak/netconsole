@@ -67,7 +67,8 @@ def parse_junos_lldp_neighbors(output: str) -> list[dict[str, str]]:
 #   <lldp-neighbor-information>
 #     <lldp-local-port>ge-0/0/1</lldp-local-port>
 #     <lldp-remote-system-name>LAB-F1-DS01</lldp-remote-system-name>
-#     <lldp-remote-port-description>ge-0/0/1</lldp-remote-port-description>
+#     <lldp-remote-port-id>ge-0/0/1</lldp-remote-port-id>
+#     <lldp-remote-port-description>Uplink to distribution</lldp-remote-port-description>
 #     <lldp-chassis-id>00:00:5e:00:53:01</lldp-chassis-id>
 #   </lldp-neighbor-information>
 # ---------------------------------------------------------------------------
@@ -77,7 +78,7 @@ _LLDP_NEIGHBOR_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _LLDP_FIELD_RE = re.compile(
-    r"<(?P<key>lldp-local-port|lldp-remote-system-name|lldp-remote-port-description|lldp-chassis-id)>(?P<val>[^<]*)</(?P=key)>",
+    r"<(?P<key>lldp-local-port|lldp-remote-system-name|lldp-remote-port-id|lldp-remote-port-description|lldp-chassis-id)>(?P<val>[^<]*)</(?P=key)>",
     re.IGNORECASE,
 )
 
@@ -94,7 +95,11 @@ def parse_junos_lldp_neighbors_xml(raw: str) -> list[dict[str, str]]:
         entries.append({
             "localPort": fields.get("lldp-local-port", ""),
             "remoteDeviceId": fields.get("lldp-remote-system-name", ""),
-            "remotePort": fields.get("lldp-remote-port-description", ""),
+            # Port Description is operator text, not the remote interface ID.
+            # Leave remotePort empty when Junos omits Port ID; the reciprocal
+            # LLDP advertisement can still supply the peer's localPort.
+            "remotePort": fields.get("lldp-remote-port-id", ""),
+            "portDescription": fields.get("lldp-remote-port-description", ""),
             "chassisId": fields.get("lldp-chassis-id", ""),
         })
     return entries

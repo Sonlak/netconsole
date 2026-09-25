@@ -144,6 +144,10 @@ function matchDevice(nodes: FabricNode[], token: string): FabricNode | null {
  */
 function normalizeLldpPort(port: string): string {
   const p = (port || '').trim().toLowerCase();
+  // A bare numeric value is an encoded chassis/port identifier, not a
+  // displayable interface name. The reciprocal LLDP record can provide the
+  // actual peer interface via its localPort.
+  if (!p || /^\d+$/.test(p)) return '';
   // EOS: EthernetN → etN
   const eosMatch = p.match(/^ethernet(\d+)$/);
   if (eosMatch) return `et${eosMatch[1]}`;
@@ -187,6 +191,7 @@ type LldpNeighbor = {
   localPort: string;
   remoteDeviceId: string;
   remotePort: string;
+  portDescription?: string;
   chassisId: string;
 };
 
@@ -379,9 +384,13 @@ export async function getFabricTopology(site?: string) {
         continue;
       }
 
-      // LLDP is more trustworthy than description — fill in missing port details
-      if (!existing.toPort && remotePort) existing.toPort = remotePort;
-      if (!existing.fromPort) existing.fromPort = localPort;
+      // LLDP localPort is authoritative for this node's end of the link.
+      if (from.id === node.id) existing.fromPort = localPort;
+      else existing.toPort = localPort;
+      if (remotePort) {
+        if (from.id === node.id) existing.toPort = remotePort;
+        else existing.fromPort = remotePort;
+      }
       if (!existing.note.startsWith('LLDP:') && n.remoteDeviceId) {
         existing.note = `LLDP: ${n.remoteDeviceId}`;
       }
