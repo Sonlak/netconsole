@@ -1042,23 +1042,20 @@ def _parse_eos_show_version(result: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _coerce_eos_port(value: Any) -> str:
-    """Convert EOS eAPI port value into the canonical Ethernet<N> string.
+def _coerce_eos_port(value: Any, *, numeric_is_local: bool = False) -> str:
+    """Normalize an EOS LLDP port value without inventing remote names.
 
-    EOS reports the `port`/`localPort`/`neighborPort`/`portId` fields in
-    different shapes depending on hardware and EOS version:
-
-    - Modular chassis (e.g. 7280) return a numeric interface ID like
-      `521` (the absolute intfId, not a name).
-    - Fixed platforms (e.g. 7050) return `"Ethernet1"`.
-
-    We turn the numeric form into `Ethernet521` so the backend's
-    `normalizeLldpPort` (which already maps `ethernet<N>` -> `etN`)
-    produces a consistent display value across the fleet.
+    On modular EOS, a local `port` may be an absolute numeric interface ID
+    (for example `521`), which can safely be displayed as `Ethernet521`.
+    The numeric `neighborPort`/`portId` value is different: it is an encoded
+    remote chassis/port identifier and is not the neighbour's interface name.
+    Converting it to `Ethernet523` incorrectly makes a Juniper peer appear as
+    `et523` in the fabric diagram. Keep numeric remote values empty so the
+    reciprocal LLDP record, when available, supplies the real interface name.
     """
     s = str(value).strip()
     if s and s.isdigit():
-        return f"Ethernet{s}"
+        return f"Ethernet{s}" if numeric_is_local else ""
     return s
 
 
@@ -1085,7 +1082,9 @@ def _parse_eos_lldp_neighbors_json(result: list[dict[str, Any]]) -> list[dict[st
         if not isinstance(n, dict):
             continue
         # Short-form keys (current EOS 4.28+ JSON-RPC):
-        local_port = _coerce_eos_port(n.get("port") or n.get("localPort") or "")
+        local_port = _coerce_eos_port(
+            n.get("port") or n.get("localPort") or "", numeric_is_local=True
+        )
         remote_device = (
             n.get("neighborDevice")
             or n.get("systemName")
