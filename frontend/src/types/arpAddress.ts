@@ -10,6 +10,8 @@ export type ArpAddressRow = {
   floor: string;
   deviceIp: string;
   collectedAt: string | null;
+  endUserDevice: string;
+  endUserPort: string;
 };
 
 export type ArpAddressInventory = {

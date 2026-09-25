@@ -5,6 +5,8 @@ import { listCollectableDevices } from './collectableDevices.js';
 import { jobPriority } from './deviceOperations.js';
 import { fetchArpTable } from './junosRest.js';
 import { fetchIosxeArpTable } from './iosxeRest.js';
+import { getFabricTopology, inferDeviceRole } from './fabricTopology.js';
+import type { FabricLink, FabricNode } from './fabricTopology.js';
 
 export type ArpTableEntry = {
   ip: string;
@@ -21,6 +23,8 @@ export type ArpAddressRow = ArpTableEntry & {
   floor: string;
   deviceIp: string;
   collectedAt: string | null;
+  endUserDevice: string;
+  endUserPort: string;
 };
 
 type ArpJobResult = {
@@ -63,6 +67,56 @@ async function fetchLatestArpJobsByDevice(
   return out;
 }
 
+type MacJobResult = {
+  entries?: Array<{ mac?: string; interface?: string }>;
+};
+
+function normalizeMac(mac: string): string {
+  const hex = mac.toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (hex.length !== 12) return mac.toLowerCase().trim();
+  return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`;
+}
+
+async function buildEndUserLookup(deviceIds: string[]): Promise<Map<string, { device: string; port: string }>> {
+  const lookup = new Map<string, { device: string; port: string }>();
+  if (deviceIds.length === 0) return lookup;
+
+  const [macJobs, topology] = await Promise.all([
+    prisma.$queryRaw<Array<{ deviceId: string; result: unknown }>>`
+      SELECT DISTINCT ON ("deviceId") "deviceId", result
+      FROM "Job"
+      WHERE type = 'GET_MAC'::"JobType"
+        AND status = 'SUCCESS'::"JobStatus"
+        AND "deviceId" IN (${Prisma.join(deviceIds)})
+      ORDER BY "deviceId", "updatedAt" DESC
+    `,
+    getFabricTopology() as Promise<{ nodes: FabricNode[]; links: FabricLink[] }>,
+  ]);
+
+  const deviceNames = new Map(topology.nodes.map((node) => [node.id, node.name]));
+  const uplinkPorts = new Set<string>();
+  for (const link of topology.links) {
+    if (link.fromPort) uplinkPorts.add(`${link.fromDeviceId}:${link.fromPort.toLowerCase()}`);
+    if (link.toPort) uplinkPorts.add(`${link.toDeviceId}:${link.toPort.toLowerCase()}`);
+  }
+
+  // Prefer access-switch MAC entries and ignore ports that topology identifies
+  // as uplinks. This prevents the same host MAC learned on a distribution
+  // trunk from being reported as the end-user port.
+  for (const job of macJobs) {
+    const node = topology.nodes.find((item) => item.id === job.deviceId);
+    if (!node || inferDeviceRole(node.name, node.floor) !== 'access') continue;
+    const entries = ((job.result ?? {}) as MacJobResult).entries ?? [];
+    for (const entry of entries) {
+      const mac = normalizeMac(String(entry.mac ?? ''));
+      const port = String(entry.interface ?? '').trim();
+      if (!mac || !port || uplinkPorts.has(`${job.deviceId}:${port.toLowerCase()}`)) continue;
+      if (!lookup.has(mac)) lookup.set(mac, { device: deviceNames.get(job.deviceId) ?? node.name, port });
+    }
+  }
+  return lookup;
+}
+
 export async function getArpInventory(): Promise<{
   rows: ArpAddressRow[];
   managedDevices: number;
@@ -73,6 +127,7 @@ export async function getArpInventory(): Promise<{
   const latestByDevice = await fetchLatestArpJobsByDevice(
     devices.map((device) => device.id),
   );
+  const endUserByMac = await buildEndUserLookup(devices.map((device) => device.id));
 
   const rows: ArpAddressRow[] = [];
   let devicesWithData = 0;
@@ -99,6 +154,8 @@ export async function getArpInventory(): Promise<{
         floor: canonicalFloor(device.name, device.floor),
         deviceIp: device.ip,
         collectedAt: job?.updatedAt?.toISOString() ?? null,
+        endUserDevice: endUserByMac.get(normalizeMac(entry.mac))?.device ?? '',
+        endUserPort: endUserByMac.get(normalizeMac(entry.mac))?.port ?? '',
       });
     }
   }
