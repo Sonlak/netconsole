@@ -252,6 +252,11 @@ export async function getFabricTopology(site?: string) {
         FROM "Job"
         WHERE type = 'GET_INTERFACES'::"JobType"
           AND status = 'SUCCESS'::"JobStatus"
+          -- A worker transport failure can currently be recorded as SUCCESS
+          -- with an empty interface list. Never let that erase the last good
+          -- topology snapshot; select only usable interface payloads.
+          AND jsonb_typeof(result->'interfaces') = 'array'
+          AND jsonb_array_length(result->'interfaces') > 0
           AND "deviceId" IN (${Prisma.join([...deviceIds])})
         ORDER BY "deviceId", "updatedAt" DESC
       `
