@@ -178,8 +178,8 @@ export function NetworkTablesPage({ kind }: { kind: Kind }) {
     { title: 'Hostname', dataIndex: 'hostname', ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
     { title: 'MAC', dataIndex: 'mac', width: 180, render: (value: string) => <MacAddress value={value} /> },
     { title: 'Interface', dataIndex: 'interface', ellipsis: true, render: (value: string) => <MonoValue value={value} /> },
-    { title: 'End-user device', dataIndex: 'endUserDevice', ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
-    { title: 'End-user port', dataIndex: 'endUserPort', width: 150, ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
+    { title: 'Client device', dataIndex: 'clientDevice', ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
+    { title: 'Client port', dataIndex: 'clientPort', width: 150, ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
     { title: 'Flags', dataIndex: 'flags', width: 88 },
   ];
 

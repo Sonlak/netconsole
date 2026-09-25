@@ -67,6 +67,9 @@ export async function keaCommand(
   throw lastError ?? new Error('Kea API unavailable');
 }
 
+import { buildClientLookup } from './arpAddress.js';
+import { listCollectableDevices } from './collectableDevices.js';
+
 export type DhcpPool = {
   subnetId: number;
   name: string;
@@ -85,6 +88,8 @@ export type DhcpLease = {
   ip: string;
   mac: string;
   hostname: string;
+  clientDevice: string;
+  clientPort: string;
   subnetId: number;
   subnet?: string;
   site?: string;
@@ -413,6 +418,8 @@ export async function listDhcpLeases(subnetId?: number): Promise<DhcpLease[]> {
       ip,
       mac: lease['hw-address'] || '',
       hostname: lease.hostname || reservedInfo?.hostname || '',
+      clientDevice: '',
+      clientPort: '',
       subnetId: id,
       subnet: meta?.subnet,
       site: meta?.site,
@@ -427,6 +434,15 @@ export async function listDhcpLeases(subnetId?: number): Promise<DhcpLease[]> {
     });
   }
 
+  const clientsByMac = await buildClientLookup(
+    (await listCollectableDevices()).map((device) => device.id),
+  );
+  for (const lease of leases) {
+    const client = clientsByMac.get(normalizeClientMac(lease.mac));
+    lease.clientDevice = client?.device ?? '';
+    lease.clientPort = client?.port ?? '';
+  }
+
   const seenIps = new Set(leases.map((row) => row.ip));
   for (const [id, reservations] of reservationsBySubnet) {
     if (subnetId != null && id !== subnetId) continue;
@@ -437,6 +453,8 @@ export async function listDhcpLeases(subnetId?: number): Promise<DhcpLease[]> {
         ip: reservation.ip,
         mac: reservation.mac,
         hostname: reservation.hostname,
+        clientDevice: clientsByMac.get(normalizeClientMac(reservation.mac))?.device ?? '',
+        clientPort: clientsByMac.get(normalizeClientMac(reservation.mac))?.port ?? '',
         subnetId: id,
         subnet: meta?.subnet,
         site: meta?.site,
@@ -491,6 +509,12 @@ export async function addDhcpReservation(input: {
     throw new Error(result.text || `Failed to add lease ${input.ip}`);
   }
   return result;
+}
+
+function normalizeClientMac(mac: string): string {
+  const hex = mac.toLowerCase().replace(/[^0-9a-f]/g, '');
+  if (hex.length !== 12) return mac.toLowerCase().trim();
+  return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`;
 }
 
 function normalizeMac(mac: string): string {

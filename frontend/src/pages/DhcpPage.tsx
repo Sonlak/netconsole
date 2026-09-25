@@ -335,6 +335,8 @@ export default function DhcpPage() {
                   { title: 'IP', dataIndex: 'ip', width: 140, render: (value: string) => <IpAddress value={value} /> },
                   { title: 'MAC', dataIndex: 'mac', width: 160, render: (value: string) => <MacAddress value={value} /> },
                   { title: 'Hostname', dataIndex: 'hostname', ellipsis: true, render: (value: string) => value || '—' },
+                  { title: 'Client device', dataIndex: 'clientDevice', ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
+                  { title: 'Client port', dataIndex: 'clientPort', width: 150, ellipsis: true, render: (value: string) => <MonoValue value={value || '—'} /> },
                   {
                     title: 'Note',
                     dataIndex: 'note',

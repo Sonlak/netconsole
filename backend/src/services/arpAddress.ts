@@ -23,8 +23,8 @@ export type ArpAddressRow = ArpTableEntry & {
   floor: string;
   deviceIp: string;
   collectedAt: string | null;
-  endUserDevice: string;
-  endUserPort: string;
+  clientDevice: string;
+  clientPort: string;
 };
 
 type ArpJobResult = {
@@ -77,7 +77,7 @@ function normalizeMac(mac: string): string {
   return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`;
 }
 
-async function buildEndUserLookup(deviceIds: string[]): Promise<Map<string, { device: string; port: string }>> {
+export async function buildClientLookup(deviceIds: string[]): Promise<Map<string, { device: string; port: string }>> {
   const lookup = new Map<string, { device: string; port: string }>();
   if (deviceIds.length === 0) return lookup;
 
@@ -102,7 +102,7 @@ async function buildEndUserLookup(deviceIds: string[]): Promise<Map<string, { de
 
   // Prefer access-switch MAC entries and ignore ports that topology identifies
   // as uplinks. This prevents the same host MAC learned on a distribution
-  // trunk from being reported as the end-user port.
+  // trunk from being reported as the client port.
   for (const job of macJobs) {
     const node = topology.nodes.find((item) => item.id === job.deviceId);
     if (!node || inferDeviceRole(node.name, node.floor) !== 'access') continue;
@@ -127,7 +127,7 @@ export async function getArpInventory(): Promise<{
   const latestByDevice = await fetchLatestArpJobsByDevice(
     devices.map((device) => device.id),
   );
-  const endUserByMac = await buildEndUserLookup(devices.map((device) => device.id));
+  const clientByMac = await buildClientLookup(devices.map((device) => device.id));
 
   const rows: ArpAddressRow[] = [];
   let devicesWithData = 0;
@@ -154,8 +154,8 @@ export async function getArpInventory(): Promise<{
         floor: canonicalFloor(device.name, device.floor),
         deviceIp: device.ip,
         collectedAt: job?.updatedAt?.toISOString() ?? null,
-        endUserDevice: endUserByMac.get(normalizeMac(entry.mac))?.device ?? '',
-        endUserPort: endUserByMac.get(normalizeMac(entry.mac))?.port ?? '',
+        clientDevice: clientByMac.get(normalizeMac(entry.mac))?.device ?? '',
+        clientPort: clientByMac.get(normalizeMac(entry.mac))?.port ?? '',
       });
     }
   }

@@ -57,6 +57,8 @@ export type DhcpLease = {
   ip: string;
   mac: string;
   hostname: string;
+  clientDevice: string;
+  clientPort: string;
   subnetId: number;
   subnet?: string;
   site?: string;
