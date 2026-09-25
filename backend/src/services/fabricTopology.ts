@@ -288,6 +288,7 @@ export async function getFabricTopology(site?: string) {
   const nodeRoleById = new Map<string, FabricRole>(nodes.map((n) => [n.id, n.role]));
 
   const merged = new Map<string, FabricLink>();
+  const descriptionLocalPorts = new Map<string, string>();
 
   for (const node of nodes) {
     const job = latest.get(node.id);
@@ -299,6 +300,7 @@ export async function getFabricTopology(site?: string) {
       if (!localPort || !parsed) continue;
       const peer = matchDevice(nodes, parsed.token);
       if (!peer || peer.id === node.id) continue;
+      descriptionLocalPorts.set(`${node.id}:${peer.id}`, localPort);
 
       const id = linkId(node.id, localPort, peer.id, normalizeLldpPort(parsed.remotePort));
       const existing = merged.get(id);
@@ -405,11 +407,15 @@ export async function getFabricTopology(site?: string) {
     }
   }
 
-  // Description strings can contain stale/manual Junos names (ge- vs xe-).
-  // Replace each endpoint with the localPort reported by that endpoint's LLDP.
+  // Both interface descriptions and LLDP report a device's own local port.
+  // Prefer LLDP when available, then fall back to the interface name. This
+  // prevents an older peer-side description (ge-0/0/x) from overwriting the
+  // Junos device's actual local interface (xe-0/0/x).
   for (const link of merged.values()) {
-    const fromLocal = lldpLocalPorts.get(`${link.fromDeviceId}:${link.toDeviceId}`);
-    const toLocal = lldpLocalPorts.get(`${link.toDeviceId}:${link.fromDeviceId}`);
+    const fromLocal = lldpLocalPorts.get(`${link.fromDeviceId}:${link.toDeviceId}`)
+      || descriptionLocalPorts.get(`${link.fromDeviceId}:${link.toDeviceId}`);
+    const toLocal = lldpLocalPorts.get(`${link.toDeviceId}:${link.fromDeviceId}`)
+      || descriptionLocalPorts.get(`${link.toDeviceId}:${link.fromDeviceId}`);
     if (fromLocal) link.fromPort = fromLocal;
     if (toLocal) link.toPort = toLocal;
   }
