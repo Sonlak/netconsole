@@ -90,7 +90,12 @@ services:
       REDIS_DB: 0
       # Allow both host (via :8001) and the in-network alias
       ALLOWED_HOSTS: "*"
-      SECRET_KEY: "netbox-dev-secret-CHANGE-ME-in-prod-9kj3hdks02"
+      # SECRET_KEY must be at least 50 chars (NetBox's Django check
+      # rejects shorter keys at startup — causes 'Models aren't loaded
+      # yet' because Django.setup() aborts before the app registry is
+      # built). Pad with non-secret noise here; rotate for prod via
+      # `docker exec netbox-netbox python /opt/netbox/netbox/generate_secret_key.py`.
+      SECRET_KEY: "netbox-dev-secret-CHANGE-ME-in-prod-9kj3hdks02-padding-1234"
       SUPERUSER_NAME: admin
       SUPERUSER_PASSWORD: Admin@123
       SUPERUSER_EMAIL: admin@netconsole.local
