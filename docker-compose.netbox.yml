@@ -44,7 +44,12 @@ services:
     volumes:
       - netbox_pgdata:/var/lib/postgresql/data
     networks:
-      - netconsole
+      netconsole:
+        # Reserve static IPs so they don't collide with the app stack.
+        # docker-compose.app.yml uses 172.31.0.2 (postgres), .3 (backend),
+        # .4 (worker), .5 (frontend), .10/.11 (kea-primary/standby).
+        # NetBox stack gets .20 (postgres), .21 (redis), .22 (app).
+        ipv4_address: 172.31.0.20
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U netbox -d netbox"]
       interval: 5s
@@ -59,7 +64,8 @@ services:
     volumes:
       - netbox_redis_data:/data
     networks:
-      - netconsole
+      netconsole:
+        ipv4_address: 172.31.0.21
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -111,7 +117,8 @@ services:
       # Init scripts: API token + custom field. See lab/netbox/init/*.
       - ./lab/netbox/init:/opt/netbox/startup_scripts:ro
     networks:
-      - netconsole
+      netconsole:
+        ipv4_address: 172.31.0.22
     ports:
       # Bind on ALL interfaces so the worker container (on the
       # netconsole bridge network) can reach NetBox via the host's
