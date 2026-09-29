@@ -315,6 +315,16 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
     // its previous netboxDeviceId. On success we update the link and
     // clear any prior error. On failure we capture the message so the
     // dashboard can show "NetBox sync failed" next to the device.
+    //
+    // Two flavours:
+    //   - NETBOX_SYNC_DEVICE: single-device job. result.netboxDeviceId
+    //     is the new NetBox id; update the linked Device row by
+    //     job.deviceId.
+    //   - NETBOX_SYNC_ALL: bulk job. result.results is an array of
+    //     { device, netconsoleId, netboxDeviceId, ok, error }. We
+    //     iterate and update each Device row whose id == entry.netconsoleId.
+    //     Failed rows store the error in netboxSyncError but leave
+    //     netboxDeviceId untouched (so a previously-good link stays).
     if (job.type === JobType.NETBOX_SYNC_DEVICE && job.deviceId) {
       try {
         const result = (job.result ?? {}) as {
@@ -343,6 +353,45 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
         }
       } catch (syncApplyError) {
         console.error('[netbox-sync] failed to persist sync result on Device', syncApplyError);
+      }
+    } else if (job.type === JobType.NETBOX_SYNC_ALL && job.status === JobStatus.SUCCESS) {
+      try {
+        const result = (job.result ?? {}) as {
+          results?: Array<{
+            netconsoleId?: string;
+            netboxDeviceId?: number;
+            ok?: boolean;
+            error?: string;
+          }>;
+        };
+        const entries = result.results ?? [];
+        let updatedCount = 0;
+        let failedCount = 0;
+        for (const entry of entries) {
+          if (!entry || !entry.netconsoleId) continue;
+          if (entry.ok && entry.netboxDeviceId) {
+            await prisma.device.update({
+              where: { id: entry.netconsoleId },
+              data: {
+                netboxDeviceId: entry.netboxDeviceId,
+                netboxSyncedAt: new Date(),
+                netboxSyncError: null,
+              },
+            });
+            updatedCount += 1;
+          } else if (!entry.ok && entry.error) {
+            await prisma.device.update({
+              where: { id: entry.netconsoleId },
+              data: { netboxSyncError: entry.error },
+            });
+            failedCount += 1;
+          }
+        }
+        console.log(
+          `[netbox-sync] bulk sync applied: updated=${updatedCount} failed=${failedCount}`,
+        );
+      } catch (syncApplyError) {
+        console.error('[netbox-sync] failed to persist bulk sync results', syncApplyError);
       }
     }
 
