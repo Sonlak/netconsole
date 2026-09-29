@@ -190,13 +190,36 @@ class NetBoxClient:
         return results[0] if results else None
 
     def get_or_create_manufacturer(self, name: str) -> int:
-        """Return the manufacturer id. Creates if missing."""
+        """Return the manufacturer id. Creates if missing.
+
+        NetBox requires a unique `slug` for new manufacturers — derive it
+        from the name (lowercased, non-alphanum → '-'). We don't get to
+        choose between slug derived from `name` and `id` here, but the
+        caller passes `name` as the human display string and we always
+        normalize that.
+        """
         mfg = self.find_manufacturer(name)
         if mfg:
             return mfg["id"]
         # Normalize: first letter upper-case, rest lower-case
         normalized = name.strip().title()
-        created = self.post("/dcim/manufacturers/", json={"name": normalized})
+        if not normalized:
+            raise NetBoxError("manufacturer name is empty")
+        slug = (
+            normalized.lower()
+            .replace(" ", "-")
+            .replace("_", "-")
+        )
+        # Strip anything that isn't [a-z0-9-]
+        slug = "".join(c for c in slug if c.isalnum() or c == "-")
+        if not slug:
+            # Fall back to a generic slug — should never happen for a
+            # sane vendor name (e.g. "Juniper Networks", "Arista", etc.).
+            slug = "unknown-vendor"
+        created = self.post("/dcim/manufacturers/", json={
+            "name": normalized,
+            "slug": slug,
+        })
         logger.info("netbox: created manufacturer '%s' (id=%d)", normalized, created["id"])
         return created["id"]
 
