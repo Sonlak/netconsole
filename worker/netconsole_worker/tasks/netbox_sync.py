@@ -28,13 +28,12 @@ Idempotency:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any
 
 import httpx
 
-from netconsole_worker.clients.netbox import NetBoxClient, NetBoxError, get_netbox_client
+from netconsole_worker.clients.netbox import NetBoxError, get_netbox_client
 from netconsole_worker.config import settings
 from netconsole_worker.models import DeviceInfo, JobInfo
 from netconsole_worker.tasks.base import BaseTask
