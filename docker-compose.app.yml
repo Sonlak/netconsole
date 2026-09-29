@@ -181,7 +181,10 @@ services:
       # Disabled by default so a fresh deploy does not hammer an absent
       # NetBox instance. Set to e.g. 300 for a 5-minute cycle.
       NETBOX_SYNC_INTERVAL_SECONDS: "300"
-      NETBOX_URL: "http://netbox-netbox:8080/api/"
+      # Use the VPS public IP so the worker (which is on the netconsole
+      # docker network but cannot reliably resolve the netbox container
+      # name `netbox-netbox`) can reach NetBox via the host's port mapping.
+      NETBOX_URL: "http://42.119.165.109:8001/api/"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       SEED_DISABLED: "false"
       CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
@@ -267,7 +270,9 @@ services:
       # talks to the same NetBox instance. The literal is the dev token
       # created by lab/netbox/init/01-init.py — rotate for prod via
       # `docker exec netbox-netbox python manage.py drf_create_token admin`.
-      NETBOX_URL: "http://netbox-netbox:8080/api/"
+      # Use the VPS public IP so the worker can reach NetBox through the
+      # host port mapping (8001 → 8080 inside the netbox container).
+      NETBOX_URL: "http://42.119.165.109:8001/api/"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
     networks:
       netconsole:

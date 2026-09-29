@@ -319,6 +319,48 @@ jobs:
           cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
           echo "💾 Updated rollback anchor to this successful deploy: sha=$SHA"
 
+      - name: Open iptables port for NetBox (8001)
+        run: |
+          set +e
+          # NetBox publishes 8001 → 8080 inside the container. The
+          # self-hosted runner can reach it locally, but the worker
+          # container is on the same docker bridge and CANNOT reach the
+          # host's port mapping via the service-name DNS (unreliable on
+          # the VPS). Instead we point the worker at the public IP.
+          #
+          # Docker adds a NAT rule for the published port automatically,
+          # but the public-NIC INPUT chain might still drop the packet
+          # depending on the host's default policy. Append an explicit
+          # ACCEPT rule for 8001 (idempotent — duplicates are OK; we
+          # de-dupe by checking for the comment).
+          if iptables -C INPUT -p tcp --dport 8001 -j ACCEPT -m comment --comment "netbox-sync" 2>/dev/null; then
+            echo "iptables rule for :8001 already present — skipping"
+          else
+            iptables -I INPUT -p tcp --dport 8001 -j ACCEPT -m comment --comment "netbox-sync" || {
+              echo "::warning::failed to add iptables rule for :8001 (need sudo?). Run manually:"
+              echo "  sudo iptables -I INPUT -p tcp --dport 8001 -j ACCEPT -m comment --comment netbox-sync"
+            }
+          fi
+          set -e
+
+      - name: Wait for NetBox healthy
+        run: |
+          set -euo pipefail
+          echo "Probing NetBox /api/dcim/sites/?limit=1 ..."
+          # NetBox first boot does Django migrations + createsuperuser +
+          # runs our init script — typical 60-90s. Allow up to 5 minutes.
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8001/api/dcim/sites/?limit=1"; then
+              echo "✅ NetBox healthy after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "  attempt $i: not ready yet, sleeping 5s"
+            sleep 5
+          done
+          echo "::warning::NetBox did not become healthy within 5 min — check 'docker logs netbox-netbox'"
+          # Non-fatal: the worker's next sync tick will retry, and the
+          # human can curl /api/health on the NetBox container to confirm.
+
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
