@@ -108,15 +108,23 @@ services:
     networks:
       - netconsole
     ports:
-      # Bind on ALL interfaces (not 127.0.0.1) so the worker container
-      # can reach NetBox via the host's public IP. The worker is on the
-      # same docker network as netbox but service-name DNS resolution
-      # (`netbox-netbox`) was unreliable on the VPS — direct IP is simpler.
-      # Note: this also exposes NetBox to the public internet. Auth is
-      # enforced by the admin superuser + API token (no anonymous access).
-      # For production you may want to bind to a Tailscale-only IP or put
-      # an nginx reverse-proxy with TLS in front.
-      - "8001:8080"
+      # Bind on ALL interfaces so the worker container (on the
+      # netconsole bridge network) can reach NetBox via the host's
+      # public IP. Service-name DNS (`netbox-netbox`) was unreliable
+      # on the VPS — direct IP is simpler.
+      #
+      # PORT NOTE: 8001 is already taken by netconsole-kea-primary
+      # (mapped to 10.10.20.20:8001 for the Kea control channel).
+      # We use 8080 instead → 8001 on the host. NetBox's internal
+      # HTTP server listens on 8080 (env DEBUG=true skips the
+      # supervisord reverse-proxy), so this maps straight through.
+      #
+      # Note: this exposes NetBox to the public internet. Auth is
+      # enforced by the admin superuser + API token (no anonymous
+      # access). For production you may want to bind to a
+      # Tailscale-only IP or put an nginx reverse-proxy with TLS
+      # in front.
+      - "8080:8080"
     healthcheck:
       # NetBox health endpoint
       test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health/"]
