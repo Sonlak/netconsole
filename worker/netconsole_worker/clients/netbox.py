@@ -308,7 +308,20 @@ class NetBoxClient:
         management_ip: str | None = None,
         version: str | None = None,
     ) -> dict[str, Any]:
-        """Build the NetBox device upsert payload (used for both POST and PATCH)."""
+        """Build the NetBox device upsert payload (used for both POST and PATCH).
+
+        Phase 1 (device inventory) intentionally does NOT set primary_ip4 or
+        oob_ip here. Both fields require a reference to an existing IP object
+        in the IPAM table (id or address dict), not a plain string. Trying
+        to pass "10.10.20.131" directly results in:
+
+          400: primary_ip4: Received an unrecognized value: 10.10.20.131
+
+        IPAM sync (Phase 2) will create the IP entries first, then link
+        them to the device. For now, the management IP is stored in the
+        `description` field with a "mgmt: " prefix so operators can still
+        see it on the NetBox device page.
+        """
         payload: dict[str, Any] = {
             "name": name,
             "device_type": device_type_id,
@@ -321,15 +334,18 @@ class NetBoxClient:
                 "netconsole_id": netconsole_id,
             },
         }
+        # Combine description and mgmt IP into one description string.
+        # The IP goes in a stable "mgmt: <ip>" prefix so phase 2 can
+        # parse it back out.
+        desc_parts = []
         if description:
-            payload["description"] = description
+            desc_parts.append(description)
         if version:
-            payload["comments"] = f"OS version: {version}"
-        # Store management IP as oob_ip — NetBox calls it "management IP" in the UI.
-        # This field is available in NetBox v4.
+            desc_parts.append(f"OS version: {version}")
         if management_ip:
-            payload["oob_ip"] = management_ip
-            payload["primary_ip4"] = management_ip  # will be resolved separately
+            desc_parts.append(f"mgmt: {management_ip}")
+        if desc_parts:
+            payload["description"] = " | ".join(desc_parts)
         return payload
 
     def _map_status(self, netconsole_status: str) -> str:
