@@ -70,5 +70,12 @@ class Settings(BaseSettings):
     ios_http_user: str = ""
     ios_http_password: str = ""
 
+    # NetBox — periodic device inventory sync (NETBOX_SYNC_DEVICE / NETBOX_SYNC_ALL).
+    # URL is the NetBox API root (no /api/ at the end — the client adds it).
+    # Token is the superuser API token created by lab/netbox/init/01-init.py.
+    # Leave both empty to disable the sync (it will fail jobs gracefully).
+    netbox_url: str = ""
+    netbox_token: str = ""
+
 
 settings = Settings()

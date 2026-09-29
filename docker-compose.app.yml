@@ -174,6 +174,15 @@ services:
       KEA_API_URL: http://172.31.0.10:8000/
       KEA_STANDBY_API_URL: http://172.31.0.11:8000/
       KEA_TIMEOUT_MS: "5000"
+      # NetBox sync — set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable
+      # the periodic sync. The worker reads NETBOX_URL / NETBOX_TOKEN
+      # to know where to push. Both should be set; if either is empty
+      # the enqueued sync jobs will fail with a clear error in the job row.
+      # Disabled by default so a fresh deploy does not hammer an absent
+      # NetBox instance. Set to e.g. 300 for a 5-minute cycle.
+      NETBOX_SYNC_INTERVAL_SECONDS: "300"
+      NETBOX_URL: "http://netbox-netbox:8080/api/"
+      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
       SEED_DISABLED: "false"
       CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
       JWT_SECRET: "d97aklKZ_BKmRrHtXH6fLSZs48AlwJpAU8_RdcuCKqBm_0Jufe8Rx-FkpGhQT-cu"
@@ -254,6 +263,12 @@ services:
       IOS_HTTP_PORT: "443"
       IOS_HTTP_USER: netconsole
       IOS_HTTP_PASSWORD: Admin@123
+      # NetBox sync — must match the value on the backend so the worker
+      # talks to the same NetBox instance. The literal is the dev token
+      # created by lab/netbox/init/01-init.py — rotate for prod via
+      # `docker exec netbox-netbox python manage.py drf_create_token admin`.
+      NETBOX_URL: "http://netbox-netbox:8080/api/"
+      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
     networks:
       netconsole:
         ipv4_address: 172.31.0.4

@@ -27,6 +27,17 @@ enum JobType {
   DISCOVERY_PROBE
   APPLY_CONFIG
   ROLLBACK_CONFIG
+  // NETBOX_SYNC_DEVICE — sync a single device to NetBox. Created by
+  // POST /api/devices/:id/sync-netbox (manual) or by the periodic
+  // scheduleNetboxSync scheduler (one job per deviceId per cycle).
+  // Worker reads Device.* + DeviceInterface[*] and upserts to NetBox.
+  NETBOX_SYNC_DEVICE
+  // NETBOX_SYNC_ALL — sync every device in one job. Created by the
+  // periodic scheduler. Worker loops over Device rows and enqueues a
+  // NETBOX_SYNC_DEVICE child job for each (or does the loop in-process
+  // for low-volume test deploys). The job exists so operators can run
+  // a single sync-everything from the UI / API.
+  NETBOX_SYNC_ALL
 }
 
 enum JobStatus {
@@ -80,6 +91,15 @@ model Device {
   // by dividing the delta between two consecutive samples by the elapsed
   // time. BigInt columns because counters easily exceed 2^32 on busy uplinks.
   counterSamples     InterfaceCounterSample[]
+  // NetBox sync state. netboxDeviceId is set to the NetBox dcim.devices.id
+  // after a successful upsert so subsequent cycles can PATCH instead of
+  // GET+find. netboxSyncedAt is updated on every successful sync;
+  // netboxSyncError captures the last failure (cleared on next success).
+  // All three are nullable so the existing rows in production don't need
+  // a backfill — first sync creates the link.
+  netboxDeviceId     Int?
+  netboxSyncedAt     DateTime?
+  netboxSyncError    String?
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 }
@@ -142,6 +162,10 @@ model Job {
   @@index([deviceId, status])
   @@index([deviceId, type, status, updatedAt(sort: Desc)])
   @@index([status, priority, createdAt])
+  // Partial index for the periodic NetBox sync — scheduler picks the
+  // oldest PENDING sync job to keep latency bounded when there are many
+  // devices.
+  @@index([type, status, createdAt])
 }
 
 enum LogSeverity {

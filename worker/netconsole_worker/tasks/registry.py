@@ -16,6 +16,7 @@ from typing import Any
 from netconsole_worker.models import DeviceInfo, JobInfo
 from netconsole_worker.tasks.base import BaseTask
 from netconsole_worker.tasks.managed_check import ManagedCheckTask
+from netconsole_worker.tasks.netbox_sync import NetboxSyncAllTask, NetboxSyncDeviceTask
 from netconsole_worker.vendor import select_backend
 
 
@@ -250,5 +251,11 @@ TASK_REGISTRY = {
         GetLogsTask(),
         InterfaceActionTask(),
         ManagedCheckTask(),
+        # NetBox sync — periodic + on-demand (see services/scheduler in
+        # backend). Not interactive (no SSH/RPC), but tagged for a
+        # dedicated queue group so we can add a special "netbox-only"
+        # pull path later if traffic warrants.
+        NetboxSyncDeviceTask(),
+        NetboxSyncAllTask(),
     ]
 }

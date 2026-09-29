@@ -41,7 +41,18 @@ concurrency:
 env:
   DEPLOY_DIR: /opt/netconsole
   COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
+  # NetBox is defined in a separate compose file but is part of the same
+  # project (`netconsole`) so all containers share the netconsole bridge
+  # network. The deploy workflow includes this file alongside the app
+  # file so `docker compose -p netconsole -f app.yml -f netbox.yml` picks
+  # up the netbox service on top of the app stack.
+  NETBOX_COMPOSE_FILE: /opt/netconsole/docker-compose.netbox.yml
   COMPOSE_PROJECT: netconsole
+  # Services to (re)build + restart on every deploy. NetBox is intentionally
+  # NOT in this list — its images are pulled by name and the first deploy
+  # that adds the file is responsible for `up -d` of the netbox stack. After
+  # that, deploys keep netbox untouched (the running container's data
+  # volume is what holds the inventory).
   DEPLOY_SERVICES: "backend worker frontend"
 
 jobs:
@@ -205,6 +216,39 @@ jobs:
           echo "==> Building + starting fresh containers..."
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
             up -d --build --no-deps $DEPLOY_SERVICES
+
+          # ── NetBox stack ────────────────────────────────────────────
+          # Bring up the netbox compose side-by-side. We do NOT rebuild it
+          # on every deploy — the netbox image is `netboxcommunity/netbox:v4.x`
+          # and the data lives in the `netbox_pgdata` volume. Once up, the
+          # netbox services are never restarted by future deploys (only the
+          # app services above get rebuilt).
+          #
+          # On first deploy: `up -d` pulls + starts everything. The init
+          # script in lab/netbox/init/01-init.py runs on first boot, sets
+          # the API token, custom field, and tag.
+          #
+          # On subsequent deploys: the service definitions are already
+          # known to the `netconsole` project (because both compose files
+          # share COMPOSE_PROJECT). The `up -d` here is a no-op for the
+          # running services but will pull the latest netboxcommunity/netbox
+          # image if the tag in docker-compose.netbox.yml changed.
+          if [ -f "$NETBOX_COMPOSE_FILE" ]; then
+            echo "==> Bringing up NetBox stack..."
+            # Use both compose files in the SAME docker compose invocation
+            # so they share the project + network. The `netbox` service in
+            # docker-compose.app.yml (the placeholder) gets merged with
+            # the real definition here.
+            docker compose \
+              -p "$COMPOSE_PROJECT" \
+              -f "$COMPOSE_FILE" \
+              -f "$NETBOX_COMPOSE_FILE" \
+              up -d netbox-postgres netbox-redis netbox || {
+                echo "::warning::NetBox up failed; backend will retry sync when netbox is available"
+              }
+          else
+            echo "::notice::$NETBOX_COMPOSE_FILE not found on VPS; skipping netbox (run \`rsync\` first or check the file was committed)"
+          fi
 
       - name: Wait for backend healthy
         run: |

@@ -309,6 +309,43 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
       }
     }
 
+    // ── NetBox sync: persist netboxDeviceId / netboxSyncedAt / error on
+    // the Device row. Runs after the upsert, so a 4xx from NetBox will
+    // have already failed the job (status=FAILED) and the device keeps
+    // its previous netboxDeviceId. On success we update the link and
+    // clear any prior error. On failure we capture the message so the
+    // dashboard can show "NetBox sync failed" next to the device.
+    if (job.type === JobType.NETBOX_SYNC_DEVICE && job.deviceId) {
+      try {
+        const result = (job.result ?? {}) as {
+          netboxDeviceId?: number;
+          ok?: boolean;
+        };
+        if (job.status === JobStatus.SUCCESS && result.netboxDeviceId) {
+          await prisma.device.update({
+            where: { id: job.deviceId },
+            data: {
+              netboxDeviceId: result.netboxDeviceId,
+              netboxSyncedAt: new Date(),
+              netboxSyncError: null,
+            },
+          });
+          console.log(
+            `[netbox-sync] device ${job.deviceId} synced → netboxDeviceId=${result.netboxDeviceId}`,
+          );
+        } else if (job.status === JobStatus.FAILED) {
+          await prisma.device.update({
+            where: { id: job.deviceId },
+            data: {
+              netboxSyncError: job.error ?? 'unknown error',
+            },
+          });
+        }
+      } catch (syncApplyError) {
+        console.error('[netbox-sync] failed to persist sync result on Device', syncApplyError);
+      }
+    }
+
     res.json({ job, device, persistedLogs });
     if (job.type === JobType.GET_INTERFACES) invalidateFabricCache();
   } catch {
@@ -399,4 +436,41 @@ jobsRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
   });
 
   res.status(201).json(job);
+});
+
+/**
+ * POST /api/jobs/netbox-sync-all
+ *
+ * Enqueue a single NETBOX_SYNC_ALL job that syncs every device to NetBox.
+ * No deviceId — the worker iterates over the full device list.
+ *
+ * Lighter than per-device endpoint: this is the "I just want to push
+ * everything" button. Idempotent — running it twice in a row produces
+ * the same NetBox state (PATCH on existing, POST on new).
+ */
+jobsRouter.post('/netbox-sync-all', authMiddleware, async (req: AuthenticatedRequest, res) => {
+  if (!req.user) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  const userId = req.user.userId;
+
+  const job = await prisma.job.create({
+    data: {
+      deviceId: null,
+      type: JobType.NETBOX_SYNC_ALL,
+      status: JobStatus.PENDING,
+      priority: 0,  // lowest priority — does not jump collection/interactive queues
+      createdById: userId,
+    },
+  });
+
+  console.log(
+    `[netbox-sync] enqueued NETBOX_SYNC_ALL job=${job.id} by userId=${userId ?? 'system'}`,
+  );
+
+  res.status(202).json({
+    job,
+    message: 'NETBOX_SYNC_ALL job created. Worker will sync all devices to NetBox.',
+  });
 });

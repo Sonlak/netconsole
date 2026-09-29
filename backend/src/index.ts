@@ -22,6 +22,7 @@ import { scheduleInterfaceCounterPoll, interfaceCounterConfig, interfaceCounterF
 import { startLogRetentionCleanup } from './services/logRetention.js';
 import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
+import { scheduleNetboxSync } from './services/netboxSync.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
@@ -70,6 +71,11 @@ const logsCollectIntervalSeconds = Number(process.env.LOGS_COLLECT_INTERVAL_SECO
 const syslogUdpPort = Number(process.env.SYSLOG_UDP_PORT) || 1514;
 const logRetentionDays = Number(process.env.LOG_RETENTION_DAYS) || 30;
 const jobRetentionDays = Number(process.env.JOB_RETENTION_DAYS) || 30;
+// NetBox periodic sync. 0 = disabled (default for stacks that haven't
+// configured a NetBox instance yet). 300s = 5 min matches the other
+// collect intervals; tune lower for small fleets or higher for very
+// large ones (the worker's per-job timeout will catch stuck syncs).
+const netboxSyncIntervalSeconds = Number(process.env.NETBOX_SYNC_INTERVAL_SECONDS) || 0;
 
 // Graceful shutdown support
 let isShuttingDown = false;
@@ -126,6 +132,16 @@ const httpServer = app.listen(port, () => {
     console.log('Interface counter auto-poll disabled (INTERFACE_COUNTERS_ENABLED=false)');
   }
 
+  // NetBox periodic sync — only starts if NETBOX_SYNC_INTERVAL_SECONDS > 0.
+  // The worker still has to have NETBOX_URL/NETBOX_TOKEN set, otherwise
+  // the enqueued jobs will all fail with "NetBox sync is not configured".
+  if (netboxSyncIntervalSeconds > 0) {
+    scheduleNetboxSync({ intervalSeconds: netboxSyncIntervalSeconds });
+    console.log(`NetBox sync scheduler enabled (every ${netboxSyncIntervalSeconds}s)`);
+  } else {
+    console.log('NetBox sync scheduler disabled (set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable)');
+  }
+
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
 
   // Start WebSocket terminal server
@@ -179,6 +195,8 @@ app.get('/api/health', (_req, res) => {
     jobRetentionDays,
     syslogUdpPort,
     keaApiUrl: process.env.KEA_API_URL || null,
+    netboxEnabled: netboxSyncIntervalSeconds > 0,
+    netboxSyncIntervalSeconds: netboxSyncIntervalSeconds > 0 ? netboxSyncIntervalSeconds : null,
   });
 });
 

@@ -110,6 +110,77 @@ export function registerDeviceOperationRoutes(router: import('express').Router) 
   router.post('/:id/connect', authMiddleware, (req, res) =>
     void triggerOperation(idParam(req), JobType.CONNECT_TEST, res, userId(req)),
   );
+
+  /**
+   * POST /api/devices/:id/sync-netbox
+   * Enqueue a NETBOX_SYNC_DEVICE job to push this device's inventory to
+   * NetBox. Workers will call back to GET /api/devices/:id to get the
+   * full Device row (serial, description, version, etc.) and then upsert
+   * it to NetBox via REST API.
+   *
+   * Response 202: job created, worker will process asynchronously.
+   * Response 404: device not found.
+   * Response 409: device already has a pending NETBOX_SYNC_DEVICE job.
+   */
+  router.post('/:id/sync-netbox', authMiddleware, (req, res) =>
+    void (async () => {
+      const deviceId = idParam(req);
+      const requestUserId = userId(req);
+      try {
+        const result = await triggerNetboxSync(deviceId, requestUserId);
+        res.status(result.queued ? 202 : 200).json(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'NetBox sync failed';
+        const lockedBy = (error as { lockedBy?: unknown }).lockedBy;
+        if (message === 'Device busy' && lockedBy) {
+          res.status(409).json({
+            error: 'Device busy',
+            code: 'device_locked',
+            lockedBy,
+          });
+          return;
+        }
+        const status = message === 'Device not found' ? 404 : 502;
+        res.status(status).json({ error: message });
+      }
+    })(),
+  );
+}
+
+/**
+ * Enqueue a NETBOX_SYNC_DEVICE job for a single device.
+ *
+ * Reuses the standard `tryCreateDeviceJob` path so the device lock and
+ * cross-user attribution logic stay consistent with the rest of the
+ * job-creating endpoints.
+ */
+async function triggerNetboxSync(deviceId: string, userId: string | null) {
+  const device = await prisma.device.findUnique({ where: { id: deviceId } });
+  if (!device) {
+    throw new Error('Device not found');
+  }
+
+  const { tryCreateDeviceJob } = await import('../services/deviceOperations.js');
+  const outcome = await prisma.$transaction((tx) =>
+    tryCreateDeviceJob(tx, deviceId, JobType.NETBOX_SYNC_DEVICE, userId, {}),
+  );
+  if (outcome.kind === 'busy') {
+    const b = outcome.error.blockingJob;
+    const error = new Error('Device busy') as Error & { lockedBy?: unknown };
+    error.lockedBy = {
+      jobId: b.id,
+      jobType: b.type,
+      jobStatus: b.status,
+      jobCreatedAt: b.createdAt,
+      username: b.createdByUsername,
+    };
+    throw error;
+  }
+
+  return {
+    queued: true,
+    job: outcome.job,
+  };
 }
 
 export async function getDeviceById(req: Request, res: Response) {

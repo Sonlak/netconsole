@@ -1,0 +1,107 @@
+# NetBox stack for local testing — used by NetConsole to sync device inventory.
+# Runs alongside docker-compose.app.yml. Shared network with the NetConsole
+# app stack so the worker can reach NetBox at http://netbox:8000.
+#
+# Usage:
+#   docker compose -f docker-compose.netbox.yml up -d
+#   # wait ~30s for first boot + migrations, then NetBox is at:
+#   #   http://localhost:8001  (host port)
+#   #   http://172.31.0.20:8000  (netconsole-network alias, used by worker)
+#
+# Admin login: admin / Admin@123  (set in env below)
+# API token: read from /var/lib/docker/volumes/netconsole_netbox_config/_data/netbox-token
+#            or run: docker exec netbox-netbox cat /tmp/netbox-api-token
+
+networks:
+  netconsole:
+    external: true
+
+volumes:
+  netbox_pgdata:
+  netbox_redis_data:
+  netbox_config:
+
+services:
+  netbox-postgres:
+    image: postgres:16-alpine
+    container_name: netbox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox
+      POSTGRES_DB: netbox
+    volumes:
+      - netbox_pgdata:/var/lib/postgresql/data
+    networks:
+      - netconsole
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netbox -d netbox"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  netbox-redis:
+    image: redis:7-alpine
+    container_name: netbox-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - netbox_redis_data:/data
+    networks:
+      - netconsole
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  netbox:
+    image: netboxcommunity/netbox:v4.0-2.9.0
+    container_name: netbox-netbox
+    restart: unless-stopped
+    depends_on:
+      netbox-postgres:
+        condition: service_healthy
+      netbox-redis:
+        condition: service_healthy
+    # The official image reads env vars to auto-generate /etc/netbox/config/configuration.py
+    # on every boot. We override only what the auto-gen script understands
+    # (DB/Redis/ALLOWED_HOSTS/SECRET_KEY/superuser), and drop our custom
+    # init into /opt/netbox/startup_scripts/.
+    environment:
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: netbox
+      DB_HOST: netbox-postgres
+      DB_PORT: 5432
+      REDIS_HOST: netbox-redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      # Allow both host (via :8001) and the in-network alias
+      ALLOWED_HOSTS: "*"
+      SECRET_KEY: "netbox-dev-secret-CHANGE-ME-in-prod-9kj3hdks02"
+      SUPERUSER_NAME: admin
+      SUPERUSER_PASSWORD: Admin@123
+      SUPERUSER_EMAIL: admin@netconsole.local
+      SKIP_STARTUP_SCRIPTS: "false"
+      # Skip the supervisord housekeeping that pulls git, runs Housekeeping
+      # commands, etc. — none of which is needed for a local dev/test instance.
+      # Set to "true" to make the container run NetBox in a single process for
+      # faster startup. We use it because we don't have a real Redis cache
+      # background process to manage.
+      DEBUG: "true"
+    volumes:
+      - netbox_config:/etc/netbox/config:rw
+      # Init scripts: API token + custom field. See lab/netbox/init/*.
+      - ./lab/netbox/init:/opt/netbox/startup_scripts:ro
+    networks:
+      - netconsole
+    ports:
+      - "127.0.0.1:8001:8080"
+    healthcheck:
+      # NetBox health endpoint
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
