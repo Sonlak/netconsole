@@ -277,6 +277,10 @@ services:
       # Port 8080 chosen because 8001 is occupied by kea-primary.
       NETBOX_URL: "http://42.119.165.109:8080/api/"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+      # Management prefix for IPAM sync. Creates /24 prefix in NetBox IPAM
+      # and populates primary_ip4 on each device. Change to match your lab subnet.
+      # Leave empty to skip IPAM (management IPs stored in device description only).
+      NETBOX_MANAGEMENT_PREFIX: "10.10.20.0/24"
     networks:
       netconsole:
         ipv4_address: 172.31.0.4

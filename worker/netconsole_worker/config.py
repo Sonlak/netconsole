@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     # Leave both empty to disable the sync (it will fail jobs gracefully).
     netbox_url: str = ""
     netbox_token: str = ""
+    # Management IP prefix for IPAM sync. Example: "10.10.20.0/24".
+    # If set, the sync task creates this prefix in NetBox's IPAM (if missing)
+    # and populates primary_ip4 on each device. If empty, IPAM is skipped
+    # and management IPs are stored in the device description field only.
+    netbox_management_prefix: str = ""
 
 
 settings = Settings()

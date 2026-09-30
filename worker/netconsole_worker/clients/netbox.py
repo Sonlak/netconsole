@@ -421,6 +421,39 @@ class NetBoxClient:
         )
         payload["tags"] = [tag_id]
 
+        # Phase 2 IPAM: populate primary_ip4 if management_ip is available
+        # and a management prefix is configured via NETBOX_MANAGEMENT_PREFIX.
+        # This creates the prefix + IP entry in NetBox IPAM, then links it
+        # to the device. Falls back gracefully (logs warning, skips IPAM)
+        # if the prefix is not configured or IP creation fails.
+        if management_ip and settings.netbox_management_prefix:
+            try:
+                prefix_id = self.get_or_create_prefix(
+                    settings.netbox_management_prefix,
+                    site_id,
+                    description="Management subnet — synced from NetConsole",
+                )
+                nb_ip = self.get_or_create_ip_address(
+                    management_ip,
+                    prefix_id,
+                    description=f"Management IP for {name} — synced from NetConsole",
+                )
+                payload["primary_ip4"] = nb_ip["id"]
+                logger.info(
+                    "netbox: linked %s as primary_ip4 on device '%s' (IP id=%d, prefix id=%d)",
+                    management_ip, name, nb_ip["id"], prefix_id,
+                )
+            except NetBoxError as exc:
+                # Non-fatal: log and continue without primary_ip4
+                logger.warning(
+                    "netbox: IPAM link failed for '%s' (%s), storing in description: %s",
+                    name, management_ip, exc,
+                )
+                # Ensure mgmt IP is at least in description as fallback
+                desc = payload.get("description") or ""
+                if f"mgmt: {management_ip}" not in desc:
+                    payload["description"] = f"mgmt: {management_ip}" + (" | " + desc if desc else "")
+
         if target_id is not None:
             # Update existing — PATCH only the fields we own
             # NetBox returns the full updated object on PATCH
@@ -439,19 +472,81 @@ class NetBoxClient:
         )
         return created, True
 
-    def resolve_ip_address(self, address: str) -> int | None:
-        """Resolve an IP address string (with or without /prefix) to a NetBox ip-address id.
-
-        If the address already exists, returns its id. If not, returns None
-        (Phase 2 / IPAM sync is responsible for creating it).
-        """
-        if not address:
-            return None
-        result = self.get("/ipam/ip-addresses/", params={"address": address})
+    # ------------------------------------------------------------------
+    # IPAM helpers — Phase 2: populate primary_ip4 on devices
+    # ------------------------------------------------------------------
+    def find_prefix(self, prefix: str) -> dict[str, Any] | None:
+        """Return the prefix object if it exists, else None."""
+        result = self.get("/ipam/prefixes/", params={"prefix": prefix})
         results = result.get("results", [])
-        if results:
-            return results[0]["id"]
-        return None
+        return results[0] if results else None
+
+    def get_or_create_prefix(
+        self,
+        prefix: str,
+        site_id: int,
+        *,
+        description: str = "",
+    ) -> int:
+        """Return the prefix id. Creates it (in the site) if missing.
+
+        The prefix is looked up by its CIDR string (e.g. "10.10.20.0/24").
+        If not found, we create it under the given site and mark it "active".
+        """
+        p = self.find_prefix(prefix)
+        if p:
+            return p["id"]
+        # Derive a slug from the prefix string. NetBox slugs must be
+        # alphanumeric + hyphens, max 50 chars. "10.10.20.0/24" → "10-10-20-0-24"
+        slug = prefix.replace("/", "-").replace(".", "-")[:50]
+        created = self.post("/ipam/prefixes/", json={
+            "prefix": prefix,
+            "site": site_id,
+            "status": "active",
+            "description": description or f"Management subnet — synced from NetConsole",
+        })
+        logger.info("netbox: created prefix '%s' (id=%d) in site %d", prefix, created["id"], site_id)
+        return created["id"]
+
+    def find_ip_address(self, address: str) -> dict[str, Any] | None:
+        """Look up an IP address by its address string (e.g. "10.10.20.131/24")."""
+        # Strip /prefix if present for the lookup
+        addr = address.split("/")[0]
+        result = self.get("/ipam/ip-addresses/", params={"address": addr})
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    def get_or_create_ip_address(
+        self,
+        address: str,
+        prefix_id: int,
+        *,
+        description: str = "",
+        status: str = "active",
+    ) -> dict[str, Any]:
+        """Create or return an existing IP address in NetBox IPAM.
+
+        Returns the NetBox ip-address object (with its "id" field).
+        The caller uses the id to link it to a device via primary_ip4.
+        """
+        # Normalise: ensure /32 for single IPs without prefix
+        addr = address.split("/")[0]
+        if "/" not in address:
+            addr = f"{addr}/32"
+
+        existing = self.find_ip_address(addr)
+        if existing:
+            logger.debug("netbox: IP address '%s' already exists (id=%d)", addr, existing["id"])
+            return existing
+
+        created = self.post("/ipam/ip-addresses/", json={
+            "address": addr,
+            "prefix": prefix_id,
+            "status": status,
+            "description": description or "Management IP — synced from NetConsole",
+        })
+        logger.info("netbox: created IP address '%s' (id=%d)", addr, created["id"])
+        return created
 
     # ------------------------------------------------------------------
     # Health check — used by the sync task to verify connectivity
