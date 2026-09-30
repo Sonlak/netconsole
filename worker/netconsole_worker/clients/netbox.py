@@ -417,7 +417,7 @@ class NetBoxClient:
                 "prefix": prefix,
                 "site": site_id,
                 "status": status,
-                "description": f"Synced from NetConsole",
+                "description": "Synced from NetConsole",
             })
             logger.info("netbox: created prefix '%s' (id=%d)", prefix, created["id"])
             return created["id"]
@@ -457,7 +457,7 @@ class NetBoxClient:
     def _find_mgmt_interface(self, device_id: int, vendor: str) -> dict[str, Any] | None:
         """Find a management interface on a device by name pattern."""
         name_patterns = ["mgmt", "mgmt0", "management", "management0", "fxp0", "em0", "ge-0/0/0"]
-        result = self.get(f"/dcim/interfaces/", params={"device_id": device_id, "limit": 50})
+        result = self.get("/dcim/interfaces/", params={"device_id": device_id, "limit": 50})
         for iface in result.get("results", []):
             name = iface.get("name", "").lower()
             for pat in name_patterns:
@@ -473,7 +473,7 @@ class NetBoxClient:
         interface_type: str = "other",
     ) -> int | None:
         """Return the interface id, creating it with minimal config if missing."""
-        result = self.get(f"/dcim/interfaces/", params={
+        result = self.get("/dcim/interfaces/", params={
             "device_id": device_id,
             "name": name,
         })
