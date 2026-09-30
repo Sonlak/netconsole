@@ -73,7 +73,7 @@ services:
       retries: 10
 
   netbox:
-    image: netboxcommunity/netbox:v4.6.10-5.0.2
+    image: netboxcommunity/netbox:v4.6.2-Docker-4.6.2
     container_name: netbox-netbox
     restart: unless-stopped
     depends_on:

@@ -37,6 +37,9 @@ class NetBoxError(Exception):
 
 
 class NetBoxClient:
+    # NetBox API base path
+    API = "/api"
+
     def __init__(
         self,
         url: str | None = None,
@@ -339,6 +342,183 @@ class NetBoxClient:
         return created["id"]
 
     # ------------------------------------------------------------------
+    # Platform helpers — map NetConsole vendor → NetBox platform
+    # ------------------------------------------------------------------
+    # Canonical slug→display-name map. NetBox platforms use slug as the
+    # lookup key (case-insensitive). We normalise vendor to lowercase slug
+    # before matching so "Cisco", "CISCO", "cisco" all hit the same entry.
+    _PLATFORM_MAP: dict[str, str] = {
+        "juniper": "juniper-junos",
+        "cisco": "cisco-ios-xe",
+        "arista": "arista-eos",
+        "aruba": "aruba-os",
+        "hp": "hp-procurve",
+        "huawei": "huawei-vrp",
+        "dell": "dell-os10",
+        "vyos": "vyos",
+        "linux": "linux",
+        "ubuntu": "linux",
+        "centos": "linux",
+        "freebsd": "freebsd",
+    }
+
+    def _vendor_to_platform_slug(self, vendor: str) -> str | None:
+        """Return the NetBox platform slug for a vendor name, or None if unknown."""
+        key = vendor.strip().lower() if vendor else ""
+        return self._PLATFORM_MAP.get(key)
+
+    def find_platform(self, slug: str) -> dict[str, Any] | None:
+        result = self.get("/dcim/platforms/", params={"slug": slug})
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    def get_or_create_platform(self, slug: str, name: str) -> int | None:
+        """Return the platform id for a NetBox slug, creating it if missing."""
+        plat = self.find_platform(slug)
+        if plat:
+            return plat["id"]
+        try:
+            created = self.post("/dcim/platforms/", json={
+                "name": name,
+                "slug": slug,
+            })
+            logger.info("netbox: created platform '%s' (id=%d)", slug, created["id"])
+            return created["id"]
+        except NetBoxError as exc:
+            logger.warning("netbox: failed to create platform '%s': %s", slug, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # IPAM helpers — prefixes, IP addresses, interface assignment
+    # ------------------------------------------------------------------
+
+    def _ip_to_prefix_24(self, ip: str) -> str | None:
+        """Derive a /24 prefix from an IP, e.g. '10.10.20.131' → '10.10.20.0/24'."""
+        parts = ip.strip().split(".")
+        if len(parts) != 4:
+            return None
+        try:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        except (ValueError, IndexError):
+            return None
+
+    def find_prefix(self, prefix: str) -> dict[str, Any] | None:
+        result = self.get("/ipam/prefixes/", params={"prefix": prefix})
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    def get_or_create_prefix(self, prefix: str, site_id: int, status: str = "active") -> int | None:
+        """Return the prefix id, creating it if missing."""
+        pfx = self.find_prefix(prefix)
+        if pfx:
+            return pfx["id"]
+        try:
+            created = self.post("/ipam/prefixes/", json={
+                "prefix": prefix,
+                "site": site_id,
+                "status": status,
+                "description": f"Synced from NetConsole",
+            })
+            logger.info("netbox: created prefix '%s' (id=%d)", prefix, created["id"])
+            return created["id"]
+        except NetBoxError as exc:
+            logger.warning("netbox: failed to create prefix '%s': %s", prefix, exc)
+            return None
+
+    def find_ip_address(self, address: str) -> dict[str, Any] | None:
+        """Look up an IP address by its 'x.x.x.x/N' representation."""
+        result = self.get("/ipam/ip-addresses/", params={"address": address})
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    def get_or_create_ip_address(
+        self,
+        address: str,
+        prefix_id: int,
+        status: str = "active",
+    ) -> dict[str, Any] | None:
+        """Return the IP address dict (with 'id'), creating it if missing."""
+        ip = self.find_ip_address(address)
+        if ip:
+            return ip
+        try:
+            created = self.post("/ipam/ip-addresses/", json={
+                "address": address,
+                "prefix": prefix_id,
+                "status": status,
+                "description": "Management IP — synced from NetConsole",
+            })
+            logger.info("netbox: created IP address '%s' (id=%d)", address, created["id"])
+            return created
+        except NetBoxError as exc:
+            logger.warning("netbox: failed to create IP '%s': %s", address, exc)
+            return None
+
+    def _find_mgmt_interface(self, device_id: int, vendor: str) -> dict[str, Any] | None:
+        """Find a management interface on a device by name pattern."""
+        name_patterns = ["mgmt", "mgmt0", "management", "management0", "fxp0", "em0", "ge-0/0/0"]
+        result = self.get(f"/dcim/interfaces/", params={"device_id": device_id, "limit": 50})
+        for iface in result.get("results", []):
+            name = iface.get("name", "").lower()
+            for pat in name_patterns:
+                if pat in name:
+                    return iface
+        return None
+
+    def _get_or_create_interface(
+        self,
+        device_id: int,
+        device_name: str,
+        name: str,
+        interface_type: str = "other",
+    ) -> int | None:
+        """Return the interface id, creating it with minimal config if missing."""
+        result = self.get(f"/dcim/interfaces/", params={
+            "device_id": device_id,
+            "name": name,
+        })
+        results = result.get("results", [])
+        if results:
+            return results[0]["id"]
+        try:
+            created = self.post("/dcim/interfaces/", json={
+                "device": device_id,
+                "name": name,
+                "type": interface_type,
+                "enabled": True,
+            })
+            logger.info(
+                "netbox: created interface '%s' on device '%s' (id=%d)",
+                name, device_name, created["id"],
+            )
+            return created["id"]
+        except NetBoxError as exc:
+            logger.warning(
+                "netbox: failed to create interface '%s' on device '%s': %s",
+                name, device_name, exc,
+            )
+            return None
+
+    def assign_ip_to_interface(
+        self,
+        ip_id: int,
+        interface_id: int,
+        device_id: int,
+    ) -> bool:
+        """Assign an IP address to an interface. Returns True on success."""
+        try:
+            self.post(f"/ipam/ip-addresses/{ip_id}/", json={
+                "interface": interface_id,
+            })
+            return True
+        except NetBoxError as exc:
+            logger.warning(
+                "netbox: failed to assign IP %d to interface %d: %s",
+                ip_id, interface_id, exc,
+            )
+            return False
+
+    # ------------------------------------------------------------------
     # Device helpers — the core of Phase 1 sync
     # ------------------------------------------------------------------
     def find_device_by_netconsole_id(self, netconsole_id: str) -> dict[str, Any] | None:
@@ -366,22 +546,17 @@ class NetBoxClient:
         status: str,
         vendor: str,
         description: str | None = None,
-        management_ip: str | None = None,
+        primary_ip4: str | None = None,
+        platform_id: int | None = None,
         version: str | None = None,
     ) -> dict[str, Any]:
         """Build the NetBox device upsert payload (used for both POST and PATCH).
 
-        Phase 1 (device inventory) intentionally does NOT set primary_ip4 or
-        oob_ip here. Both fields require a reference to an existing IP object
-        in the IPAM table (id or address dict), not a plain string. Trying
-        to pass "10.10.20.131" directly results in:
-
-          400: primary_ip4: Received an unrecognized value: 10.10.20.131
-
-        IPAM sync (Phase 2) will create the IP entries first, then link
-        them to the device. For now, the management IP is stored in the
-        `description` field with a "mgmt: " prefix so operators can still
-        see it on the NetBox device page.
+        - primary_ip4: passed as a CIDR string (e.g. "10.10.20.131/32").
+          NetBox v4 accepts this and auto-creates the IPAM entry.
+        - platform: set to the OS platform (e.g. Juniper Junos, Cisco IOS-XE).
+        - version: stored in a custom field, not description.
+        - description: kept clean — just the operator-supplied description.
         """
         payload: dict[str, Any] = {
             "name": name,
@@ -395,18 +570,14 @@ class NetBoxClient:
                 "netconsole_id": netconsole_id,
             },
         }
-        # Combine description and mgmt IP into one description string.
-        # The IP goes in a stable "mgmt: <ip>" prefix so phase 2 can
-        # parse it back out.
-        desc_parts = []
         if description:
-            desc_parts.append(description)
+            payload["description"] = description
+        if primary_ip4:
+            payload["primary_ip4"] = {"address": primary_ip4}
+        if platform_id is not None:
+            payload["platform"] = platform_id
         if version:
-            desc_parts.append(f"OS version: {version}")
-        if management_ip:
-            desc_parts.append(f"mgmt: {management_ip}")
-        if desc_parts:
-            payload["description"] = " | ".join(desc_parts)
+            payload["custom_fields"]["os_version"] = version
         return payload
 
     def _map_status(self, netconsole_status: str) -> str:
@@ -443,6 +614,10 @@ class NetBoxClient:
           2. `netconsole_id` custom field — used as the canonical external key
           3. `serial` — fallback for devices created before the custom field existed
 
+        On creation/update, the management IP is set as `primary_ip4` (NetBox
+        v4 auto-creates the IPAM entry from the CIDR string). The OS version
+        is stored in custom field `os_version`.
+
         Returns the NetBox device dict and a boolean `created` indicating whether
         it was newly created (vs updated).
         """
@@ -463,9 +638,20 @@ class NetBoxClient:
         site_id = self.get_or_create_site(site, netconsole_id)
         mfg_id = self.get_or_create_manufacturer(vendor)
         dt_id = self.get_or_create_device_type(model, mfg_id, part_number)
-        # Default role: "network" for switches/routers, "other" otherwise
         role_name = "Network" if vendor.lower() in ("juniper", "cisco", "arista", "aruba", "hp") else "Other"
         role_id = self.get_or_create_device_role(role_name)
+
+        # Resolve platform from vendor slug
+        platform_id: int | None = None
+        platform_slug = self._vendor_to_platform_slug(vendor)
+        if platform_slug:
+            platform_id = self.get_or_create_platform(platform_slug, platform_slug.replace("-", " ").title())
+
+        # Derive primary_ip4 as CIDR string from management IP
+        primary_ip4: str | None = None
+        if management_ip:
+            # Accept both plain IP ("10.10.20.131") and CIDR ("10.10.20.131/32")
+            primary_ip4 = management_ip if "/" in management_ip else f"{management_ip}/32"
 
         payload = self._build_device_payload(
             site_id=site_id,
@@ -477,54 +663,24 @@ class NetBoxClient:
             status=status,
             vendor=vendor,
             description=description,
-            management_ip=management_ip,
+            primary_ip4=primary_ip4,
+            platform_id=platform_id,
             version=version,
         )
         payload["tags"] = [tag_id]
 
-        # Store the management IP in two places:
-        # 1. Description (always) — always visible on the device detail page.
-        # 2. Custom field 'management_ip' — visible in the device list table
-        #    and on the detail page without touching NetBox IPAM.
-        #
-        # We deliberately do NOT create IPAM entries (prefixes, IP objects,
-        # interface assignment, primary_ip4). IPAM linking must be done
-        # manually after the device is confirmed in NetBox.
-        if management_ip:
-            desc = payload.get("description") or ""
-            ip_marker = f"mgmt: {management_ip}"
-            if ip_marker not in desc:
-                payload["description"] = ip_marker + (" | " + desc if desc else "")
-
-            # Best-effort: ensure the custom field exists and write to it.
-            # The field is cached after first creation, so subsequent syncs
-            # only set the value without extra API calls.
-            cf_id = self.ensure_custom_field(
-                "management_ip",
-                "Management IP",
-                "type:text",
-                "dcim.device",
-                description="Management IP — synced from NetConsole",
-            )
-            if cf_id is not None:
-                payload.setdefault("custom_fields", {})
-                payload["custom_fields"]["management_ip"] = management_ip
-
         if target_id is not None:
-            # Update existing — PATCH only the fields we own
-            # NetBox returns the full updated object on PATCH
             updated = self.patch(f"/dcim/devices/{target_id}/", json=payload)
             logger.info(
-                "netbox: updated device '%s' (id=%d, netconsole_id=%s)",
-                name, target_id, netconsole_id,
+                "netbox: updated device '%s' (id=%d, netconsole_id=%s, primary_ip4=%s)",
+                name, target_id, netconsole_id, primary_ip4,
             )
             return updated, False
 
-        # Create new
         created = self.post("/dcim/devices/", json=payload)
         logger.info(
-            "netbox: created device '%s' (id=%d, netconsole_id=%s)",
-            name, created["id"], netconsole_id,
+            "netbox: created device '%s' (id=%d, netconsole_id=%s, primary_ip4=%s)",
+            name, created["id"], netconsole_id, primary_ip4,
         )
         return created, True
 

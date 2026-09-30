@@ -89,6 +89,24 @@ def main() -> None:
             field.object_types.add(device_ot)
         print("[netbox-init] custom field 'netconsole_id' already exists")
 
+    # 2b. Custom field `os_version` on dcim.Device — stores the device OS version
+    #     (e.g. "18.4R1.5", "15.5(3)M2") synced from NetConsole.
+    field_os, created = CustomField.objects.get_or_create(
+        name="os_version",
+        defaults={
+            "type": "text",
+            "label": "OS Version",
+            "description": "Device OS version string (e.g. 18.4R1.5) — synced from NetConsole.",
+        },
+    )
+    if created:
+        field_os.object_types.add(device_ot)
+        print("[netbox-init] created custom field 'os_version' on dcim.device")
+    else:
+        if not field_os.object_types.filter(id=device_ot.id).exists():
+            field_os.object_types.add(device_ot)
+        print("[netbox-init] custom field 'os_version' already exists")
+
     # 3. Tag — for filter-by-source in the NetBox UI. NetBox tag names
     # cannot contain spaces.
     tag, created = Tag.objects.get_or_create(
