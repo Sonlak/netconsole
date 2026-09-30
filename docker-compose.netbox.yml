@@ -4,8 +4,8 @@
 #
 # Usage:
 #   docker compose -f docker-compose.app.yml -f docker-compose.netbox.yml up -d
-#   # wait ~30s for first boot + migrations, then NetBox is at:
-#   #   http://localhost:8001  (host port, admin / Admin@123)
+#   # wait ~60s for first boot + migrations, then NetBox is at:
+#   #   http://localhost:8080  (host port, admin / Admin@123)
 #   #   http://netbox-netbox:8080/api/  (in-network, used by worker)
 #
 # Admin login: admin / Admin@123  (set in env below)
@@ -73,7 +73,7 @@ services:
       retries: 10
 
   netbox:
-    image: netboxcommunity/netbox:v4.0-2.9.0
+    image: netboxcommunity/netbox:v4.6.2-4.6.2
     container_name: netbox-netbox
     restart: unless-stopped
     depends_on:
