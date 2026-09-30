@@ -1,0 +1,21 @@
+[project]
+name = "netconsole"
+version = "0.0.0"
+description = "NetConsole — Network Operations Console for TAI LOC BANK"
+
+[tool.ruff]
+# Exclude directories that are part of the repo but not the core project:
+#   scripts/  — local VPS-ops scripts (run directly, not imported)
+#   lab/      — containerlab / development lab fixtures
+#   .tmp-cfg/ — agent scratch files (gitignored, but belt-and-suspenders)
+exclude = [
+    "scripts/",
+    "lab/",
+    ".tmp-cfg/",
+]
+
+[tool.ruff.lint]
+# Only check the core worker code; lab and script files are excluded above.
+# E402 (module-level import not at top of file) is excluded because
+# some scripts intentionally open credentials before imports.
+ignore = ["E402"]

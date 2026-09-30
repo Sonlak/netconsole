@@ -20,8 +20,8 @@ field with no associated content types, which surfaces downstream as
 worker POSTs a device. Always use `object_types` on v4.x.
 """
 
-import os
 import sys
+from typing import Any
 
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType

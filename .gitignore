@@ -145,6 +145,9 @@ agent-tools/*.json
 # Worker scratch probe / debug files (same convention)
 worker/_*.py
 
+# Cursor/agent scratch helpers (exploration scripts, probes, dumps)
+.tmp-cfg/
+
 # Cache directories
 .ruff_cache/
 worker/.ruff_cache/

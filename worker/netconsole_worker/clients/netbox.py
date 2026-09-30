@@ -26,6 +26,11 @@ from netconsole_worker.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for custom field IDs — avoids repeated lookups per sync.
+# Keyed by (name, object_type) so the same field attached to different models
+# gets separate cache entries.
+_cf_cache: dict[tuple[str, str], int] = {}
+
 
 class NetBoxError(Exception):
     """Raised when the NetBox API returns a non-2xx status we can't handle."""
@@ -152,6 +157,62 @@ class NetBoxClient:
             "description": description,
         })
         return created["id"]
+
+    def ensure_custom_field(
+        self,
+        name: str,
+        label: str,
+        type_str: str,
+        object_type: str,
+        *,
+        description: str = "",
+        weight: int = 100,
+    ) -> int | None:
+        """Idempotently create a custom field; return its id, or None on failure.
+
+        Uses a module-level cache keyed by (name, object_type) to avoid
+        redundant lookups on every device sync.
+        """
+        cache_key = (name, object_type)
+        if cache_key in _cf_cache:
+            return _cf_cache[cache_key]
+
+        # Check if it already exists
+        try:
+            result = self.get("/extras/custom-fields/", params={"name": name})
+            for cf in result.get("results", []):
+                if cf.get("name") != name:
+                    continue
+                obj_types = [str(t) for t in cf.get("object_types", [])]
+                if any(object_type in t for t in obj_types):
+                    _cf_cache[cache_key] = cf["id"]
+                    logger.debug(
+                        "netbox: custom field '%s' already exists (id=%d)",
+                        name, cf["id"],
+                    )
+                    return cf["id"]
+        except NetBoxError:
+            pass  # fall through to create
+
+        try:
+            created = self.post("/extras/custom-fields/", json={
+                "name": name,
+                "label": label,
+                "type": type_str,
+                "object_types": [object_type],
+                "required": False,
+                "weight": weight,
+                "description": description or f"{label} — synced from NetConsole",
+            })
+            logger.info(
+                "netbox: created custom field '%s' (id=%d) on %s",
+                name, created["id"], object_type,
+            )
+            _cf_cache[cache_key] = created["id"]
+            return created["id"]
+        except NetBoxError as exc:
+            logger.warning("netbox: failed to create custom field '%s': %s", name, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Site helpers
@@ -421,63 +482,33 @@ class NetBoxClient:
         )
         payload["tags"] = [tag_id]
 
-        # Phase 2 IPAM: populate primary_ip4 if management_ip is available
-        # and a management prefix is configured via NETBOX_MANAGEMENT_PREFIX.
-        # Flow:
-        #   1. Create / get the /24 prefix in NetBox IPAM
-        #   2. Create / get the IP address entry in NetBox IPAM
-        #   3. Assign the IP to the device's management interface
-        #   4. Set primary_ip4 on the device
-        # If any step fails, we fall back gracefully to storing the IP in the
-        # description field only.
-        ip_linked = False
-        if management_ip and settings.netbox_management_prefix:
-            try:
-                prefix_id = self.get_or_create_prefix(
-                    settings.netbox_management_prefix,
-                    site_id,
-                    description="Management subnet — synced from NetConsole",
-                )
-                nb_ip = self.get_or_create_ip_address(
-                    management_ip,
-                    prefix_id,
-                    description=f"Management IP for {name} — synced from NetConsole",
-                )
-                ip_id = nb_ip["id"]
-
-                # NetBox requires the IP to be assigned to an interface before
-                # it can be set as primary_ip4. We use a "Management" interface.
-                # get_or_create_management_interface returns the existing interface
-                # if one already exists on the device.
-                assigned = False
-                if target_id is not None:
-                    assigned = self.assign_ip_to_interface(ip_id, target_id, name)
-
-                if assigned:
-                    payload["primary_ip4"] = ip_id
-                    logger.info(
-                        "netbox: primary_ip4 set on device '%s': IP id=%d, prefix id=%d",
-                        name, ip_id, prefix_id,
-                    )
-                    ip_linked = True
-                else:
-                    logger.warning(
-                        "netbox: could not assign IP to interface, storing in description instead: %s",
-                        name,
-                    )
-            except NetBoxError as exc:
-                # Non-fatal: log and continue without primary_ip4
-                logger.warning(
-                    "netbox: IPAM link failed for '%s' (%s), storing in description: %s",
-                    name, management_ip, exc,
-                )
-
-        # Ensure mgmt IP is at least in description as fallback
-        if management_ip and not ip_linked:
+        # Store the management IP in two places:
+        # 1. Description (always) — always visible on the device detail page.
+        # 2. Custom field 'management_ip' — visible in the device list table
+        #    and on the detail page without touching NetBox IPAM.
+        #
+        # We deliberately do NOT create IPAM entries (prefixes, IP objects,
+        # interface assignment, primary_ip4). IPAM linking must be done
+        # manually after the device is confirmed in NetBox.
+        if management_ip:
             desc = payload.get("description") or ""
             ip_marker = f"mgmt: {management_ip}"
             if ip_marker not in desc:
                 payload["description"] = ip_marker + (" | " + desc if desc else "")
+
+            # Best-effort: ensure the custom field exists and write to it.
+            # The field is cached after first creation, so subsequent syncs
+            # only set the value without extra API calls.
+            cf_id = self.ensure_custom_field(
+                "management_ip",
+                "Management IP",
+                "type:text",
+                "dcim.device",
+                description="Management IP — synced from NetConsole",
+            )
+            if cf_id is not None:
+                payload.setdefault("custom_fields", {})
+                payload["custom_fields"]["management_ip"] = management_ip
 
         if target_id is not None:
             # Update existing — PATCH only the fields we own
@@ -496,146 +527,6 @@ class NetBoxClient:
             name, created["id"], netconsole_id,
         )
         return created, True
-
-    # ------------------------------------------------------------------
-    # IPAM helpers — Phase 2: populate primary_ip4 on devices
-    # ------------------------------------------------------------------
-    def find_prefix(self, prefix: str) -> dict[str, Any] | None:
-        """Return the prefix object if it exists, else None."""
-        result = self.get("/ipam/prefixes/", params={"prefix": prefix})
-        results = result.get("results", [])
-        return results[0] if results else None
-
-    def get_or_create_prefix(
-        self,
-        prefix: str,
-        site_id: int,
-        *,
-        description: str = "",
-    ) -> int:
-        """Return the prefix id. Creates it (in the site) if missing.
-
-        The prefix is looked up by its CIDR string (e.g. "10.10.20.0/24").
-        If not found, we create it under the given site and mark it "active".
-        """
-        p = self.find_prefix(prefix)
-        if p:
-            return p["id"]
-        # Derive a slug from the prefix string. NetBox slugs must be
-        # alphanumeric + hyphens, max 50 chars. "10.10.20.0/24" → "10-10-20-0-24"
-        slug = prefix.replace("/", "-").replace(".", "-")[:50]
-        created = self.post("/ipam/prefixes/", json={
-            "prefix": prefix,
-            "site": site_id,
-            "status": "active",
-            "description": description or f"Management subnet — synced from NetConsole",
-        })
-        logger.info("netbox: created prefix '%s' (id=%d) in site %d", prefix, created["id"], site_id)
-        return created["id"]
-
-    def find_ip_address(self, address: str) -> dict[str, Any] | None:
-        """Look up an IP address by its address string (e.g. "10.10.20.131/24")."""
-        # Strip /prefix if present for the lookup
-        addr = address.split("/")[0]
-        result = self.get("/ipam/ip-addresses/", params={"address": addr})
-        results = result.get("results", [])
-        return results[0] if results else None
-
-    def get_or_create_ip_address(
-        self,
-        address: str,
-        prefix_id: int,
-        *,
-        description: str = "",
-        status: str = "active",
-    ) -> dict[str, Any]:
-        """Create or return an existing IP address in NetBox IPAM.
-
-        Returns the NetBox ip-address object (with its "id" field).
-        The caller uses the id to link it to a device via primary_ip4.
-        """
-        # Normalise: ensure /32 for single IPs without prefix
-        addr = address.split("/")[0]
-        if "/" not in address:
-            addr = f"{addr}/32"
-
-        existing = self.find_ip_address(addr)
-        if existing:
-            logger.debug("netbox: IP address '%s' already exists (id=%d)", addr, existing["id"])
-            return existing
-
-        created = self.post("/ipam/ip-addresses/", json={
-            "address": addr,
-            "prefix": prefix_id,
-            "status": status,
-            "description": description or "Management IP — synced from NetConsole",
-        })
-        logger.info("netbox: created IP address '%s' (id=%d)", addr, created["id"])
-        return created
-
-    # ------------------------------------------------------------------
-    # Interface helpers — needed to link IP addresses to devices
-    # NetBox requires IPs to be assigned to an interface before they can be
-    # set as primary_ip4. We use the dcim.interfaces endpoint for this.
-    # ------------------------------------------------------------------
-    def _find_management_interface(self, device_id: int) -> dict[str, Any] | None:
-        """Look for a management interface on the device (name='Management' or 'mgmt0')."""
-        result = self.get(f"/dcim/devices/{device_id}/interfaces/", params={"limit": 50})
-        results = result.get("results", [])
-        for iface in results:
-            name_lower = iface.get("name", "").lower()
-            if name_lower in ("management", "mgmt0", "mgmt", "oob", "management0"):
-                return iface
-        return None
-
-    def get_or_create_management_interface(
-        self,
-        device_id: int,
-        device_name: str,
-    ) -> dict[str, Any]:
-        """Return the management interface for the device, creating it if missing.
-
-        Creates an interface named 'Management' with type='other' if none exists.
-        """
-        existing = self._find_management_interface(device_id)
-        if existing:
-            return existing
-        created = self.post(f"/dcim/devices/{device_id}/interfaces/", json={
-            "name": "Management",
-            "type": "other",
-            "enabled": True,
-            "description": f"Management interface for {device_name} — synced from NetConsole",
-        })
-        logger.info("netbox: created management interface on device %d (%s)", device_id, device_name)
-        return created
-
-    def assign_ip_to_interface(
-        self,
-        ip_id: int,
-        device_id: int,
-        device_name: str,
-    ) -> bool:
-        """Assign an IP address to the device's management interface.
-
-        NetBox requires IPs to be assigned to an interface before they can be
-        set as primary_ip4. Returns True on success, False on failure (non-fatal).
-        """
-        try:
-            iface = self.get_or_create_management_interface(device_id, device_name)
-            iface_id = iface["id"]
-            # POST to the interface's ip-addresses endpoint to assign the IP
-            self.post(f"/dcim/interfaces/{iface_id}/ip-addresses/", json={"id": ip_id})
-            logger.info(
-                "netbox: assigned IP id=%d to interface '%s' (id=%d) on device '%s'",
-                ip_id, iface["name"], iface_id, device_name,
-            )
-            return True
-        except NetBoxError as exc:
-            logger.warning(
-                "netbox: could not assign IP id=%d to device '%s' interface: %s",
-                ip_id, device_name, exc,
-            )
-            return False
 
     # ------------------------------------------------------------------
     # Health check — used by the sync task to verify connectivity
