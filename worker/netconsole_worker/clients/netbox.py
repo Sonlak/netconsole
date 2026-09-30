@@ -423,9 +423,14 @@ class NetBoxClient:
 
         # Phase 2 IPAM: populate primary_ip4 if management_ip is available
         # and a management prefix is configured via NETBOX_MANAGEMENT_PREFIX.
-        # This creates the prefix + IP entry in NetBox IPAM, then links it
-        # to the device. Falls back gracefully (logs warning, skips IPAM)
-        # if the prefix is not configured or IP creation fails.
+        # Flow:
+        #   1. Create / get the /24 prefix in NetBox IPAM
+        #   2. Create / get the IP address entry in NetBox IPAM
+        #   3. Assign the IP to the device's management interface
+        #   4. Set primary_ip4 on the device
+        # If any step fails, we fall back gracefully to storing the IP in the
+        # description field only.
+        ip_linked = False
         if management_ip and settings.netbox_management_prefix:
             try:
                 prefix_id = self.get_or_create_prefix(
@@ -438,21 +443,41 @@ class NetBoxClient:
                     prefix_id,
                     description=f"Management IP for {name} — synced from NetConsole",
                 )
-                payload["primary_ip4"] = nb_ip["id"]
-                logger.info(
-                    "netbox: linked %s as primary_ip4 on device '%s' (IP id=%d, prefix id=%d)",
-                    management_ip, name, nb_ip["id"], prefix_id,
-                )
+                ip_id = nb_ip["id"]
+
+                # NetBox requires the IP to be assigned to an interface before
+                # it can be set as primary_ip4. We use a "Management" interface.
+                # get_or_create_management_interface returns the existing interface
+                # if one already exists on the device.
+                assigned = False
+                if target_id is not None:
+                    assigned = self.assign_ip_to_interface(ip_id, target_id, name)
+
+                if assigned:
+                    payload["primary_ip4"] = ip_id
+                    logger.info(
+                        "netbox: primary_ip4 set on device '%s': IP id=%d, prefix id=%d",
+                        name, ip_id, prefix_id,
+                    )
+                    ip_linked = True
+                else:
+                    logger.warning(
+                        "netbox: could not assign IP to interface, storing in description instead: %s",
+                        name,
+                    )
             except NetBoxError as exc:
                 # Non-fatal: log and continue without primary_ip4
                 logger.warning(
                     "netbox: IPAM link failed for '%s' (%s), storing in description: %s",
                     name, management_ip, exc,
                 )
-                # Ensure mgmt IP is at least in description as fallback
-                desc = payload.get("description") or ""
-                if f"mgmt: {management_ip}" not in desc:
-                    payload["description"] = f"mgmt: {management_ip}" + (" | " + desc if desc else "")
+
+        # Ensure mgmt IP is at least in description as fallback
+        if management_ip and not ip_linked:
+            desc = payload.get("description") or ""
+            ip_marker = f"mgmt: {management_ip}"
+            if ip_marker not in desc:
+                payload["description"] = ip_marker + (" | " + desc if desc else "")
 
         if target_id is not None:
             # Update existing — PATCH only the fields we own
@@ -547,6 +572,70 @@ class NetBoxClient:
         })
         logger.info("netbox: created IP address '%s' (id=%d)", addr, created["id"])
         return created
+
+    # ------------------------------------------------------------------
+    # Interface helpers — needed to link IP addresses to devices
+    # NetBox requires IPs to be assigned to an interface before they can be
+    # set as primary_ip4. We use the dcim.interfaces endpoint for this.
+    # ------------------------------------------------------------------
+    def _find_management_interface(self, device_id: int) -> dict[str, Any] | None:
+        """Look for a management interface on the device (name='Management' or 'mgmt0')."""
+        result = self.get(f"/dcim/devices/{device_id}/interfaces/", params={"limit": 50})
+        results = result.get("results", [])
+        for iface in results:
+            name_lower = iface.get("name", "").lower()
+            if name_lower in ("management", "mgmt0", "mgmt", "oob", "management0"):
+                return iface
+        return None
+
+    def get_or_create_management_interface(
+        self,
+        device_id: int,
+        device_name: str,
+    ) -> dict[str, Any]:
+        """Return the management interface for the device, creating it if missing.
+
+        Creates an interface named 'Management' with type='other' if none exists.
+        """
+        existing = self._find_management_interface(device_id)
+        if existing:
+            return existing
+        created = self.post(f"/dcim/devices/{device_id}/interfaces/", json={
+            "name": "Management",
+            "type": "other",
+            "enabled": True,
+            "description": f"Management interface for {device_name} — synced from NetConsole",
+        })
+        logger.info("netbox: created management interface on device %d (%s)", device_id, device_name)
+        return created
+
+    def assign_ip_to_interface(
+        self,
+        ip_id: int,
+        device_id: int,
+        device_name: str,
+    ) -> bool:
+        """Assign an IP address to the device's management interface.
+
+        NetBox requires IPs to be assigned to an interface before they can be
+        set as primary_ip4. Returns True on success, False on failure (non-fatal).
+        """
+        try:
+            iface = self.get_or_create_management_interface(device_id, device_name)
+            iface_id = iface["id"]
+            # POST to the interface's ip-addresses endpoint to assign the IP
+            self.post(f"/dcim/interfaces/{iface_id}/ip-addresses/", json={"id": ip_id})
+            logger.info(
+                "netbox: assigned IP id=%d to interface '%s' (id=%d) on device '%s'",
+                ip_id, iface["name"], iface_id, device_name,
+            )
+            return True
+        except NetBoxError as exc:
+            logger.warning(
+                "netbox: could not assign IP id=%d to device '%s' interface: %s",
+                ip_id, device_name, exc,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Health check — used by the sync task to verify connectivity
