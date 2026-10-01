@@ -610,6 +610,12 @@ class NetBoxClient:
         results = result.get("results", [])
         return results[0] if results else None
 
+    def _find_device_by_ip(self, ip_id: int) -> dict[str, Any] | None:
+        """Find which device has the given IP as primary_ip4 (search by ip_address id)."""
+        result = self.get("/dcim/devices/", params={"primary_ip4": ip_id})
+        results = result.get("results", [])
+        return results[0] if results else None
+
     def _build_device_payload(
         self,
         site_id: int,
@@ -860,7 +866,7 @@ class NetBoxClient:
                             f"IP {cidr} is already assigned to device id={ip_device_id}; "
                             f"cannot share IP across devices — skipping primary_ip4 for '{name}'",
                         )
-                    # IP is either unassigned or assigned to our device — proceed below
+                    # IP is assigned to our device (or unassigned) — proceed below
                     mgmt_iface = self._find_mgmt_interface(device_id, vendor)
                     if mgmt_iface:
                         iface_id = mgmt_iface["id"]
@@ -887,27 +893,52 @@ class NetBoxClient:
                         "netbox: primary_ip4 set on device '%s': IP=%s (id=%d), interface=%s",
                         name, cidr, nb_ip["id"], iface_name,
                     )
-                else:
-                    # IP exists in IPAM but has no assigned_object — safe to assign
-                    mgmt_iface = self._find_mgmt_interface(device_id, vendor)
-                    if mgmt_iface:
-                        iface_id = mgmt_iface["id"]
-                        iface_name = mgmt_iface.get("name", "mgmt0")
-                    else:
-                        iface_id = self._get_or_create_interface(
-                            device_id, name, "mgmt0", interface_type="other",
+                elif nb_ip.get("assigned_object_id"):
+                    # IP has assigned_object_id but assigned_object is null (stale API
+                    # response or partially-assigned IP).  If it is assigned to a different
+                    # device, skip to avoid stealing it.
+                    if nb_ip["assigned_object_id"] != device_id:
+                        raise NetBoxError(
+                            f"IP {cidr} is already assigned to interface id={nb_ip['assigned_object_id']}; "
+                            f"cannot share IP across devices — skipping primary_ip4 for '{name}'",
                         )
-                        iface_name = "mgmt0"
-
+                    # Assigned to our device — assign interface and set primary
+                    mgmt_iface = self._find_mgmt_interface(device_id, vendor)
+                    iface_id = mgmt_iface["id"] if mgmt_iface else self._get_or_create_interface(
+                        device_id, name, "mgmt0", interface_type="other",
+                    )
+                    iface_name = mgmt_iface.get("name", "mgmt0") if mgmt_iface else "mgmt0"
                     if iface_id is None:
                         raise NetBoxError("could not find or create management interface")
-
                     if not self.assign_ip_to_interface(nb_ip["id"], iface_id, device_id):
                         raise NetBoxError(f"could not assign IP {cidr} to interface {iface_name}")
-
-                    self.patch(f"/dcim/devices/{device_id}/", json={
-                        "primary_ip4": nb_ip["id"],
-                    })
+                    self.patch(f"/dcim/devices/{device_id}/", json={"primary_ip4": nb_ip["id"]})
+                    logger.info(
+                        "netbox: primary_ip4 set on device '%s': IP=%s (id=%d), interface=%s",
+                        name, cidr, nb_ip["id"], iface_name,
+                    )
+                else:
+                    # IP exists in IPAM but has no interface assignment.
+                    # We need to check whether this IP is already the primary_ip4
+                    # of a DIFFERENT device — if so, we cannot use it here.
+                    # Iterate all devices to find if any device uses this IP as primary.
+                    # This is a last-resort safety check (expensive but correct).
+                    existing_device = self._find_device_by_ip(nb_ip["id"])
+                    if existing_device and existing_device["id"] != device_id:
+                        raise NetBoxError(
+                            f"IP {cidr} is already primary_ip4 of device '{existing_device.get('name')}' "
+                            f"(id={existing_device['id']}); cannot share IP — skipping primary_ip4 for '{name}'",
+                        )
+                    mgmt_iface = self._find_mgmt_interface(device_id, vendor)
+                    iface_id = mgmt_iface["id"] if mgmt_iface else self._get_or_create_interface(
+                        device_id, name, "mgmt0", interface_type="other",
+                    )
+                    iface_name = mgmt_iface.get("name", "mgmt0") if mgmt_iface else "mgmt0"
+                    if iface_id is None:
+                        raise NetBoxError("could not find or create management interface")
+                    if not self.assign_ip_to_interface(nb_ip["id"], iface_id, device_id):
+                        raise NetBoxError(f"could not assign IP {cidr} to interface {iface_name}")
+                    self.patch(f"/dcim/devices/{device_id}/", json={"primary_ip4": nb_ip["id"]})
                     logger.info(
                         "netbox: primary_ip4 set on device '%s': IP=%s (id=%d), interface=%s",
                         name, cidr, nb_ip["id"], iface_name,
