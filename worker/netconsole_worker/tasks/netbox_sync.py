@@ -6,11 +6,15 @@ gets all the existing queue/retry/audit infrastructure for free.
 
 Phase 1 scope (this task):
   - dcim.devices: name, device_type, role, site, serial, status,
-    description, custom_fields.netconsole_id, oob_ip
+    description, custom_fields.netconsole_id, rack, position (unit)
   - dcim.sites (auto-created if missing)
   - dcim.manufacturers (auto-created if missing)
   - dcim.device-types (auto-created if missing, model + part-number)
   - dcim.device-roles (auto-created if missing)
+  - dcim.racks (auto-created if missing, 42U)
+  - dcim.platforms: version string becomes the platform name (e.g. "18.4R1.5")
+    so operators can filter devices by exact OS release; falls back to the
+    canonical vendor→platform map when version is not set
   - tags: source-netconsole (created on first sync)
 
 Phase 2 (deferred): interfaces + IPAM. The task structure (separate
@@ -119,6 +123,8 @@ class NetboxSyncDeviceTask(BaseTask):
         management_ip = full_device.get("ip") or device.ip or None
         version = full_device.get("version") or None
         part_number = full_device.get("partNumber") or None
+        rack = full_device.get("rack") or None
+        unit = full_device.get("unit") or None
         existing_nb_id = full_device.get("netboxDeviceId") or None
 
         if not serial:
@@ -141,6 +147,8 @@ class NetboxSyncDeviceTask(BaseTask):
                 management_ip=management_ip,
                 version=version,
                 part_number=part_number,
+                rack=rack,
+                unit=unit,
                 existing_device_id=existing_nb_id,
             )
         except NetBoxError as exc:
@@ -260,6 +268,8 @@ class NetboxSyncAllTask(BaseTask):
             management_ip = dev.get("ip") or None
             version = dev.get("version") or None
             part_number = dev.get("partNumber") or None
+            rack = dev.get("rack") or None
+            unit = dev.get("unit") or None
             existing_nb_id = dev.get("netboxDeviceId") or None
 
             if not serial:
@@ -284,6 +294,8 @@ class NetboxSyncAllTask(BaseTask):
                     management_ip=management_ip,
                     version=version,
                     part_number=part_number,
+                    rack=rack,
+                    unit=unit,
                     existing_device_id=existing_nb_id,
                 )
                 if created:

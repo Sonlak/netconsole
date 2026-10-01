@@ -342,6 +342,68 @@ class NetBoxClient:
         return created["id"]
 
     # ------------------------------------------------------------------
+    # Rack helpers
+    # ------------------------------------------------------------------
+    # Default rack height in NetBox "U" units (42U is the industry standard).
+    DEFAULT_RACK_HEIGHT = 42
+
+    def find_rack(self, name: str, site_id: int) -> dict[str, Any] | None:
+        """Look up a rack by name within a site."""
+        result = self.get("/dcim/racks/", params={
+            "name": name,
+            "site_id": site_id,
+        })
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    def get_or_create_rack(
+        self,
+        name: str,
+        site_id: int,
+        *,
+        u_height: int = DEFAULT_RACK_HEIGHT,
+        description: str = "",
+    ) -> int | None:
+        """Return the rack id, creating it if missing.
+
+        The rack name is the canonical key — we look it up by (name, site_id)
+        before creating so the same rack name in the same site never duplicates.
+        """
+        rack = self.find_rack(name, site_id)
+        if rack:
+            return rack["id"]
+        try:
+            created = self.post("/dcim/racks/", json={
+                "name": name,
+                "site": site_id,
+                "status": "active",
+                "u_height": u_height,
+                "description": description or f"Synced from NetConsole",
+            })
+            logger.info(
+                "netbox: created rack '%s' (id=%d, site_id=%d, u_height=%d)",
+                name, created["id"], site_id, u_height,
+            )
+            return created["id"]
+        except NetBoxError as exc:
+            logger.warning("netbox: failed to create rack '%s': %s", name, exc)
+            return None
+
+    def _resolve_rack_id(
+        self,
+        rack_name: str | None,
+        site_id: int,
+    ) -> int | None:
+        """Resolve a rack name to a NetBox rack id. Returns None if rack_name is empty."""
+        if not rack_name:
+            return None
+        return self.get_or_create_rack(
+            rack_name,
+            site_id,
+            u_height=self.DEFAULT_RACK_HEIGHT,
+        )
+
+    # ------------------------------------------------------------------
     # Platform helpers — map NetConsole vendor → NetBox platform
     # ------------------------------------------------------------------
     # Canonical slug→display-name map. NetBox platforms use slug as the
@@ -372,16 +434,28 @@ class NetBoxClient:
         results = result.get("results", [])
         return results[0] if results else None
 
-    def get_or_create_platform(self, slug: str, name: str) -> int | None:
-        """Return the platform id for a NetBox slug, creating it if missing."""
+    def get_or_create_platform(
+        self,
+        slug: str,
+        name: str,
+        *,
+        manufacturer_id: int | None = None,
+    ) -> int | None:
+        """Return the platform id, creating it if missing.
+
+        If manufacturer_id is provided, the new platform is linked to it.
+        """
         plat = self.find_platform(slug)
         if plat:
             return plat["id"]
         try:
-            created = self.post("/dcim/platforms/", json={
+            payload: dict[str, Any] = {
                 "name": name,
                 "slug": slug,
-            })
+            }
+            if manufacturer_id is not None:
+                payload["manufacturer"] = manufacturer_id
+            created = self.post("/dcim/platforms/", json=payload)
             logger.info("netbox: created platform '%s' (id=%d)", slug, created["id"])
             return created["id"]
         except NetBoxError as exc:
@@ -549,6 +623,8 @@ class NetBoxClient:
         description: str | None = None,
         platform_id: int | None = None,
         version: str | None = None,
+        rack_id: int | None = None,
+        unit: str | None = None,
     ) -> dict[str, Any]:
         """Build the NetBox device upsert payload (used for both POST and PATCH).
 
@@ -557,8 +633,9 @@ class NetBoxClient:
         before it can be set as primary_ip4 on the device. That flow is handled
         separately in upsert_device after the device is created/updated.
 
-        - platform: set to the OS platform (e.g. Juniper Junos, Cisco IOS-XE).
-        - version: stored in a custom field, not description.
+        - platform_id: NetBox platform record id (version is the platform name).
+        - version: stored in custom field `os_version` (the raw OS version string).
+        - rack_id + unit: physical location — rack record and U-position.
         - description: kept clean — just the operator-supplied description.
         """
         payload: dict[str, Any] = {
@@ -579,6 +656,16 @@ class NetBoxClient:
             payload["platform"] = platform_id
         if version:
             payload["custom_fields"]["os_version"] = version
+        if rack_id is not None:
+            payload["rack"] = rack_id
+        if unit is not None:
+            try:
+                payload["position"] = int(unit)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "netbox: invalid unit '%s' for device '%s' — skipping position",
+                    unit, name,
+                )
         return payload
 
     def _map_status(self, netconsole_status: str) -> str:
@@ -606,6 +693,8 @@ class NetBoxClient:
         management_ip: str | None = None,
         version: str | None = None,
         part_number: str | None = None,
+        rack: str | None = None,
+        unit: str | None = None,
         existing_device_id: int | None = None,
     ) -> dict[str, Any]:
         """Create or update a NetBox device record.
@@ -618,6 +707,9 @@ class NetBoxClient:
         On creation/update, the management IP is set as `primary_ip4` (NetBox
         v4 auto-creates the IPAM entry from the CIDR string). The OS version
         is stored in custom field `os_version`.
+
+        Physical location (rack + unit): the rack is resolved by name within the
+        site and auto-created if missing. The unit is the U-position (integer 1-42).
 
         Returns the NetBox device dict and a boolean `created` indicating whether
         it was newly created (vs updated).
@@ -642,11 +734,37 @@ class NetBoxClient:
         role_name = "Network" if vendor.lower() in ("juniper", "cisco", "arista", "aruba", "hp") else "Other"
         role_id = self.get_or_create_device_role(role_name)
 
-        # Resolve platform from vendor slug
+        # Resolve NetBox platform.
+        # Priority: version string (e.g. "18.4R1.5") → vendor-based canonical slug.
+        # When version is provided it becomes the platform name so operators can
+        # filter/view devices by exact OS release in NetBox.
         platform_id: int | None = None
-        platform_slug = self._vendor_to_platform_slug(vendor)
-        if platform_slug:
-            platform_id = self.get_or_create_platform(platform_slug, platform_slug.replace("-", " ").title())
+        if version:
+            # Build a slug like "junos-18.4r1.5" from the version string.
+            # Lowercase, strip spaces, replace non-alphanum with '-', collapse runs.
+            slug_base = vendor.lower().replace(" ", "") if vendor else ""
+            ver_clean = version.strip().replace(" ", "-").lower()
+            platform_slug = f"{slug_base}-{ver_clean}"
+            # Collapse any double-dashes
+            while "--" in platform_slug:
+                platform_slug = platform_slug.replace("--", "-")
+            platform_id = self.get_or_create_platform(
+                slug=platform_slug,
+                name=version,
+                manufacturer_id=mfg_id,
+            )
+        if platform_id is None:
+            # Fall back to the canonical vendor→platform mapping
+            platform_slug = self._vendor_to_platform_slug(vendor)
+            if platform_slug:
+                platform_id = self.get_or_create_platform(
+                    slug=platform_slug,
+                    name=platform_slug.replace("-", " ").title(),
+                    manufacturer_id=mfg_id,
+                )
+
+        # Resolve rack (physical location)
+        rack_id = self._resolve_rack_id(rack, site_id)
 
         payload = self._build_device_payload(
             site_id=site_id,
@@ -659,6 +777,8 @@ class NetBoxClient:
             description=description,
             platform_id=platform_id,
             version=version,
+            rack_id=rack_id,
+            unit=unit,
         )
         payload["tags"] = [tag_id]
 
