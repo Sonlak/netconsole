@@ -611,8 +611,11 @@ class NetBoxClient:
         return results[0] if results else None
 
     def _find_device_by_ip(self, ip_id: int) -> dict[str, Any] | None:
-        """Find which device has the given IP as primary_ip4 (search by ip_address id)."""
-        result = self.get("/dcim/devices/", params={"primary_ip4": ip_id})
+        """Find which device has the given IP as primary_ip4 (search by ip_address id).
+
+        NetBox v4: primary_ip4 is a nested object. Use ?primary_ip4_id=<int> filter.
+        """
+        result = self.get("/dcim/devices/", params={"primary_ip4_id": ip_id})
         results = result.get("results", [])
         return results[0] if results else None
 
