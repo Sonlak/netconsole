@@ -610,14 +610,26 @@ class NetBoxClient:
         results = result.get("results", [])
         return results[0] if results else None
 
-    def _find_device_by_ip(self, ip_id: int) -> dict[str, Any] | None:
-        """Find which device has the given IP as primary_ip4 (search by ip_address id).
+    def _find_device_by_ip(self, ip_address: str) -> dict[str, Any] | None:
+        """Find which device has the given IP address as primary_ip4.
 
-        NetBox v4: primary_ip4 is a nested object. Use ?primary_ip4_id=<int> filter.
+        NetBox v4: search IPAM for the address, then look up its assigned_object
+        to find the device. Returns the device dict or None.
         """
-        result = self.get("/dcim/devices/", params={"primary_ip4_id": ip_id})
-        results = result.get("results", [])
-        return results[0] if results else None
+        # Search IPAM for the address
+        result = self.get("/ipam/ip-addresses/", params={"address": ip_address})
+        for ip in result.get("results", []):
+            assigned = ip.get("assigned_object")
+            if assigned and assigned.get("device"):
+                return {"id": assigned["device"]["id"], "name": assigned["device"].get("name")}
+            # Also check if this IP is a device's primary_ip4 via the device's nested data
+            if ip.get("assigned_object_type") == "dcim.interface":
+                # The IP is assigned to an interface — the device is in assigned_object
+                ao = ip.get("assigned_object") or {}
+                dev = ao.get("device") or {}
+                if dev.get("id"):
+                    return {"id": dev["id"], "name": dev.get("name")}
+        return None
 
     def _build_device_payload(
         self,
@@ -926,7 +938,7 @@ class NetBoxClient:
                     # of a DIFFERENT device — if so, we cannot use it here.
                     # Iterate all devices to find if any device uses this IP as primary.
                     # This is a last-resort safety check (expensive but correct).
-                    existing_device = self._find_device_by_ip(nb_ip["id"])
+                    existing_device = self._find_device_by_ip(cidr)
                     if existing_device and existing_device["id"] != device_id:
                         raise NetBoxError(
                             f"IP {cidr} is already primary_ip4 of device '{existing_device.get('name')}' "
