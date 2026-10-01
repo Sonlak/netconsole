@@ -54,6 +54,8 @@ export function DeviceModal({ open, saving, device, onClose, onSubmit }: DeviceM
         version: device.version,
         serial: device.serial,
         description: device.description ?? '',
+        rack: device.rack ?? '',
+        unit: device.unit ?? '',
       });
     } else {
       form.resetFields();
@@ -150,6 +152,12 @@ export function DeviceModal({ open, saving, device, onClose, onSubmit }: DeviceM
           </Form.Item>
           <Form.Item name="serial" label="Serial" rules={[{ required: true, message: 'Enter serial' }]} className="nc-form-span-2">
             <Input />
+          </Form.Item>
+          <Form.Item name="rack" label="Rack">
+            <Input placeholder="e.g. Rack A / A1" />
+          </Form.Item>
+          <Form.Item name="unit" label="Unit">
+            <Input placeholder="e.g. U12" />
           </Form.Item>
           <Form.Item name="description" label="Description" className="nc-form-span-2">
             <Input.TextArea rows={3} placeholder="Location, role, notes..." />

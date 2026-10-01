@@ -236,6 +236,18 @@ export default function DevicesPage() {
       render: (_value, record) => <span className="nc-role-chip">{deviceRole(record)}</span>,
     },
     {
+      title: 'Rack',
+      width: 90,
+      ellipsis: true,
+      render: (_value, record) => record.rack ?? '—',
+    },
+    {
+      title: 'Unit',
+      width: 70,
+      ellipsis: true,
+      render: (_value, record) => record.unit ?? '—',
+    },
+    {
       title: 'Management IP',
       dataIndex: 'ip',
       width: 140,
@@ -251,6 +263,16 @@ export default function DevicesPage() {
           {record.model ? ` · ${record.model}` : ''}
         </span>
       ),
+    },
+    {
+      title: 'Version',
+      width: 120,
+      ellipsis: true,
+      render: (_value, record) => {
+        const v = record.version?.trim();
+        if (!v || v === '-' || v === '') return '—';
+        return <MonoValue value={v} copyable />;
+      },
     },
     {
       title: 'Serial',

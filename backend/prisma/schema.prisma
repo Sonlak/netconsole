@@ -100,6 +100,10 @@ model Device {
   netboxDeviceId     Int?
   netboxSyncedAt     DateTime?
   netboxSyncError    String?
+  // Rack and unit — physical location in the data centre. Populated
+  // manually via the device form; discovery does not touch these fields.
+  rack               String?
+  unit               String?
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
 }

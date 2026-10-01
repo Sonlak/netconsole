@@ -38,6 +38,8 @@ export type Device = {
   manageError: string | null;
   uptimeSeconds: number | null;
   uptimeAt: string | null;
+  rack: string | null;
+  unit: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -53,6 +55,8 @@ export type DeviceInput = {
   version: string;
   serial: string;
   description?: string;
+  rack?: string;
+  unit?: string;
 };
 
 export { DEVICE_STATUS_OPTIONS } from '@/design/status';

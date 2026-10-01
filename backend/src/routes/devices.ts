@@ -26,6 +26,8 @@ function parseDeviceBody(body: Record<string, unknown>, isUpdate = false) {
     version,
     serial,
     description,
+    rack,
+    unit,
   } = body;
 
   if (
@@ -60,6 +62,8 @@ function parseDeviceBody(body: Record<string, unknown>, isUpdate = false) {
         typeof description === 'string' && description.trim()
           ? description.trim()
           : null,
+      rack: typeof rack === 'string' && rack.trim() ? rack.trim() : null,
+      unit: typeof unit === 'string' && unit.trim() ? unit.trim() : null,
     },
   };
 }
