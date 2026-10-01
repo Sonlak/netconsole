@@ -661,7 +661,7 @@ class NetBoxClient:
         if unit is not None:
             try:
                 payload["position"] = int(unit)
-                payload["face"] = 0  # front face — NetBox requires face when position is set
+                payload["face"] = "front"  # NetBox v4 requires a string choice; "front" = front of rack
             except (ValueError, TypeError):
                 logger.warning(
                     "netbox: invalid unit '%s' for device '%s' — skipping position",
