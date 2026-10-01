@@ -434,20 +434,22 @@ class NetBoxClient:
     def get_or_create_ip_address(
         self,
         address: str,
-        prefix_id: int,
+        prefix_id: int | None = None,
         status: str = "active",
     ) -> dict[str, Any] | None:
         """Return the IP address dict (with 'id'), creating it if missing."""
         ip = self.find_ip_address(address)
         if ip:
             return ip
+        payload: dict[str, Any] = {
+            "address": address,
+            "status": status,
+            "description": "Management IP — synced from NetConsole",
+        }
+        if prefix_id is not None:
+            payload["prefix"] = prefix_id
         try:
-            created = self.post("/ipam/ip-addresses/", json={
-                "address": address,
-                "prefix": prefix_id,
-                "status": status,
-                "description": "Management IP — synced from NetConsole",
-            })
+            created = self.post("/ipam/ip-addresses/", json=payload)
             logger.info("netbox: created IP address '%s' (id=%d)", address, created["id"])
             return created
         except NetBoxError as exc:
@@ -507,7 +509,7 @@ class NetBoxClient:
     ) -> bool:
         """Assign an IP address to an interface. Returns True on success."""
         try:
-            self.post(f"/ipam/ip-addresses/{ip_id}/", json={
+            self.patch(f"/ipam/ip-addresses/{ip_id}/", json={
                 "interface": interface_id,
             })
             return True
@@ -544,16 +546,17 @@ class NetBoxClient:
         name: str,
         serial: str,
         status: str,
-        vendor: str,
         description: str | None = None,
-        primary_ip4: str | None = None,
         platform_id: int | None = None,
         version: str | None = None,
     ) -> dict[str, Any]:
         """Build the NetBox device upsert payload (used for both POST and PATCH).
 
-        - primary_ip4: passed as a CIDR string (e.g. "10.10.20.131/32").
-          NetBox v4 accepts this and auto-creates the IPAM entry.
+        NOTE: primary_ip4 is intentionally NOT set here. NetBox requires the
+        IP address to be (1) created in IPAM, (2) assigned to a device interface,
+        before it can be set as primary_ip4 on the device. That flow is handled
+        separately in upsert_device after the device is created/updated.
+
         - platform: set to the OS platform (e.g. Juniper Junos, Cisco IOS-XE).
         - version: stored in a custom field, not description.
         - description: kept clean — just the operator-supplied description.
@@ -572,8 +575,6 @@ class NetBoxClient:
         }
         if description:
             payload["description"] = description
-        if primary_ip4:
-            payload["primary_ip4"] = {"address": primary_ip4}
         if platform_id is not None:
             payload["platform"] = platform_id
         if version:
@@ -647,12 +648,6 @@ class NetBoxClient:
         if platform_slug:
             platform_id = self.get_or_create_platform(platform_slug, platform_slug.replace("-", " ").title())
 
-        # Derive primary_ip4 as CIDR string from management IP
-        primary_ip4: str | None = None
-        if management_ip:
-            # Accept both plain IP ("10.10.20.131") and CIDR ("10.10.20.131/32")
-            primary_ip4 = management_ip if "/" in management_ip else f"{management_ip}/32"
-
         payload = self._build_device_payload(
             site_id=site_id,
             device_type_id=dt_id,
@@ -661,28 +656,88 @@ class NetBoxClient:
             name=name,
             serial=serial,
             status=status,
-            vendor=vendor,
             description=description,
-            primary_ip4=primary_ip4,
             platform_id=platform_id,
             version=version,
         )
         payload["tags"] = [tag_id]
 
-        if target_id is not None:
-            updated = self.patch(f"/dcim/devices/{target_id}/", json=payload)
-            logger.info(
-                "netbox: updated device '%s' (id=%d, netconsole_id=%s, primary_ip4=%s)",
-                name, target_id, netconsole_id, primary_ip4,
-            )
-            return updated, False
+        nb_device: dict[str, Any]
 
-        created = self.post("/dcim/devices/", json=payload)
-        logger.info(
-            "netbox: created device '%s' (id=%d, netconsole_id=%s, primary_ip4=%s)",
-            name, created["id"], netconsole_id, primary_ip4,
-        )
-        return created, True
+        if target_id is not None:
+            nb_device = self.patch(f"/dcim/devices/{target_id}/", json=payload)
+            logger.info(
+                "netbox: updated device '%s' (id=%d, netconsole_id=%s)",
+                name, target_id, netconsole_id,
+            )
+        else:
+            nb_device = self.post("/dcim/devices/", json=payload)
+            logger.info(
+                "netbox: created device '%s' (id=%d, netconsole_id=%s)",
+                name, nb_device["id"], netconsole_id,
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2 IPAM: set primary_ip4 if management_ip is available.
+        #
+        # NetBox requires a 3-step dance before primary_ip4 can be set:
+        #   1. Create the IP address entry in IPAM (or find existing)
+        #   2. Assign that IP to a management interface on the device
+        #   3. Then set primary_ip4 on the device (PATCH with ip id)
+        #
+        # We derive the /24 prefix from the management IP so each subnet
+        # gets its own IPAM prefix automatically.
+        # ------------------------------------------------------------------
+        if management_ip:
+            cidr = management_ip if "/" in management_ip else f"{management_ip}/32"
+            device_id = nb_device["id"]
+            try:
+                # Step 1: get or create the /24 prefix (e.g. 10.10.20.0/24)
+                prefix_24 = self._ip_to_prefix_24(management_ip)
+                prefix_id: int | None = None
+                if prefix_24:
+                    prefix_id = self.get_or_create_prefix(prefix_24, site_id)
+
+                # Step 2: create/find the IP address in IPAM
+                nb_ip = self.get_or_create_ip_address(cidr, prefix_id=prefix_id)
+                if not nb_ip:
+                    raise NetBoxError(f"could not create or find IP {cidr} in IPAM")
+
+                # Step 3: find or create a management interface on the device
+                mgmt_iface = self._find_mgmt_interface(device_id, vendor)
+                if mgmt_iface:
+                    iface_id = mgmt_iface["id"]
+                    iface_name = mgmt_iface.get("name", "mgmt0")
+                else:
+                    # No management interface found — create a generic one
+                    iface_id = self._get_or_create_interface(
+                        device_id, name, "mgmt0", interface_type="other",
+                    )
+                    iface_name = "mgmt0"
+
+                if iface_id is None:
+                    raise NetBoxError("could not find or create management interface")
+
+                # Step 4: assign the IP to the management interface
+                if not self.assign_ip_to_interface(nb_ip["id"], iface_id, device_id):
+                    raise NetBoxError(f"could not assign IP {cidr} to interface {iface_name}")
+
+                # Step 5: set primary_ip4 on the device (requires IP assigned to interface first)
+                self.patch(f"/dcim/devices/{device_id}/", json={
+                    "primary_ip4": nb_ip["id"],
+                })
+                logger.info(
+                    "netbox: primary_ip4 set on device '%s': IP=%s (id=%d), interface=%s",
+                    name, cidr, nb_ip["id"], iface_name,
+                )
+            except NetBoxError as exc:
+                # Non-fatal: log and continue without primary_ip4
+                logger.warning(
+                    "netbox: IPAM link failed for '%s' (IP=%s): %s",
+                    name, management_ip, exc,
+                )
+
+        return nb_device, target_id is None
 
     # ------------------------------------------------------------------
     # Health check — used by the sync task to verify connectivity
