@@ -583,8 +583,12 @@ class NetBoxClient:
     ) -> bool:
         """Assign an IP address to an interface. Returns True on success."""
         try:
+            # NetBox v4 uses assigned_object_type + assigned_object_id instead of
+            # the deprecated 'interface' field. 'interface' returns 200 but does
+            # not actually update the assignment.
             self.patch(f"/ipam/ip-addresses/{ip_id}/", json={
-                "interface": interface_id,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": interface_id,
             })
             return True
         except NetBoxError as exc:
