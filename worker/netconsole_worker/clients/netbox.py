@@ -921,8 +921,7 @@ class NetBoxClient:
                     )
                 elif nb_ip.get("assigned_object_id"):
                     # IP has assigned_object_id but assigned_object is null (stale API
-                    # response or partially-assigned IP).  If it is assigned to a different
-                    # device, skip to avoid stealing it.
+                    # response). If it points to a different device, skip to avoid stealing it.
                     if nb_ip["assigned_object_id"] != device_id:
                         raise NetBoxError(
                             f"IP {cidr} is already assigned to interface id={nb_ip['assigned_object_id']}; "
@@ -944,17 +943,17 @@ class NetBoxClient:
                         name, cidr, nb_ip["id"], iface_name,
                     )
                 else:
-                    # IP exists in IPAM but has no interface assignment.
-                    # We need to check whether this IP is already the primary_ip4
-                    # of a DIFFERENT device — if so, we cannot use it here.
-                    # Iterate all devices to find if any device uses this IP as primary.
-                    # This is a last-resort safety check (expensive but correct).
-                    existing_device = self._find_device_by_ip(cidr)
-                    if existing_device and existing_device["id"] != device_id:
+                    # IP has no interface assignment. Use description ("Management IP for <name>")
+                    # to determine which device this IP belongs to. If it belongs to a DIFFERENT
+                    # device, skip (we cannot steal it). If it belongs to THIS device or is
+                    # unclaimed, proceed to assign it.
+                    ip_owner = self._find_device_by_ip(cidr)
+                    if ip_owner and ip_owner["id"] != device_id:
                         raise NetBoxError(
-                            f"IP {cidr} is already primary_ip4 of device '{existing_device.get('name')}' "
-                            f"(id={existing_device['id']}); cannot share IP — skipping primary_ip4 for '{name}'",
+                            f"IP {cidr} is already the primary IP of device '{ip_owner['name']}' "
+                            f"(id={ip_owner['id']}); cannot share IP — skipping primary_ip4 for '{name}'",
                         )
+                    # IP is either for this device or unclaimed — safe to assign
                     mgmt_iface = self._find_mgmt_interface(device_id, vendor)
                     iface_id = mgmt_iface["id"] if mgmt_iface else self._get_or_create_interface(
                         device_id, name, "mgmt0", interface_type="other",
