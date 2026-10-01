@@ -378,7 +378,7 @@ class NetBoxClient:
                 "site": site_id,
                 "status": "active",
                 "u_height": u_height,
-                "description": description or f"Synced from NetConsole",
+                "description": description or "Synced from NetConsole",
             })
             logger.info(
                 "netbox: created rack '%s' (id=%d, site_id=%d, u_height=%d)",
