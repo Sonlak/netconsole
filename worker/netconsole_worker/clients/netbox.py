@@ -661,6 +661,7 @@ class NetBoxClient:
         if unit is not None:
             try:
                 payload["position"] = int(unit)
+                payload["face"] = 0  # front face — NetBox requires face when position is set
             except (ValueError, TypeError):
                 logger.warning(
                     "netbox: invalid unit '%s' for device '%s' — skipping position",
@@ -740,12 +741,14 @@ class NetBoxClient:
         # filter/view devices by exact OS release in NetBox.
         platform_id: int | None = None
         if version:
-            # Build a slug like "junos-18.4r1.5" from the version string.
-            # Lowercase, strip spaces, replace non-alphanum with '-', collapse runs.
+            # Build a slug like "junos-18-4r1-5" from the version string.
+            # Non-alphanumeric chars (dots, slashes, parens) → hyphens, then collapse runs.
+            import re as _re
+
             slug_base = vendor.lower().replace(" ", "") if vendor else ""
-            ver_clean = version.strip().replace(" ", "-").lower()
+            ver_clean = _re.sub(r"[^a-z0-9]", "-", version.strip().lower())
             platform_slug = f"{slug_base}-{ver_clean}"
-            # Collapse any double-dashes
+            # Collapse any runs of hyphens
             while "--" in platform_slug:
                 platform_slug = platform_slug.replace("--", "-")
             platform_id = self.get_or_create_platform(
