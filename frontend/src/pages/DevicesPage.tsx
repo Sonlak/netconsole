@@ -14,7 +14,7 @@ import {
 } from '@ant-design/icons';
 import { Button, Dropdown, Input, Popconfirm, Select, Space, Table, Tooltip, Typography, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { checkManagedAllDevices, pingAllDevices, pingDevice } from '@/api/devices';
+import { checkManagedAllDevices, patchDevice, pingAllDevices, pingDevice } from '@/api/devices';
 import { JobWaitTimeoutError, waitForJob } from '@/api/jobs';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
@@ -64,6 +64,9 @@ export default function DevicesPage() {
   const [checkingAll, setCheckingAll] = useState(false);
   const [pingingId, setPingingId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(Date.now());
+  // Inline edit state: { deviceId, field: 'rack'|'unit', value: string }
+  const [inlineEdit, setInlineEdit] = useState<{ deviceId: string; field: 'rack' | 'unit'; value: string } | null>(null);
+  const [inlineSaving, setInlineSaving] = useState(false);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowTick(Date.now()), 30000);
@@ -90,6 +93,29 @@ export default function DevicesPage() {
     setSearchText('');
     setSite('all');
     patch({ floor: null, role: null, status: null, q: null });
+  };
+
+  const startInlineEdit = (deviceId: string, field: 'rack' | 'unit', currentValue: string) => {
+    setInlineEdit({ deviceId, field, value: currentValue ?? '' });
+  };
+
+  const cancelInlineEdit = () => {
+    setInlineEdit(null);
+  };
+
+  const saveInlineEdit = async () => {
+    if (!inlineEdit) return;
+    const { deviceId, field, value } = inlineEdit;
+    setInlineSaving(true);
+    try {
+      const updated = await patchDevice(deviceId, { [field]: value || null });
+      setDevices((current) => current.map((d) => (d.id === deviceId ? updated : d)));
+      setInlineEdit(null);
+    } catch (cause) {
+      message.error(cause instanceof Error ? cause.message : 'Save failed');
+    } finally {
+      setInlineSaving(false);
+    }
   };
 
   const filtered = useMemo(() => {
@@ -239,13 +265,77 @@ export default function DevicesPage() {
       title: 'Rack',
       width: 90,
       ellipsis: true,
-      render: (_value, record) => record.rack ?? '—',
+      render: (_value, record) => {
+        const isEditing = inlineEdit?.deviceId === record.id && inlineEdit?.field === 'rack';
+        if (isEditing) {
+          return (
+            <Input
+              size="small"
+              value={inlineEdit.value}
+              autoFocus
+              disabled={inlineSaving}
+              style={{ width: 80 }}
+              onChange={(e) => setInlineEdit({ deviceId: record.id, field: 'rack', value: e.target.value })}
+              onPressEnter={saveInlineEdit}
+              onBlur={saveInlineEdit}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') cancelInlineEdit();
+                e.stopPropagation();
+              }}
+            />
+          );
+        }
+        return (
+          <span
+            title="Click to edit"
+            style={{ cursor: 'pointer', display: 'block', width: '100%' }}
+            onClick={(e) => {
+              e.stopPropagation();
+              startInlineEdit(record.id, 'rack', record.rack ?? '');
+            }}
+          >
+            {record.rack ?? '—'}
+          </span>
+        );
+      },
     },
     {
       title: 'Unit',
       width: 70,
       ellipsis: true,
-      render: (_value, record) => record.unit ?? '—',
+      render: (_value, record) => {
+        const isEditing = inlineEdit?.deviceId === record.id && inlineEdit?.field === 'unit';
+        if (isEditing) {
+          return (
+            <Input
+              size="small"
+              value={inlineEdit.value}
+              autoFocus
+              disabled={inlineSaving}
+              style={{ width: 60 }}
+              onChange={(e) => setInlineEdit({ deviceId: record.id, field: 'unit', value: e.target.value })}
+              onPressEnter={saveInlineEdit}
+              onBlur={saveInlineEdit}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') cancelInlineEdit();
+                e.stopPropagation();
+              }}
+            />
+          );
+        }
+        return (
+          <span
+            title="Click to edit"
+            style={{ cursor: 'pointer', display: 'block', width: '100%' }}
+            onClick={(e) => {
+              e.stopPropagation();
+              startInlineEdit(record.id, 'unit', record.unit ?? '');
+            }}
+          >
+            {record.unit ?? '—'}
+          </span>
+        );
+      },
     },
     {
       title: 'Management IP',

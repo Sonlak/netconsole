@@ -98,6 +98,33 @@ devicesRouter.post('/', async (req, res) => {
   }
 });
 
+devicesRouter.patch('/:id', async (req, res) => {
+  const { rack, unit } = req.body as { rack?: string; unit?: string };
+
+  const data: Record<string, unknown> = {};
+  if (rack !== undefined) {
+    data.rack = typeof rack === 'string' && rack.trim() ? rack.trim() : null;
+  }
+  if (unit !== undefined) {
+    data.unit = typeof unit === 'string' && unit.trim() ? unit.trim() : null;
+  }
+
+  if (Object.keys(data).length === 0) {
+    res.status(400).json({ error: 'rack or unit field is required' });
+    return;
+  }
+
+  try {
+    const device = await prisma.device.update({
+      where: { id: req.params.id },
+      data,
+    });
+    res.json(device);
+  } catch {
+    res.status(404).json({ error: 'Device not found' });
+  }
+});
+
 devicesRouter.put('/:id', async (req, res) => {
   const parsed = parseDeviceBody(req.body, true);
   if ('error' in parsed) {

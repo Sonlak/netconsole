@@ -21,6 +21,13 @@ export async function updateDevice(id: string, input: DeviceInput): Promise<Devi
   });
 }
 
+export async function patchDevice(id: string, patch: { rack?: string | null; unit?: string | null }): Promise<Device> {
+  return authJsonFetch<Device>(`${API_BASE}/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
 export async function deleteDevice(id: string): Promise<void> {
   await authJsonFetch<void>(`${API_BASE}/${id}`, { method: 'DELETE' });
 }
