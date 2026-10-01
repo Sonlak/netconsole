@@ -613,22 +613,33 @@ class NetBoxClient:
     def _find_device_by_ip(self, ip_address: str) -> dict[str, Any] | None:
         """Find which device has the given IP address as primary_ip4.
 
-        NetBox v4: search IPAM for the address, then look up its assigned_object
-        to find the device. Returns the device dict or None.
+        Searches IPAM for the address and checks:
+        1. assigned_object.device — normal NetBox assignment
+        2. description field — legacy format "Management IP for <name>"
+
+        Returns {"id": ..., "name": ...} if found, else None.
         """
-        # Search IPAM for the address
         result = self.get("/ipam/ip-addresses/", params={"address": ip_address})
         for ip in result.get("results", []):
             assigned = ip.get("assigned_object")
-            if assigned and assigned.get("device"):
-                return {"id": assigned["device"]["id"], "name": assigned["device"].get("name")}
-            # Also check if this IP is a device's primary_ip4 via the device's nested data
-            if ip.get("assigned_object_type") == "dcim.interface":
-                # The IP is assigned to an interface — the device is in assigned_object
-                ao = ip.get("assigned_object") or {}
-                dev = ao.get("device") or {}
-                if dev.get("id"):
+            if assigned and isinstance(assigned, dict):
+                dev = assigned.get("device")
+                if dev and isinstance(dev, dict) and dev.get("id"):
                     return {"id": dev["id"], "name": dev.get("name")}
+
+            # Legacy description format: "Management IP for <device_name> — synced from NetConsole"
+            desc = ip.get("description") or ""
+            if "Management IP for " in desc:
+                # Extract device name between "Management IP for " and " —"
+                prefix = "Management IP for "
+                suffix = " — synced from NetConsole"
+                if desc.startswith(prefix) and desc.endswith(suffix):
+                    device_name = desc[len(prefix):-len(suffix)]
+                    # Look up the device by name to get its id
+                    dev_result = self.get("/dcim/devices/", params={"name": device_name})
+                    for dev in dev_result.get("results", []):
+                        if dev.get("id"):
+                            return {"id": dev["id"], "name": device_name}
         return None
 
     def _build_device_payload(
