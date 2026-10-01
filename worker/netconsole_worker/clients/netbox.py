@@ -826,6 +826,24 @@ class NetBoxClient:
                 if not nb_ip:
                     raise NetBoxError(f"could not create or find IP {cidr} in IPAM")
 
+                # Step 2b: Check if this IP is already correctly assigned to this device.
+                # NetBox IP addresses are unique — the same IP (e.g. 10.10.20.221/32)
+                # can only appear once in IPAM and belongs to exactly one device.
+                # If the IP is already assigned to a DIFFERENT device, we cannot reuse it
+                # (that would create an IPAM conflict). In that case, skip primary_ip4
+                # for this device — it's non-fatal and the IP remains on the correct device.
+                assigned_obj = nb_ip.get("assigned_object") or {}
+                ip_device_id: int | None = (
+                    assigned_obj.get("device", {}).get("id")
+                    if isinstance(assigned_obj, dict)
+                    else None
+                )
+                if ip_device_id is not None and ip_device_id != device_id:
+                    raise NetBoxError(
+                        f"IP {cidr} is already assigned to device id={ip_device_id}; "
+                        f"cannot share IP across devices — skipping primary_ip4 for '{name}'",
+                    )
+
                 # Step 3: find or create a management interface on the device
                 mgmt_iface = self._find_mgmt_interface(device_id, vendor)
                 if mgmt_iface:
