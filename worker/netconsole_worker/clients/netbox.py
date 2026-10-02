@@ -1079,6 +1079,387 @@ class NetBoxClient:
         return nb_device, target_id is None
 
     # ------------------------------------------------------------------
+    # Interface helpers — Phase 2: sync port inventory to NetBox
+    # ------------------------------------------------------------------
+
+    # Static map: interface name prefix → NetBox interface-type value.
+    # NetBox v4 interface types (value field, not label):
+    #   "other"          — management / virtual / unknown
+    #   "100base-tx"     — FastEthernet (100M)
+    #   "1000base-t"     — GigabitEthernet / ge / et / arista Ethernet / lo
+    #   "10gbase-t"      — TenGigabitEthernet / 10GE optics
+    #   "10gbase-fs-lr"  — 10GE fibre LR
+    #   "10gbase-sr"     — 10GE fibre SR
+    #   "25gbase-sr"     — 25GE
+    #   "40gbase-cr4"    — 40GE copper
+    #   "40gbase-sr4"    — 40GE fibre
+    #   "100gbase-cr4"   — 100GE copper
+    #   "100gbase-sr4"   — 100GE fibre
+    #   "lag"            — LACP etherchannel
+    #   "virtual"        — SVI / IRB / loopback
+    _IFACE_TYPE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
+        # (label, compiled_re, netbox_type_value)
+        # ── Cisco short forms (abbreviations) ──────────────────────────────
+        # These must come FIRST so "Te1/0/1" (Cisco 10GE) doesn't fall into
+        # the generic "t..." branch that handles Arista "Et1".
+        # Negative lookahead (?![a-z]) ensures "TenGigabitEthernet" is NOT
+        # matched here — it belongs to the long-form rule below.
+        ("Cisco 10GE (Te)",  re.compile(r"^te(?![a-z])\d", re.I), "10gbase-t"),
+        ("Cisco FE (Fa)",    re.compile(r"^fa(?![a-z])\d", re.I), "100base-tx"),
+        ("Cisco GE (Gi)",   re.compile(r"^gi(?![a-z])\d", re.I), "1000base-t"),
+        ("Cisco 25GE (25Ge)", re.compile(r"^25g(?![a-z])\d", re.I), "25gbase-sr"),
+        ("Cisco 40GE (Fo)", re.compile(r"^fo(?![a-z])\d", re.I), "40gbase-sr4"),
+        ("Cisco 100GE (Hu)", re.compile(r"^hu(?![a-z])\d", re.I), "100gbase-sr4"),
+        # ── Management / OOB ─────────────────────────────────────────────
+        ("mgmt / oob",      re.compile(r"^(?:mgmt|management|oob|mge0?|em0|fxp0)\d*$", re.I), "other"),
+        # ── Cisco long forms ─────────────────────────────────────────────
+        ("TwentyFiveGigE", re.compile(r"^tw", re.I), "25gbase-sr"),
+        ("FastEthernet",    re.compile(r"^fas", re.I), "100base-tx"),
+        ("GigabitEthernet", re.compile(r"^gi", re.I), "1000base-t"),
+        ("TenGigabitEthernet", re.compile(r"^te", re.I), "10gbase-t"),
+        ("25GigabitEthernet", re.compile(r"^25g", re.I), "25gbase-sr"),
+        ("40GigabitEthernet", re.compile(r"^fo", re.I), "40gbase-sr4"),
+        ("100GigabitEthernet", re.compile(r"^hu", re.I), "100gbase-sr4"),
+        ("Port-channel",    re.compile(r"^po", re.I), "lag"),
+        ("Loopback",        re.compile(r"^lo", re.I), "virtual"),
+        ("SVI / Vlan",      re.compile(r"^vlan", re.I), "virtual"),
+        # ── Juniper ───────────────────────────────────────────────────────
+        ("Juniper ge",      re.compile(r"^ge-\d", re.I), "1000base-t"),
+        ("Juniper et",      re.compile(r"^et-\d", re.I), "10gbase-t"),
+        ("Juniper xe",      re.compile(r"^xe-\d", re.I), "10gbase-fs-lr"),
+        ("Juniper lc",      re.compile(r"^lc-\d", re.I), "other"),
+        ("Juniper ae",      re.compile(r"^ae\d", re.I), "lag"),
+        ("Juniper irb",    re.compile(r"^irb", re.I), "virtual"),
+        # ── Arista ───────────────────────────────────────────────────────
+        ("Arista Ethernet", re.compile(r"^et(?:h)?", re.I), "1000base-t"),
+        ("Arista loopback", re.compile(r"^lo", re.I), "virtual"),
+        # ── Generic fallback (strips vendor prefix then checks first char) ─
+        # Matches everything starting with a digit or slash after vendor-stripping.
+        # Order of remaining patterns: te>fo>gi>lo>other.
+        ("generic 10GE",    re.compile(r"^t"), "10gbase-t"),
+        ("generic 40GE",    re.compile(r"^fo"), "40gbase-sr4"),
+        ("generic 100GE+",  re.compile(r"^hu"), "100gbase-sr4"),
+        ("generic GE",      re.compile(r"^g"), "1000base-t"),
+        ("generic loopback", re.compile(r"^lo"), "virtual"),
+        ("default",         re.compile(r""), "1000base-t"),
+    ]
+
+    @staticmethod
+    def _map_interface_type(name: str) -> str:
+        """Map an interface name to a NetBox interface-type value.
+
+        Uses a priority-ordered prefix match. The last entry (empty regex)
+        is always the fallback.
+        """
+        for _label, pattern, netbox_type in NetBoxClient._IFACE_TYPE_PATTERNS:
+            if pattern.match(name):
+                return netbox_type
+        return "1000base-t"
+
+    def list_interfaces(self, device_id: int) -> dict[str, dict[str, Any]]:
+        """Fetch all NetBox interfaces for a device and return a name→dict lookup.
+
+        The returned dict is keyed by lower-cased interface name so lookups
+        are case-insensitive (interface names are case-sensitive on devices
+        but NetBox normalises to lower-case).
+        """
+        result = self.get("/dcim/interfaces/", params={
+            "device_id": device_id,
+            "limit": 500,
+        })
+        lookup: dict[str, dict[str, Any]] = {}
+        for iface in result.get("results", []):
+            key = iface.get("name", "").lower()
+            if key:
+                lookup[key] = iface
+        return lookup
+
+    def upsert_interface(
+        self,
+        device_id: int,
+        device_name: str,
+        iface: dict[str, Any],
+        site_id: int,
+    ) -> tuple[int, bool]:
+        """Create or update a single NetBox interface.
+
+        Returns (netbox_interface_id, was_created).
+        Handles the three-way conflict: mgmt0 already exists → PATCH it.
+        Skips update if the NetBox record already matches (no-op for idempotency).
+        """
+        name = str(iface.get("name", "")).strip()
+        if not name:
+            raise NetBoxError("interface name is empty")
+
+        netbox_type = self._map_interface_type(name)
+
+        # Normalise speed: NetBox uses bps; device reports Mbps.
+        # "1000" Mbps → 1_000_000_000 bps.
+        raw_speed: int | None = None
+        raw = iface.get("speed")
+        if raw is not None:
+            try:
+                raw_speed = int(raw) * 1_000_000
+            except (ValueError, TypeError):
+                raw_speed = None
+
+        # Admin state: NetBox `enabled` is the inverse of admin down.
+        admin_up = str(iface.get("adminStatus", "up")).lower() not in ("down", "disabled", "admin-down")
+        enabled = admin_up
+
+        description = str(iface.get("description") or "").strip()
+
+        # Determine mode: NetBox mode is "access" | "tagged" | "tagged-all"
+        mode_raw = str(iface.get("mode", "")).lower()
+        if mode_raw in ("access", "trunk"):
+            mode = "tagged" if mode_raw == "trunk" else "access"
+        else:
+            mode = None  # not set (null in NetBox)
+
+        payload: dict[str, Any] = {
+            "device": device_id,
+            "name": name,
+            "type": netbox_type,
+            "enabled": enabled,
+            "description": description or None,
+        }
+        if raw_speed:
+            payload["speed"] = raw_speed
+        if mode:
+            payload["mode"] = mode
+
+        # Check if it already exists in NetBox
+        nb_interfaces = self.list_interfaces(device_id)
+        key = name.lower()
+        existing = nb_interfaces.get(key)
+
+        if existing:
+            # Only PATCH if something actually changed — avoids a useless write
+            # and keeps updatedAt clean for truly unchanged interfaces.
+            needs_update = (
+                existing.get("type", {}).get("value") != netbox_type
+                or existing.get("enabled") != enabled
+                or (existing.get("description") or "") != (description or "")
+                or existing.get("mtu") != iface.get("mtu")
+                or existing.get("speed") != raw_speed
+                or existing.get("mode") != mode
+            )
+            if not needs_update:
+                return existing["id"], False
+            self.patch(f"/dcim/interfaces/{existing['id']}/", json=payload)
+            logger.info(
+                "netbox: updated interface '%s' on device '%s' (id=%d)",
+                name, device_name, existing["id"],
+            )
+            return existing["id"], False
+
+        # Create new
+        try:
+            created = self.post("/dcim/interfaces/", json=payload)
+            logger.info(
+                "netbox: created interface '%s' on device '%s' (id=%d, type=%s)",
+                name, device_name, created["id"], netbox_type,
+            )
+            return created["id"], True
+        except NetBoxError as exc:
+            # Race: another process created it between our GET and POST.
+            # Re-fetch and return the existing id.
+            if "already exists" in str(exc).lower():
+                nb_interfaces = self.list_interfaces(device_id)
+                if key in nb_interfaces:
+                    return nb_interfaces[key]["id"], False
+            raise
+
+    def _ensure_vlan(self, site_id: int, vid: int, name: str | None = None) -> int:
+        """Return a VLAN id, creating it if missing.
+
+        VLANs are scoped to a site in NetBox. Creates the default VLAN group
+        "default" under the site if no VLAN group exists yet.
+        """
+        # Try to find existing VLAN by vid + site
+        result = self.get("/ipam/vlans/", params={"vid": vid, "site_id": site_id})
+        results = result.get("results", [])
+        if results:
+            return results[0]["id"]
+
+        # Ensure a VLAN group exists under the site
+        group_result = self.get("/ipam/vlan-groups/", params={"site_id": site_id})
+        group_id: int | None = None
+        if group_result.get("results"):
+            group_id = group_result["results"][0]["id"]
+        else:
+            try:
+                group = self.post("/ipam/vlan-groups/", json={
+                    "name": "default",
+                    "site": site_id,
+                })
+                group_id = group["id"]
+                logger.info("netbox: created VLAN group 'default' (id=%d) under site %d", group_id, site_id)
+            except NetBoxError as exc:
+                logger.warning("netbox: could not create VLAN group: %s", exc)
+
+        vlan_name = name or f"VLAN{vid}"
+        payload: dict[str, Any] = {
+            "vid": vid,
+            "name": vlan_name,
+            "site": site_id,
+            "status": "active",
+        }
+        if group_id is not None:
+            payload["group"] = group_id
+
+        try:
+            created = self.post("/ipam/vlans/", json=payload)
+            logger.info("netbox: created VLAN %d '%s' (id=%d)", vid, vlan_name, created["id"])
+            return created["id"]
+        except NetBoxError as exc:
+            # Race — look it up again
+            result = self.get("/ipam/vlans/", params={"vid": vid, "site_id": site_id})
+            if result.get("results"):
+                return result["results"][0]["id"]
+            raise NetBoxError(f"could not create or find VLAN {vid}: {exc}") from exc
+
+    def sync_device_interfaces(
+        self,
+        device_id: int,
+        device_name: str,
+        interfaces: list[dict[str, Any]],
+        site_id: int,
+    ) -> dict[str, Any]:
+        """Sync a device's interface list to NetBox.
+
+        Handles:
+        - Create missing interfaces
+        - Update changed interfaces (type, enabled, description, mtu, speed, mode)
+        - Assign VLANs (access → untagged_vlan; trunk → tagged_vlans)
+        - Assign IP addresses for L3 interfaces (via IPAM)
+
+        Returns a summary dict with counts and per-interface status.
+        """
+        if not interfaces:
+            logger.debug(
+                "netbox: no interfaces to sync for device '%s' (id=%d)",
+                device_name, device_id,
+            )
+            return {"ok": True, "created": 0, "updated": 0, "skipped": 0, "vlans": [], "ips": []}
+
+        # Pre-fetch existing NetBox interfaces once (shared by all upserts)
+        nb_iface_map = self.list_interfaces(device_id)
+
+        created = 0
+        updated = 0
+        skipped = 0
+        vlan_ids: list[int] = []
+        ip_ids: list[int] = []
+        errors: list[str] = []
+
+        for iface in interfaces:
+            name = str(iface.get("name", "")).strip()
+            if not name:
+                continue
+
+            try:
+                iface_id, was_created = self.upsert_interface(
+                    device_id, device_name, iface, site_id,
+                )
+                if was_created:
+                    created += 1
+                else:
+                    updated += 1
+
+                # --- VLAN assignment ------------------------------------------------
+                mode_raw = str(iface.get("mode", "")).lower()
+                access_vlan_raw = str(iface.get("accessVlan") or "").strip()
+
+                if mode_raw in ("access", "trunk") and access_vlan_raw and access_vlan_raw.upper() != "ALL":
+                    # Parse VLAN IDs from accessVlan string.
+                    # Format: "10" (single), "10,20,30" (trunk allowed), or "10-20" (future-proof).
+                    vids: list[int] = []
+                    for part in access_vlan_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if "-" in part:
+                            try:
+                                start, end = part.split("-", 1)
+                                vids.extend(range(int(start), int(end) + 1))
+                            except (ValueError, TypeError):
+                                vids.append(int(part))
+                        else:
+                            vids.append(int(part))
+
+                    for vid in vids:
+                        try:
+                            vlan_id = self._ensure_vlan(site_id, vid)
+                            if vlan_id not in vlan_ids:
+                                vlan_ids.append(vlan_id)
+                        except NetBoxError as exc:
+                            logger.warning(
+                                "netbox: could not ensure VLAN %d for interface '%s': %s",
+                                vid, name, exc,
+                            )
+                            continue
+
+                        # Patch the interface with VLAN assignment
+                        vlan_payload: dict[str, Any] = {}
+                        if mode_raw == "access":
+                            vlan_payload["untagged_vlan"] = vlan_id
+                        else:
+                            # trunk — add to tagged_vlans (merge with existing)
+                            existing_vlans = nb_iface_map.get(name.lower(), {}).get("tagged_vlans", [])
+                            existing_ids = {v["id"] for v in existing_vlans}
+                            existing_ids.add(vlan_id)
+                            vlan_payload["tagged_vlans"] = list(existing_ids)
+
+                        if vlan_payload:
+                            self.patch(f"/dcim/interfaces/{iface_id}/", json=vlan_payload)
+
+                # --- IP address assignment for L3 interfaces ------------------------
+                address = str(iface.get("address") or "").strip()
+                if address and "/" in address:
+                    try:
+                        # Get or create the IP in IPAM
+                        nb_ip = self.get_or_create_ip_address(address, prefix_id=None)
+                        if nb_ip:
+                            ip_ids.append(nb_ip["id"])
+                            # Assign IP to this interface (idempotent — re-assigning same IP is fine)
+                            self.assign_ip_to_interface(nb_ip["id"], iface_id, device_id)
+                            logger.info(
+                                "netbox: assigned IP %s to interface '%s' (device=%s)",
+                                address, name, device_name,
+                            )
+                    except NetBoxError as exc:
+                        logger.warning(
+                            "netbox: could not assign IP %s to interface '%s': %s",
+                            address, name, exc,
+                        )
+                        errors.append(f"IP {address} on {name}: {exc}")
+
+            except NetBoxError as exc:
+                skipped += 1
+                errors.append(f"{name}: {exc}")
+                logger.warning(
+                    "netbox: interface '%s' sync failed: %s",
+                    name, exc,
+                )
+
+        logger.info(
+            "netbox: synced interfaces for device '%s' (id=%d): "
+            "created=%d updated=%d skipped=%d vlans=%d ips=%d",
+            device_name, device_id, created, updated, skipped, len(vlan_ids), len(ip_ids),
+        )
+
+        return {
+            "ok": True,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "vlans": vlan_ids,
+            "ips": ip_ids,
+            "errors": errors,
+        }
+
+    # ------------------------------------------------------------------
     # Health check — used by the sync task to verify connectivity
     # ------------------------------------------------------------------
     def health_check(self) -> bool:

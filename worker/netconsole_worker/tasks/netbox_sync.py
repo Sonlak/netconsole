@@ -1,10 +1,10 @@
-"""NETBOX_SYNC_DEVICE / NETBOX_SYNC_ALL — sync device inventory to NetBox.
+"""NETBOX_SYNC_DEVICE / NETBOX_SYNC_ALL — sync device inventory + ports to NetBox.
 
-Periodically pushes the NetConsole `Device` table to NetBox so operators
-have a single source of truth for IPAM/DCIM. Runs as a worker job so it
-gets all the existing queue/retry/audit infrastructure for free.
+Periodically pushes the NetConsole `Device` table and port inventory to NetBox
+so operators have a single source of truth for IPAM/DCIM. Runs as a worker
+job so it gets all the existing queue/retry/audit infrastructure for free.
 
-Phase 1 scope (this task):
+Phase 1 scope (device-level):
   - dcim.devices: name, device_type, role, site, serial, status,
     description, custom_fields.netconsole_id, rack, position (unit)
   - dcim.sites (auto-created if missing)
@@ -17,16 +17,26 @@ Phase 1 scope (this task):
     canonical vendor→platform map when version is not set
   - tags: source-netconsole (created on first sync)
 
-Phase 2 (deferred): interfaces + IPAM. The task structure (separate
-NETBOX_SYNC_DEVICE / NETBOX_SYNC_ALL job types) is in place to add
-that without re-architecting.
+Phase 2 scope (port/interface-level, added 2026-10-02):
+  - dcim.interfaces: name, type, enabled, description, mtu, speed (bps),
+    mode (access / tagged / tagged-all), mac_address
+  - ipam.vlans: created on-the-fly when an interface carries VLAN info
+  - dcim.interfaces.tagged_vlans / untagged_vlan: VLAN assignment
+  - ipam.ip-addresses + dcim.interfaces: L3 interface IP assignment
+  - Speed map: device reports Mbps; NetBox stores bps (× 1 000 000)
+  - Interface type map: name prefix → NetBox type value (e.g.
+    "GigabitEthernet" → "1000base-t", "ge-" → "1000base-t")
+  - Idempotency: create if missing; PATCH only if something changed
 
 Idempotency:
-  - Look-up by custom_fields.netconsole_id (canonical key)
-  - Fallback to serial (for devices created before the custom field was set)
-  - PATCH if found, POST if not
-  - Saves the NetBox device id on the Device row (netboxDeviceId) so
+  - Device: Look-up by custom_fields.netconsole_id (canonical key)
+    Fallback to serial (for devices created before the custom field was set)
+    PATCH if found, POST if not
+    Saves the NetBox device id on the Device row (netboxDeviceId) so
     subsequent cycles can skip the look-up entirely
+  - Interface: Look-up by (device_id, name). PATCH if found; POST if not.
+    Only writes if something changed (type, enabled, description, mtu,
+    speed, mode) to keep updatedAt clean.
 """
 
 from __future__ import annotations
@@ -158,6 +168,32 @@ class NetboxSyncDeviceTask(BaseTask):
             # next cycle. We re-raise so the job ends in FAILED status.
             raise NetBoxError(f"NetBox upsert failed for device '{name}': {exc}") from exc
 
+        # --- Phase 2: sync interfaces ---------------------------------
+        nb_site = nb.find_site(site)
+        site_id = nb_site["id"] if nb_site else None
+        iface_result: dict[str, Any] = {"ok": True, "created": 0, "updated": 0, "skipped": 0}
+        if site_id is None:
+            logger.warning(
+                "[netbox-sync] device '%s' site '%s' not found in NetBox — skipping interface sync",
+                name, site,
+            )
+        else:
+            interfaces = self._fetch_device_interfaces(netconsole_id)
+            if interfaces:
+                iface_result = nb.sync_device_interfaces(
+                    device_id=nb_device["id"],
+                    device_name=name,
+                    interfaces=interfaces,
+                    site_id=site_id,
+                )
+                logger.info(
+                    "[netbox-sync] device '%s' interface sync: created=%d updated=%d skipped=%d",
+                    name,
+                    iface_result.get("created", 0),
+                    iface_result.get("updated", 0),
+                    iface_result.get("skipped", 0),
+                )
+
         return {
             "ok": True,
             "device": name,
@@ -165,6 +201,7 @@ class NetboxSyncDeviceTask(BaseTask):
             "netboxDeviceId": nb_device.get("id"),
             "netboxUrl": nb_device.get("url"),
             "created": created,
+            "interfaces": iface_result,
             "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
@@ -196,6 +233,57 @@ class NetboxSyncDeviceTask(BaseTask):
             logger.warning("netbox-sync: GET /devices/%s failed: %s", device_id, exc)
         return None
 
+    def _fetch_device_interfaces(self, device_id: str) -> list[dict[str, Any]]:
+        """Fetch the latest GET_INTERFACES job result for a device from the backend.
+
+        Calls GET /api/interfaces/:deviceId — returns the full interfaces[] array
+        from the most recent SUCCESS GET_INTERFACES job. Returns [] if no
+        successful interface collection exists yet.
+        """
+        url = settings.api_base_url.rstrip("/")
+        token = settings.worker_auth_token
+        if not token:
+            logger.debug(
+                "netbox-sync: WORKER_AUTH_TOKEN not set, cannot fetch interfaces for device %s",
+                device_id,
+            )
+            return []
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.get(
+                    f"{url}/interfaces/{device_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if response.status_code == 200:
+                body = response.json()
+                interfaces = body.get("interfaces", [])
+                if isinstance(interfaces, list):
+                    logger.debug(
+                        "netbox-sync: fetched %d interfaces for device %s",
+                        len(interfaces), device_id,
+                    )
+                    return interfaces
+                logger.warning(
+                    "netbox-sync: /interfaces/%s returned interfaces=%r (not a list)",
+                    device_id, body.get("interfaces"),
+                )
+            elif response.status_code == 404:
+                logger.debug(
+                    "netbox-sync: no interface data for device %s (404)",
+                    device_id,
+                )
+            else:
+                logger.warning(
+                    "netbox-sync: GET /interfaces/%s returned %d",
+                    device_id, response.status_code,
+                )
+        except Exception as exc:
+            logger.warning(
+                "netbox-sync: GET /interfaces/%s failed: %s",
+                device_id, exc,
+            )
+        return []
+
     def stub_result(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
         return {
             "implemented": True,
@@ -208,7 +296,7 @@ class NetboxSyncDeviceTask(BaseTask):
 
 
 class NetboxSyncAllTask(BaseTask):
-    """Sync every device to NetBox in one job.
+    """Sync every device (+ its interfaces) to NetBox in one job.
 
     Used by the periodic scheduler (so the scheduler doesn't have to
     pre-resolve the device list, and so the run shows up as ONE job
@@ -217,6 +305,9 @@ class NetboxSyncAllTask(BaseTask):
     Resolution: GET /api/devices on the backend, then iterate. This is
     simpler than the worker tracking the full inventory, and the backend
     is the single source of truth anyway.
+
+    After each device is upserted, fetches its latest GET_INTERFACES job
+    result and syncs port inventory to NetBox (Phase 2: dcim.interfaces).
 
     Failure mode: if any single device fails, we log it and continue
     (the job result records the list of failed devices). Only a
@@ -253,6 +344,13 @@ class NetboxSyncAllTask(BaseTask):
         fail_count = 0
         created_count = 0
         updated_count = 0
+
+        # Aggregate counters across all devices
+        total_iface_created = 0
+        total_iface_updated = 0
+        total_iface_skipped = 0
+        total_vlans = 0
+        total_ips = 0
 
         for dev in devices:
             dev_id = str(dev.get("id") or "")
@@ -307,12 +405,68 @@ class NetboxSyncAllTask(BaseTask):
                 else:
                     updated_count += 1
                 ok_count += 1
+
+                # --- Phase 2: sync interfaces ---------------------------------
+                # Fetch the latest GET_INTERFACES job result from the backend.
+                # If no interface data exists (never collected), skip silently.
+                # site_name → site_id is needed for VLAN creation.
+                nb_site = nb.find_site(site)
+                site_id = nb_site["id"] if nb_site else None
+                if site_id is None:
+                    logger.warning(
+                        "[netbox-sync] device '%s' site '%s' not found in NetBox — "
+                        "skipping interface sync",
+                        name, site,
+                    )
+                    results.append({
+                        "device": name,
+                        "netconsoleId": netconsole_id,
+                        "netboxDeviceId": nb_device.get("id"),
+                        "ok": True,
+                        "created": created,
+                        "interfaces": None,
+                    })
+                    continue
+
+                interfaces = self._fetch_device_interfaces(dev_id)
+                if not interfaces:
+                    results.append({
+                        "device": name,
+                        "netconsoleId": netconsole_id,
+                        "netboxDeviceId": nb_device.get("id"),
+                        "ok": True,
+                        "created": created,
+                        "interfaces": {"ok": True, "created": 0, "updated": 0, "skipped": 0},
+                    })
+                    continue
+
+                iface_result = nb.sync_device_interfaces(
+                    device_id=nb_device["id"],
+                    device_name=name,
+                    interfaces=interfaces,
+                    site_id=site_id,
+                )
+                total_iface_created += iface_result.get("created", 0)
+                total_iface_updated += iface_result.get("updated", 0)
+                total_iface_skipped += iface_result.get("skipped", 0)
+                total_vlans += len(iface_result.get("vlans", []))
+                total_ips += len(iface_result.get("ips", []))
+
                 results.append({
                     "device": name,
                     "netconsoleId": netconsole_id,
                     "netboxDeviceId": nb_device.get("id"),
                     "ok": True,
                     "created": created,
+                    "interfaces": {
+                        "ok": True,
+                        "created": iface_result.get("created", 0),
+                        "updated": iface_result.get("updated", 0),
+                        "skipped": iface_result.get("skipped", 0),
+                        "vlans": len(iface_result.get("vlans", [])),
+                        "ips": len(iface_result.get("ips", [])),
+                        "errors": iface_result.get("errors", []),
+                    },
                 })
             except NetBoxError as exc:
                 fail_count += 1
@@ -324,8 +478,12 @@ class NetboxSyncAllTask(BaseTask):
                 logger.warning("[netbox-sync] device '%s' failed: %s", name, exc)
 
         logger.info(
-            "[netbox-sync] bulk sync complete: total=%d ok=%d failed=%d created=%d updated=%d",
+            "[netbox-sync] bulk sync complete: "
+            "devices total=%d ok=%d failed=%d created=%d updated=%d | "
+            "interfaces created=%d updated=%d skipped=%d vlans=%d ips=%d",
             len(devices), ok_count, fail_count, created_count, updated_count,
+            total_iface_created, total_iface_updated, total_iface_skipped,
+            total_vlans, total_ips,
         )
 
         return {
@@ -335,6 +493,13 @@ class NetboxSyncAllTask(BaseTask):
             "failedCount": fail_count,
             "createdCount": created_count,
             "updatedCount": updated_count,
+            "interfaceSummary": {
+                "created": total_iface_created,
+                "updated": total_iface_updated,
+                "skipped": total_iface_skipped,
+                "vlans": total_vlans,
+                "ips": total_ips,
+            },
             "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "results": results,
         }
@@ -360,6 +525,57 @@ class NetboxSyncAllTask(BaseTask):
             )
         except Exception as exc:
             logger.warning("netbox-sync: GET /devices failed: %s", exc)
+        return []
+
+    def _fetch_device_interfaces(self, device_id: str) -> list[dict[str, Any]]:
+        """Fetch the latest GET_INTERFACES job result for a device from the backend.
+
+        Calls GET /api/interfaces/:deviceId — returns the full interfaces[] array
+        from the most recent SUCCESS GET_INTERFACES job. Returns [] if no
+        successful interface collection exists yet.
+        """
+        url = settings.api_base_url.rstrip("/")
+        token = settings.worker_auth_token
+        if not token:
+            logger.debug(
+                "netbox-sync: WORKER_AUTH_TOKEN not set, cannot fetch interfaces for device %s",
+                device_id,
+            )
+            return []
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.get(
+                    f"{url}/interfaces/{device_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if response.status_code == 200:
+                body = response.json()
+                interfaces = body.get("interfaces", [])
+                if isinstance(interfaces, list):
+                    logger.debug(
+                        "netbox-sync: fetched %d interfaces for device %s",
+                        len(interfaces), device_id,
+                    )
+                    return interfaces
+                logger.warning(
+                    "netbox-sync: /interfaces/%s returned interfaces=%r (not a list)",
+                    device_id, body.get("interfaces"),
+                )
+            elif response.status_code == 404:
+                logger.debug(
+                    "netbox-sync: no interface data for device %s (404)",
+                    device_id,
+                )
+            else:
+                logger.warning(
+                    "netbox-sync: GET /interfaces/%s returned %d",
+                    device_id, response.status_code,
+                )
+        except Exception as exc:
+            logger.warning(
+                "netbox-sync: GET /interfaces/%s failed: %s",
+                device_id, exc,
+            )
         return []
 
     def stub_result(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
