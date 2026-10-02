@@ -823,6 +823,7 @@ class NetBoxClient:
         platform_id: int | None = None
         if version:
             # Build a slug like "junos-18-4r1-5" from the version string.
+            slug_base = vendor.lower().replace(" ", "") if vendor else ""
             ver_clean = re.sub(r"[^a-z0-9]", "-", version.strip().lower())
             platform_slug = f"{slug_base}-{ver_clean}"
             # Collapse any runs of hyphens
