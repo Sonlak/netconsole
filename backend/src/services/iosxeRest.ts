@@ -60,6 +60,7 @@ type IosxeInterfaceEntry = {
   description: string;
   mode: string;
   accessVlan: string;
+  taggedVlans: string;  // trunk allowed VLANs (distinct from accessVlan = native/untagged VLAN)
   address: string;
   mtu: string;
   speed: string;
@@ -186,6 +187,8 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
       //                 trunk.native.vlan.vlan-id  (uint16, native VLAN)
       let mode = '';
       let accessVlan = '';
+      let taggedVlans = '';  // trunk allowed VLANs → goes to NetBox tagged_vlans
+
       const swConfig = (i as Record<string, unknown>)['switchport-config'] as Record<string, unknown> | undefined;
       if (swConfig && typeof swConfig === 'object') {
         // switchport-config dereferences to the Cisco-IOS-XE-switch:switchport subtree
@@ -222,6 +225,8 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
           }
 
           // Trunk VLANs — extract when mode is trunk
+          // allowed VLANs → taggedVlans (NetBox tagged_vlans)
+          // native VLAN   → accessVlan (NetBox untagged_vlan, shown as "native VLAN")
           if (mode === 'trunk') {
             const trunkObj = (swEffective['trunk'] ||
                             swEffective['Cisco-IOS-XE-switch:trunk']) as Record<string, unknown> | undefined;
@@ -234,21 +239,17 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
                 if (vlanObj && typeof vlanObj === 'object') {
                   const vlans = vlanObj['vlans'];
                   if (vlans !== undefined && vlans !== null) {
-                    accessVlan = String(vlans);
+                    taggedVlans = String(vlans);   // was incorrectly assigned to accessVlan (Bug A)
                   }
                 }
               }
-              // Also include native VLAN in trunk display
+              // Native VLAN: set as accessVlan for the trunk (untagged on this trunk)
               const nativeObj = (trunkObj['native'] ||
                                trunkObj['Cisco-IOS-XE-switch:native']) as Record<string, unknown> | undefined;
               if (nativeObj && typeof nativeObj === 'object') {
                 const nativeVlanId = nativeObj['vlan-id'];
                 if (nativeVlanId !== undefined && nativeVlanId !== null && String(nativeVlanId) !== '1') {
-                  // Append native VLAN to allowed VLANs if not already present
-                  const nativeStr = String(nativeVlanId);
-                  if (accessVlan && !accessVlan.split(',').includes(nativeStr)) {
-                    accessVlan = `${nativeStr},${accessVlan}`;
-                  }
+                  accessVlan = String(nativeVlanId);  // native VLAN on this trunk → untagged
                 }
               }
             }
@@ -263,6 +264,7 @@ function parseIosxeNativeInterfaces(payload: unknown): IosxeInterfaceEntry[] {
         description,
         mode,
         accessVlan,
+        taggedVlans,
         address: '',
         mtu: String(i.mtu ?? ''),
         speed: '',

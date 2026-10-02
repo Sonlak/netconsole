@@ -237,9 +237,11 @@ export interface EosInterfaceEntry {
   description: string;
   mode: string;
   accessVlan: string;
+  taggedVlans: string;   // trunk allowed VLANs (distinct from accessVlan which is the native/untagged VLAN)
   address: string;
   mtu: string;
-  speed: string;
+  speed: string;          // in bps (backend converts from EOS Kbps)
+  mac_address: string;    // MAC address, colon-separated lowercase
 }
 
 // ----------------------------------------------------------------
@@ -256,6 +258,14 @@ const EOS_STATUS_MAP: Record<string, string> = {
 function eosStatus(raw: string | undefined): string {
   if (!raw) return 'unknown';
   return EOS_STATUS_MAP[raw.toLowerCase()] ?? raw.toLowerCase();
+}
+
+/** Normalise an EOS MAC address (e.g. "5200.000a.1234") to lowercase colon form
+ *  (e.g. "52:00:00:0a:12:34").  Returns '' for unparseable strings. */
+function normalizeEosMac(raw: string): string {
+  const hex = raw.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length !== 12) return '';
+  return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`.toLowerCase();
 }
 
 function parseEosInterfaces(result: unknown[]): EosInterfaceEntry[] {
@@ -277,9 +287,15 @@ function parseEosInterfaces(result: unknown[]): EosInterfaceEntry[] {
       description: String(b.description ?? ''),
       mode: '',
       accessVlan: '',
+      taggedVlans: '',
       address: '',
       mtu: String(b.mtu ?? ''),
-      speed: String(b.bandwidth ?? ''),
+      // EOS eAPI reports bandwidth in Kbps. Convert to bps so the NetBox worker
+      // receives a consistent bps value without needing a per-vendor multiplier.
+      speed: String(Number(b.bandwidth ?? 0) * 1000),
+      // EOS "show interfaces" JSON includes hardwareAddr (e.g. "5200.000a.1234").
+      // Normalise to canonical lowercase colon form for NetBox.
+      mac_address: normalizeEosMac(String(b.hardwareAddr ?? '')),
     });
   }
   return out;
@@ -460,17 +476,20 @@ function mergeEosSwitchport(interfaces: EosInterfaceEntry[], switchport: Record<
     if (sp.mode) iface.mode = sp.mode;
 
     if (sp.mode === 'trunk' && sp.trunkVlans) {
-      iface.accessVlan = sp.trunkVlans;
+      // Trunk allowed VLANs → taggedVlans (NetBox tagged_vlans).
+      // Keep accessVlan as-is (native/untagged VLAN for this trunk) — do NOT overwrite.
+      iface.taggedVlans = sp.trunkVlans;
     } else if (sp.mode === 'access' && sp.accessVlan) {
       iface.accessVlan = sp.accessVlan;
     } else if (sp.trunkVlans && !sp.mode) {
+      // No explicit mode but switchport data exists — treat as trunk.
       iface.mode = 'trunk';
-      iface.accessVlan = sp.trunkVlans;
+      iface.taggedVlans = sp.trunkVlans;   // was incorrectly assigned to accessVlan (Bug B)
     } else if (sp.accessVlan && !sp.mode) {
       iface.mode = 'access';
       iface.accessVlan = sp.accessVlan;
     }
-    console.log(`[eosApi] merge: ${iface.name} final -> mode=${iface.mode}, accessVlan=${iface.accessVlan}`);
+    console.log(`[eosApi] merge: ${iface.name} final -> mode=${iface.mode}, accessVlan=${iface.accessVlan}, taggedVlans=${iface.taggedVlans}`);
   }
 }
 

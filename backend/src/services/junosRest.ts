@@ -581,6 +581,8 @@ export type JunosInterfaceEntry = {
   description: string;
   mode: string;
   accessVlan: string;
+  taggedVlans: string;   // Junos doesn't expose trunk allowed VLANs via RESTCONF;
+                         // interface-level VLAN membership goes to accessVlan instead.
   address: string;
   mtu: string;
   speed: string;
@@ -613,6 +615,7 @@ function parseTerseLine(line: string): JunosInterfaceEntry | null {
     description: '',
     mode,
     accessVlan: '',
+    taggedVlans: '',
     address,
     mtu: '',
     speed: '',

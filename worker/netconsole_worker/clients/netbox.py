@@ -1193,13 +1193,13 @@ class NetBoxClient:
 
         netbox_type = self._map_interface_type(name)
 
-        # Normalise speed: NetBox uses bps; device reports Mbps.
-        # "1000" Mbps → 1_000_000_000 bps.
+        # Normalise speed: NetBox uses bps; EOS reports bandwidth in Kbps (backend
+        # already multiplied × 1,000 to convert to bps).  Confirm × 1,000, not × 1,000,000.
         raw_speed: int | None = None
         raw = iface.get("speed")
         if raw is not None:
             try:
-                raw_speed = int(raw) * 1_000_000
+                raw_speed = int(raw) * 1_000   # was * 1_000_000 — Bug B (1000× overcount)
             except (ValueError, TypeError):
                 raw_speed = None
 
@@ -1223,6 +1223,27 @@ class NetBoxClient:
             "enabled": enabled,
             "description": description or None,
         }
+        # MTU — add on create (was missing, Bug D)
+        raw_mtu = iface.get("mtu")
+        if raw_mtu is not None:
+            try:
+                payload["mtu"] = int(raw_mtu)
+            except (ValueError, TypeError):
+                pass
+        # MAC address — EOS provides hardwareAddr; NetBox expects colon-separated uppercase
+        raw_mac = iface.get("mac_address") or iface.get("mac")
+        if raw_mac:
+            mac = str(raw_mac).strip()
+            if mac:
+                # Accept any format (5200.000a.1234 / 52:00:00:0a:12:34 / 5200000a1234)
+                # and normalise to canonical uppercase colon form.
+                hex_clean = re.sub(r"[^0-9a-fA-F]", "", mac)
+                if len(hex_clean) == 12:
+                    payload["mac_address"] = (
+                        f"{hex_clean[0:2].upper()}:{hex_clean[2:4].upper()}:"
+                        f"{hex_clean[4:6].upper()}:{hex_clean[6:8].upper()}:"
+                        f"{hex_clean[8:10].upper()}:{hex_clean[10:12].upper()}"
+                    )
         if raw_speed:
             payload["speed"] = raw_speed
         if mode:
@@ -1368,12 +1389,16 @@ class NetBoxClient:
                     updated += 1
 
                 # --- VLAN assignment ------------------------------------------------
+                # IOS-XE/EOS now use separate fields:
+                #   accessVlan   = native/untagged VLAN (for both access and trunk modes)
+                #   taggedVlans  = trunk allowed VLANs (for trunk mode only)
                 mode_raw = str(iface.get("mode", "")).lower()
                 access_vlan_raw = str(iface.get("accessVlan") or "").strip()
+                tagged_vlans_raw = str(iface.get("taggedVlans") or "").strip()
 
                 if mode_raw in ("access", "trunk") and access_vlan_raw and access_vlan_raw.upper() != "ALL":
                     # Parse VLAN IDs from accessVlan string.
-                    # Format: "10" (single), "10,20,30" (trunk allowed), or "10-20" (future-proof).
+                    # Format: "10" (single), "10,20,30" (list), or "10-20" (range).
                     vids: list[int] = []
                     for part in access_vlan_raw.split(","):
                         part = part.strip()
@@ -1386,7 +1411,10 @@ class NetBoxClient:
                             except (ValueError, TypeError):
                                 vids.append(int(part))
                         else:
-                            vids.append(int(part))
+                            try:
+                                vids.append(int(part))
+                            except (ValueError, TypeError):
+                                pass
 
                     for vid in vids:
                         try:
@@ -1403,16 +1431,59 @@ class NetBoxClient:
                         # Patch the interface with VLAN assignment
                         vlan_payload: dict[str, Any] = {}
                         if mode_raw == "access":
+                            # access port — this VLAN is untagged
                             vlan_payload["untagged_vlan"] = vlan_id
                         else:
-                            # trunk — add to tagged_vlans (merge with existing)
-                            existing_vlans = nb_iface_map.get(name.lower(), {}).get("tagged_vlans", [])
-                            existing_ids = {v["id"] for v in existing_vlans}
-                            existing_ids.add(vlan_id)
-                            vlan_payload["tagged_vlans"] = list(existing_ids)
-
+                            # trunk port — accessVlan is the native (untagged) VLAN
+                            vlan_payload["untagged_vlan"] = vlan_id
+                            # (allowed VLANs handled separately below)
                         if vlan_payload:
                             self.patch(f"/dcim/interfaces/{iface_id}/", json=vlan_payload)
+
+                # Trunk allowed VLANs (taggedVlans) — distinct from native VLAN
+                # Now populated correctly from EOS / IOS-XE parsers.
+                if mode_raw == "trunk" and tagged_vlans_raw and tagged_vlans_raw.upper() != "ALL":
+                    tagged_vids: list[int] = []
+                    for part in tagged_vlans_raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if "-" in part:
+                            try:
+                                start, end = part.split("-", 1)
+                                tagged_vids.extend(range(int(start), int(end) + 1))
+                            except (ValueError, TypeError):
+                                try:
+                                    tagged_vids.append(int(part))
+                                except (ValueError, TypeError):
+                                    pass
+                        else:
+                            try:
+                                tagged_vids.append(int(part))
+                            except (ValueError, TypeError):
+                                pass
+
+                    if tagged_vids:
+                        # Fetch existing tagged VLANs from NetBox and merge
+                        existing_tagged = nb_iface_map.get(name.lower(), {}).get("tagged_vlans", [])
+                        existing_ids = {v["id"] for v in existing_tagged}
+                        for vid in tagged_vids:
+                            try:
+                                vlan_id = self._ensure_vlan(site_id, vid)
+                                existing_ids.add(vlan_id)
+                                if vlan_id not in vlan_ids:
+                                    vlan_ids.append(vlan_id)
+                            except NetBoxError as exc:
+                                logger.warning(
+                                    "netbox: could not ensure VLAN %d for interface '%s': %s",
+                                    vid, name, exc,
+                                )
+                                continue
+                        if existing_ids:
+                            self.patch(
+                                f"/dcim/interfaces/{iface_id}/",
+                                json={"tagged_vlans": list(existing_ids)},
+                            )
 
                 # --- IP address assignment for L3 interfaces ------------------------
                 address = str(iface.get("address") or "").strip()
