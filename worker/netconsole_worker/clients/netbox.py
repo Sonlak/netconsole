@@ -339,24 +339,42 @@ class NetBoxClient:
     # Device role helpers
     # ------------------------------------------------------------------
     def find_device_role(self, name: str) -> dict[str, Any] | None:
-        result = self.get("/dcim/device-roles/", params={"name": name})
-        results = result.get("results", [])
-        return results[0] if results else None
+        # NetBox API name search is case-sensitive. Fetch all roles and match
+        # case-insensitively to avoid creating duplicates (e.g. "Access" vs "access").
+        result = self.get("/dcim/device-roles/", params={"limit": 100})
+        name_lower = name.strip().lower()
+        for role in result.get("results", []):
+            if role.get("name", "").lower() == name_lower:
+                return role
+        return None
 
     def get_or_create_device_role(self, name: str, color: str = "9e9e9e") -> int:
-        """Return the device-role id. Creates if missing."""
+        """Return the device-role id. Creates if missing.
+
+        Handles the race where the role was created by another process between
+        our GET and POST — 400 on duplicate name/slug is caught and the
+        existing id is returned.
+        """
         role = self.find_device_role(name)
         if role:
             return role["id"]
         normalized = name.strip().title()
         slug = normalized.lower().replace(" ", "-").replace("_", "-")
-        created = self.post("/dcim/device-roles/", json={
-            "name": normalized,
-            "slug": slug,
-            "color": color,
-        })
-        logger.info("netbox: created device-role '%s' (id=%d)", normalized, created["id"])
-        return created["id"]
+        try:
+            created = self.post("/dcim/device-roles/", json={
+                "name": normalized,
+                "slug": slug,
+                "color": color,
+            })
+            logger.info("netbox: created device-role '%s' (id=%d)", normalized, created["id"])
+            return created["id"]
+        except NetBoxError as exc:
+            # Role was created concurrently — look it up and return the existing id.
+            if "already exists" in str(exc).lower():
+                role = self.find_device_role(normalized)
+                if role:
+                    return role["id"]
+            raise
 
     # ------------------------------------------------------------------
     # Fabric role inference — mirrors NetConsole's inferDeviceRole()
@@ -393,12 +411,12 @@ class NetBoxClient:
         # This catches "distribution", "DIST-SW", etc. where 'dist' appears as
         # a substring even without word-boundary 'ds'.
         if "dist" in key:
-            return "distribution"
+            return "Distribution"
         for _label, pattern, _role in self._FABRIC_ROLE_PATTERNS:
             if pattern.search(key):
-                return _role
+                return _role.title()
         # Default: treat unknown names as access switches
-        return "access"
+        return "Access"
 
     # ------------------------------------------------------------------
     # Rack helpers
