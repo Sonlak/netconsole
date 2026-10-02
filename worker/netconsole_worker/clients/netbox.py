@@ -1380,9 +1380,6 @@ class NetBoxClient:
             )
             return {"ok": True, "created": 0, "updated": 0, "skipped": 0, "vlans": [], "ips": []}
 
-        # Pre-fetch existing NetBox interfaces once (shared by all upserts)
-        nb_iface_map = self.list_interfaces(device_id)
-
         created = 0
         updated = 0
         skipped = 0
