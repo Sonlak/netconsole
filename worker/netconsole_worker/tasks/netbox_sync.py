@@ -125,6 +125,7 @@ class NetboxSyncDeviceTask(BaseTask):
         part_number = full_device.get("partNumber") or None
         rack = full_device.get("rack") or None
         unit = full_device.get("unit") or None
+        floor = full_device.get("floor") or None
         existing_nb_id = full_device.get("netboxDeviceId") or None
 
         if not serial:
@@ -149,6 +150,7 @@ class NetboxSyncDeviceTask(BaseTask):
                 part_number=part_number,
                 rack=rack,
                 unit=unit,
+                floor=floor,
                 existing_device_id=existing_nb_id,
             )
         except NetBoxError as exc:
@@ -270,6 +272,7 @@ class NetboxSyncAllTask(BaseTask):
             part_number = dev.get("partNumber") or None
             rack = dev.get("rack") or None
             unit = dev.get("unit") or None
+            floor = dev.get("floor") or None
             existing_nb_id = dev.get("netboxDeviceId") or None
 
             if not serial:
@@ -296,6 +299,7 @@ class NetboxSyncAllTask(BaseTask):
                     part_number=part_number,
                     rack=rack,
                     unit=unit,
+                    floor=floor,
                     existing_device_id=existing_nb_id,
                 )
                 if created:

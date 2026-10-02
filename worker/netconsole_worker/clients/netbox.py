@@ -17,6 +17,7 @@ result — no duplicates.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -342,6 +343,37 @@ class NetBoxClient:
         return created["id"]
 
     # ------------------------------------------------------------------
+    # Fabric role inference — mirrors NetConsole's inferDeviceRole()
+    # ------------------------------------------------------------------
+    # FabricNode.role values: 'core' | 'dist' | 'access'
+    # These map directly to NetBox device-role names.
+    # The logic is based on device name patterns (same as fabricTopology.ts):
+    #   "core"     → core / spine switches
+    #   "dist"     → distribution switches (DS)
+    #   "access"   → fabric access switches (AS) — the default fallback
+    _FABRIC_ROLE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
+        # (label, compiled_re, netbox_role_slug)
+        ("core", re.compile(r"core", re.I), "core"),
+        ("dist", re.compile(r"(?:^|[-_])ds(?:[-_]|\d|$)", re.I), "distribution"),
+        ("access", re.compile(r"(?:^|[-_])as(?:[-_]|\d|$)", re.I), "access"),
+    ]
+
+    def _infer_fabric_role(self, name: str, floor: str) -> str:
+        """Infer the fabric role (core/dist/access) from device name and floor string.
+
+        Mirrors the `inferDeviceRole(name, floor)` function in
+        backend/src/services/fabricTopology.ts — both systems must agree on the
+        same role inference so the NetBox device-role reflects the actual fabric
+        topology, not just the vendor type.
+        """
+        key = f"{name} {floor}".lower()
+        for _label, pattern, _role in self._FABRIC_ROLE_PATTERNS:
+            if pattern.search(key):
+                return _role
+        # Default: treat unknown names as access switches
+        return "access"
+
+    # ------------------------------------------------------------------
     # Rack helpers
     # ------------------------------------------------------------------
     # Default rack height in NetBox "U" units (42U is the industry standard).
@@ -661,6 +693,7 @@ class NetBoxClient:
         version: str | None = None,
         rack_id: int | None = None,
         unit: str | None = None,
+        floor: str | None = None,
     ) -> dict[str, Any]:
         """Build the NetBox device upsert payload (used for both POST and PATCH).
 
@@ -672,6 +705,7 @@ class NetBoxClient:
         - platform_id: NetBox platform record id (version is the platform name).
         - version: stored in custom field `os_version` (the raw OS version string).
         - rack_id + unit: physical location — rack record and U-position.
+        - floor: stored in custom field `floor` (floor/building level).
         - description: kept clean — just the operator-supplied description.
         """
         payload: dict[str, Any] = {
@@ -703,6 +737,8 @@ class NetBoxClient:
                     "netbox: invalid unit '%s' for device '%s' — skipping position",
                     unit, name,
                 )
+        if floor:
+            payload["custom_fields"]["floor"] = floor
         return payload
 
     def _map_status(self, netconsole_status: str) -> str:
@@ -732,6 +768,7 @@ class NetBoxClient:
         part_number: str | None = None,
         rack: str | None = None,
         unit: str | None = None,
+        floor: str | None = None,
         existing_device_id: int | None = None,
     ) -> dict[str, Any]:
         """Create or update a NetBox device record.
@@ -747,6 +784,11 @@ class NetBoxClient:
 
         Physical location (rack + unit): the rack is resolved by name within the
         site and auto-created if missing. The unit is the U-position (integer 1-42).
+
+        Fabric role: inferred from device name + floor string using the same
+        logic as `inferDeviceRole()` in `fabricTopology.ts`. The device role
+        in NetBox reflects the fabric topology (core/dist/access) rather than
+        the vendor type.
 
         Returns the NetBox device dict and a boolean `created` indicating whether
         it was newly created (vs updated).
@@ -768,8 +810,11 @@ class NetBoxClient:
         site_id = self.get_or_create_site(site, netconsole_id)
         mfg_id = self.get_or_create_manufacturer(vendor)
         dt_id = self.get_or_create_device_type(model, mfg_id, part_number)
-        role_name = "Network" if vendor.lower() in ("juniper", "cisco", "arista", "aruba", "hp") else "Other"
-        role_id = self.get_or_create_device_role(role_name)
+        # Resolve fabric role (core/dist/access) from device name + floor.
+        # This reflects the actual fabric topology, not just the vendor type.
+        # Mirrors inferDeviceRole() in backend/src/services/fabricTopology.ts.
+        nb_role = self._infer_fabric_role(name, floor or "")
+        role_id = self.get_or_create_device_role(nb_role)
 
         # Resolve NetBox platform.
         # Priority: version string (e.g. "18.4R1.5") → vendor-based canonical slug.
@@ -778,11 +823,7 @@ class NetBoxClient:
         platform_id: int | None = None
         if version:
             # Build a slug like "junos-18-4r1-5" from the version string.
-            # Non-alphanumeric chars (dots, slashes, parens) → hyphens, then collapse runs.
-            import re as _re
-
-            slug_base = vendor.lower().replace(" ", "") if vendor else ""
-            ver_clean = _re.sub(r"[^a-z0-9]", "-", version.strip().lower())
+            ver_clean = re.sub(r"[^a-z0-9]", "-", version.strip().lower())
             platform_slug = f"{slug_base}-{ver_clean}"
             # Collapse any runs of hyphens
             while "--" in platform_slug:
@@ -805,6 +846,15 @@ class NetBoxClient:
         # Resolve rack (physical location)
         rack_id = self._resolve_rack_id(rack, site_id)
 
+        # Ensure the floor custom field exists on dcim > devices
+        self.ensure_custom_field(
+            name="floor",
+            label="Floor",
+            type_str="text",
+            object_type="dcim > devices",
+            description="Floor / building level — synced from NetConsole Device.floor",
+        )
+
         payload = self._build_device_payload(
             site_id=site_id,
             device_type_id=dt_id,
@@ -818,6 +868,7 @@ class NetBoxClient:
             version=version,
             rack_id=rack_id,
             unit=unit,
+            floor=floor,
         )
         payload["tags"] = [tag_id]
 
