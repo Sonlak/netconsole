@@ -1180,6 +1180,9 @@ class NetBoxClient:
         device_name: str,
         iface: dict[str, Any],
         site_id: int,
+        *,
+        resolved_untagged_vlan_id: int | None = None,
+        resolved_tagged_vlan_ids: list[int] | None = None,
     ) -> tuple[int, bool]:
         """Create or update a single NetBox interface.
 
@@ -1248,6 +1251,11 @@ class NetBoxClient:
             payload["speed"] = raw_speed
         if mode:
             payload["mode"] = mode
+        # VLANs — set on both create and update (resolved in sync_device_interfaces before calling)
+        if resolved_untagged_vlan_id is not None:
+            payload["untagged_vlan"] = resolved_untagged_vlan_id
+        if resolved_tagged_vlan_ids:
+            payload["tagged_vlans"] = resolved_tagged_vlan_ids
 
         # Check if it already exists in NetBox
         nb_interfaces = self.list_interfaces(device_id)
@@ -1257,6 +1265,10 @@ class NetBoxClient:
         if existing:
             # Only PATCH if something actually changed — avoids a useless write
             # and keeps updatedAt clean for truly unchanged interfaces.
+            # Compare VLANs by NetBox ID (untagged_vlan in NetBox API is a nested object)
+            existing_untagged = existing.get("untagged_vlan")
+            existing_untagged_id = existing_untagged["id"] if isinstance(existing_untagged, dict) else None
+            existing_tagged = [v["id"] for v in (existing.get("tagged_vlans") or [])]
             needs_update = (
                 existing.get("type", {}).get("value") != netbox_type
                 or existing.get("enabled") != enabled
@@ -1264,6 +1276,10 @@ class NetBoxClient:
                 or existing.get("mtu") != iface.get("mtu")
                 or existing.get("speed") != raw_speed
                 or existing.get("mode") != mode
+                # VLAN change: include in needs_update so existing trunk ports with empty
+                # tagged_vlans get updated when the new data has VLANs.
+                or existing_untagged_id != resolved_untagged_vlan_id
+                or set(existing_tagged) != set(resolved_tagged_vlan_ids or [])
             )
             if not needs_update:
                 return existing["id"], False
@@ -1379,111 +1395,70 @@ class NetBoxClient:
             if not name:
                 continue
 
+            # --- Pre-resolve VLAN IDs (needed for upsert payload + needs_update comparison)
+            # This must happen BEFORE upsert_interface so the resolved IDs are included
+            # in the payload and NetBox can detect a change (e.g. empty→[201,202,203]).
+            mode_raw = str(iface.get("mode", "")).lower()
+            access_vlan_raw = str(iface.get("accessVlan") or "").strip()
+            tagged_vlans_raw = str(iface.get("taggedVlans") or "").strip()
+
+            resolved_untagged_vlan_id: int | None = None
+            resolved_tagged_vlan_ids: list[int] = []
+
+            def _parse_vids(raw: str) -> list[int]:
+                vids: list[int] = []
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part or raw.upper() == "ALL":
+                        continue
+                    if "-" in part:
+                        try:
+                            start_s, end_s = part.split("-", 1)
+                            vids.extend(range(int(start_s), int(end_s) + 1))
+                        except (ValueError, TypeError):
+                            try:
+                                vids.append(int(part))
+                            except ValueError:
+                                pass
+                    else:
+                        try:
+                            vids.append(int(part))
+                        except ValueError:
+                            pass
+                return vids
+
+            if mode_raw in ("access", "trunk") and access_vlan_raw and access_vlan_raw.upper() != "ALL":
+                for vid in _parse_vids(access_vlan_raw):
+                    try:
+                        vid_id = self._ensure_vlan(site_id, vid)
+                        if vid_id not in vlan_ids:
+                            vlan_ids.append(vid_id)
+                        if resolved_untagged_vlan_id is None:
+                            resolved_untagged_vlan_id = vid_id
+                    except NetBoxError:
+                        pass
+
+            if mode_raw == "trunk" and tagged_vlans_raw and tagged_vlans_raw.upper() != "ALL":
+                for vid in _parse_vids(tagged_vlans_raw):
+                    try:
+                        vid_id = self._ensure_vlan(site_id, vid)
+                        if vid_id not in vlan_ids:
+                            vlan_ids.append(vid_id)
+                        resolved_tagged_vlan_ids.append(vid_id)
+                    except NetBoxError:
+                        pass
+
+            # --- Upsert (pass resolved VLAN IDs so needs_update can compare them)
             try:
                 iface_id, was_created = self.upsert_interface(
                     device_id, device_name, iface, site_id,
+                    resolved_untagged_vlan_id=resolved_untagged_vlan_id,
+                    resolved_tagged_vlan_ids=resolved_tagged_vlan_ids,
                 )
                 if was_created:
                     created += 1
                 else:
                     updated += 1
-
-                # --- VLAN assignment ------------------------------------------------
-                # IOS-XE/EOS now use separate fields:
-                #   accessVlan   = native/untagged VLAN (for both access and trunk modes)
-                #   taggedVlans  = trunk allowed VLANs (for trunk mode only)
-                mode_raw = str(iface.get("mode", "")).lower()
-                access_vlan_raw = str(iface.get("accessVlan") or "").strip()
-                tagged_vlans_raw = str(iface.get("taggedVlans") or "").strip()
-
-                if mode_raw in ("access", "trunk") and access_vlan_raw and access_vlan_raw.upper() != "ALL":
-                    # Parse VLAN IDs from accessVlan string.
-                    # Format: "10" (single), "10,20,30" (list), or "10-20" (range).
-                    vids: list[int] = []
-                    for part in access_vlan_raw.split(","):
-                        part = part.strip()
-                        if not part:
-                            continue
-                        if "-" in part:
-                            try:
-                                start, end = part.split("-", 1)
-                                vids.extend(range(int(start), int(end) + 1))
-                            except (ValueError, TypeError):
-                                vids.append(int(part))
-                        else:
-                            try:
-                                vids.append(int(part))
-                            except (ValueError, TypeError):
-                                pass
-
-                    for vid in vids:
-                        try:
-                            vlan_id = self._ensure_vlan(site_id, vid)
-                            if vlan_id not in vlan_ids:
-                                vlan_ids.append(vlan_id)
-                        except NetBoxError as exc:
-                            logger.warning(
-                                "netbox: could not ensure VLAN %d for interface '%s': %s",
-                                vid, name, exc,
-                            )
-                            continue
-
-                        # Patch the interface with VLAN assignment
-                        vlan_payload: dict[str, Any] = {}
-                        if mode_raw == "access":
-                            # access port — this VLAN is untagged
-                            vlan_payload["untagged_vlan"] = vlan_id
-                        else:
-                            # trunk port — accessVlan is the native (untagged) VLAN
-                            vlan_payload["untagged_vlan"] = vlan_id
-                            # (allowed VLANs handled separately below)
-                        if vlan_payload:
-                            self.patch(f"/dcim/interfaces/{iface_id}/", json=vlan_payload)
-
-                # Trunk allowed VLANs (taggedVlans) — distinct from native VLAN
-                # Now populated correctly from EOS / IOS-XE parsers.
-                if mode_raw == "trunk" and tagged_vlans_raw and tagged_vlans_raw.upper() != "ALL":
-                    tagged_vids: list[int] = []
-                    for part in tagged_vlans_raw.split(","):
-                        part = part.strip()
-                        if not part:
-                            continue
-                        if "-" in part:
-                            try:
-                                start, end = part.split("-", 1)
-                                tagged_vids.extend(range(int(start), int(end) + 1))
-                            except (ValueError, TypeError):
-                                try:
-                                    tagged_vids.append(int(part))
-                                except (ValueError, TypeError):
-                                    pass
-                        else:
-                            try:
-                                tagged_vids.append(int(part))
-                            except (ValueError, TypeError):
-                                pass
-
-                    if tagged_vids:
-                        # Fetch existing tagged VLANs from NetBox and merge
-                        existing_tagged = nb_iface_map.get(name.lower(), {}).get("tagged_vlans", [])
-                        existing_ids = {v["id"] for v in existing_tagged}
-                        for vid in tagged_vids:
-                            try:
-                                vlan_id = self._ensure_vlan(site_id, vid)
-                                existing_ids.add(vlan_id)
-                                if vlan_id not in vlan_ids:
-                                    vlan_ids.append(vlan_id)
-                            except NetBoxError as exc:
-                                logger.warning(
-                                    "netbox: could not ensure VLAN %d for interface '%s': %s",
-                                    vid, name, exc,
-                                )
-                                continue
-                        if existing_ids:
-                            self.patch(
-                                f"/dcim/interfaces/{iface_id}/",
-                                json={"tagged_vlans": list(existing_ids)},
-                            )
 
                 # --- IP address assignment for L3 interfaces ------------------------
                 address = str(iface.get("address") or "").strip()
