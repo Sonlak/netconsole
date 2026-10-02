@@ -176,6 +176,12 @@ class NetBoxClient:
 
         Uses a module-level cache keyed by (name, object_type) to avoid
         redundant lookups on every device sync.
+
+        Matching logic:
+        - First pass: exact match on object_type (e.g. "dcim.device").
+        - Second pass (on NetBox v4): if the field exists with a different
+          object_type, we still use it (the field is already there; re-creating
+          it with a different type would 400). Fall back to first found by name.
         """
         cache_key = (name, object_type)
         if cache_key in _cf_cache:
@@ -188,11 +194,21 @@ class NetBoxClient:
                 if cf.get("name") != name:
                     continue
                 obj_types = [str(t) for t in cf.get("object_types", [])]
-                if any(object_type in t for t in obj_types):
+                # Exact match on object_type — NetBox v4 uses "dcim.device" format
+                if object_type in obj_types:
                     _cf_cache[cache_key] = cf["id"]
                     logger.debug(
-                        "netbox: custom field '%s' already exists (id=%d)",
-                        name, cf["id"],
+                        "netbox: custom field '%s' already exists (id=%d, type=%s)",
+                        name, cf["id"], object_type,
+                    )
+                    return cf["id"]
+                # Fallback: field exists but attached to a different object type.
+                # Use the first match by name (avoids 400 on re-creation).
+                if not any(k[0] == name for k in _cf_cache):
+                    _cf_cache[cache_key] = cf["id"]
+                    logger.debug(
+                        "netbox: custom field '%s' already exists (id=%d, obj_types=%s) — using existing",
+                        name, cf["id"], obj_types,
                     )
                     return cf["id"]
         except NetBoxError:
@@ -209,7 +225,7 @@ class NetBoxClient:
                 "description": description or f"{label} — synced from NetConsole",
             })
             logger.info(
-                "netbox: created custom field '%s' (id=%d) on %s",
+                "netbox: created custom field '%s' (id=%d, type=%s)",
                 name, created["id"], object_type,
             )
             _cf_cache[cache_key] = created["id"]
@@ -347,14 +363,20 @@ class NetBoxClient:
     # ------------------------------------------------------------------
     # FabricNode.role values: 'core' | 'dist' | 'access'
     # These map directly to NetBox device-role names.
-    # The logic is based on device name patterns (same as fabricTopology.ts):
-    #   "core"     → core / spine switches
-    #   "dist"     → distribution switches (DS)
-    #   "access"   → fabric access switches (AS) — the default fallback
+    # The logic mirrors `inferDeviceRole(name, floor)` in
+    # backend/src/services/fabricTopology.ts — both systems must agree on the
+    # same role inference so the NetBox device-role reflects the actual fabric
+    # topology, not just the vendor type.
+    #
+    # Pattern semantics (matching backend exactly):
+    #   "core"     → key.includes('core') — matches "CORE", "core-switch", etc.
+    #   "dist"     → key.includes('dist') OR word-boundary "ds" (same as backend)
+    #   "access"   → key.includes('access') OR word-boundary "as" (same as backend)
+    #                 default fallback = 'access'
     _FABRIC_ROLE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         # (label, compiled_re, netbox_role_slug)
-        ("core", re.compile(r"core", re.I), "core"),
-        ("dist", re.compile(r"(?:^|[-_])ds(?:[-_]|\d|$)", re.I), "distribution"),
+        ("core",   re.compile(r"core", re.I), "core"),
+        ("dist",   re.compile(r"(?:^|[-_])ds(?:[-_]|\d|$)", re.I), "distribution"),
         ("access", re.compile(r"(?:^|[-_])as(?:[-_]|\d|$)", re.I), "access"),
     ]
 
@@ -367,6 +389,11 @@ class NetBoxClient:
         topology, not just the vendor type.
         """
         key = f"{name} {floor}".lower()
+        # Check substring match first (same as backend: key.includes('dist')).
+        # This catches "distribution", "DIST-SW", etc. where 'dist' appears as
+        # a substring even without word-boundary 'ds'.
+        if "dist" in key:
+            return "distribution"
         for _label, pattern, _role in self._FABRIC_ROLE_PATTERNS:
             if pattern.search(key):
                 return _role
@@ -847,12 +874,12 @@ class NetBoxClient:
         # Resolve rack (physical location)
         rack_id = self._resolve_rack_id(rack, site_id)
 
-        # Ensure the floor custom field exists on dcim > devices
+        # Ensure the floor custom field exists on dcim.device
         self.ensure_custom_field(
             name="floor",
             label="Floor",
             type_str="text",
-            object_type="dcim > devices",
+            object_type="dcim.device",
             description="Floor / building level — synced from NetConsole Device.floor",
         )
 
