@@ -59,13 +59,24 @@ jobs:
   deploy:
     name: Deploy to production
     runs-on: self-hosted
-    # Phase 3 of the deploy-pipeline perf plan: the deploy job now
-    # depends on push-images. CI builds the images in parallel-friendly
-    # GitHub-hosted runners (warm BuildKit cache via `cache-from: type=gha`),
-    # pushes them to GHCR, and only THEN does the deploy step on the VPS
-    # pull + restart. This eliminates the ~60s in-VPS build that was the
-    # biggest remaining wall-time contributor after Phase 1.
-    needs: push-images
+    # Phase 3 of the deploy-pipeline perf plan: the deploy job pulls
+    # pre-built images from GHCR (built in the parallel push-images job)
+    # instead of compiling TypeScript / running apt-get on the VPS.
+    #
+    # NO `needs: push-images` dependency — deploy runs in PARALLEL with
+    # the build. The pull targets the `:main` tag (overwritten by each
+    # push-images run), so the deploy ALWAYS finds an image. There is
+    # a small race window (~50s while push-images is building): if the
+    # deploy's pull lands first, it gets the PREVIOUS `:main` image.
+    # The next deploy fixes that, so the worst case is a 1-deploy lag
+    # on the new code. For a lab system this is acceptable; for prod
+    # you can switch back to `needs: push-images` to lock-step the
+    # two jobs.
+    #
+    # Wall-time win: parallel = max(CI build, deploy pull) vs
+    # sequential = CI build + deploy pull. On observed runs the pull
+    # + restart is ~80s and the build is ~50s, so parallel saves the
+    # full ~50s of build time.
     timeout-minutes: 25
 
     steps:
@@ -209,12 +220,6 @@ jobs:
 
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
-        env:
-          # Pass the running commit SHA into docker compose so the prod
-          # overlay (docker-compose.app.prod.yml) can pin the image tag
-          # to exactly the SHA that CI just pushed. Without this, the
-          # default `:latest` would race against concurrent deploys.
-          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # Stop + rm old containers FIRST so we can pull fresh images
@@ -228,7 +233,7 @@ jobs:
           docker compose -p "$COMPOSE_PROJECT" \
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
             rm -sf $DEPLOY_SERVICES || true
-          echo "==> Pulling fresh images from GHCR..."
+          echo "==> Pulling fresh images from GHCR (tag: main)..."
           docker compose -p "$COMPOSE_PROJECT" \
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
             pull $DEPLOY_SERVICES

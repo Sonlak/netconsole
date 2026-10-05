@@ -14,7 +14,7 @@
 #     (`cache-from: type=gha` in the push-images job) so the CI build
 #     is consistently 1-2 min even on cold cache.
 #   - Splitting build (CI) from deploy (VPS) lets us:
-#       * build in parallel with other CI checks
+#       * build in parallel with deploy
 #       * keep deploy atomic: pull → stop → recreate → up. No
 #         possibility of a half-built image sitting on the VPS.
 #
@@ -25,18 +25,24 @@
 # Local dev still uses docker-compose.app.yml alone (with `build:`),
 # so the `image:` override only applies when the prod overlay is
 # passed.
+#
+# Image tag: `:main`. The deploy runs in PARALLEL with push-images, so
+# the SHA tag isn't available when deploy starts. `:main` is overwritten
+# on every push to main, so the deploy always finds an image. Worst case
+# is a 1-deploy lag if the pull lands before push-images finishes (the
+# next deploy will deploy the new code). For SHA-pinned deploys, run
+# the push-images job first via `workflow_dispatch` and then trigger
+# deploy with the same ref input.
 
 services:
   backend:
-    # Pinned by github.sha from the push-images job. The deploy step
-    # runs `docker compose pull` to refresh this exact tag.
-    image: ghcr.io/sonlak/netconsole-backend:${GITHUB_SHA:-latest}
+    image: ghcr.io/sonlak/netconsole-backend:main
     pull_policy: always
 
   worker:
-    image: ghcr.io/sonlak/netconsole-worker:${GITHUB_SHA:-latest}
+    image: ghcr.io/sonlak/netconsole-worker:main
     pull_policy: always
 
   frontend:
-    image: ghcr.io/sonlak/netconsole-frontend:${GITHUB_SHA:-latest}
+    image: ghcr.io/sonlak/netconsole-frontend:main
     pull_policy: always
