@@ -60,23 +60,22 @@ jobs:
     name: Deploy to production
     runs-on: self-hosted
     # Phase 3 of the deploy-pipeline perf plan: the deploy job pulls
-    # pre-built images from GHCR (built in the parallel push-images job)
-    # instead of compiling TypeScript / running apt-get on the VPS.
+    # pre-built images from GHCR (built by the push-images job) instead
+    # of compiling TypeScript / running apt-get on the VPS.
     #
-    # NO `needs: push-images` dependency — deploy runs in PARALLEL with
-    # the build. The pull targets the `:main` tag (overwritten by each
-    # push-images run), so the deploy ALWAYS finds an image. There is
-    # a small race window (~50s while push-images is building): if the
-    # deploy's pull lands first, it gets the PREVIOUS `:main` image.
-    # The next deploy fixes that, so the worst case is a 1-deploy lag
-    # on the new code. For a lab system this is acceptable; for prod
-    # you can switch back to `needs: push-images` to lock-step the
-    # two jobs.
+    # `needs: push-images` is REQUIRED (not optional) — without it, the
+    # deploy's `docker compose pull` lands BEFORE push-images finishes
+    # pushing the new :main tag, so the deploy silently uses the OLD
+    # image. This is a silent failure: the workflow reports "success"
+    # and the new code never runs. Re-introduced 2026-10-05 after
+    # observing the race on deploy #533.
     #
-    # Wall-time win: parallel = max(CI build, deploy pull) vs
-    # sequential = CI build + deploy pull. On observed runs the pull
-    # + restart is ~80s and the build is ~50s, so parallel saves the
-    # full ~50s of build time.
+    # Wall-time cost of the dependency: ~50s (the push-images build time
+    # is now sequential with the deploy pull). With multi-stage builds
+    # cutting the backend image from 950MB to ~250MB (Phase 4), the
+    # pull is faster (~10-20s vs ~55s), so the sequential total is
+    # actually competitive with parallel-but-stale.
+    needs: push-images
     timeout-minutes: 25
 
     steps:
@@ -220,6 +219,13 @@ jobs:
 
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          # Pass the running commit SHA into docker compose so the prod
+          # overlay (docker-compose.app.prod.yml) can pin the image tag
+          # to exactly the SHA that push-images just pushed. Combined
+          # with `needs: push-images` above, this eliminates the race
+          # condition where a parallel deploy could pull a stale image.
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           # Stop + rm old containers FIRST so we can pull fresh images

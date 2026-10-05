@@ -26,23 +26,22 @@
 # so the `image:` override only applies when the prod overlay is
 # passed.
 #
-# Image tag: `:main`. The deploy runs in PARALLEL with push-images, so
-# the SHA tag isn't available when deploy starts. `:main` is overwritten
-# on every push to main, so the deploy always finds an image. Worst case
-# is a 1-deploy lag if the pull lands before push-images finishes (the
-# next deploy will deploy the new code). For SHA-pinned deploys, run
-# the push-images job first via `workflow_dispatch` and then trigger
-# deploy with the same ref input.
+# Image tag: pinned to the running commit SHA. The deploy runs
+# SEQUENTIALLY after push-images (`needs: push-images` in the
+# workflow), so the SHA tag is guaranteed to exist by the time
+# the pull runs. This eliminates the race condition where a
+# parallel deploy could pull the previous :main image before the
+# new push completes. See deploy.yml for the full analysis.
 
 services:
   backend:
-    image: ghcr.io/sonlak/netconsole-backend:main
+    image: ghcr.io/sonlak/netconsole-backend:${GITHUB_SHA:-main}
     pull_policy: always
 
   worker:
-    image: ghcr.io/sonlak/netconsole-worker:main
+    image: ghcr.io/sonlak/netconsole-worker:${GITHUB_SHA:-main}
     pull_policy: always
 
   frontend:
-    image: ghcr.io/sonlak/netconsole-frontend:main
+    image: ghcr.io/sonlak/netconsole-frontend:${GITHUB_SHA:-main}
     pull_policy: always
