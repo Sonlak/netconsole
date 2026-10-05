@@ -389,29 +389,37 @@ jobs:
           set -euo pipefail
           echo "Probing NetBox /api/dcim/sites/?limit=1 ..."
 
-          # Fast path: if NetBox container is already running and healthy,
-          # do a single probe and exit. This is the common case on every
-          # deploy after the first one — NetBox is never restarted by
-          # app deploys (it holds the netbox_pgdata volume), so the 5-min
-          # loop below is pure waste on warm deploys.
+          # Fast path: if the NetBox container is ANY running state, skip the wait.
+          # NetBox is NEVER restarted by app deploys (only the app services
+          # backend/worker/frontend are rebuilt+recreated; netbox holds the
+          # netbox_pgdata volume). So if the container is Up, its API state
+          # post-deploy is identical to pre-deploy — there's no reason to
+          # block the deploy on a 5-minute probe loop.
           #
-          # Container name comes from docker-compose.netbox.yml; the
-          # "Up" state is the standard "running" indicator from
-          # `docker ps`. We pair it with a /api probe to confirm
-          # readiness (Up doesn't guarantee the API is responding yet).
+          # The previous check required `Up .* (healthy)`, but NetBox can
+          # legitimately be Up + unhealthy (e.g. its internal Docker
+          # healthcheck on /api/health/ returns 404 because the endpoint
+          # isn't enabled, or the NetBox API is wedged). In both cases
+          # waiting 5 min is pure waste — the worker just retries on its
+          # next sync tick regardless.
+          #
+          # We do a quick API probe (1 attempt, 5s timeout) to log the
+          # state, but we never fail the deploy on NetBox.
           if docker ps --format '{{.Names}}\t{{.Status}}' \
-              | grep -E '^(netbox-netbox)\s+(Up .* \(healthy\))' >/dev/null 2>&1; then
-            echo "==> NetBox container already up + healthy — quick probe only"
+              | grep -E '^(netbox-netbox)\s+Up' >/dev/null 2>&1; then
+            echo "==> NetBox container Up — skipping full wait"
             if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
-              echo "✅ NetBox reachable (skipped full wait — container was already healthy)"
-              exit 0
+              echo "✅ NetBox reachable"
+            else
+              echo "::warning::NetBox container is Up but API probe failed — worker's next sync tick will retry"
             fi
-            echo "::warning::NetBox container is Up+healthy but API probe failed; falling through to full wait"
+            exit 0
           fi
 
-          # Slow path: first deploy OR NetBox was recreated. NetBox first boot
-          # does Django migrations + createsuperuser + runs our init script —
-          # typical 60-90s. Allow up to 5 minutes.
+          # Slow path: NetBox container is missing or being recreated (first
+          # deploy, or docker-compose.netbox.yml changed).
+          # NetBox first boot does Django migrations + createsuperuser +
+          # runs our init script — typical 60-90s. Allow up to 5 minutes.
           for i in $(seq 1 60); do
             if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
               echo "✅ NetBox healthy after ${i} attempt(s)"
