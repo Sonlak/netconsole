@@ -267,15 +267,18 @@ jobs:
         run: |
           set -euo pipefail
           echo "Probing backend /api/health via container network..."
-          # NOTE: tuned down from 40 attempts (80s) → 30 attempts (60s).
-          # 30s was too aggressive: the FIRST deploy after a Dockerfile
-          # change (npm install → npm ci) has no layer cache on the
-          # self-hosted runner, so `apt-get + npm ci + tsc build` push
-          # the container cold start past 30s. 60s is a safe middle
-          # ground — warm deploys typically succeed in <15s, while cold
-          # builds get a 2-3x safety margin over the observed ~25s
-          # prisma-push + node-start window.
-          for i in $(seq 1 30); do
+          # Tuned: 80s baseline -> 90s for first-boot safety.
+          # Observations from real deploys:
+          #   - Warm deploy (no Dockerfile change): backend ready in 15-25s.
+          #   - First deploy after Dockerfile change (npm install -> npm ci):
+          #     backend was NOT ready by 60s on the latest attempts, only
+          #     became healthy ~70-90s after container start (manual log
+          #     inspection confirmed: pg_isready + prisma migrate + db push
+          #     + node startup + API bind on slow VPS disks pushes past 60s).
+          #   - 90s gives a 4-5x margin over the warm path while leaving
+          #     a single ~10s safety net for the cold path.
+          # To revert to baseline (80s) or aggressive (60s), edit this block.
+          for i in $(seq 1 45); do
             # Backend container's bridge IP (deterministic from compose ipam).
             # Note: the backend startup script (scripts/docker-start.sh) applies
             # schema migrations resiliently — it NEVER blocks container start,
@@ -290,7 +293,7 @@ jobs:
             sleep 2
           done
 
-          echo "❌ Backend did not become healthy within 60s"
+          echo "❌ Backend did not become healthy within 90s"
           echo "--- Last 40 lines of backend log ---"
           docker logs --tail 40 netconsole-backend || true
           exit 1
