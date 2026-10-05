@@ -498,7 +498,7 @@ jobs:
     #   - ghcr.io/sonlak/netconsole-backend:latest    (only on main push)
     # Same for worker + frontend.
   push-images:
-    name: Push images to GHCR
+    name: Push ${{ matrix.service }} to GHCR
     runs-on: ubuntu-latest
     # Run on:
     #   - push to main (auto-deploy on merge)
@@ -513,6 +513,23 @@ jobs:
     permissions:
       contents: read
       packages: write
+
+    strategy:
+      # Run all 3 service images in parallel — saves ~50-60s vs the
+      # previous sequential build (49s + 21s + 27s = 97s becomes
+      # max(49, 21, 27) + setup ~10s = ~60s).
+      fail-fast: false
+      matrix:
+        include:
+          - service: backend
+            context: backend
+            dockerfile: backend/Dockerfile
+          - service: worker
+            context: worker
+            dockerfile: worker/Dockerfile
+          - service: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile.prod
 
     steps:
       - uses: actions/checkout@v4
@@ -531,11 +548,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for backend
-        id: meta-backend
+      - name: Extract metadata for ${{ matrix.service }}
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/sonlak/netconsole-backend
+          images: ghcr.io/sonlak/netconsole-${{ matrix.service }}
           tags: |
             # Full SHA tag — used by the deploy step to pull EXACTLY this
             # image. Always set (not just on default branch) so workflow_dispatch
@@ -546,76 +563,23 @@ jobs:
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build + push backend
+      - name: Build + push ${{ matrix.service }}
         uses: docker/build-push-action@v6
         with:
-          context: backend
-          file: backend/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
-          tags: ${{ steps.meta-backend.outputs.tags }}
-          labels: ${{ steps.meta-backend.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          # `mode=min` (not `max`) because the backend Dockerfile uses
-          # `--mount=type=cache` for apt + npm. See worker step for
-          # the full explanation.
-          cache-to: type=gha,mode=min
-
-      - name: Extract metadata for worker
-        id: meta-worker
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/sonlak/netconsole-worker
-          tags: |
-            type=raw,value=${{ github.sha }}
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build + push worker
-        uses: docker/build-push-action@v6
-        with:
-          context: worker
-          file: worker/Dockerfile
-          push: true
-          tags: ${{ steps.meta-worker.outputs.tags }}
-          labels: ${{ steps.meta-worker.outputs.labels }}
-          cache-from: type=gha
-          # `mode=min` (not `max`) because the worker Dockerfile uses
-          # `--mount=type=cache` for apt + pip. With `mode=max` the GHA
-          # cache backend tries to export cache-mount content as a
-          # layer, which it isn't, and the build fails with a cache
-          # key computation error. `mode=min` only exports the final
-          # image layers — which is what the cache is for.
-          cache-to: type=gha,mode=min
-
-      - name: Extract metadata for frontend
-        id: meta-frontend
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/sonlak/netconsole-frontend
-          tags: |
-            type=raw,value=${{ github.sha }}
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build + push frontend
-        uses: docker/build-push-action@v6
-        with:
-          context: frontend
-          file: frontend/Dockerfile.prod
-          push: true
-          tags: ${{ steps.meta-frontend.outputs.tags }}
-          labels: ${{ steps.meta-frontend.outputs.labels }}
-          cache-from: type=gha
-          # `mode=min` (not `max`) because the frontend Dockerfile.prod
-          # uses `--mount=type=cache` for npm. See worker step for
-          # the full explanation.
+          # `mode=min` (not `max`) because all 3 Dockerfiles use
+          # `--mount=type=cache` for apt / pip / npm. `mode=max` tries
+          # to export cache-mount content as a layer (which it isn't)
+          # and the build fails with a cache-key computation error.
           cache-to: type=gha,mode=min
 
       - name: Summary
+        if: ${{ matrix.service == 'backend' }}
         run: |
           echo "## 📦 Images pushed to GHCR" >> $GITHUB_STEP_SUMMARY
           echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
