@@ -7,11 +7,13 @@ WORKDIR /app
 # lxml, ncclient, scrapli etc. — total ~50MB of downloads. Caching
 # `/root/.cache/pip` across builds turns a 30-60s pip install into
 # a 2-5s resolve-from-cache on warm rebuilds.
-# `sharing=locked` for both — pip's resolver acquires a lock on the
-# cache, and apt holds locks on its lists/cache too.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+# Note: do NOT add `sharing=locked` here — the GHA buildx cache exporter
+# (`cache-to: type=gha`) interacts badly with locked cache mounts and
+# the build fails. Default `shared` is safe for both single- and
+# multi-stage builds.
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
+    --mount=type=cache,target=/root/.cache/pip \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update \
     && apt-get install -y --no-install-recommends \

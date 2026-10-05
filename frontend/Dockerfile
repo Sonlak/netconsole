@@ -7,7 +7,7 @@ COPY package.json package-lock.json* ./
 # On warm rebuilds (no package*.json change), `npm ci` resolves
 # from cache in <2s instead of 20-30s of network downloads.
 # Requires BuildKit (`DOCKER_BUILDKIT=1`).
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
 COPY . .

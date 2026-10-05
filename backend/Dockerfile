@@ -7,11 +7,10 @@ WORKDIR /app
 # Saves ~10-15s on rebuilds by keeping /var/cache/apt across builds.
 # `id` lets us share this cache across multiple RUN steps in the same
 # Dockerfile (e.g. the apt-get below and any future apt-using step).
-# `sharing=locked` means the mount is exclusive to this build (the
-# safe default for apt/pip/npm caches — they all need exclusive access
-# to their lock files).
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+# Default `shared` mode — `sharing=locked` interacts badly with the
+# GHA cache exporter (`cache-to: type=gha`) and the build fails.
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt \
     rm -f /etc/apt/apt.conf.d/docker-clean \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -25,7 +24,7 @@ COPY package.json package-lock.json* ./
 # instead of 30-60s of network downloads.
 # Note: `npm ci` always purges node_modules first, but it still uses
 # the cache to skip downloading tarballs it has seen before.
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+RUN --mount=type=cache,target=/root/.npm \
     npm ci
 
 COPY prisma ./prisma
