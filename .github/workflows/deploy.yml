@@ -267,13 +267,15 @@ jobs:
         run: |
           set -euo pipefail
           echo "Probing backend /api/health via container network..."
-          # NOTE: tuned down from 40 attempts (80s) → 15 attempts (30s).
-          # The build now skips the redundant `npx prisma generate` at
-          # container start (already done at image build time), so cold
-          # start is ~10-20s in practice. 30s leaves a 1.5x safety margin
-          # for first-boot schema push on slow disks without dragging
-          # warm deploys.
-          for i in $(seq 1 15); do
+          # NOTE: tuned down from 40 attempts (80s) → 30 attempts (60s).
+          # 30s was too aggressive: the FIRST deploy after a Dockerfile
+          # change (npm install → npm ci) has no layer cache on the
+          # self-hosted runner, so `apt-get + npm ci + tsc build` push
+          # the container cold start past 30s. 60s is a safe middle
+          # ground — warm deploys typically succeed in <15s, while cold
+          # builds get a 2-3x safety margin over the observed ~25s
+          # prisma-push + node-start window.
+          for i in $(seq 1 30); do
             # Backend container's bridge IP (deterministic from compose ipam).
             # Note: the backend startup script (scripts/docker-start.sh) applies
             # schema migrations resiliently — it NEVER blocks container start,
@@ -288,7 +290,7 @@ jobs:
             sleep 2
           done
 
-          echo "❌ Backend did not become healthy within 30s"
+          echo "❌ Backend did not become healthy within 60s"
           echo "--- Last 40 lines of backend log ---"
           docker logs --tail 40 netconsole-backend || true
           exit 1
