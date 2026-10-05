@@ -1,0 +1,42 @@
+# Production overlay for docker-compose.app.yml.
+#
+# This file is loaded with `-f docker-compose.app.yml -f docker-compose.app.prod.yml`.
+# It OVERRIDES the `build:` directives from the base file with pre-built
+# GHCR images, so the deploy step becomes `docker compose pull && up -d`
+# instead of `up -d --build`.
+#
+# Why this exists:
+#   - On the deploy runner, the network egress for the GitHub Container
+#     Registry is fine, but rebuilding three ~1-2GB images from local
+#     Dockerfiles is slow (5-7 min) because the runner is a thin VPS
+#     and Docker layer cache misses after any Dockerfile change.
+#   - GitHub Actions runners, in contrast, have warm BuildKit cache
+#     (`cache-from: type=gha` in the push-images job) so the CI build
+#     is consistently 1-2 min even on cold cache.
+#   - Splitting build (CI) from deploy (VPS) lets us:
+#       * build in parallel with other CI checks
+#       * keep deploy atomic: pull → stop → recreate → up. No
+#         possibility of a half-built image sitting on the VPS.
+#
+# The kea-dhcp* services are NOT overridden here because they are
+# built ONCE (locally, on first deploy) and never rebuilt — their
+# data lives in `kea_{primary,standby}_leases` volumes.
+#
+# Local dev still uses docker-compose.app.yml alone (with `build:`),
+# so the `image:` override only applies when the prod overlay is
+# passed.
+
+services:
+  backend:
+    # Pinned by github.sha from the push-images job. The deploy step
+    # runs `docker compose pull` to refresh this exact tag.
+    image: ghcr.io/sonlak/netconsole-backend:${GITHUB_SHA:-latest}
+    pull_policy: always
+
+  worker:
+    image: ghcr.io/sonlak/netconsole-worker:${GITHUB_SHA:-latest}
+    pull_policy: always
+
+  frontend:
+    image: ghcr.io/sonlak/netconsole-frontend:${GITHUB_SHA:-latest}
+    pull_policy: always

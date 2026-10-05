@@ -59,6 +59,13 @@ jobs:
   deploy:
     name: Deploy to production
     runs-on: self-hosted
+    # Phase 3 of the deploy-pipeline perf plan: the deploy job now
+    # depends on push-images. CI builds the images in parallel-friendly
+    # GitHub-hosted runners (warm BuildKit cache via `cache-from: type=gha`),
+    # pushes them to GHCR, and only THEN does the deploy step on the VPS
+    # pull + restart. This eliminates the ~60s in-VPS build that was the
+    # biggest remaining wall-time contributor after Phase 1.
+    needs: push-images
     timeout-minutes: 25
 
     steps:
@@ -202,20 +209,37 @@ jobs:
 
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          # Pass the running commit SHA into docker compose so the prod
+          # overlay (docker-compose.app.prod.yml) can pin the image tag
+          # to exactly the SHA that CI just pushed. Without this, the
+          # default `:latest` would race against concurrent deploys.
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Stop + rm old containers FIRST so we can rebuild with the same tag
+          # Stop + rm old containers FIRST so we can pull fresh images
           # without "container name conflict" errors from docker compose.
           # --no-deps: don't touch kea/postgres (they hold persistent state)
           echo "==> Stopping old containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+          docker compose -p "$COMPOSE_PROJECT" \
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
             stop $DEPLOY_SERVICES || true
           echo "==> Removing old containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+          docker compose -p "$COMPOSE_PROJECT" \
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
             rm -sf $DEPLOY_SERVICES || true
-          echo "==> Building + starting fresh containers..."
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-            up -d --build --no-deps $DEPLOY_SERVICES
+          echo "==> Pulling fresh images from GHCR..."
+          docker compose -p "$COMPOSE_PROJECT" \
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
+            pull $DEPLOY_SERVICES
+          echo "==> Starting fresh containers..."
+          # NOTE: NO --build flag. Images are built in CI (push-images job)
+          # and pulled here. This is Phase 3 of the deploy-pipeline perf plan:
+          # the VPS no longer compiles TypeScript / runs apt-get — it just
+          # pulls a pre-baked image and restarts the container.
+          docker compose -p "$COMPOSE_PROJECT" \
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
+            up -d --no-deps $DEPLOY_SERVICES
 
           # ── NetBox stack ────────────────────────────────────────────
           # Bring up the netbox compose side-by-side. We do NOT rebuild it
@@ -465,7 +489,15 @@ jobs:
   push-images:
     name: Push images to GHCR
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # Run on:
+    #   - push to main (auto-deploy on merge)
+    #   - push of a v*.*.* tag (release deploy)
+    #   - workflow_dispatch (manual deploy; uses dispatched `ref` input)
+    # PRs and pushes to other branches do NOT trigger this (and therefore
+    # do NOT trigger the deploy job that depends on it).
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      github.event_name == 'workflow_dispatch'
     timeout-minutes: 25
     permissions:
       contents: read
@@ -473,6 +505,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the ref the user requested.
+          # On push, build the ref that was pushed.
+          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -490,6 +526,10 @@ jobs:
         with:
           images: ghcr.io/sonlak/netconsole-backend
           tags: |
+            # Full SHA tag — used by the deploy step to pull EXACTLY this
+            # image. Always set (not just on default branch) so workflow_dispatch
+            # deploys of any ref can pull a deterministically-named image.
+            type=raw,value=${{ github.sha }}
             type=sha,prefix=sha-
             type=ref,event=branch
             type=ref,event=tag
@@ -512,6 +552,7 @@ jobs:
         with:
           images: ghcr.io/sonlak/netconsole-worker
           tags: |
+            type=raw,value=${{ github.sha }}
             type=sha,prefix=sha-
             type=ref,event=branch
             type=ref,event=tag
@@ -534,6 +575,7 @@ jobs:
         with:
           images: ghcr.io/sonlak/netconsole-frontend
           tags: |
+            type=raw,value=${{ github.sha }}
             type=sha,prefix=sha-
             type=ref,event=branch
             type=ref,event=tag
