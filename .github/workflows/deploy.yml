@@ -544,7 +544,10 @@ jobs:
           tags: ${{ steps.meta-backend.outputs.tags }}
           labels: ${{ steps.meta-backend.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `mode=min` (not `max`) because the backend Dockerfile uses
+          # `--mount=type=cache` for apt + npm. See worker step for
+          # the full explanation.
+          cache-to: type=gha,mode=min
 
       - name: Extract metadata for worker
         id: meta-worker
@@ -567,7 +570,13 @@ jobs:
           tags: ${{ steps.meta-worker.outputs.tags }}
           labels: ${{ steps.meta-worker.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `mode=min` (not `max`) because the worker Dockerfile uses
+          # `--mount=type=cache` for apt + pip. With `mode=max` the GHA
+          # cache backend tries to export cache-mount content as a
+          # layer, which it isn't, and the build fails with a cache
+          # key computation error. `mode=min` only exports the final
+          # image layers — which is what the cache is for.
+          cache-to: type=gha,mode=min
 
       - name: Extract metadata for frontend
         id: meta-frontend
@@ -590,7 +599,10 @@ jobs:
           tags: ${{ steps.meta-frontend.outputs.tags }}
           labels: ${{ steps.meta-frontend.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `mode=min` (not `max`) because the frontend Dockerfile.prod
+          # uses `--mount=type=cache` for npm. See worker step for
+          # the full explanation.
+          cache-to: type=gha,mode=min
 
       - name: Summary
         run: |
