@@ -8,7 +8,11 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./
-RUN npm install
+# `npm ci` is deterministic + ~20-30% faster than `npm install`.
+# Reads package-lock.json exactly; container layer cache is invalidated
+# only when package*.json changes (not on every source change).
+# build-time `npx prisma generate` below also benefits from this cache.
+RUN npm ci
 
 COPY prisma ./prisma
 COPY tsconfig.json ./

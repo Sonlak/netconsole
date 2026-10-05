@@ -267,7 +267,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "Probing backend /api/health via container network..."
-          for i in $(seq 1 40); do
+          # NOTE: tuned down from 40 attempts (80s) → 15 attempts (30s).
+          # The build now skips the redundant `npx prisma generate` at
+          # container start (already done at image build time), so cold
+          # start is ~10-20s in practice. 30s leaves a 1.5x safety margin
+          # for first-boot schema push on slow disks without dragging
+          # warm deploys.
+          for i in $(seq 1 15); do
             # Backend container's bridge IP (deterministic from compose ipam).
             # Note: the backend startup script (scripts/docker-start.sh) applies
             # schema migrations resiliently — it NEVER blocks container start,
@@ -282,7 +288,7 @@ jobs:
             sleep 2
           done
 
-          echo "❌ Backend did not become healthy within 80s"
+          echo "❌ Backend did not become healthy within 30s"
           echo "--- Last 40 lines of backend log ---"
           docker logs --tail 40 netconsole-backend || true
           exit 1
@@ -377,8 +383,30 @@ jobs:
         run: |
           set -euo pipefail
           echo "Probing NetBox /api/dcim/sites/?limit=1 ..."
-          # NetBox first boot does Django migrations + createsuperuser +
-          # runs our init script — typical 60-90s. Allow up to 5 minutes.
+
+          # Fast path: if NetBox container is already running and healthy,
+          # do a single probe and exit. This is the common case on every
+          # deploy after the first one — NetBox is never restarted by
+          # app deploys (it holds the netbox_pgdata volume), so the 5-min
+          # loop below is pure waste on warm deploys.
+          #
+          # Container name comes from docker-compose.netbox.yml; the
+          # "Up" state is the standard "running" indicator from
+          # `docker ps`. We pair it with a /api probe to confirm
+          # readiness (Up doesn't guarantee the API is responding yet).
+          if docker ps --format '{{.Names}}\t{{.Status}}' \
+              | grep -E '^(netbox-netbox)\s+(Up .* \(healthy\))' >/dev/null 2>&1; then
+            echo "==> NetBox container already up + healthy — quick probe only"
+            if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
+              echo "✅ NetBox reachable (skipped full wait — container was already healthy)"
+              exit 0
+            fi
+            echo "::warning::NetBox container is Up+healthy but API probe failed; falling through to full wait"
+          fi
+
+          # Slow path: first deploy OR NetBox was recreated. NetBox first boot
+          # does Django migrations + createsuperuser + runs our init script —
+          # typical 60-90s. Allow up to 5 minutes.
           for i in $(seq 1 60); do
             if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
               echo "✅ NetBox healthy after ${i} attempt(s)"

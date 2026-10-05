@@ -61,9 +61,13 @@ if [ "$READY" != "true" ]; then
   echo "[startup] WARNING: postgres not ready after 60s — proceeding anyway"
 fi
 
-# Prisma generate (must match the schema baked into the image)
-echo "[startup] Generating Prisma client..."
-npx prisma generate
+# NOTE: `npx prisma generate` is intentionally NOT run here.
+# It already ran at image build time (backend/Dockerfile line ~28),
+# and the prisma/ directory is COPY-baked into the image (no volume
+# mount in docker-compose.app.yml), so the schema cannot drift between
+# build and runtime. Re-running generate at every container restart
+# costs ~15-30s for no benefit. If you ever bind-mount prisma/ at
+# runtime, restore this step.
 
 # Step 1: migrate deploy (safe, respects migration history)
 echo "[startup] Running prisma migrate deploy..."

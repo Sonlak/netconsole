@@ -3,7 +3,9 @@ FROM node:22-bookworm-slim
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm install
+# `npm ci` for deterministic + faster installs (mirrors backend/Dockerfile
+# change; the prod build uses Dockerfile.prod which already used `npm ci`).
+RUN npm ci
 
 COPY . .
 
