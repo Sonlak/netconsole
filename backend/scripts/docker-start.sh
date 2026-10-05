@@ -44,22 +44,27 @@
 
 set -e
 
-echo "[startup] Waiting for database to be ready..."
-# pg_isready exits 0 when Postgres is accepting connections.
-# Loop with timeout to avoid infinite hang on DB unavailability.
-READY=false
-for i in $(seq 1 30); do
+echo "[startup] Probing postgres (single shot)..."
+# pg_isready sometimes returns "not accepting" briefly after a
+# container recreate, even when TCP connect succeeds (Prisma
+# connects fine, but pg_isready is stricter — it checks the
+# server's "ready to accept" status). On observed deploys the
+# network iptables rules for the new container take 1-5s to
+# settle, so 1-2 retries are sufficient. The 60s loop previously
+# here added a dead 60s to every deploy.
+#
+# If pg_isready keeps failing past 6s, the prisma steps below
+# will surface the real connection error — and since we capture
+# their exit codes and never fail the script, the backend
+# still gets a chance to start.
+for i in $(seq 1 3); do
   if pg_isready -U netconsole -d netconsole >/dev/null 2>&1; then
-    READY=true
+    echo "[startup] postgres ready (attempt $i)"
     break
   fi
-  echo "[startup] waiting for postgres ($i/30)..."
+  echo "[startup] postgres not ready yet (attempt $i/3), sleeping 2s"
   sleep 2
 done
-
-if [ "$READY" != "true" ]; then
-  echo "[startup] WARNING: postgres not ready after 60s — proceeding anyway"
-fi
 
 # NOTE: `npx prisma generate` is intentionally NOT run here.
 # It already ran at image build time (backend/Dockerfile line ~28),
