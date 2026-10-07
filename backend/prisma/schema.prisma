@@ -1,5 +1,14 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  // runtime container is node:22-bookworm-slim (Debian 12) which
+  // ships libssl.so.3 only — requires `debian-openssl-3.0.x` engine.
+  // Without this, Prisma generates the engine for the *build* host
+  // only (CI = ubuntu-latest = openssl-1.1 detected at the time the
+  // multi-stage build landed in Phase 4, see deploy #537 image hash
+  // 5d88825 — that release shipped `libquery_engine-debian-openssl-1.1.x`
+  // and login started returning 500 because the runtime could not
+  // load that engine).
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
