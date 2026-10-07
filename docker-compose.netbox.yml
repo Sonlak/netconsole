@@ -73,7 +73,14 @@ services:
       retries: 10
 
   netbox:
-    image: netboxcommunity/netbox:v4.6.2-Docker-4.6.2
+    # Tag MUST exist on Docker Hub — otherwise `docker compose
+    # ... --force-recreate netbox` on every deploy silently fails
+    # to pull and skips the recreate, leaving the container on
+    # the stale healthcheck (and any other config drift). The
+    # previously committed `v4.6.2-Docker-4.6.2` tag does NOT exist;
+    # the running container is `v4.6.10-5.0.2` (carried over from
+    # commit 5f09b81 upgrade(netbox) but the tag here was not).
+    image: netboxcommunity/netbox:v4.6.10-5.0.2
     container_name: netbox-netbox
     restart: unless-stopped
     depends_on:
