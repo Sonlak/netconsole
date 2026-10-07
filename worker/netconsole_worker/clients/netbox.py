@@ -1083,12 +1083,19 @@ class NetBoxClient:
     # ------------------------------------------------------------------
 
     # Static map: interface name prefix → NetBox interface-type value.
-    # NetBox v4 interface types (value field, not label):
+    # NetBox v4 interface types (value field, not label).
+    #
+    # IMPORTANT: values must match NetBox's allowed choices exactly.
+    # NetBox v4.6.10 rejected "10gbase-fs-lr" with 400 — that string is from
+    # the old NetBox v2 schema. The actual valid 10G fibre choices are
+    # "10gbase-lr", "10gbase-er", "10gbase-sr", "10gbase-zr", "10gbase-lrm",
+    # "10gbase-lx4", "10gbase-cx4", "10gbase-kx4", "10gbase-kr". For the
+    # generic Juniper `xe-` 10G port we use "10gbase-lr" (most common LR optic).
     #   "other"          — management / virtual / unknown
     #   "100base-tx"     — FastEthernet (100M)
     #   "1000base-t"     — GigabitEthernet / ge / et / arista Ethernet / lo
-    #   "10gbase-t"      — TenGigabitEthernet / 10GE optics
-    #   "10gbase-fs-lr"  — 10GE fibre LR
+    #   "10gbase-t"      — TenGigabitEthernet / 10GE copper base-T
+    #   "10gbase-lr"     — 10GE fibre LR  ← used for Juniper xe- (was 10gbase-fs-lr, rejected)
     #   "10gbase-sr"     — 10GE fibre SR
     #   "25gbase-sr"     — 25GE
     #   "40gbase-cr4"    — 40GE copper
@@ -1126,7 +1133,8 @@ class NetBoxClient:
         # ── Juniper ───────────────────────────────────────────────────────
         ("Juniper ge",      re.compile(r"^ge-\d", re.I), "1000base-t"),
         ("Juniper et",      re.compile(r"^et-\d", re.I), "10gbase-t"),
-        ("Juniper xe",      re.compile(r"^xe-\d", re.I), "10gbase-fs-lr"),
+        # xe- = 10G fibre → use "10gbase-lr" (was "10gbase-fs-lr" — rejected by NetBox v4)
+        ("Juniper xe",      re.compile(r"^xe-\d", re.I), "10gbase-lr"),
         ("Juniper lc",      re.compile(r"^lc-\d", re.I), "other"),
         ("Juniper ae",      re.compile(r"^ae\d", re.I), "lag"),
         ("Juniper irb",    re.compile(r"^irb", re.I), "virtual"),
@@ -1224,8 +1232,14 @@ class NetBoxClient:
             "name": name,
             "type": netbox_type,
             "enabled": enabled,
-            "description": description or None,
         }
+        # Description: only include the key when there's an actual value.
+        # Sending `description: null` causes NetBox v4 to reject with
+        # `{"description": ["This field may not be null."]}` (verified
+        # 2026-10-07). An empty string IS allowed but we omit the key
+        # entirely to keep the API request lean.
+        if description:
+            payload["description"] = description
         # MTU — add on create (was missing, Bug D)
         raw_mtu = iface.get("mtu")
         if raw_mtu is not None:
