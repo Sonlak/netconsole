@@ -138,9 +138,15 @@ services:
       # in front.
       - "8080:8080"
     healthcheck:
-      # NetBox health endpoint
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/health/"]
-      interval: 10s
+      # NetBox does NOT expose `/api/health/` (404), so the previous
+      # endpoint silently kept the container in "(unhealthy)" state
+      # for 5+ days until the gunicorn workers deadlocked and the
+      # real failure cascaded. `/api/` returns 200 with the NetBox
+      # version payload and is a reliable liveness probe. Interval
+      # widened to 30s (was 10s) to avoid hammering the slow
+      # first-query path after restart.
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/"]
+      interval: 30s
       timeout: 5s
-      retries: 30
+      retries: 5
       start_period: 60s
