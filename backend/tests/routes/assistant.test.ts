@@ -523,5 +523,98 @@ describe('POST /api/assistant', () => {
     const events = await collectEvents(res);
     const text = events.filter((e) => e.type === 'text').map((e) => e.content).join('');
     expect(text).toMatch(/job/);
+
+    // Regression (2026-10-09): when the client re-sends a prior
+    // assistant(tool_calls) message WITHOUT the corresponding tool
+    // response (because we paused on a confirmation card), the
+    // confirmation continuation MUST inject a tool message right
+    // after the assistant message. Otherwise OpenAI returns 400
+    // ("An assistant message with 'tool_calls' must be followed
+    // by tool messages responding to each 'tool_call_id'"). This
+    // test drives the real flow: client sends the full prior
+    // history including the assistant(tool_calls) row, and we
+    // verify the LLM call carries the injected tool response in
+    // the correct position.
+    expect(createCompletionMock).toHaveBeenCalledTimes(1);
+    const followUpArgs = createCompletionMock.mock.calls[0][0] as {
+      messages: Array<{ role: string; tool_calls?: Array<{ id: string }>; tool_call_id?: string }>;
+    };
+    const asstIdx = followUpArgs.messages.findIndex((m) => Array.isArray(m.tool_calls));
+    expect(asstIdx).toBeGreaterThanOrEqual(0);
+    const toolMsg = followUpArgs.messages
+      .slice(asstIdx + 1)
+      .find((m) => m.role === 'tool' && m.tool_call_id === 'call-2');
+    expect(toolMsg).toBeTruthy();
+    // No non-tool message should sit between the assistant(tool_calls)
+    // and the injected tool result.
+    const between = followUpArgs.messages
+      .slice(asstIdx + 1)
+      .filter((m) => m.role === 'tool' && m.tool_call_id === 'call-2');
+    expect(between.length).toBe(1);
+  });
+
+  it('injects tool result when prior assistant(tool_calls) was followed by other tool results (mixed READ+WRITE fan-out)', async () => {
+    // Flow: LLM emitted [get_device, queue_interface_action] in one
+    // turn. get_device ran inline and was persisted. queue_interface_action
+    // paused on confirmation. The frontend now sends the prior history
+    // (user, assistant(tool_calls), tool(get_device)) and we confirm
+    // queue_interface_action. The continuation must inject the WRITE
+    // tool result after the existing READ tool result, not before.
+    mocks.deviceFindFirst.mockResolvedValueOnce({ id: 'dev-1', name: 'LAB-F2-AS-01', ip: '10.10.20.1', status: 'ONLINE' });
+    createCompletionMock.mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: { role: 'assistant', content: 'Đã shutdown port ge-0/0/5. Job #job-100.' },
+        },
+      ],
+      usage: { prompt_tokens: 300, completion_tokens: 30, total_tokens: 330, prompt_tokens_details: { cached_tokens: 200 } },
+    });
+
+    const priorMessages = [
+      { role: 'user', content: 'Shutdown port ge-0/0/5 trên F2-AS-01' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'call-r', type: 'function', function: { name: 'get_device', arguments: '{"query":"LAB-F2-AS-01"}' } },
+          { id: 'call-w', type: 'function', function: { name: 'queue_interface_action', arguments: '{"device_name":"LAB-F2-AS-01","interface":"ge-0/0/5","action":"shut"}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call-r', content: JSON.stringify({ found: 1, devices: [{ name: 'LAB-F2-AS-01' }] }) },
+    ];
+
+    const res = await fetch(baseUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${makeAdminToken()}` },
+      body: JSON.stringify({
+        userMessage: 'Xác nhận',
+        messages: priorMessages,
+        confirmedToolCall: {
+          id: 'call-w',
+          name: 'queue_interface_action',
+          arguments: { device_name: 'LAB-F2-AS-01', interface: 'ge-0/0/5', action: 'shut' },
+        },
+      }),
+    });
+    if (res.status !== 200) {
+      const body = await res.text();
+      throw new Error(`Expected 200, got ${res.status}: ${body}`);
+    }
+    const events = await collectEvents(res);
+    expect(events.find((e) => e.type === 'error')).toBeUndefined();
+    expect(createCompletionMock).toHaveBeenCalledTimes(1);
+    const followUpArgs = createCompletionMock.mock.calls[0][0] as {
+      messages: Array<{ role: string; tool_calls?: Array<{ id: string }>; tool_call_id?: string }>;
+    };
+    const asstIdx = followUpArgs.messages.findIndex((m) => Array.isArray(m.tool_calls));
+    expect(asstIdx).toBeGreaterThanOrEqual(0);
+    // After the assistant message: tool(call-r) then tool(call-w), no
+    // other role in between. Order is allowed; both must be present.
+    const tail = followUpArgs.messages.slice(asstIdx + 1);
+    const firstNonTool = tail.findIndex((m) => m.role !== 'tool');
+    const toolSection = firstNonTool === -1 ? tail : tail.slice(0, firstNonTool);
+    const toolIds = toolSection.map((m) => m.tool_call_id).sort();
+    expect(toolIds).toEqual(['call-r', 'call-w']);
   });
 });

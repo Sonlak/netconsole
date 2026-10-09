@@ -51,6 +51,7 @@ import type {
   AssistantRequest,
   AssistantRole,
   AssistantStreamEvent,
+  AssistantToolMessage,
   AssistantToolName,
   ToolContext,
 } from '../services/assistant/types.js';
@@ -203,8 +204,34 @@ async function runConfirmation(
 
   // Feed the confirmed action + result back to the LLM so it can
   // produce a natural follow-up message.
+  //
+  // The body.messages we receive includes the prior assistant
+  // message that emitted the tool_calls (the one we paused on for
+  // confirmation), but does NOT include a corresponding `tool`
+  // message — by design, because at the time we sent the
+  // confirmation_required event we hadn't run the tool yet.
+  //
+  // OpenAI's API is strict here: an assistant message with
+  // tool_calls MUST be followed by `tool` messages for every
+  // tool_call_id, with nothing in between. If we just append our
+  // "[Confirmed] ..." user message after the original assistant
+  // message, the LLM rejects the request with
+  //   "An assistant message with 'tool_calls' must be followed
+  //    by tool messages responding to each 'tool_call_id'."
+  //
+  // injectToolResult finds the assistant message that contains our
+  // toolCallId and inserts the tool response right after it (and
+  // any other tool responses already there from READ tools that
+  // ran inline before the confirmation pause).
+  const messagesWithToolResult = injectToolResult(
+    body.messages,
+    id,
+    name,
+    JSON.stringify(result.preview ?? {}),
+  );
+
   const followUp: AssistantMessage[] = [
-    ...body.messages,
+    ...messagesWithToolResult,
     {
       role: 'user',
       content:
@@ -214,6 +241,95 @@ async function runConfirmation(
   ];
 
   await callAndStream(followUp, ctx, model, res, 'confirmation');
+}
+
+/**
+ * Insert a `tool` role message into a conversation so that OpenAI's
+ * strict "tool message must follow assistant(tool_calls)" invariant
+ * holds. Returns a new array; the input is not mutated.
+ *
+ * Strategy: walk the messages, and after each assistant message
+ * that contains a tool_call matching our `toolCallId`, append all
+ * the immediately-following tool messages that are already in the
+ * input (these belong to READ tools that ran inline before the
+ * confirmation pause — e.g. the LLM called `get_device` to verify
+ * existence, then `queue_interface_action` which we paused on).
+ * Then append our new tool result.
+ *
+ * If the toolCallId is not found in any assistant message (defensive
+ * — shouldn't happen in normal flow), the result is appended at the
+ * end with a synthetic preceding assistant(tool_calls) message.
+ */
+function injectToolResult(
+  messages: AssistantMessage[],
+  toolCallId: string,
+  toolName: string,
+  resultContent: string,
+): AssistantMessage[] {
+  const out: AssistantMessage[] = [];
+  let injected = false;
+  let i = 0;
+
+  while (i < messages.length) {
+    const m = messages[i];
+    out.push(m);
+    i++;
+
+    if (
+      !injected &&
+      m.role === 'assistant' &&
+      Array.isArray(m.tool_calls) &&
+      m.tool_calls.some((tc) => tc.id === toolCallId)
+    ) {
+      // Carry forward any tool messages already in the input that
+      // follow this assistant message (READ tool results from
+      // before the confirmation pause). Skip if the input already
+      // has a result for our id (defensive — shouldn't happen for
+      // WRITE tools, since runConfirmation is the only caller).
+      while (i < messages.length && messages[i].role === 'tool') {
+        const tm = messages[i] as AssistantToolMessage;
+        if (tm.tool_call_id === toolCallId) {
+          injected = true;
+          break;
+        }
+        out.push(messages[i]);
+        i++;
+      }
+      if (!injected) {
+        out.push({
+          role: 'tool',
+          tool_call_id: toolCallId,
+          content: resultContent,
+        });
+        injected = true;
+      }
+    }
+  }
+
+  if (!injected) {
+    // Defensive: the toolCallId wasn't found in any assistant
+    // message. Synthesize the smallest valid sequence so the LLM
+    // call doesn't 400. The LLM will likely reply with something
+    // generic, which is the right fallback.
+    out.push({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: toolCallId,
+          type: 'function',
+          function: { name: toolName, arguments: '{}' },
+        },
+      ],
+    });
+    out.push({
+      role: 'tool',
+      tool_call_id: toolCallId,
+      content: resultContent,
+    });
+  }
+
+  return out;
 }
 
 // ─── Main turn ────────────────────────────────────────────────────────────────
