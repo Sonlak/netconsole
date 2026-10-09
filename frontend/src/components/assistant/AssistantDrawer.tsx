@@ -55,6 +55,7 @@ import {
 import { useAuth } from '@/hooks/useAuth';
 import { streamAssistant, type AssistantMessage, type AssistantStreamEvent } from '@/api/assistant';
 import { MessageBubble, type AssistantMessageView } from './MessageBubble';
+import { startJobFollowUp } from '@/lib/jobFollowUp';
 
 type Props = {
   open: boolean;
@@ -270,6 +271,70 @@ export function AssistantDrawer({ open, onClose }: Props) {
                   tc.id === id ? { ...tc, result: { ok, preview, error: errorMsg } } : tc,
                 ),
               }));
+              // If the tool queued a background job (queue_interface_action,
+              // queue_log_collect, queue_managed_check), the preview carries
+              // a jobId. Start a background follow-up so the chip animates
+              // PENDING → RUNNING → SUCCESS/FAILED and a toast fires on
+              // terminal — without this, the user only sees "Job queued"
+              // and has to navigate to /jobs to learn the outcome.
+              const jobId = (preview as { jobId?: unknown } | null | undefined)?.jobId;
+              if (typeof jobId === 'string' && jobId) {
+                const stop = startJobFollowUp(jobId, (update) => {
+                  updateAssistant((m) => ({
+                    ...m,
+                    toolCalls: (m.toolCalls ?? []).map((tc) =>
+                      tc.id === id
+                        ? {
+                            ...tc,
+                            jobFollowUp: {
+                              jobId,
+                              status: update.status,
+                              ...(update.elapsedMs !== undefined
+                                ? { elapsedMs: update.elapsedMs }
+                                : {}),
+                              ...(update.error ? { error: update.error } : {}),
+                            },
+                          }
+                        : tc,
+                    ),
+                  }));
+                  if (
+                    update.status === 'SUCCESS' ||
+                    update.status === 'FAILED' ||
+                    update.status === 'CANCELLED' ||
+                    update.status === 'TIMEOUT'
+                  ) {
+                    // One-shot notification. Don't fire on the synthetic
+                    // PENDING replay that startJobFollowUp emits for late
+                    // subscribers — that has no elapsedMs and is just a
+                    // rehydration.
+                    if (update.elapsedMs !== undefined) {
+                      const summary = (preview as { message?: string } | null | undefined)?.message;
+                      if (update.status === 'SUCCESS') {
+                        const ms = update.elapsedMs;
+                        const dur =
+                          ms < 1000
+                            ? `${ms}ms`
+                            : ms < 60_000
+                              ? `${(ms / 1000).toFixed(1)}s`
+                              : `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+                        toast.success(
+                          summary
+                            ? `✅ ${summary} (${dur})`
+                            : `Job hoàn thành trong ${dur}`,
+                        );
+                      } else {
+                        toast.error(
+                          update.error
+                            ? `❌ ${update.error}`
+                            : `Job ${update.status.toLowerCase()}. Xem /jobs.`,
+                        );
+                      }
+                    }
+                    stop();
+                  }
+                });
+              }
             },
             onConfirmationRequired: (id, name, args, summary) => {
               updateAssistant((m) => ({ ...m, pendingConfirmation: { id, name, arguments: args, summary } }));

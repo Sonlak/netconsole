@@ -23,6 +23,7 @@ export const JOB_STATUS_META: Record<JobStatus, StatusMeta> = {
   RUNNING: { label: 'Running', tone: 'processing', pulse: true },
   SUCCESS: { label: 'Success', tone: 'success' },
   FAILED: { label: 'Failed', tone: 'error' },
+  CANCELLED: { label: 'Cancelled', tone: 'default' },
 };
 
 export const DISCOVERY_SCAN_META: Record<DiscoveryScanStatus, StatusMeta> = {

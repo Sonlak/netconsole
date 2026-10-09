@@ -10,7 +10,7 @@ export type JobType =
   | 'DISCOVERY_PROBE'
   | 'APPLY_CONFIG'
   | 'ROLLBACK_CONFIG';
-export type JobStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+export type JobStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CANCELLED';
 
 export type Job = {
   id: string;

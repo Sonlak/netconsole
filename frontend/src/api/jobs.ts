@@ -151,7 +151,7 @@ export async function waitForJobIfNeeded(
   return waitForJob(job.id, { ...options, initial: job });
 }
 
-async function fetchJob(jobId: string): Promise<Job> {
+export async function fetchJob(jobId: string): Promise<Job> {
   return authJsonFetch<Job>(`${API_BASE}/${jobId}`);
 }
 

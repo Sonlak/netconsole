@@ -14,7 +14,9 @@
  *     reads as "this is the AI's reply" without shouting.
  *
  *   - Tool calls: small inline chips above the content. They feel
- *     like inline references, not badges.
+ *     like inline references, not badges. For tool calls that
+ *     queued a background job, the chip shows a live status pill
+ *     (RUNNING spinner, SUCCESS check + duration, FAILED x + reason).
  *
  *   - Streaming: a 3-dot pulse + blinking caret at the end of text.
  *
@@ -27,12 +29,15 @@ import {
   CheckCircleTwoTone,
   CloseCircleTwoTone,
   InfoCircleOutlined,
+  LoadingOutlined,
   RobotFilled,
 } from '@ant-design/icons';
 import { MarkdownText } from './MarkdownText';
 import { ConfirmationCard } from './ConfirmationCard';
 
 export type AssistantMessageRole = 'user' | 'assistant' | 'system';
+
+export type ToolCallJobStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED' | 'CANCELLED' | 'TIMEOUT';
 
 export type AssistantMessageView = {
   id: string;
@@ -43,6 +48,20 @@ export type AssistantMessageView = {
     name: string;
     arguments: Record<string, unknown>;
     result?: { ok: boolean; preview?: unknown; error?: string };
+    /**
+     * Live status of the background job queued by this tool call.
+     * Only populated for the `queue_*` WRITE tools. The drawer
+     * patches this in via `startJobFollowUp` from the moment a
+     * `jobId` is detected in the tool_result preview, so the chip
+     * animates from PENDING → RUNNING → SUCCESS/FAILED without the
+     * user having to switch to the Jobs page.
+     */
+    jobFollowUp?: {
+      jobId: string;
+      status: ToolCallJobStatus;
+      elapsedMs?: number;
+      error?: string;
+    };
   }>;
   pendingConfirmation?: {
     id: string;
@@ -75,15 +94,82 @@ const TOOL_LABELS: Record<string, { label: string; color: string }> = {
   queue_managed_check: { label: 'Managed check', color: 'orange' },
 };
 
+function formatElapsed(ms: number | undefined): string {
+  if (ms === undefined) return '';
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const rem = sec % 60;
+  return rem === 0 ? `${min}m` : `${min}m${rem}s`;
+}
+
+type ToolCallJobFollowUp = NonNullable<
+  NonNullable<AssistantMessageView['toolCalls']>[number]['jobFollowUp']
+>;
+
 function ToolCallChip({
   name,
   result,
+  jobFollowUp,
 }: {
   name: string;
   result?: { ok: boolean; error?: string };
+  jobFollowUp?: ToolCallJobFollowUp;
 }) {
   const { token } = theme.useToken();
   const meta = TOOL_LABELS[name] ?? { label: name, color: 'default' };
+
+  // Background job takes precedence over the synchronous result icon:
+  // the tool call returned ok=true ("queued") but the actual outcome
+  // is what the user cares about.
+  if (jobFollowUp) {
+    const { status, elapsedMs, error } = jobFollowUp;
+    const isInFlight = status === 'PENDING' || status === 'RUNNING';
+    const isSuccess = status === 'SUCCESS';
+    const isFailed = status === 'FAILED' || status === 'CANCELLED' || status === 'TIMEOUT';
+    const labelText = isInFlight
+      ? `${meta.label} · ${status === 'PENDING' ? 'queued' : 'running'} ${formatElapsed(elapsedMs)}`
+      : isSuccess
+        ? `${meta.label} · done ${formatElapsed(elapsedMs)}`
+        : `${meta.label} · ${status === 'TIMEOUT' ? 'timeout' : 'failed'}`;
+    const tooltip = isFailed
+      ? error ?? `Job ${status.toLowerCase()}`
+      : `Job ${jobFollowUp.jobId.slice(0, 8)} · ${status}${elapsedMs !== undefined ? ` · ${formatElapsed(elapsedMs)}` : ''}`;
+    const accentColor = isInFlight
+      ? token.colorPrimary
+      : isSuccess
+        ? token.colorSuccess
+        : token.colorError;
+    return (
+      <Tooltip title={tooltip} placement="topLeft">
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            padding: '2px 8px',
+            borderRadius: 999,
+            fontSize: 11,
+            fontWeight: 500,
+            color: token.colorTextSecondary,
+            background: token.colorFillTertiary,
+            border: `1px solid ${token.colorBorderSecondary}`,
+          }}
+        >
+          <ApiOutlined style={{ fontSize: 10 }} />
+          <span style={{ color: accentColor }}>{labelText}</span>
+          {isInFlight ? (
+            <LoadingOutlined style={{ color: accentColor, fontSize: 11 }} />
+          ) : isSuccess ? (
+            <CheckCircleTwoTone twoToneColor={accentColor} style={{ fontSize: 12 }} />
+          ) : (
+            <CloseCircleTwoTone twoToneColor={accentColor} style={{ fontSize: 12 }} />
+          )}
+        </span>
+      </Tooltip>
+    );
+  }
+
   const statusIcon = result === undefined ? (
     <InfoCircleOutlined style={{ color: token.colorTextTertiary, fontSize: 11 }} />
   ) : result.ok ? (
@@ -264,7 +350,12 @@ export function MessageBubble({ message, onConfirm, onCancel, showUsage: _showUs
             }}
           >
             {message.toolCalls.map((tc) => (
-              <ToolCallChip key={tc.id} name={tc.name} result={tc.result} />
+              <ToolCallChip
+                key={tc.id}
+                name={tc.name}
+                result={tc.result}
+                jobFollowUp={tc.jobFollowUp}
+              />
             ))}
           </div>
         )}
