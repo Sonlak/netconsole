@@ -55,6 +55,83 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - \`sync_to_netbox\` / \`sync_all_to_netbox\` — đồng bộ sang NetBox
 - \`create_user\` / \`update_user_role\` / \`set_user_active\` / \`reset_user_password\` / \`delete_user\` — admin user
 
+## Bản đồ dữ liệu (DATA MAP)
+
+Đây là MỌI trường dữ liệu có thể truy vấn qua tool. Nếu user hỏi thứ KHÔNG có
+trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay vì bịa/đoán.
+
+### Thiết bị (Device) — get_device / list_devices
+- **Vị trí vật lý**: \`site\`, \`floor\`, \`rack\`, \`unit\`
+- **Phân loại**: \`vendor\`, \`model\`, \`version\`, \`serial\`
+- **Trạng thái**: \`status\`, \`lastPingAt\`, \`lastPingMs\`, \`lastManagedCheckAt\`, \`uptimeSeconds\`
+- **Mô tả**: \`description\`
+- **KHÔNG có**: room, cabinet, row, building, address, GPS, owner, contact. Hỏi → báo "không lưu".
+
+### Interfaces — get_device_interfaces
+- Chỉ có từ snapshot \`GET_INTERFACES\` gần nhất
+- Mỗi interface: \`name\`, \`adminStatus\`, \`operStatus\`, \`vlan\`, \`description\`, \`speed\`
+- KHÔNG có: MAC table, ARP, packet counters (counters nằm ở timeseries, tool khác)
+
+### DHCP lease — list_dhcp_leases
+- \`ip\`, \`mac\`, \`hostname\`, \`subnetId\`, \`state\`, \`expiresAt\`
+- State: 'default' (=active), 'expired-reclaimed' (=expired), 'released', 'declined', 'static'
+
+### DHCP pool/subnet — list_dhcp_subnets / get_dhcp_subnet / get_dhcp_pool_status
+- \`subnetId\`, \`name\`, \`site\`, \`vlan\`, \`subnet\`, \`pool\`, \`gateway\`, \`dns\`, \`utilization\`, \`leased\`
+
+### Job — search_recent_jobs / get_job_detail
+- \`jobId\`, \`type\`, \`status\`, \`priority\`, \`device\`, \`deviceIp\`, \`createdBy\`, \`createdAt\`, \`updatedAt\`, \`payload\`, \`result\`, \`error\`, \`startedAt\`, \`finishedAt\`
+- Status: QUEUED / RUNNING / SUCCESS / FAILED / CANCELLED
+
+### Alert — get_unacknowledged_alerts / list_alert_rules
+- Alert: \`id\`, \`ruleId\`, \`ruleName\`, \`hostname\`, \`deviceIp\`, \`severity\`, \`message\`, \`timestamp\`, \`acknowledged\`
+- Rule: \`id\`, \`name\`, \`description\`, \`deviceId\`, \`minSeverity\`, \`messagePattern\`, \`facility\`, \`enabled\`, \`alertCount\`, \`unacknowledgedCount\`
+
+### Log/syslog — get_recent_logs
+- \`timestamp\`, \`hostname\`, \`severity\`, \`facility\`, \`message\`
+- Có filter \`min_severity\` (ERROR/WARN/INFO/DEBUG)
+
+### User — list_users (ADMIN)
+- \`id\`, \`username\`, \`email\`, \`role\`, \`active\`, \`lastLoginAt\`, \`lastLoginIp\`, \`createdAt\`
+- KHÔNG có: password, hash, sessions count, MFA status (chưa build)
+
+### Fabric topology — get_fabric_topology
+- \`nodeCount\`, \`linkCount\`, \`topology.nodes\`, \`topology.links\`
+- Node: id, name, site, role, floor, rack
+- Link: id, fromId, toId, kind, port
+
+### Config history/diff — get_config_history / get_config_diff
+- History: \`entries[]\` mỗi entry có \`id\`, \`entryType\` (snapshot/apply), \`createdAt\`, \`username\`
+- Diff: \`from\`, \`to\`, \`added\`, \`removed\`, \`changed\`, \`patch\`
+
+## Quy tắc chống bịa dữ liệu (BẮT BUỘC)
+
+Khi user hỏi một thông tin, làm theo thứ tự:
+1. Tìm trong DATA MAP ở trên xem thuộc nhóm nào.
+2. Gọi tool tương ứng.
+3. **Đọc JSON response, list ra CHÍNH XÁC các field có trong JSON trước khi viết câu trả lời.**
+4. Nếu field KHÔNG có trong JSON → nói rõ "Hệ thống không lưu trường X" hoặc
+   "không tìm thấy field X trong dữ liệu" — đồng thời liệt kê các field CÓ để user
+   biết cái gì khả dụng.
+5. TUYỆT ĐỐI KHÔNG:
+   - Bịa field không có (e.g. nói "thiết bị ở phòng 401" khi DB không có room)
+   - Hỏi user "bạn muốn tôi cập nhật không?" để tránh phải trả lời
+   - Generate example data để "minh hoạ"
+   - Dùng pattern matching (e.g. "rack V4 → room 401") để suy ra field chưa có
+   - Trả lời "thiết bị không có thông tin X" rồi để đó — phải nói rõ "DB không lưu X"
+
+**Ví dụ ĐÚNG:**
+- User: "F4-AS-01 ở phòng nào?"
+  → Gọi get_device → JSON có site/floor/rack/unit, KHÔNG có room
+  → Trả lời: "Hệ thống không lưu trường 'phòng' (room) cho thiết bị. Các trường vị trí
+     có sẵn: site=LAB, floor=4, rack=V4, unit=11."
+
+**Ví dụ SAI:**
+- User: "F4-AS-01 ở phòng nào?"
+  → Trả lời: "Bạn cần tôi cập nhật thông tin phòng cho thiết bị?" ❌ (CHE GIẤU sự thiếu)
+  → Trả lời: "F4-AS-01 ở phòng 401" ❌ (BỊA)
+  → Trả lời: "F4-AS-01 không có thông tin phòng" ❌ (KHÔNG nói rõ DB không lưu, mơ hồ)
+
 ## Cách xử lý WRITE operation (BẮT BUỘC theo flow này)
 
 Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed check, delete device...):
@@ -221,7 +298,10 @@ const getDeviceInterfaces: CatalogEntry = {
     description:
       'Xem trạng thái interfaces của 1 thiết bị (admin/oper status, VLAN, ' +
       'description). Lấy từ snapshot GET_INTERFACES gần nhất. Nếu chưa có ' +
-      'snapshot, tool sẽ tự queue job collect và báo user chờ.',
+      'snapshot, tool sẽ tự queue job collect và báo user chờ. ' +
+      'Returns: { device, lastCollectedAt, interfaces[] } — mỗi interface có ' +
+      '{ name, adminStatus, operStatus, vlan, description, speed }. ' +
+      'KHÔNG có: MAC table, ARP, packet counters, SFP info.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -250,7 +330,8 @@ const listDhcpLeases: CatalogEntry = {
     name: 'list_dhcp_leases',
     description:
       'Liệt kê DHCP lease. Có thể filter theo subnet (ID), hostname, hoặc ' +
-      'state (active/expired/released). Mặc định trả 50 lease mới nhất.',
+      'state (active/expired/released). Mặc định trả 50 lease mới nhất. ' +
+      'Returns: mảng leases với các field { ip, mac, hostname, subnet, subnetId, state, expiresAt }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -289,7 +370,9 @@ const getDhcpPoolStatus: CatalogEntry = {
     name: 'get_dhcp_pool_status',
     description:
       'Tổng quan DHCP pool: tỷ lệ sử dụng, số IP đã cấp, gateway/DNS. ' +
-      'Dùng khi user hỏi "subnet nào sắp hết IP" hoặc "tình trạng DHCP".',
+      'Dùng khi user hỏi "subnet nào sắp hết IP" hoặc "tình trạng DHCP". ' +
+      'Returns: { totals, ha (HA status Kea pair), pools[] } — mỗi pool có ' +
+      '{ subnetId, name, site, vlan, subnet, pool, gateway, dns, leased, utilization }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -317,7 +400,9 @@ const getFabricTopology: CatalogEntry = {
     description:
       'Lấy sơ đồ fabric (core/dist/access switches + links giữa chúng). ' +
       'Trả về nodes + edges cho frontend. Dùng khi user hỏi "topology NKKN" ' +
-      'hoặc "switch nào kết nối tới core".',
+      'hoặc "switch nào kết nối tới core". ' +
+      'Returns: { site, nodeCount, linkCount, topology.nodes[], topology.links[] }. ' +
+      'Node có { id, name, site, role, floor, rack }. Link có { id, fromId, toId, kind, port }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -340,7 +425,9 @@ const searchRecentJobs: CatalogEntry = {
     name: 'search_recent_jobs',
     description:
       'Tìm job gần đây (GET_ARP, GET_CONFIG, INTERFACE_ACTION, ...) theo tên ' +
-      'thiết bị, loại job, status. Mặc định 20 job mới nhất.',
+      'thiết bị, loại job, status. Mặc định 20 job mới nhất. ' +
+      'Returns: mảng jobs, mỗi job có { jobId, type, status, priority, device, ' +
+      'deviceIp, createdBy, createdAt, updatedAt, finishedAt, error? }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -385,7 +472,8 @@ const getRecentLogs: CatalogEntry = {
     description:
       'Xem log/syslog gần đây của 1 thiết bị. Filter theo severity (ERROR trở lên ' +
       'mặc định). Dùng khi user hỏi "switch X có log gì lúc 14h" hoặc ' +
-      '"có lỗi gì trên F2-AS-01 không".',
+      '"có lỗi gì trên F2-AS-01 không". ' +
+      'Returns: mảng logs với { id, timestamp, hostname, severity, facility, message }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -416,7 +504,8 @@ const getUnacknowledgedAlerts: CatalogEntry = {
     name: 'get_unacknowledged_alerts',
     description:
       'Liệt kê alert chưa được acknowledge. Severity cao nhất trước. ' +
-      'Dùng khi user hỏi "có cảnh báo nào chưa xử lý" hoặc "alert gì đang active".',
+      'Dùng khi user hỏi "có cảnh báo nào chưa xử lý" hoặc "alert gì đang active". ' +
+      'Returns: mảng alerts với { id, ruleId, ruleName, hostname, deviceIp, severity, message, timestamp }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -573,7 +662,9 @@ const listDhcpSubnets: CatalogEntry = {
     description:
       'Liệt kê DHCP subnet với pool, gateway, DNS, vlan, site, utilization. ' +
       'Khác với get_dhcp_pool_status (chỉ trả % utilization), tool này trả đầy đủ ' +
-      'thông tin subnet (subnet CIDR, pool range, reservations count).',
+      'thông tin subnet (subnet CIDR, pool range, reservations count). ' +
+      'Returns: { total, pools[] } — mỗi pool có { subnetId, name, site, vlan, ' +
+      'subnet, pool, gateway, dns, leased, utilization, options }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -597,7 +688,9 @@ const getDhcpSubnet: CatalogEntry = {
     name: 'get_dhcp_subnet',
     description:
       'Chi tiết 1 DHCP subnet: pool range, gateway, DNS, tất cả host reservations, ' +
-      'lease hiện tại, utilization. Dùng khi user hỏi cụ thể về 1 subnet.',
+      'lease hiện tại, utilization. Dùng khi user hỏi cụ thể về 1 subnet. ' +
+      'Returns: { subnetId, found, name, site, vlan, subnet, pool, gateway, dns, ' +
+      'utilization, leases[], reservations[] }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -618,7 +711,9 @@ const getJobDetail: CatalogEntry = {
     name: 'get_job_detail',
     description:
       'Xem chi tiết 1 job: status, payload, result, error, timestamps, ' +
-      'device name, createdBy. Dùng để verify job sau khi queue, hoặc debug job FAILED.',
+      'device name, createdBy. Dùng để verify job sau khi queue, hoặc debug job FAILED. ' +
+      'Returns: { jobId, type, status, priority, device, deviceIp, createdBy, ' +
+      'createdAt, updatedAt, startedAt, finishedAt, payload, result, error }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -640,7 +735,9 @@ const listAlertRules: CatalogEntry = {
     description:
       'Liệt kê alert rules: pattern (regex), severity, device filter, enabled status, ' +
       'số alert chưa acknowledge. Dùng khi user hỏi "rule nào đang monitor" hoặc ' +
-      '"có rule nào cho thiết bị X không".',
+      '"có rule nào cho thiết bị X không". ' +
+      'Returns: mảng rules, mỗi rule có { id, name, description, deviceId, ' +
+      'minSeverity, messagePattern, facility, enabled, alertCount, unacknowledgedCount }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -660,7 +757,9 @@ const listUsers: CatalogEntry = {
     name: 'list_users',
     description:
       'Liệt kê tất cả user trong hệ thống: username, email, role, active, last login. ' +
-      'CHỈ ADMIN mới dùng được. Trả về danh sách user (KHÔNG bao gồm password hash).',
+      'CHỈ ADMIN mới dùng được. Trả về danh sách user (KHÔNG bao gồm password hash). ' +
+      'Returns: mảng users với { id, username, email, role, active, lastLoginAt, ' +
+      'lastLoginIp, createdAt }. KHÔNG có password/hash/MFA.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -681,7 +780,9 @@ const getConfigHistory: CatalogEntry = {
       '(web pushes, có username + role) và GET_CONFIG snapshot (periodic). ' +
       'Trả về danh sách entries với id, label, timestamp, username, lineCount, ' +
       'entryType (apply/snapshot). Dùng khi user hỏi "config F2-AS-01 có những ' +
-      'phiên bản nào" hoặc "ai đã commit gần đây".',
+      'phiên bản nào" hoặc "ai đã commit gần đây". ' +
+      'Returns: mảng entries, mỗi entry có { id, label, entryType, createdAt, username, lineCount }. ' +
+      'KHÔNG có: full content (dùng get_config_diff để xem nội dung).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -707,7 +808,9 @@ const getConfigDiff: CatalogEntry = {
       'IDs có thể là Job ID (GET_CONFIG snapshot) hoặc ConfigAuditLog jobId (APPLY_CONFIG). ' +
       'Trả về line-by-line diff + tổng kết (added/removed/unchanged count). ' +
       'Dùng khi user hỏi "config thay đổi gì giữa 2 lần commit" hoặc "diff giữa ' +
-      'phiên bản X và Y".',
+      'phiên bản X và Y". ' +
+      'Returns: { from, to, stats: { added, removed, unchanged }, lines[] } ' +
+      '— mỗi line có { kind, content }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
