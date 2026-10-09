@@ -425,13 +425,33 @@ class IOSBackend(DeviceBackend):
         # `show interfaces status` whose "Name" column truncates at
         # ~20 chars. The Ports panel needs the full link label
         # (e.g. "LINK_TO_SW-F6-DS-01_ge-0/0/5"), so prefer this command.
+        #
+        # That command has no IP column, so we also call `show ip interface
+        # brief` to populate the `address` field for L3 ports + SVIs
+        # (Vlan10, Loopback0, Port-channel1, GigabitEthernet routed, ...).
+        # L2 access ports stay with address="" — same shape EOS / Junos
+        # already use, so the frontend "—" placeholder shows.
         try:
             output = self._exec(device, "show interfaces description", timeout=30)
             interfaces = _parse_ios_interfaces_description(output)
+
+            # Best-effort: enrich with IP. If the second call fails (e.g.
+            # device is mid-reload, or `show ip interface brief` is gated
+            # by a privilege that drops the column), we still return the
+            # description-derived rows — `address` just stays empty.
+            try:
+                ip_output = self._exec(device, "show ip interface brief", timeout=20)
+                _merge_ios_ip_brief(interfaces, ip_output)
+            except RuntimeError as ip_exc:
+                logger.warning(
+                    "[IOS] %s: show ip interface brief failed (%s); address column will be empty",
+                    device.ip, ip_exc,
+                )
+
             return {
                 "implemented": True,
                 "source": "ios-http",
-                "command": "show interfaces description",
+                "command": "show interfaces description + show ip interface brief",
                 "interfaces": interfaces,
                 "message": f"IOS HTTP interfaces OK ({len(interfaces)} ports)",
                 "raw": output,
@@ -994,6 +1014,91 @@ def _parse_speed(speed: str, duplex: str) -> int | None:
         return int(s)
     except ValueError:
         return None
+
+
+# `show ip interface brief` columns (Cisco IOS 12.x / 15.x / XE):
+#
+#   Interface              IP-Address      OK? Method Status                Protocol
+#   GigabitEthernet0/0     10.10.20.211    YES NVRAM  up                    up
+#   GigabitEthernet0/1     unassigned      YES NVRAM  down                  down
+#   Vlan10                 192.168.10.1    YES manual up                    up
+#   Loopback0              1.1.1.1         YES manual up                    up
+#
+# Columns are whitespace-separated. The "IP-Address" column carries the
+# address (or the literal "unassigned" when L2). Method is two tokens
+# wide on some IOS versions ("NVRAM  up") so we anchor on the IP column
+# — if it parses as a quad-dot IPv4, it's an address, otherwise skip.
+_IP_BRIEF_LINE_RE = re.compile(
+    r"^\s*(?P<name>\S+)\s+(?P<ip>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b",
+)
+
+
+def _parse_ios_ip_brief(output: str) -> dict[str, str]:
+    """`show ip interface brief` text → {iface_name: ip_address}.
+
+    Returns ONLY entries with a real IPv4 address. L2 ports that print
+    `unassigned` are skipped (they'd be empty in the address column
+    anyway). The dict is keyed by the exact interface name IOS prints
+    (`GigabitEthernet0/0`, `Vlan10`, `Loopback0`, `Port-channel1`,
+    `Tunnel0`, ...) so the caller can merge by name without any
+    normalisation — the same form `show interfaces description` uses.
+
+    The prefix is intentional: when the IOS box is sitting on a
+    /31 /30 /24 /16 /8, IOS prints the bare host address without any
+    mask. The Ports tab already shows the mask in the ARP table and in
+    `show ip interface`, so we don't try to guess it from
+    `show ip interface brief` (that would mean a third call).
+    """
+    out: dict[str, str] = {}
+    if not output:
+        return out
+    for line in output.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("interface") and "ip-address" in low:
+            # Header row
+            continue
+        if "#" in s.split(" ", 1)[0]:
+            # Echo of "<hostname>#"
+            continue
+        m = _IP_BRIEF_LINE_RE.match(line)
+        if not m:
+            continue
+        name = m.group("name")
+        ip = m.group("ip")
+        # Sanity-check the quad
+        octets = ip.split(".")
+        if len(octets) != 4 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+            continue
+        out[name] = ip
+    return out
+
+
+def _merge_ios_ip_brief(interfaces: list[dict[str, Any]], ip_brief_output: str) -> None:
+    """Fill `address` on each interface row from `show ip interface brief`.
+
+    Mutates `interfaces` in place. We always overwrite an existing
+    `address` with the IP-brief value when one is found (in case the
+    description-derived row carried a stale value from a previous
+    parser pass). The keyed-by-name merge is exact: IOS uses the same
+    interface-name spelling in both `show interfaces description` and
+    `show ip interface brief` on a single box, so we don't need to
+    normalise prefixes (`Gi`/`GigabitEthernet`, `Vl`/`Vlan`, ...).
+    """
+    ip_by_name = _parse_ios_ip_brief(ip_brief_output)
+    if not ip_by_name:
+        return
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or "").strip()
+        if not name:
+            continue
+        ip = ip_by_name.get(name)
+        if ip:
+            iface["address"] = ip
 
 
 def _parse_hostname(config: str) -> str | None:

@@ -288,7 +288,7 @@ function parseEosInterfaces(result: unknown[]): EosInterfaceEntry[] {
       mode: '',
       accessVlan: '',
       taggedVlans: '',
-      address: '',
+      address: parseEosInterfaceAddress(b),
       mtu: String(b.mtu ?? ''),
       // EOS eAPI reports bandwidth in Kbps. Convert to bps so the NetBox worker
       // receives a consistent bps value without needing a per-vendor multiplier.
@@ -299,6 +299,35 @@ function parseEosInterfaces(result: unknown[]): EosInterfaceEntry[] {
     });
   }
   return out;
+}
+
+/**
+ * Extract the primary IPv4 address from an EOS `show interfaces` JSON block.
+ *
+ * EOS eAPI returns the L3 address under:
+ *   interfaceAddress.primaryIp.address    (e.g. "10.10.20.131")
+ *   interfaceAddress.primaryIp.maskLen    (e.g. 24)
+ * We return the address in CIDR form (e.g. "10.10.20.131/24") so the
+ * Ports tab can show the full subnet the interface sits on. Routed L3
+ * ports (Management1, Port-Channel, Vxlan) and SVIs on a vlan-aware
+ * bridge all carry `interfaceAddress`; pure L2 access ports omit it, in
+ * which case we return "" so the existing "—" placeholder shows.
+ *
+ * Mirrors the Python helper `_parse_eos_address` in
+ * `worker/netconsole_worker/backends/eos.py` — keep both in sync.
+ */
+function parseEosInterfaceAddress(body: Record<string, unknown>): string {
+  const ifaceAddr = body.interfaceAddress;
+  if (!ifaceAddr || typeof ifaceAddr !== 'object') return '';
+  const primary = (ifaceAddr as Record<string, unknown>).primaryIp;
+  if (!primary || typeof primary !== 'object') return '';
+  const address = String((primary as Record<string, unknown>).address ?? '').trim();
+  if (!address) return '';
+  const maskLen = (primary as Record<string, unknown>).maskLen;
+  if (typeof maskLen === 'number' && Number.isInteger(maskLen) && maskLen >= 0 && maskLen <= 32) {
+    return `${address}/${maskLen}`;
+  }
+  return address;
 }
 
 function parseEosDescriptions(text: string): Record<string, string> {

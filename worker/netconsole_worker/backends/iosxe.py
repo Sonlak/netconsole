@@ -258,7 +258,14 @@ class IOSxeBackend(DeviceBackend):
         # list response (`/native/interface`). We must:
         #   1. GET /native/interface          → basic interface info (name, desc, MTU)
         #   2. GET /native/interface/<type>=<name> for each interface → switchport config
-        # This two-pass approach is required to get switchport mode + VLAN data.
+        #   3. GET /ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address
+        #      → L3 address per interface (the native model omits it; ietf
+        #         model is the canonical place). This is what makes the
+        #         Ports tab show "10.10.20.211/24" on a routed port or
+        #         on a Vlan SVI like `Vlan10`.
+        # Pass 3 is best-effort: if the ietf path is gated or returns an
+        # empty array, we still return the row from pass 1+2 with
+        # `address=""` — same shape as before this fix.
         #
         # See `_is_restconf_known_broken` for why we sometimes skip RESTCONF
         # entirely on lab images that ship nginx/openresty on :443.
@@ -270,10 +277,12 @@ class IOSxeBackend(DeviceBackend):
                 if basic_interfaces:
                     # Second pass: fetch switchport config for each interface
                     enriched = self._fetch_iosxe_switchports(device, basic_interfaces)
+                    # Third pass: fetch L3 addresses (best-effort, never fatal)
+                    self._fetch_iosxe_ip_addresses(device, enriched)
                     return {
                         "implemented": True,
                         "source": "iosxe-rest",
-                        "command": "Cisco-IOS-XE-native:native/interface (+ per-iface switchport)",
+                        "command": "Cisco-IOS-XE-native:native/interface (+ per-iface switchport + ietf-interfaces IP)",
                         "interfaces": enriched,
                         "message": "IOS-XE RESTCONF interfaces OK",
                         "restError": rest_error,
@@ -289,6 +298,14 @@ class IOSxeBackend(DeviceBackend):
                 lines = (fb["output"] or "").splitlines()
                 interfaces = _parse_cisco_interfaces(lines)
                 if interfaces:
+                    # SSH path: `show interfaces` text already has the L3
+                    # address in the per-interface block (e.g. "Internet
+                    # address is 10.10.20.211/24"). `_parse_cisco_interfaces`
+                    # currently drops that field, so the merge step below
+                    # is a one-shot regex sweep over the raw text and
+                    # fills `address` on each row whose name appears in
+                    # the prose block.
+                    _merge_cisco_show_interfaces_addresses(interfaces, fb["output"] or "")
                     return {
                         "implemented": True,
                         "source": "ssh-cli",
@@ -314,6 +331,49 @@ class IOSxeBackend(DeviceBackend):
             "restError": rest_error,
             "sshError": ssh_error,
         }
+
+    def _fetch_iosxe_ip_addresses(
+        self,
+        device: DeviceInfo,
+        interfaces: list[dict[str, Any]],
+    ) -> None:
+        """Fetch L3 addresses from `ietf-interfaces:interfaces` and merge.
+
+        Mutates `interfaces` in place. Best-effort: a failure here is
+        logged at debug level and silently swallowed (the row is still
+        returned with `address=""`). The merge is keyed by the
+        full interface name (`GigabitEthernet1/0/1`, `Vlan10`, ...),
+        which is the same string `show interfaces description` and the
+        `Cisco-IOS-XE-native:native/interface` response use.
+
+        Why we don't read IP from the native YANG: the native model
+        nests the IP under `Cisco-IOS-XE-native:interface/<type>/<id>/
+        ip/address/primary`, but the per-interface request shape varies
+        across IOS-XE versions (16.x vs 17.x). The ietf model is the
+        contract every IOS-XE 16.6+ image implements, and it returns the
+        same data shape for routed ports, L3 sub-interfaces, and SVIs.
+        """
+        if not interfaces:
+            return
+        r = self._rc_get(device, "/ietf-interfaces:interfaces")
+        if not r["ok"]:
+            logger.debug(
+                "[IOS-XE] %s: ietf-interfaces:interfaces fetch failed (%s); address column will be empty",
+                device.ip, r.get("error"),
+            )
+            return
+        ip_by_name = _parse_iosxe_ietf_interfaces_addresses(r.get("payload"))
+        if not ip_by_name:
+            return
+        for iface in interfaces:
+            if not isinstance(iface, dict):
+                continue
+            name = str(iface.get("name") or "").strip()
+            if not name:
+                continue
+            ip = ip_by_name.get(name)
+            if ip:
+                iface["address"] = ip
 
     def _fetch_iosxe_switchports(
         self,
@@ -1153,6 +1213,204 @@ def _dump_json(payload: Any) -> str:
     import json
 
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _netmask_to_cidr(netmask: str | int | None) -> int | None:
+    """Convert an IPv4 dotted-quad netmask (or a CIDR int) to a CIDR prefix length.
+
+    Examples:
+        "255.255.255.0"   -> 24
+        "255.255.255.252" -> 30
+        24                -> 24   (already a CIDR int)
+        None / "" / bogus -> None
+    """
+    if isinstance(netmask, int):
+        return netmask if 0 <= netmask <= 32 else None
+    if not isinstance(netmask, str):
+        return None
+    s = netmask.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        n = int(s)
+        return n if 0 <= n <= 32 else None
+    parts = s.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        packed = 0
+        for p in parts:
+            v = int(p)
+            if not 0 <= v <= 255:
+                return None
+            packed = (packed << 8) | v
+    except ValueError:
+        return None
+    # Count consecutive 1 bits from the MSB. ipaddress treats the
+    # netmask as a host-order int; we bit-pack it the same way.
+    bits = 0
+    for i in range(31, -1, -1):
+        if packed & (1 << i):
+            bits += 1
+        else:
+            break
+    # Validate that the remaining bits are all zero (otherwise the
+    # netmask is non-contiguous and we return None rather than guess).
+    if packed != ((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF):
+        return None
+    return bits
+
+
+def _parse_iosxe_ietf_interfaces_addresses(payload: Any) -> dict[str, str]:
+    """Extract L3 addresses from a `ietf-interfaces:interfaces` RESTCONF payload.
+
+    Input shape (one entry per interface, repeated):
+        {
+          "ietf-interfaces:interfaces": {
+            "interface": [
+              {
+                "name": "GigabitEthernet0/0/0",
+                "ietf-ip:ipv4": {
+                  "address": [
+                    { "ip": "10.10.20.211", "netmask": "255.255.255.0" }
+                  ]
+                }
+              },
+              {
+                "name": "Vlan10",
+                "ietf-ip:ipv4": {
+                  "address": [
+                    { "ip": "192.168.10.1", "netmask": "255.255.255.0" }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+
+    Some IOS-XE versions wrap the address list as a single object
+    instead of an array when there's only one address; we normalise.
+    We use the FIRST IPv4 entry only (the Ports tab is a one-IP-per-
+    row table; secondaries belong in the ARP view). Output keys are
+    exact interface names (`GigabitEthernet0/0/0`, `Vlan10`, ...) so
+    the caller can merge by name without any prefix translation.
+    """
+    out: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return out
+    root = payload.get("ietf-interfaces:interfaces") or payload.get("interfaces")
+    if not isinstance(root, dict):
+        return out
+    ifaces_raw = root.get("interface")
+    if ifaces_raw is None:
+        return out
+    ifaces = ifaces_raw if isinstance(ifaces_raw, list) else [ifaces_raw]
+
+    for entry in ifaces:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        ipv4 = entry.get("ietf-ip:ipv4") or entry.get("ipv4")
+        if not isinstance(ipv4, dict):
+            continue
+        addrs_raw = ipv4.get("address")
+        if addrs_raw is None:
+            continue
+        addrs = addrs_raw if isinstance(addrs_raw, list) else [addrs_raw]
+        for addr in addrs:
+            if not isinstance(addr, dict):
+                continue
+            ip = addr.get("ip")
+            if not isinstance(ip, str) or not ip:
+                continue
+            netmask = addr.get("netmask") or addr.get("prefix-length")
+            cidr = _netmask_to_cidr(netmask)
+            out[name] = f"{ip}/{cidr}" if cidr is not None else ip
+            break  # first address only; secondaries go to ARP view
+    return out
+
+
+def _merge_cisco_show_interfaces_addresses(
+    interfaces: list[dict[str, Any]],
+    show_output: str,
+) -> None:
+    """Fill `address` from a Cisco `show interfaces` text block.
+
+    SSH fallback path: when RESTCONF is gated (lab nginx/openresty on
+    :443, broken-cap cache hit, etc.) we parse the prose `show
+    interfaces` text. Each interface block has a line like:
+
+        Internet address is 10.10.20.211/24
+        Internet address is 10.10.20.211/32 (secondary)
+        Internet address will be negotiated using DHCP
+
+    We pick the FIRST non-DHCP, non-secondary address per block. The
+    secondary flag is preserved as a " (secondary)" suffix only when
+    the primary is missing — that way the Ports tab still shows
+    *something* for VRRP/HSRP standby IPs that float to peers.
+    """
+    if not show_output or not interfaces:
+        return
+    # Build iface-name -> text-block map. A block starts at a header
+    # line "<name> is up|down|admin..." and runs until the next such
+    # header or end-of-input. Reuse the same heuristic as
+    # `_parse_cisco_interfaces` (a line that doesn't start with
+    # whitespace and contains " is ").
+    blocks: dict[str, str] = {}
+    block_names: list[str] = []
+    current_name: str | None = None
+    current_lines: list[str] = []
+
+    def _flush() -> None:
+        if current_name is not None:
+            blocks[current_name] = "\n".join(current_lines)
+
+    for line in show_output.splitlines():
+        if line and not line[0].isspace() and re.search(r"\s+is\s+", line):
+            _flush()
+            name_m = re.match(r"^(\S+)", line)
+            current_name = name_m.group(1) if name_m else None
+            if current_name and current_name not in blocks:
+                block_names.append(current_name)
+            current_lines = [line]
+        elif current_name is not None:
+            current_lines.append(line)
+    _flush()
+
+    # Now scan each block for the Internet-address line.
+    for iface in interfaces:
+        if not isinstance(iface, dict):
+            continue
+        name = str(iface.get("name") or "").strip()
+        if not name or name not in blocks:
+            continue
+        block = blocks[name]
+        primary_addr: str | None = None
+        secondary_addr: str | None = None
+        for line in block.splitlines():
+            m = re.search(
+                r"Internet\s+address\s+is\s+(\d{1,3}(?:\.\d{1,3}){3})\s*(/\d+)?\s*(\([^)]*\))?",
+                line,
+            )
+            if not m:
+                continue
+            ip = m.group(1)
+            prefix = m.group(2) or ""
+            qual = (m.group(3) or "").lower()
+            if "negotiated" in line.lower():
+                continue
+            if "secondary" in qual:
+                if secondary_addr is None:
+                    secondary_addr = f"{ip}{prefix}"
+            else:
+                if primary_addr is None:
+                    primary_addr = f"{ip}{prefix}"
+                break  # stop at the first primary so the row is stable
+        address = primary_addr or secondary_addr
+        if address:
+            iface["address"] = address
 
 
 def _parse_cisco_interfaces(lines: list[str]) -> list[dict[str, Any]]:

@@ -928,6 +928,45 @@ def _parse_eos_uptime(result: list[dict[str, Any]]) -> dict[str, str]:
     return parsed
 
 
+def _parse_eos_address(body: dict[str, Any]) -> str:
+    """Extract the primary IPv4 address from an EOS `show interfaces` JSON block.
+
+    EOS eAPI returns the L3 address under:
+        interfaceAddress.primaryIp.address    (e.g. "10.10.20.131")
+        interfaceAddress.primaryIp.maskLen    (e.g. 24)
+    We return the address in CIDR form (e.g. "10.10.20.131/24") so the
+    Ports tab can show the full subnet the interface sits on. Routed L3
+    ports like Management1, Port-Channel, Vxlan, and SVIs (vlan-aware
+    bridges on EOS) all carry `interfaceAddress`; pure L2 access ports
+    omit it, in which case we return "" so the existing "—" placeholder
+    shows.
+
+    The `secondaryIps` list is intentionally ignored here — IOS-XE and
+    Junos SVIs can carry many secondaries, and the Ports panel is
+    designed to show one IP per row. If a device has multiple secondaries
+    on the same interface, the user can read them from the ARP table or
+    the device config; we don't want them to render as separate rows.
+    """
+    if not isinstance(body, dict):
+        return ""
+    iface_addr = body.get("interfaceAddress")
+    if not isinstance(iface_addr, dict):
+        return ""
+    primary = iface_addr.get("primaryIp")
+    if not isinstance(primary, dict):
+        return ""
+    address = primary.get("address")
+    if not address or not isinstance(address, str):
+        return ""
+    address = address.strip()
+    if not address:
+        return ""
+    mask_len = primary.get("maskLen")
+    if isinstance(mask_len, int) and 0 <= mask_len <= 32:
+        return f"{address}/{mask_len}"
+    return address
+
+
 def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """`show interfaces` JSON → list of {name, adminStatus, operStatus, ...}."""
     if not result:
@@ -946,6 +985,7 @@ def _parse_eos_interfaces(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "speed": body.get("bandwidth"),
             "mtu": body.get("mtu"),
             "macAddress": body.get("physicalAddress") or body.get("macAddress"),
+            "address": _parse_eos_address(body),
         })
     return out
 

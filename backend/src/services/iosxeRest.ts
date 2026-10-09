@@ -362,7 +362,122 @@ export async function fetchIosxeInterfaceList(host: string): Promise<{
     }
   }
 
+  // PASS 3 (best-effort): fetch L3 addresses from the ietf-interfaces model.
+  // The native YANG used in pass 1 omits IP per interface; the ietf model
+  // is the canonical place for `ietf-ip:ipv4.address[]`. This is what
+  // makes the Ports tab show "10.10.20.211/24" on a routed port or on
+  // a Vlan SVI like `Vlan10`. Mirrors `_fetch_iosxe_ip_addresses` in
+  // `worker/netconsole_worker/backends/iosxe.py` — keep both in sync.
+  const ipResult = await rcGet(host, '/ietf-interfaces:interfaces', 15000);
+  if (ipResult.ok) {
+    const ipByName = parseIetfInterfacesAddresses(ipResult.payload);
+    for (const iface of basicInterfaces) {
+      const ip = ipByName.get(iface.name);
+      if (ip) iface.address = ip;
+    }
+  }
+
   return { ok: true, interfaces: basicInterfaces, collectMs: Date.now() - started };
+}
+
+/**
+ * Convert a dotted-quad netmask (or a CIDR integer already) to a CIDR
+ * prefix length. Returns `null` on garbage so the caller can fall back
+ * to a bare address without a prefix.
+ *
+ *   "255.255.255.0"   -> 24
+ *   "255.255.255.252" -> 30
+ *   24                -> 24   (already CIDR)
+ *   "" / bogus / non-contiguous mask -> null
+ */
+function netmaskToCidr(netmask: unknown): number | null {
+  if (typeof netmask === 'number' && Number.isInteger(netmask) && netmask >= 0 && netmask <= 32) {
+    return netmask;
+  }
+  if (typeof netmask !== 'string') return null;
+  const s = netmask.trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return n >= 0 && n <= 32 ? n : null;
+  }
+  const parts = s.split('.');
+  if (parts.length !== 4) return null;
+  let packed = 0;
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) return null;
+    const v = Number(p);
+    if (v < 0 || v > 255) return null;
+    packed = (packed << 8) | v;
+  }
+  let bits = 0;
+  for (let i = 31; i >= 0; i--) {
+    if (packed & (1 << i)) bits++;
+    else break;
+  }
+  const expected = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  if (packed !== expected) return null;
+  return bits;
+}
+
+/**
+ * Extract L3 addresses from a `ietf-interfaces:interfaces` RESTCONF payload.
+ *
+ * Input shape (one entry per interface, repeated):
+ *   {
+ *     "ietf-interfaces:interfaces": {
+ *       "interface": [
+ *         {
+ *           "name": "GigabitEthernet0/0/0",
+ *           "ietf-ip:ipv4": {
+ *             "address": [
+ *               { "ip": "10.10.20.211", "netmask": "255.255.255.0" }
+ *             ]
+ *           }
+ *         }
+ *       ]
+ *     }
+ *   }
+ *
+ * Some IOS-XE versions wrap the address list as a single object when
+ * there's only one address; we normalise. We use the FIRST IPv4 entry
+ * only (the Ports tab is a one-IP-per-row table; secondaries go to
+ * the ARP view). Mirrors `_parse_iosxe_ietf_interfaces_addresses` in
+ * the worker — keep both in sync.
+ */
+function parseIetfInterfacesAddresses(payload: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!payload || typeof payload !== 'object') return out;
+  const root = (payload as Record<string, unknown>)['ietf-interfaces:interfaces'] as
+    | Record<string, unknown>
+    | undefined;
+  const rootAny = (root ?? (payload as Record<string, unknown>)) as Record<string, unknown>;
+  const ifacesRaw = rootAny['interface'];
+  if (ifacesRaw === undefined || ifacesRaw === null) return out;
+  const ifaces = Array.isArray(ifacesRaw) ? ifacesRaw : [ifacesRaw];
+
+  for (const entry of ifaces) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const name = typeof e['name'] === 'string' ? e['name'] : '';
+    if (!name) continue;
+    const ipv4 = e['ietf-ip:ipv4'] as Record<string, unknown> | undefined;
+    if (!ipv4 || typeof ipv4 !== 'object') continue;
+    const addrsRaw = ipv4['address'];
+    if (addrsRaw === undefined || addrsRaw === null) continue;
+    const addrs = Array.isArray(addrsRaw) ? addrsRaw : [addrsRaw];
+    for (const addr of addrs) {
+      if (!addr || typeof addr !== 'object') continue;
+      const a = addr as Record<string, unknown>;
+      const ip = typeof a['ip'] === 'string' ? a['ip'] : '';
+      if (!ip) continue;
+      const netmask = a['netmask'] ?? a['prefix-length'];
+      const cidr = netmaskToCidr(netmask);
+      out.set(name, cidr !== null ? `${ip}/${cidr}` : ip);
+      break; // first address only; secondaries go to the ARP view
+    }
+  }
+  return out;
 }
 
 /**
