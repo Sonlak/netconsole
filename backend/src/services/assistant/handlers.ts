@@ -241,8 +241,22 @@ async function listDhcpLeasesHandler(
     leases = leases.filter((l) => l.hostname.toLowerCase().includes(needle));
   }
   if (typeof args.state === 'string' && args.state) {
+    // Kea stateLabel values are 'default' / 'expired-reclaimed' /
+    // 'released' / 'declined'. LLM often asks for the human-friendly
+    // 'active' (which is Kea's 'default') or 'expired' (which is
+    // 'expired-reclaimed'). Normalize aliases so the filter works.
     const wanted = args.state.toLowerCase();
-    leases = leases.filter((l) => l.stateLabel.toLowerCase() === wanted);
+    const aliases: Record<string, string[]> = {
+      active: ['default', 'static'],
+      'expired-reclaimed': ['expired-reclaimed'],
+      expired: ['expired-reclaimed'],
+      released: ['released'],
+      declined: ['declined'],
+      default: ['default'],
+      static: ['static'],
+    };
+    const matchLabels = (aliases[wanted] ?? [wanted]).map((s) => s.toLowerCase());
+    leases = leases.filter((l) => matchLabels.includes(l.stateLabel.toLowerCase()));
   }
 
   const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 500);

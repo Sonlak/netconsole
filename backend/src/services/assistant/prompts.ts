@@ -264,8 +264,11 @@ const listDhcpLeases: CatalogEntry = {
         },
         state: {
           type: 'string',
-          enum: ['active', 'expired', 'released', 'declined'],
-          description: 'Filter theo state. Tùy chọn.',
+          enum: ['active', 'default', 'static', 'expired', 'expired-reclaimed', 'released', 'declined'],
+          description:
+            'Filter theo state. LLM-friendly: "active" (match "default" + "static" — tức lease còn sống), ' +
+            '"expired" (match "expired-reclaimed"). Kea thật: "default" / "static" / "expired-reclaimed" / ' +
+            '"released" / "declined".',
         },
         limit: {
           type: 'number',
