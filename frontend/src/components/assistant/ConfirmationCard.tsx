@@ -1,15 +1,14 @@
 /**
  * Confirmation card for a WRITE tool call.
  *
- * The backend emits a `confirmation_required` event with the
- * proposed action + a human summary. This component renders the
- * card with [Confirm] and [Cancel] buttons; clicking either fires
- * the corresponding callback. The backend never executes the tool
- * without a confirmedToolCall echo from the client.
+ * Subtle, low-noise warning style — matches the production AI
+ * assistant convention of "this action needs you to OK it" rather
+ * than the old aggressive yellow border. Accent strip on the left
+ * signals the caution level without painting the whole card.
  */
 
-import { Button, Card, Space, Typography } from 'antd';
-import { ExclamationCircleOutlined, RocketOutlined, StopOutlined } from '@ant-design/icons';
+import { Button, Space, Typography, theme } from 'antd';
+import { CheckOutlined, CloseOutlined, WarningFilled } from '@ant-design/icons';
 import { useState } from 'react';
 
 type Props = {
@@ -28,6 +27,7 @@ const TOOL_LABELS: Record<string, string> = {
 };
 
 export function ConfirmationCard({ name, arguments: args, summary, onConfirm, onCancel }: Props) {
+  const { token } = theme.useToken();
   const [busy, setBusy] = useState(false);
 
   const handleConfirm = async () => {
@@ -40,58 +40,75 @@ export function ConfirmationCard({ name, arguments: args, summary, onConfirm, on
   };
 
   return (
-    <Card
-      size="small"
+    <div
       style={{
-        borderColor: '#faad14',
-        background: 'rgba(250, 173, 20, 0.05)',
+        // Subtle warning card: tinted bg + 1px warning-tinted border
+        // + a 3px left accent strip. No harsh yellow surface.
+        background: token.colorWarningBg,
+        border: `1px solid ${token.colorWarningBorder}`,
+        borderLeft: `3px solid ${token.colorWarning}`,
+        borderRadius: 10,
+        padding: 12,
       }}
-      styles={{ body: { padding: 12 } }}
     >
-      <Space direction="vertical" size={6} style={{ width: '100%' }}>
-        <Space>
-          <ExclamationCircleOutlined style={{ color: '#faad14', fontSize: 16 }} />
-          <Typography.Text strong>
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Space size={6}>
+          <WarningFilled style={{ color: token.colorWarning, fontSize: 14 }} />
+          <Typography.Text strong style={{ fontSize: 13 }}>
             {TOOL_LABELS[name] ?? 'Yêu cầu xác nhận'}
           </Typography.Text>
         </Space>
 
-        <div style={{ fontSize: 14 }}>{summary}</div>
+        <div style={{ fontSize: 13.5, lineHeight: 1.55 }}>{summary}</div>
 
         <details>
-          <summary style={{ cursor: 'pointer', fontSize: 12, color: '#888' }}>
-            Chi tiết tham số
+          <summary
+            style={{
+              cursor: 'pointer',
+              fontSize: 11,
+              color: token.colorTextTertiary,
+              userSelect: 'none',
+            }}
+          >
+            Xem tham số
           </summary>
           <pre
             style={{
               fontSize: 11,
-              background: 'rgba(0,0,0,0.04)',
-              padding: 6,
-              borderRadius: 4,
-              margin: '4px 0 0',
+              background: token.colorFillTertiary,
+              padding: 8,
+              borderRadius: 6,
+              margin: '6px 0 0',
               maxHeight: 200,
               overflow: 'auto',
+              border: `1px solid ${token.colorBorderSecondary}`,
             }}
           >
             {JSON.stringify(args, null, 2)}
           </pre>
         </details>
 
-        <Space size={8} style={{ marginTop: 4 }}>
+        <Space size={6} style={{ marginTop: 2 }}>
           <Button
-            type="primary"
             danger
-            icon={<RocketOutlined />}
+            type="primary"
+            icon={<CheckOutlined />}
             loading={busy}
             onClick={handleConfirm}
+            size="small"
           >
             Xác nhận
           </Button>
-          <Button icon={<StopOutlined />} disabled={busy} onClick={onCancel}>
+          <Button
+            icon={<CloseOutlined />}
+            disabled={busy}
+            onClick={onCancel}
+            size="small"
+          >
             Huỷ
           </Button>
         </Space>
       </Space>
-    </Card>
+    </div>
   );
 }

@@ -30,7 +30,6 @@ import {
   Badge,
   Button,
   Drawer,
-  Empty,
   Input,
   Popconfirm,
   Space,
@@ -40,12 +39,18 @@ import {
   theme,
 } from 'antd';
 import {
+  ApartmentOutlined,
+  ApiOutlined,
+  ArrowUpOutlined,
   ClearOutlined,
   CloseOutlined,
+  GlobalOutlined,
+  KeyOutlined,
   LoadingOutlined,
-  RobotOutlined,
-  SendOutlined,
+  RobotFilled,
+  SafetyCertificateOutlined,
   ThunderboltOutlined,
+  WifiOutlined,
 } from '@ant-design/icons';
 import { useAuth } from '@/hooks/useAuth';
 import { streamAssistant, type AssistantMessage, type AssistantStreamEvent } from '@/api/assistant';
@@ -59,12 +64,46 @@ type Props = {
 const SESSION_STORAGE_KEY = 'netconsole:assistant:session';
 const MESSAGES_STORAGE_KEY = 'netconsole:assistant:messages';
 
-const SUGGESTED_PROMPTS = [
-  'MAC 00:11:22:33:44:55 đang ở port nào?',
-  'LAB-F2-AS-01 có online không?',
-  'Subnet NKKN sắp hết IP chưa?',
-  'Có alert nào chưa acknowledge?',
-  'Shutdown port ge-0/0/5 trên LAB-F2-AS-01',
+// Card-grid suggested prompts for the welcome state. Each card has
+// an icon, title, and the actual prompt. Clicking the card fires
+// the prompt. Pattern borrowed from Notion AI / Linear AI / Vercel
+// AI Chat — gives the user immediate value without forcing them to
+// think of a question.
+const SUGGESTED_CARDS: Array<{
+  icon: React.ReactNode;
+  title: string;
+  prompt: string;
+}> = [
+  {
+    icon: <KeyOutlined />,
+    title: 'Tìm MAC address',
+    prompt: 'MAC 00:11:22:33:44:55 hiện đang nằm ở port nào?',
+  },
+  {
+    icon: <WifiOutlined />,
+    title: 'Trạng thái thiết bị',
+    prompt: 'LAB-F2-AS-01 có đang online không?',
+  },
+  {
+    icon: <ApartmentOutlined />,
+    title: 'Fabric topology',
+    prompt: 'Cho tôi xem fabric topology hiện tại',
+  },
+  {
+    icon: <GlobalOutlined />,
+    title: 'DHCP leases',
+    prompt: 'Liệt kê 10 DHCP lease gần nhất',
+  },
+  {
+    icon: <SafetyCertificateOutlined />,
+    title: 'Alerts',
+    prompt: 'Có alert nào chưa acknowledge không?',
+  },
+  {
+    icon: <ApiOutlined />,
+    title: 'Job gần đây',
+    prompt: 'Job nào fail gần đây?',
+  },
 ];
 
 export function AssistantDrawer({ open, onClose }: Props) {
@@ -320,12 +359,50 @@ export function AssistantDrawer({ open, onClose }: Props) {
   return (
     <Drawer
       title={
-        <Space>
-          <RobotOutlined style={{ color: '#1677ff' }} />
-          <span>NetConsole Assistant</span>
-          {streaming && <LoadingOutlined />}
+        <Space size={8} align="center">
+          <div
+            aria-hidden
+            style={{
+              width: 26,
+              height: 26,
+              borderRadius: 7,
+              background: `linear-gradient(135deg, ${token.colorPrimary} 0%, ${token.colorPrimaryActive} 100%)`,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              boxShadow: `0 2px 6px ${token.colorPrimary}33`,
+            }}
+          >
+            <RobotFilled style={{ fontSize: 13 }} />
+          </div>
+          <span style={{ fontWeight: 600, fontSize: 15 }}>NetConsole Assistant</span>
+          <Tag
+            color="blue"
+            style={{
+              fontSize: 10,
+              padding: '0 6px',
+              lineHeight: '16px',
+              borderRadius: 4,
+              margin: 0,
+              fontWeight: 500,
+            }}
+          >
+            gpt-4.1-mini
+          </Tag>
           {sessionId && (
-            <Tag color="default" style={{ fontSize: 10 }}>
+            <Tag
+              style={{
+                fontSize: 10,
+                padding: '0 6px',
+                lineHeight: '16px',
+                borderRadius: 4,
+                margin: 0,
+                color: token.colorTextTertiary,
+                background: token.colorFillTertiary,
+                border: 'none',
+              }}
+            >
               sess-{sessionId.slice(0, 6)}
             </Tag>
           )}
@@ -342,27 +419,15 @@ export function AssistantDrawer({ open, onClose }: Props) {
           display: 'flex',
           flexDirection: 'column',
           height: '100%',
-          // Make the drawer body follow the active theme instead of the
-          // AntD default (always light). Without this, the chat scroll
-          // area ends up stuck on a white surface in dark mode and the
-          // assistant bubble's --ant-color-bg-elevated contrast is wrong.
           background: token.colorBgContainer,
         },
-        // Header is dark-by-default in AntD's Drawer; align it to the
-        // same container color so the top edge doesn't read as a stripe.
         header: {
           background: token.colorBgContainer,
           borderBottom: `1px solid ${token.colorBorderSecondary}`,
+          padding: '12px 16px',
         },
-        // Footer/content panels inside the drawer should also follow
-        // the theme (the Input.TextArea wrapper sits in `footer` in
-        // older AntD; safe to set on both for future-proofing).
-        footer: {
-          background: token.colorBgContainer,
-        },
-        content: {
-          background: token.colorBgContainer,
-        },
+        footer: { background: token.colorBgContainer },
+        content: { background: token.colorBgContainer },
         mask: { background: 'rgba(0, 0, 0, 0.55)' },
       }}
       extra={
@@ -376,52 +441,44 @@ export function AssistantDrawer({ open, onClose }: Props) {
             disabled={messages.length === 0}
           >
             <Tooltip title="Xoá cuộc trò chuyện">
-              <Button type="text" icon={<ClearOutlined />} disabled={messages.length === 0} />
+              <Button
+                type="text"
+                icon={<ClearOutlined />}
+                disabled={messages.length === 0}
+              />
             </Tooltip>
           </Popconfirm>
         </Space>
       }
     >
+      {/* Global keyframes for streaming cursor + typing dots. Kept
+          inside the drawer so they only live while the drawer is
+          mounted (avoids any leak into the rest of the app). */}
+      <style>
+        {`
+        @keyframes nc-cursor-blink {
+          0%, 50%   { opacity: 1; }
+          50.01%, 100% { opacity: 0; }
+        }
+        @keyframes nc-typing-bounce {
+          0%, 60%, 100% { transform: translateY(0);   opacity: 0.4; }
+          30%           { transform: translateY(-4px); opacity: 1;   }
+        }
+        `}
+      </style>
+
       {/* Messages scroll area */}
       <div
         ref={scrollRef}
         style={{
           flex: 1,
           overflowY: 'auto',
-          padding: '12px 16px',
-          // Subtle vertical gradient: a touch lighter at the top, settling
-          // into the container color below. Reads as a distinct "chat
-          // surface" against the surrounding Drawer body without fighting
-          // the theme.
+          padding: '16px 14px',
           background: token.colorBgLayout,
-          backgroundImage: `linear-gradient(180deg, ${token.colorFillQuaternary} 0%, ${token.colorBgLayout} 240px)`,
         }}
       >
         {messages.length === 0 ? (
-          <Empty
-            image={<RobotOutlined style={{ fontSize: 48, color: '#1677ff' }} />}
-            description={
-              <div>
-                <Typography.Title level={5} style={{ marginTop: 8 }}>
-                  Tôi có thể giúp gì?
-                </Typography.Title>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  Tra cứu thiết bị, MAC, DHCP, fabric topology, job gần đây...
-                </Typography.Text>
-                <div style={{ marginTop: 12 }}>
-                  {SUGGESTED_PROMPTS.map((p) => (
-                    <Tag
-                      key={p}
-                      style={{ cursor: 'pointer', marginBottom: 4, padding: '2px 8px' }}
-                      onClick={() => void sendMessage(p)}
-                    >
-                      <ThunderboltOutlined /> {p}
-                    </Tag>
-                  ))}
-                </div>
-              </div>
-            }
-          />
+          <EmptyState onPick={(p) => void sendMessage(p)} token={token} />
         ) : (
           messages.map((m) => (
             <MessageBubble
@@ -446,7 +503,9 @@ export function AssistantDrawer({ open, onClose }: Props) {
         )}
       </div>
 
-      {/* Usage footer (admin only) */}
+      {/* Usage footer (admin only) — sits above the composer, not below
+          the input, so it doesn't push the composer off-screen on tall
+          conversations. */}
       {isAdmin && (totalInputTokens > 0 || totalOutputTokens > 0) && (
         <div
           style={{
@@ -456,14 +515,14 @@ export function AssistantDrawer({ open, onClose }: Props) {
             color: token.colorTextTertiary,
             display: 'flex',
             justifyContent: 'space-between',
-            background: token.colorBgElevated,
+            background: token.colorBgContainer,
           }}
         >
           <span>
             Tokens: {totalInputTokens} in
             {totalCachedTokens > 0 && (
               <Tooltip title="Tokens served from prompt cache (50% off)">
-                <span style={{ color: '#52c41a' }}> ({totalCachedTokens} cached)</span>
+                <span style={{ color: token.colorSuccess }}> ({totalCachedTokens} cached)</span>
               </Tooltip>
             )}
             {' + '}{totalOutputTokens} out
@@ -474,40 +533,87 @@ export function AssistantDrawer({ open, onClose }: Props) {
         </div>
       )}
 
-      {/* Input area */}
+      {/* Composer — ChatGPT-style rounded card with textarea + a
+          circular send button on the right. The button is hidden
+          until the user types something (no dead-button look). */}
       <div
         style={{
           padding: 12,
           borderTop: `1px solid ${token.colorBorderSecondary}`,
-          background: token.colorBgElevated,
+          background: token.colorBgContainer,
         }}
       >
-        <Space.Compact style={{ width: '100%' }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'flex-end',
+            gap: 8,
+            background: token.colorBgLayout,
+            border: `1px solid ${token.colorBorderSecondary}`,
+            borderRadius: 16,
+            padding: '8px 8px 8px 14px',
+            transition: 'border-color 180ms ease, box-shadow 180ms ease',
+          }}
+          onFocus={(e: React.FocusEvent<HTMLDivElement>) => {
+            // Lift the border to primary on focus to give a soft
+            // "active" cue. Applied on the wrapper since the actual
+            // textarea sits inside.
+            e.currentTarget.style.borderColor = token.colorPrimary;
+            e.currentTarget.style.boxShadow = `0 0 0 3px ${token.colorPrimaryBg}`;
+          }}
+          onBlur={(e: React.FocusEvent<HTMLDivElement>) => {
+            e.currentTarget.style.borderColor = token.colorBorderSecondary;
+            e.currentTarget.style.boxShadow = 'none';
+          }}
+        >
           <Input.TextArea
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="Hỏi về thiết bị, MAC, DHCP, alert... (Enter để gửi, Shift+Enter xuống dòng)"
-            autoSize={{ minRows: 1, maxRows: 5 }}
+            placeholder={
+              streaming
+                ? 'Đang chờ phản hồi...'
+                : 'Hỏi về thiết bị, MAC, DHCP, alert... (Enter để gửi)'
+            }
+            autoSize={{ minRows: 1, maxRows: 6 }}
             disabled={streaming}
-            style={{ resize: 'none' }}
+            variant="borderless"
+            style={{
+              resize: 'none',
+              padding: '4px 0',
+              background: 'transparent',
+              fontSize: 14,
+            }}
           />
           <Button
             type="primary"
-            icon={<SendOutlined />}
+            shape="circle"
+            icon={streaming ? <LoadingOutlined /> : <ArrowUpOutlined />}
             loading={streaming}
-            disabled={!input.trim() || streaming}
+            disabled={!input.trim()}
             onClick={() => void sendMessage(input)}
-            style={{ height: 'auto' }}
-          >
-            Gửi
-          </Button>
-        </Space.Compact>
-        <div style={{ fontSize: 10, color: '#999', marginTop: 4 }}>
-          <Badge status="processing" text="gpt-4.1-mini + prompt caching" />
-          {' · '}
-          <span>WRITE actions (shutdown port, ...) cần xác nhận trước khi chạy</span>
+            size="middle"
+            aria-label="Gửi"
+          />
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            fontSize: 10,
+            color: token.colorTextTertiary,
+            marginTop: 6,
+            padding: '0 4px',
+          }}
+        >
+          <span>
+            <Badge status="processing" text="prompt caching" />
+            <span style={{ marginLeft: 8, opacity: 0.7 }}>
+              WRITE actions cần xác nhận trước khi chạy
+            </span>
+          </span>
         </div>
       </div>
     </Drawer>
@@ -581,4 +687,150 @@ function handleEvent(event: AssistantStreamEvent, h: EventHandlers): void {
   // handle it, the switch above fails to type-check.
   const _exhaustive: never = event;
   void _exhaustive;
+}
+
+// ─── EmptyState: card grid of suggested tasks ──────────────────────────────
+//
+// Pattern borrowed from Notion AI / Linear AI / Vercel AI Chat — gives
+// the user immediate value instead of an empty void. Each card is
+// clickable and fires its prompt into the composer.
+
+function EmptyState({
+  onPick,
+  token,
+}: {
+  onPick: (prompt: string) => void;
+  token: ReturnType<typeof theme.useToken>['token'];
+}) {
+  return (
+    <div
+      style={{
+        padding: '24px 8px 8px',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+      }}
+    >
+      {/* Brand mark + welcome line */}
+      <div
+        aria-hidden
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: 12,
+          background: `linear-gradient(135deg, ${token.colorPrimary} 0%, ${token.colorPrimaryActive} 100%)`,
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: '#fff',
+          boxShadow: `0 6px 16px ${token.colorPrimary}33`,
+          marginBottom: 14,
+        }}
+      >
+        <RobotFilled style={{ fontSize: 22 }} />
+      </div>
+      <Typography.Title
+        level={5}
+        style={{
+          margin: 0,
+          fontSize: 18,
+          fontWeight: 600,
+          color: token.colorText,
+        }}
+      >
+        Tôi có thể giúp gì hôm nay?
+      </Typography.Title>
+      <Typography.Text
+        type="secondary"
+        style={{ fontSize: 12, marginTop: 4, textAlign: 'center', maxWidth: 360 }}
+      >
+        Tra cứu thiết bị, MAC, DHCP, fabric topology, jobs, alerts. Hoặc click thử một gợi ý bên dưới.
+      </Typography.Text>
+
+      {/* 2-column card grid */}
+      <div
+        style={{
+          marginTop: 22,
+          width: '100%',
+          display: 'grid',
+          gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+          gap: 10,
+        }}
+      >
+        {SUGGESTED_CARDS.map((card) => (
+          <button
+            key={card.title}
+            type="button"
+            onClick={() => onPick(card.prompt)}
+            style={{
+              cursor: 'pointer',
+              textAlign: 'left',
+              padding: 12,
+              borderRadius: 12,
+              background: token.colorBgContainer,
+              border: `1px solid ${token.colorBorderSecondary}`,
+              transition: 'border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease',
+              color: token.colorText,
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = token.colorPrimary;
+              e.currentTarget.style.transform = 'translateY(-1px)';
+              e.currentTarget.style.boxShadow = `0 4px 12px ${token.colorPrimary}22`;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = token.colorBorderSecondary;
+              e.currentTarget.style.transform = 'translateY(0)';
+              e.currentTarget.style.boxShadow = 'none';
+            }}
+          >
+            <div
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 8,
+                background: token.colorPrimaryBg,
+                color: token.colorPrimary,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: 14,
+                marginBottom: 8,
+              }}
+            >
+              {card.icon}
+            </div>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{card.title}</div>
+            <div
+              style={{
+                fontSize: 11.5,
+                color: token.colorTextTertiary,
+                lineHeight: 1.4,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+              }}
+            >
+              {card.prompt}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div
+        style={{
+          marginTop: 18,
+          fontSize: 11,
+          color: token.colorTextTertiary,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+        }}
+      >
+        <ThunderboltOutlined />
+        <span>Tip: mọi tác vụ trên NetConsole đều có thể thực hiện qua chat.</span>
+      </div>
+    </div>
+  );
 }
