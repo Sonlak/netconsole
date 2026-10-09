@@ -4,20 +4,24 @@
  * Replaces the old header-mounted icon with a production-style FAB
  * (floating action button) at the bottom-right corner — the same
  * pattern used by Notion AI, Linear, Cursor, Vercel, Intercom,
- * etc. Uses the app's primary color as a gradient with a soft glow
- * + idle pulse to feel "alive" without being annoying.
+ * etc. Static gradient pill with a soft shadow + hover lift; no
+ * looping animation (removed 2026-10-09 — felt too distracting on
+ * a page that already has plenty of motion from live data
+ * refreshes, fabric highlights, and the drawer's own typing
+ * indicator).
  *
  * Visual layers (bottom → top):
  *   1. Gradient pill (theme primary → primary-hover, ~135deg)
- *   2. Soft glow (box-shadow ring) — same color, low alpha
- *   3. Inner highlight (top 1px white-alpha) — glass feel
- *   4. Idle pulse — slow scale + opacity on the glow ring
- *   5. Content: gradient-stroked robot icon + label + chevron
+ *   2. Soft shadow (theme primary, low alpha) — static
+ *   3. Top-edge inner highlight (glass feel)
+ *   4. Content: gradient-stroked robot icon + label + ✦ marker
+ *
+ * Hover: scale 1.05 + lift 1px + stronger shadow. Focus ring
+ * comes from the browser's default outline on the AntD button so
+ * keyboard users get a visible focus state.
  *
  * Theme support: dark + light, both pull from the same primary so
- * the brand color stays consistent. Background uses
- * `colorBgContainer` (semi-transparent) so it sits on top of any
- * page without looking like a sticker.
+ * the brand color stays consistent.
  */
 
 import { useState, type CSSProperties } from 'react';
@@ -44,7 +48,6 @@ export function AssistantFab({ open, onOpen, unread = 0 }: Props) {
   const gradient = `linear-gradient(135deg, ${token.colorPrimary} 0%, ${token.colorPrimaryActive} 100%)`;
   const ringShadow = `0 8px 24px -4px ${token.colorPrimary}55, 0 2px 6px rgba(0,0,0,0.12)`;
   const hoverShadow = `0 12px 32px -4px ${token.colorPrimary}77, 0 4px 10px rgba(0,0,0,0.18)`;
-  const idleGlow = `0 0 0 0 ${token.colorPrimary}33`;
 
   const wrapperStyle: CSSProperties = {
     position: 'fixed',
@@ -53,20 +56,6 @@ export function AssistantFab({ open, onOpen, unread = 0 }: Props) {
     zIndex: 100,
     borderRadius: SIZE,
     isolation: 'isolate',
-  };
-
-  // The outer ring handles the idle pulse + hover scale. Sits
-  // underneath the button content via z-index.
-  const ringStyle: CSSProperties = {
-    position: 'absolute',
-    inset: 0,
-    borderRadius: SIZE,
-    background: gradient,
-    boxShadow: idleGlow,
-    transform: hover ? 'scale(1.05)' : 'scale(1)',
-    transition: 'transform 220ms cubic-bezier(0.4, 0, 0.2, 1), box-shadow 220ms ease',
-    animation: 'nc-assistant-fab-pulse 3.2s ease-in-out infinite',
-    pointerEvents: 'none',
   };
 
   const buttonStyle: CSSProperties = {
@@ -89,8 +78,7 @@ export function AssistantFab({ open, onOpen, unread = 0 }: Props) {
   };
 
   // Top-edge inner highlight gives the pill a glass / "lit from
-  // above" feel without needing a real ::before pseudo on AntD's
-  // button (which we can't reliably target).
+  // above" feel. Static — no animation.
   const highlightStyle: CSSProperties = {
     position: 'absolute',
     top: 1,
@@ -122,77 +110,43 @@ export function AssistantFab({ open, onOpen, unread = 0 }: Props) {
   };
 
   return (
-    <>
-      <style>
-        {`
-        @keyframes nc-assistant-fab-pulse {
-          0%   { box-shadow: 0 0 0 0   ${token.colorPrimary}55; }
-          70%  { box-shadow: 0 0 0 14px ${token.colorPrimary}00; }
-          100% { box-shadow: 0 0 0 0   ${token.colorPrimary}00; }
-        }
-        @keyframes nc-assistant-fab-shimmer {
-          0%, 100% { transform: translateX(-120%); }
-          50%      { transform: translateX(120%); }
-        }
-        .nc-assistant-fab-icon {
-          filter: drop-shadow(0 1px 1px rgba(0,0,0,0.25));
-        }
-        .nc-assistant-fab-shimmer::after {
-          content: '';
-          position: absolute;
-          top: 0;
-          left: 0;
-          width: 60%;
-          height: 100%;
-          background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.35) 50%, transparent 100%);
-          transform: translateX(-120%);
-          animation: nc-assistant-fab-shimmer 4.5s ease-in-out infinite;
-          pointer-events: none;
-          border-radius: inherit;
-        }
-        `}
-      </style>
-      <div
-        style={wrapperStyle}
-        onMouseEnter={() => setHover(true)}
-        onMouseLeave={() => setHover(false)}
-      >
-        <div style={ringStyle} aria-hidden />
-        <Tooltip title="NetConsole Assistant (AI)" placement="left" mouseEnterDelay={0.4}>
-          <Button
-            type="primary"
-            onClick={onOpen}
-            style={buttonStyle}
-            className="nc-assistant-fab-shimmer"
-            aria-label="Open AI Assistant"
-            icon={
-              <RobotOutlined
-                className="nc-assistant-fab-icon"
-                style={{ fontSize: 20, color: '#fff' }}
-              />
-            }
+    <div
+      style={wrapperStyle}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <Tooltip title="NetConsole Assistant (AI)" placement="left" mouseEnterDelay={0.4}>
+        <Button
+          type="primary"
+          onClick={onOpen}
+          style={buttonStyle}
+          aria-label="Open AI Assistant"
+          icon={
+            <RobotOutlined
+              style={{ fontSize: 20, color: '#fff', filter: 'drop-shadow(0 1px 1px rgba(0,0,0,0.25))' }}
+            />
+          }
+        >
+          <span>Ask AI</span>
+          <span
+            aria-hidden
+            style={{
+              fontSize: 11,
+              opacity: 0.85,
+              marginLeft: 2,
+              transform: 'translateY(-0.5px)',
+            }}
           >
-            <span>Ask AI</span>
-            <span
-              aria-hidden
-              style={{
-                fontSize: 11,
-                opacity: 0.85,
-                marginLeft: 2,
-                transform: 'translateY(-0.5px)',
-              }}
-            >
-              ✦
+            ✦
+          </span>
+          {unread > 0 && (
+            <span style={unreadStyle} aria-label={`${unread} unread`}>
+              {unread > 9 ? '9+' : unread}
             </span>
-            {unread > 0 && (
-              <span style={unreadStyle} aria-label={`${unread} unread`}>
-                {unread > 9 ? '9+' : unread}
-              </span>
-            )}
-          </Button>
-        </Tooltip>
-        <div style={highlightStyle} aria-hidden />
-      </div>
-    </>
+          )}
+        </Button>
+      </Tooltip>
+      <div style={highlightStyle} aria-hidden />
+    </div>
   );
 }
