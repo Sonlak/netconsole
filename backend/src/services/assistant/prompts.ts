@@ -73,8 +73,12 @@ Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed
   user trả lời. Phải GỌI TOOL luôn — backend lo phần confirmation UI.
 
 ⚠️ APPLY_CONFIG: luôn LUÔN LUÔN chạy \`apply_config_dry_run\` TRƯỚC khi \`queue_apply_config\`
-  để cho user thấy diff. Nếu diff quá lớn (>100 dòng thay đổi) hoặc config rỗng, CẢNH BÁO
-  user trước khi queue.
+  để cho user thấy diff. Giải thích diff cho user:
+  - Diff nhỏ (<=200 dòng): thay đổi bình thường, có thể proceed.
+  - Diff lớn (>200 dòang): BÌNH THƯỜNG khi replace full config (Config Studio
+    gửi toàn bộ device config, không phải delta). Cảnh báo user nhưng VẪN queue được.
+  - Nếu muốn CHỈ thêm dòng mà không replace config: hướng user dùng
+    Config Studio trực tiếp thay vì assistant.
 
 ⚠️ DELETE / WIPE: Những tool này phá huỷ dữ liệu. CẢNH BÁO user rõ ràng trong confirmation
   card, đặc biệt:
@@ -758,9 +762,9 @@ const queueApplyConfig: CatalogEntry = {
       'Queue APPLY_CONFIG job: commit config mới lên thiết bị (Junos/EOS/IOS-XE). ' +
       'Mặc định dùng DeviceSavedConfig.content (config đã lưu trên web). ' +
       'Nếu truyền content, sẽ dùng content đó (sau khi validate). ' +
-      'BẮT BUỘC chạy apply_config_dry_run TRƯỚC để show diff. ' +
-      'CẢNH BÁO: việc này thay đổi running-config của thiết bị, không thể undo tự động ' +
-      '(dùng queue_rollback_config nếu cần).',
+      'Config Studio GHI ĐÈN toàn bộ running-config = full config replacement. ' +
+      'Diff lớn là BÌNH THƯỜNG — không phải lỗi. ' +
+      'Nếu chỉ muốn thêm dòng (merge chứ không replace), dùng Config Studio.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -770,17 +774,10 @@ const queueApplyConfig: CatalogEntry = {
         content: {
           type: 'string',
           description:
-            'Tùy chọn. Nếu bỏ qua, dùng DeviceSavedConfig.content (config đã lưu). ' +
+            'Tùy chọn. Nếu bỏ qua, dùng DeviceSavedConfig.content (đã lưu trên web). ' +
             'Nếu truyền, dùng content này và CẬP NHẬT DeviceSavedConfig trước khi commit.',
         },
         role: strEnum(['core', 'dist', 'access', 'custom']),
-        dry_run_first: {
-          type: 'boolean',
-          description:
-            'Mặc định true. Nếu true, tool sẽ chạy apply_config_dry_run trước và chỉ ' +
-            'queue job nếu diff < threshold (200 dòng). Nếu diff >= threshold, trả về ' +
-            'preview mà KHÔNG queue (admin phải gọi lại với dry_run_first=false để force).',
-        },
       },
     },
   },
@@ -821,7 +818,10 @@ const applyConfigDryRun: CatalogEntry = {
     description:
       'Tính diff giữa config hiện tại (running) và config sẽ apply (DeviceSavedConfig.content ' +
       'hoặc content truyền vào). KHÔNG commit, chỉ preview. Trả về added/removed/unchanged count ' +
-      'và first N diff lines. BẮT BUỘC chạy tool này trước khi queue_apply_config.',
+      'và first N diff lines. Chạy TRƯỚC queue_apply_config để xem thay đổi. ' +
+      'NOTE: DeviceSavedConfig chứa FULL device config (không phải delta). ' +
+      'Diff lớn (>200 dòng) là BÌNH THƯỜNG khi replace toàn bộ config. ' +
+      'Nếu chỉ muốn thêm dòng mà không replace, dùng Config Studio thay vì assistant.',
     parameters: {
       type: 'object',
       additionalProperties: false,

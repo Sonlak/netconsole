@@ -946,20 +946,37 @@ async function applyConfigDryRunHandler(
   const maxLines = Math.min(typeof args.max_lines === 'number' ? args.max_lines : 100, 1000);
   const lines = diff.lines.slice(0, maxLines);
 
+  // Threshold warning: large diff (> 200 lines) is normal for full config replacement
+  // (the saved content is the full device config, not a delta). We do NOT block —
+  // the user may intentionally want to replace the entire config. We just warn.
+  const isLargeDiff = diff.added + diff.removed > 200;
+  const warning = isLargeDiff
+    ? `Diff > 200 dòng (${diff.added} added, ${diff.removed} removed). `
+        + 'Đây là BÌNH THƯỜNG khi replace full config. '
+        + 'Nếu chỉ muốn THÊM dòng mới mà không thay đổi phần còn lại, '
+        + 'dùng Config Studio để merge config thay vì thay thế toàn bộ.'
+    : null;
+
   return {
     ok: true,
     preview: {
       device: device.name,
+      vendor: device.vendor,
       role: device.savedConfig?.role ?? 'custom',
       runningCollectedAt: latest?.updatedAt ?? null,
+      targetLineCount: targetContent.split('\n').length,
+      runningLineCount: running.split('\n').length,
       added: diff.added,
       removed: diff.removed,
       unchanged: diff.unchanged,
       truncated: diff.lines.length > maxLines,
       diffLines: lines,
-      warning: diff.added + diff.removed > 200
-        ? 'Diff > 200 dòng — cẩn thận khi apply, có thể ảnh hưởng lớn đến thiết bị.'
-        : null,
+      warning,
+      instruction: isLargeDiff
+        ? 'Đây là config replace (thay thế toàn bộ config hiện tại). '
+            + 'Nếu muốn chỉ thêm dòng, hãy dùng Config Studio thay vì assistant. '
+            + 'Nếu muốn replace toàn bộ config, gọi queue_apply_config để queue job.'
+        : 'Có thể gọi queue_apply_config để queue job apply config.',
     },
   };
 }
@@ -1082,7 +1099,7 @@ async function queueApplyConfigHandler(
     }
   }
 
-  // Compute diff for safety net + threshold check.
+  // Compute diff for informational warning (large diff is normal for full config replace).
   const latest = await prisma.job.findFirst({
     where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
     orderBy: { updatedAt: 'desc' },
@@ -1090,17 +1107,11 @@ async function queueApplyConfigHandler(
   });
   const runningConfig = ((latest?.result ?? {}) as { config?: string }).config ?? '';
   const diff = diffConfigs(runningConfig, content);
-  const totalChanges = diff.added + diff.removed;
+  const isLargeDiff = diff.added + diff.removed > 200;
 
-  // dry_run_first: refuse if diff is too large; user must explicitly force.
-  if (args.dry_run_first !== false && totalChanges > 200) {
-    return {
-      ok: false,
-      error:
-        `Diff quá lớn (${diff.added} added, ${diff.removed} removed, ${totalChanges} total). ` +
-        'Nếu chắc chắn muốn apply, gọi lại với dry_run_first=false để force.',
-    };
-  }
+  // NOTE: threshold check removed. Config Studio replaces the full config (it is
+  // intentional to send the complete device config). Large diff = normal behavior
+  // for config replace. The dry_run handler already warns the LLM; we just queue.
 
   // Persist DeviceSavedConfig (mirrors routes/generateConfig.ts).
   const role = (typeof args.role === 'string' ? args.role : device.savedConfig?.role ?? 'custom') as string;
@@ -1133,6 +1144,11 @@ async function queueApplyConfigHandler(
       added: diff.added,
       removed: diff.removed,
       unchanged: diff.unchanged,
+      isLargeDiff,
+      warning: isLargeDiff
+        ? `CẢNH BÁO: Full config replace (${diff.added} added, ${diff.removed} removed). `
+            + 'Đây là hành vi BÌNH THƯỜNG của Config Studio.'
+        : null,
       jobId: outcome.job.id,
       jobStatus: outcome.job.status,
       message: `Apply config queued (added=${diff.added} removed=${diff.removed}). Worker sẽ commit trong vài giây.`,
