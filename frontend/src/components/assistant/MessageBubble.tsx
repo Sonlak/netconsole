@@ -165,10 +165,18 @@ export function MessageBubble({ message, onConfirm, onCancel, showUsage: _showUs
       {message.content && (
         <div
           style={{
-            padding: '8px 12px',
-            borderRadius: 8,
-            background: 'var(--ant-color-fill-tertiary, #f5f5f5)',
+            // Assistant bubble: elevated surface + 1px subtle border so it
+            // pops against the chat background in BOTH light and dark
+            // themes. `fill-tertiary` (~4% black) was too low-contrast
+            // against a near-white drawer and basically invisible against
+            // a near-black one.
+            padding: '10px 14px',
+            borderRadius: 10,
+            background: 'var(--ant-color-bg-elevated, #ffffff)',
+            border: '1px solid var(--ant-color-border-secondary, rgba(0,0,0,0.06))',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
             maxWidth: '95%',
+            color: 'var(--ant-color-text, rgba(0,0,0,0.88))',
           }}
         >
           <MarkdownText content={message.content} />

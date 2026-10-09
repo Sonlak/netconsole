@@ -357,7 +357,13 @@ export function AssistantDrawer({ open, onClose }: Props) {
           flex: 1,
           overflowY: 'auto',
           padding: '12px 16px',
+          // Subtle vertical gradient: a touch lighter at the top, settling
+          // into the elevated container color below. Reads as a distinct
+          // "chat surface" against the surrounding Drawer body without
+          // fighting the theme. Honors dark mode via the token fallback.
           background: 'var(--ant-color-bg-layout, #fafafa)',
+          backgroundImage:
+            'linear-gradient(180deg, var(--ant-color-fill-quaternary, rgba(0,0,0,0.02)) 0%, var(--ant-color-bg-layout, #fafafa) 240px)',
         }}
       >
         {messages.length === 0 ? (

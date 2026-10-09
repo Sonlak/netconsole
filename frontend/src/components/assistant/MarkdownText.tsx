@@ -166,12 +166,13 @@ function Block({ block }: { block: Block }) {
       return (
         <pre
           style={{
-            background: 'rgba(0,0,0,0.04)',
+            background: 'var(--ant-color-fill-tertiary, rgba(0,0,0,0.04))',
             padding: 8,
             borderRadius: 6,
             overflow: 'auto',
             fontSize: 12,
             margin: '6px 0',
+            border: '1px solid var(--ant-color-border-secondary, rgba(0,0,0,0.06))',
           }}
         >
           <code>{block.code}</code>
@@ -193,9 +194,9 @@ function Block({ block }: { block: Block }) {
                   <th
                     key={i}
                     style={{
-                      border: '1px solid #d9d9d9',
+                      border: '1px solid var(--ant-color-border-secondary, #d9d9d9)',
                       padding: '4px 8px',
-                      background: 'rgba(0,0,0,0.02)',
+                      background: 'var(--ant-color-fill-quaternary, rgba(0,0,0,0.02))',
                       textAlign: 'left',
                     }}
                   >
@@ -210,7 +211,7 @@ function Block({ block }: { block: Block }) {
                   {row.map((c, i) => (
                     <td
                       key={i}
-                      style={{ border: '1px solid #d9d9d9', padding: '4px 8px' }}
+                      style={{ border: '1px solid var(--ant-color-border-secondary, #d9d9d9)', padding: '4px 8px' }}
                     >
                       <Inline text={c} />
                     </td>
@@ -222,7 +223,7 @@ function Block({ block }: { block: Block }) {
         </div>
       );
     case 'hr':
-      return <hr style={{ border: 0, borderTop: '1px solid #e8e8e8', margin: '8px 0' }} />;
+      return <hr style={{ border: 0, borderTop: '1px solid var(--ant-color-border-secondary, #e8e8e8)', margin: '8px 0' }} />;
   }
 }
 
@@ -277,7 +278,7 @@ function Inline({ text }: { text: string }) {
               <code
                 key={idx}
                 style={{
-                  background: 'rgba(0,0,0,0.05)',
+                  background: 'var(--ant-color-fill-tertiary, rgba(0,0,0,0.05))',
                   padding: '1px 5px',
                   borderRadius: 3,
                   fontSize: '0.92em',
