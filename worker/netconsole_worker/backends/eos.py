@@ -932,14 +932,24 @@ def _parse_eos_address(body: dict[str, Any]) -> str:
     """Extract the primary IPv4 address from an EOS `show interfaces` JSON block.
 
     EOS eAPI returns the L3 address under:
-        interfaceAddress.primaryIp.address    (e.g. "10.10.20.131")
-        interfaceAddress.primaryIp.maskLen    (e.g. 24)
+        interfaceAddress[0].primaryIp.address    (e.g. "10.10.20.131")
+        interfaceAddress[0].primaryIp.maskLen    (e.g. 24)
+
+    **Note**: `interfaceAddress` is an **array** (not a single object). On a
+    physical L3 interface like Management1 the array has one element
+    carrying the primary + secondary + virtual IP. The previous parser
+    treated the field as a dict and silently returned "", which is why
+    the Ports tab was showing "—" for every interface even after the new
+    code shipped. Confirmed against real EOS (10.10.20.131) on 2026-10-09:
+    Management1 returns
+    `interfaceAddress: [{ primaryIp: { address, maskLen }, ... }]`.
+
     We return the address in CIDR form (e.g. "10.10.20.131/24") so the
     Ports tab can show the full subnet the interface sits on. Routed L3
     ports like Management1, Port-Channel, Vxlan, and SVIs (vlan-aware
     bridges on EOS) all carry `interfaceAddress`; pure L2 access ports
-    omit it, in which case we return "" so the existing "—" placeholder
-    shows.
+    omit it (or have an empty `[]`), in which case we return "" so the
+    existing "—" placeholder shows.
 
     The `secondaryIps` list is intentionally ignored here — IOS-XE and
     Junos SVIs can carry many secondaries, and the Ports panel is
@@ -950,10 +960,22 @@ def _parse_eos_address(body: dict[str, Any]) -> str:
     if not isinstance(body, dict):
         return ""
     iface_addr = body.get("interfaceAddress")
-    if not isinstance(iface_addr, dict):
-        return ""
-    primary = iface_addr.get("primaryIp")
-    if not isinstance(primary, dict):
+    # The field is an array. Accept both shapes defensively in case a
+    # future EOS build collapses it back to a single object, but the
+    # verified production shape (EOS 4.28+ at the time of writing) is
+    # the array.
+    primary: dict[str, Any] | None = None
+    if isinstance(iface_addr, list):
+        first = iface_addr[0] if iface_addr else None
+        if isinstance(first, dict):
+            p = first.get("primaryIp")
+            if isinstance(p, dict):
+                primary = p
+    elif isinstance(iface_addr, dict):
+        p = iface_addr.get("primaryIp")
+        if isinstance(p, dict):
+            primary = p
+    if primary is None:
         return ""
     address = primary.get("address")
     if not address or not isinstance(address, str):

@@ -114,7 +114,21 @@ def _extract_csrf(html: str) -> str | None:
 
 
 def _strip_html(text: str) -> str:
-    """Strip HTML tags from IOS HTTP response to get plain CLI output."""
+    """Strip HTML tags from IOS HTTP response to get plain CLI output.
+
+    IOSexec wraps each output line in a ``<DT>...</DT>`` (or
+    ``<dd>...</dd>`` / ``<li>...</li>``) tag. The naive ``<[^>]+>``
+    removal collapses everything onto a single line, which then breaks
+    per-line parsers (e.g. ``show ip interface brief`` needs each
+    interface on its own line for the ``_IP_BRIEF_LINE_RE`` regex to
+    match ``^name + IP``).
+
+    To preserve row boundaries, we first turn every block-level or
+    table-cell closing tag into a newline, THEN drop the remaining
+    tags. This way each ``<DT>line1</DT><DT>line2</DT>`` becomes
+    ``line1\nline2`` after stripping, and the line-based parsers see
+    the rows they expect.
+    """
     # Replace common HTML entities
     text = (
         text.replace("&#34;", '"')
@@ -124,14 +138,33 @@ def _strip_html(text: str) -> str:
         .replace("&nbsp;", " ")
         .replace("&copy;", "(c)")
     )
-    # Remove HTML tags
+    # Inject a newline before each block-level / table-cell closing tag
+    # so that, after the tag is removed, the row starts on its own line.
+    # Cover the tags IOS 12.x / 15.x / IOSv actually emit around exec
+    # output: <DT>, <DD>, <LI>, <TR>, <P>, <BR>, <DIV>, </DL>, </HR>.
+    text = re.sub(
+        r"</(?:DT|DD|LI|TR|P|DIV|DL)(?:\s[^>]*)?>",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Also handle <BR> and <HR> (no closing slash)
+    text = re.sub(r"<\s*br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*hr\s*/?>", "\n", text, flags=re.IGNORECASE)
+    # Now strip the remaining tags.
     text = re.sub(r"<[^>]+>", "", text)
-    # Collapse blank lines
-    lines = [line.rstrip() for line in text.splitlines()]
-    # Remove trailing blank lines
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return "\n".join(lines).strip()
+    # Collapse runs of whitespace on each line (HTML often has stray
+    # double spaces from table padding), but keep newlines.
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        # Keep indented CLI output (e.g. "show running-config" has
+        # two-space indents for sub-commands), but trim trailing
+        # whitespace and drop pure-whitespace lines.
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        cleaned_lines.append(stripped)
+    return "\n".join(cleaned_lines).strip()
 
 
 def _extract_output(html: str) -> str:
@@ -1082,23 +1115,84 @@ def _merge_ios_ip_brief(interfaces: list[dict[str, Any]], ip_brief_output: str) 
     Mutates `interfaces` in place. We always overwrite an existing
     `address` with the IP-brief value when one is found (in case the
     description-derived row carried a stale value from a previous
-    parser pass). The keyed-by-name merge is exact: IOS uses the same
-    interface-name spelling in both `show interfaces description` and
-    `show ip interface brief` on a single box, so we don't need to
-    normalise prefixes (`Gi`/`GigabitEthernet`, `Vl`/`Vlan`, ...).
+    parser pass).
+
+    **Name normalisation**: IOS does NOT use the same interface-name
+    spelling across all `show` commands. On a real IOS 15.x box
+    `show interfaces description` abbreviates to ``Vl10`` (the canonical
+    short form for SVIs), but ``show ip interface brief`` spells it
+    ``Vlan10``. Same goes for ``Gi0/0`` vs ``GigabitEthernet0/0``,
+    ``Po1`` vs ``Port-channel1``, ``Lo0`` vs ``Loopback0``, ``Tu0`` vs
+    ``Tunnel0``, etc. An exact-name merge therefore misses every L3
+    port that the user most wants to see (SVI = Vlan10, uplink =
+    Port-channel1, router-id = Loopback0).
+
+    We build a normalised lookup table that maps every short form
+    (``Vl10``) to its long form (``Vlan10``) and look up by both keys.
+    The Ports panel only ever renders the original name from the
+    description parser, so we never *write* the long form back to the
+    interface record.
     """
-    ip_by_name = _parse_ios_ip_brief(ip_brief_output)
-    if not ip_by_name:
+    ip_by_name_raw = _parse_ios_ip_brief(ip_brief_output)
+    if not ip_by_name_raw:
         return
+    # Build the alternate-spelling lookup table once.
+    ip_by_alt: dict[str, str] = {}
+    for name, ip in ip_by_name_raw.items():
+        ip_by_alt[name] = ip
+        ip_by_alt[_ios_short_to_long(name)] = ip
     for iface in interfaces:
         if not isinstance(iface, dict):
             continue
         name = str(iface.get("name") or "").strip()
         if not name:
             continue
-        ip = ip_by_name.get(name)
+        ip = ip_by_alt.get(name) or ip_by_alt.get(_ios_short_to_long(name))
         if ip:
             iface["address"] = ip
+
+
+def _ios_short_to_long(name: str) -> str:
+    """Expand an IOS short interface name to its long form.
+
+    Used to bridge the ``show interfaces description`` / ``show ip
+    interface brief`` naming gap (see ``_merge_ios_ip_brief``). Returns
+    the input unchanged when no expansion applies (already-long names
+    like ``GigabitEthernet0/0`` pass through, as do unknown prefixes).
+    """
+    n = name.strip()
+    # SVIs: Vl10 → Vlan10
+    if n.startswith("Vl") and n[2:].isdigit():
+        return "Vlan" + n[2:]
+    # Loopback: Lo0 → Loopback0
+    if n.startswith("Lo") and n[2:].isdigit():
+        return "Loopback" + n[2:]
+    # Port-channel: Po1 → Port-channel1
+    if n.startswith("Po") and n[2:].isdigit():
+        return "Port-channel" + n[2:]
+    # Tunnel: Tu0 → Tunnel0
+    if n.startswith("Tu") and n[2:].isdigit():
+        return "Tunnel" + n[2:]
+    # BDI (Bridge Domain Interface on IOS-XE 16+ routers): BDI10 stays
+    # as-is, IOS already prints the long form. No expansion needed.
+    return n
+
+
+def _ios_long_to_short(name: str) -> str:
+    """Inverse of ``_ios_short_to_long``. Not currently used by the
+    merger (we always read both directions) but kept for symmetry /
+    future callers (e.g. cross-validator between description and
+    switchport parsers)."""
+    n = name.strip()
+    if n.startswith("Vlan") and n[4:].isdigit():
+        return "Vl" + n[4:]
+    if n.startswith("Loopback") and n[8:].isdigit():
+        return "Lo" + n[8:]
+    if n.startswith("Port-channel") and n[12:].isdigit():
+        return "Po" + n[12:]
+    if n.startswith("Tunnel") and n[6:].isdigit():
+        return "Tu" + n[6:]
+    return n
 
 
 def _parse_hostname(config: str) -> str | None:

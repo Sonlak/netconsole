@@ -85,7 +85,7 @@ async function eosRpc(host: string, cmds: unknown[], format = 'json'): Promise<E
 
     return { ok: true, result: data.result as unknown[], raw };
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : 'eAPI call failed' };
+    return { ok: false, error: error instanceof Error ? `${error.message}\n${error.stack}` : 'eAPI call failed' };
   }
 }
 
@@ -305,25 +305,48 @@ function parseEosInterfaces(result: unknown[]): EosInterfaceEntry[] {
  * Extract the primary IPv4 address from an EOS `show interfaces` JSON block.
  *
  * EOS eAPI returns the L3 address under:
- *   interfaceAddress.primaryIp.address    (e.g. "10.10.20.131")
- *   interfaceAddress.primaryIp.maskLen    (e.g. 24)
+ *   interfaceAddress[0].primaryIp.address    (e.g. "10.10.20.131")
+ *   interfaceAddress[0].primaryIp.maskLen    (e.g. 24)
+ *
+ * **Note**: `interfaceAddress` is an **array** (not a single object). On a
+ * physical L3 interface like Management1 the array has one element carrying
+ * the primary + secondary + virtual IP. The previous parser read
+ * `body.interfaceAddress.primaryIp` (treating the field as an object) and
+ * silently got `undefined`, which is why the Ports tab was showing "—" for
+ * every interface even after the new code shipped. Confirmed against real
+ * EOS (10.10.20.131) on 2026-10-09: Management1 returns
+ * `interfaceAddress: [{ primaryIp: { address, maskLen }, ... }]`.
+ *
  * We return the address in CIDR form (e.g. "10.10.20.131/24") so the
  * Ports tab can show the full subnet the interface sits on. Routed L3
  * ports (Management1, Port-Channel, Vxlan) and SVIs on a vlan-aware
- * bridge all carry `interfaceAddress`; pure L2 access ports omit it, in
- * which case we return "" so the existing "—" placeholder shows.
+ * bridge all carry `interfaceAddress`; pure L2 access ports omit it (or
+ * have an empty `[]`), in which case we return "" so the existing "—"
+ * placeholder shows.
  *
  * Mirrors the Python helper `_parse_eos_address` in
  * `worker/netconsole_worker/backends/eos.py` — keep both in sync.
  */
 function parseEosInterfaceAddress(body: Record<string, unknown>): string {
   const ifaceAddr = body.interfaceAddress;
-  if (!ifaceAddr || typeof ifaceAddr !== 'object') return '';
-  const primary = (ifaceAddr as Record<string, unknown>).primaryIp;
-  if (!primary || typeof primary !== 'object') return '';
-  const address = String((primary as Record<string, unknown>).address ?? '').trim();
+  // The field is an array. Accept both shapes defensively in case a future
+  // EOS build collapses it back to a single object, but the verified
+  // production shape (EOS 4.28+ at the time of writing) is the array.
+  let primary: Record<string, unknown> | null = null;
+  if (Array.isArray(ifaceAddr)) {
+    const first = ifaceAddr[0];
+    if (first && typeof first === 'object') {
+      const p = (first as Record<string, unknown>).primaryIp;
+      if (p && typeof p === 'object') primary = p as Record<string, unknown>;
+    }
+  } else if (ifaceAddr && typeof ifaceAddr === 'object') {
+    const p = (ifaceAddr as Record<string, unknown>).primaryIp;
+    if (p && typeof p === 'object') primary = p as Record<string, unknown>;
+  }
+  if (!primary) return '';
+  const address = String(primary.address ?? '').trim();
   if (!address) return '';
-  const maskLen = (primary as Record<string, unknown>).maskLen;
+  const maskLen = primary.maskLen;
   if (typeof maskLen === 'number' && Number.isInteger(maskLen) && maskLen >= 0 && maskLen <= 32) {
     return `${address}/${maskLen}`;
   }
