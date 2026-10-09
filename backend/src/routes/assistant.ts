@@ -336,9 +336,16 @@ async function callAndStream(
 
       const nextMessages: AssistantMessage[] = [
         ...messages,
-        ...(response.text
-          ? [{ role: 'assistant' as const, content: response.text, tool_calls: response.toolCalls ?? undefined }]
-          : []),
+        // Always include the assistant turn so the tool message below has
+        // a valid preceding message with `tool_calls`. The OpenAI API
+        // requires this — emitting a `tool` role message without a
+        // matching `assistant` `tool_calls` returns 400. The assistant
+        // content can be null when the LLM only emitted tool calls.
+        {
+          role: 'assistant' as const,
+          content: response.text,
+          tool_calls: response.toolCalls ?? undefined,
+        },
         { role: 'tool' as const, tool_call_id: tc.id, content: JSON.stringify(result.preview ?? {}) },
       ];
       // Recurse for the first read tool in the batch (multi-tool

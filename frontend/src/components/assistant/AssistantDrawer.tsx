@@ -131,13 +131,44 @@ export function AssistantDrawer({ open, onClose }: Props) {
       abortRef.current = ac;
 
       // Build OpenAI messages: collapse the view back to the wire shape.
+      // We MUST preserve tool_calls on assistant messages and the tool
+      // result rows so the LLM sees the prior turn's tool history.
+      // Otherwise the LLM re-runs the same tool on every follow-up.
       const wire: AssistantMessage[] = messages
-        .filter((m) => m.content && (m.role === 'user' || m.role === 'assistant'))
-        .map((m) =>
-          m.role === 'user'
-            ? { role: 'user' as const, content: m.content }
-            : { role: 'assistant' as const, content: m.content },
-        );
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .filter((m) => m.role === 'user' || m.content || (m.toolCalls && m.toolCalls.length > 0))
+        .flatMap((m): AssistantMessage[] => {
+          if (m.role === 'user') return [{ role: 'user' as const, content: m.content }];
+          // assistant: keep text + tool_calls + any tool result rows that
+          // we stored on the view (each tool result lives next to its call).
+          const out: AssistantMessage[] = [
+            {
+              role: 'assistant' as const,
+              content: m.content,
+              ...(m.toolCalls && m.toolCalls.length > 0
+                ? {
+                    tool_calls: m.toolCalls.map((tc) => ({
+                      id: tc.id,
+                      type: 'function' as const,
+                      function: {
+                        name: tc.name,
+                        arguments: JSON.stringify(tc.arguments ?? {}),
+                      },
+                    })),
+                  }
+                : {}),
+            },
+          ];
+          for (const tc of m.toolCalls ?? []) {
+            if (tc.result === undefined) continue;
+            out.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: JSON.stringify(tc.result.preview ?? { ok: tc.result.ok, error: tc.result.error ?? null }),
+            });
+          }
+          return out;
+        });
       if (userMessage) wire.push({ role: 'user', content: userMessage });
 
       // Add the user bubble (skip when re-sending via confirmation).

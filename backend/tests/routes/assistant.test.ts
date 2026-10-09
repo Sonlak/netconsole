@@ -325,6 +325,20 @@ describe('POST /api/assistant', () => {
 
     const text = events.filter((e) => e.type === 'text').map((e) => e.content).join('');
     expect(text).toMatch(/ONLINE/);
+
+    // Regression: the recursive LLM call MUST receive an `assistant`
+    // message carrying `tool_calls` BEFORE the `tool` result row, or
+    // OpenAI returns 400 ("messages with role 'tool' must be a response
+    // to a preceding message with 'tool_calls'"). Bug seen 2026-10-09
+    // when the LLM emitted tool_calls with no text content.
+    expect(createCompletionMock).toHaveBeenCalledTimes(2);
+    const recursiveArgs = createCompletionMock.mock.calls[1][0] as {
+      messages: Array<{ role: string; tool_calls?: unknown; tool_call_id?: string }>;
+    };
+    const idxToolCall = recursiveArgs.messages.findIndex((m) => Array.isArray(m.tool_calls));
+    const idxToolResult = recursiveArgs.messages.findIndex((m) => m.role === 'tool');
+    expect(idxToolCall).toBeGreaterThanOrEqual(0);
+    expect(idxToolResult).toBeGreaterThan(idxToolCall);
   });
 
   it('emits confirmation_required for a WRITE tool and does NOT execute', async () => {
