@@ -37,6 +37,7 @@ import {
   Tag,
   Tooltip,
   Typography,
+  theme,
 } from 'antd';
 import {
   ClearOutlined,
@@ -69,6 +70,11 @@ const SUGGESTED_PROMPTS = [
 export function AssistantDrawer({ open, onClose }: Props) {
   const { user } = useAuth();
   const { message: toast } = AntApp.useApp();
+  // Pull real token values (not CSS vars) so we can pass them as
+  // inline style overrides. AntD's Drawer renders into a portal, and
+  // the body/header/footer wrappers can ship their own background that
+  // beats var() cascade. Inline-style values are guaranteed to apply.
+  const { token } = theme.useToken();
 
   // ── state ────────────────────────────────────────────────────────────
   const [messages, setMessages] = useState<AssistantMessageView[]>(() => loadMessages());
@@ -340,22 +346,22 @@ export function AssistantDrawer({ open, onClose }: Props) {
           // AntD default (always light). Without this, the chat scroll
           // area ends up stuck on a white surface in dark mode and the
           // assistant bubble's --ant-color-bg-elevated contrast is wrong.
-          background: 'var(--ant-color-bg-container, #ffffff)',
+          background: token.colorBgContainer,
         },
         // Header is dark-by-default in AntD's Drawer; align it to the
         // same container color so the top edge doesn't read as a stripe.
         header: {
-          background: 'var(--ant-color-bg-container, #ffffff)',
-          borderBottom: '1px solid var(--ant-color-border-secondary)',
+          background: token.colorBgContainer,
+          borderBottom: `1px solid ${token.colorBorderSecondary}`,
         },
         // Footer/content panels inside the drawer should also follow
         // the theme (the Input.TextArea wrapper sits in `footer` in
         // older AntD; safe to set on both for future-proofing).
         footer: {
-          background: 'var(--ant-color-bg-container, #ffffff)',
+          background: token.colorBgContainer,
         },
         content: {
-          background: 'var(--ant-color-bg-container, #ffffff)',
+          background: token.colorBgContainer,
         },
         mask: { background: 'rgba(0, 0, 0, 0.55)' },
       }}
@@ -384,12 +390,11 @@ export function AssistantDrawer({ open, onClose }: Props) {
           overflowY: 'auto',
           padding: '12px 16px',
           // Subtle vertical gradient: a touch lighter at the top, settling
-          // into the elevated container color below. Reads as a distinct
-          // "chat surface" against the surrounding Drawer body without
-          // fighting the theme. Honors dark mode via the token fallback.
-          background: 'var(--ant-color-bg-layout, #fafafa)',
-          backgroundImage:
-            'linear-gradient(180deg, var(--ant-color-fill-quaternary, rgba(0,0,0,0.02)) 0%, var(--ant-color-bg-layout, #fafafa) 240px)',
+          // into the container color below. Reads as a distinct "chat
+          // surface" against the surrounding Drawer body without fighting
+          // the theme.
+          background: token.colorBgLayout,
+          backgroundImage: `linear-gradient(180deg, ${token.colorFillQuaternary} 0%, ${token.colorBgLayout} 240px)`,
         }}
       >
         {messages.length === 0 ? (
@@ -446,12 +451,12 @@ export function AssistantDrawer({ open, onClose }: Props) {
         <div
           style={{
             padding: '4px 16px',
-            borderTop: '1px solid var(--ant-color-border-secondary)',
+            borderTop: `1px solid ${token.colorBorderSecondary}`,
             fontSize: 11,
-            color: 'var(--ant-color-text-tertiary)',
+            color: token.colorTextTertiary,
             display: 'flex',
             justifyContent: 'space-between',
-            background: 'var(--ant-color-bg-elevated)',
+            background: token.colorBgElevated,
           }}
         >
           <span>
@@ -473,8 +478,8 @@ export function AssistantDrawer({ open, onClose }: Props) {
       <div
         style={{
           padding: 12,
-          borderTop: '1px solid var(--ant-color-border-secondary)',
-          background: 'var(--ant-color-bg-elevated)',
+          borderTop: `1px solid ${token.colorBorderSecondary}`,
+          background: token.colorBgElevated,
         }}
       >
         <Space.Compact style={{ width: '100%' }}>
