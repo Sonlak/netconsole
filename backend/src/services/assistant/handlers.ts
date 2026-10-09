@@ -21,7 +21,7 @@
  * operator (audit requirement).
  */
 
-import { JobStatus, JobType } from '@prisma/client';
+import { JobStatus, JobType, Prisma } from '@prisma/client';
 import type { AuthenticatedRequest } from '../../middleware/auth.js';
 import type {
   AssistantRole,
@@ -35,10 +35,29 @@ import { getTool } from './prompts.js';
 import { prisma } from '../../lib/prisma.js';
 import { getMacAddressInventory } from '../macAddress.js';
 import { getFabricTopology } from '../fabricTopology.js';
-import { listDhcpLeases, getDhcpDashboard } from '../keaDhcp.js';
+import {
+  addDhcpReservation,
+  addDhcpSubnet,
+  deleteDhcpLease,
+  fixStaticReservation,
+  getDhcpDashboard,
+  listDhcpLeases,
+  unfixStaticReservation,
+  wipeDhcpSubnet,
+} from '../keaDhcp.js';
 import { listLogs, queueLogsCollection } from '../logs.js';
-import { listAlerts } from '../logAlerts.js';
+import { acknowledgeAlert, listAlertRules, listAlerts } from '../logAlerts.js';
 import { getLatestInterfacesJob, queueInterfaceAction, parseInterfaceActionPayload } from '../interfaces.js';
+import { tryCreateDeviceJob } from '../deviceOperations.js';
+import { collectArpForDevice } from '../arpAddress.js';
+import { collectMacForDevice } from '../macAddress.js';
+import { collectDeviceConfig } from '../collectConfig.js';
+import { diffConfigs, getDeviceSnapshots, getSnapshotConfig } from '../configCompare.js';
+import { startDiscoveryScan, syncDiscoveryResults } from '../discoveryScan.js';
+import { pingAndUpdateDevice } from '../devicePing.js';
+import bcrypt from 'bcryptjs';
+
+const BCRYPT_ROUNDS = 12;
 
 const PREVIEW_BYTES = 4_000;
 
@@ -553,6 +572,1121 @@ async function queueManagedCheckHandler(
   };
 }
 
+// ── READ handlers (new) ──────────────────────────────────────────────────────
+
+async function listDevicesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const where: Record<string, unknown> = {};
+  if (typeof args.site === 'string' && args.site) where.site = args.site;
+  if (typeof args.status === 'string') where.status = args.status;
+  if (typeof args.vendor === 'string' && args.vendor) {
+    where.vendor = { contains: args.vendor, mode: 'insensitive' };
+  }
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 500);
+
+  const devices = await prisma.device.findMany({
+    where,
+    take: limit,
+    orderBy: [{ site: 'asc' }, { floor: 'asc' }, { name: 'asc' }],
+    select: {
+      id: true, name: true, ip: true, status: true, vendor: true, model: true,
+      version: true, site: true, floor: true, lastPingAt: true, lastPingMs: true,
+    },
+  });
+  return {
+    ok: true,
+    preview: {
+      total: devices.length,
+      devices: devices.map((d) => ({
+        name: d.name,
+        ip: d.ip,
+        status: d.status,
+        vendor: d.vendor,
+        model: d.model,
+        version: d.version,
+        site: d.site,
+        floor: d.floor,
+        lastPingAt: d.lastPingAt,
+        lastPingMs: d.lastPingMs,
+      })),
+    },
+  };
+}
+
+async function listDhcpSubnetsHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const dashboard = await getDhcpDashboard();
+  let pools = dashboard.pools;
+  if (typeof args.site === 'string' && args.site) {
+    pools = pools.filter((p) => p.site === args.site);
+  }
+  if (args.only_high_utilization === true) {
+    pools = pools.filter((p) => p.utilization >= 80);
+  }
+  return {
+    ok: true,
+    preview: {
+      total: pools.length,
+      pools: pools.map((p) => ({
+        subnetId: p.subnetId,
+        name: p.name,
+        site: p.site,
+        vlan: p.vlan,
+        subnet: p.subnet,
+        pool: p.pool,
+        gateway: p.gateway,
+        dns: p.dns,
+        leased: p.leased,
+        poolSize: p.poolSize,
+        utilization: p.utilization,
+      })),
+    },
+  };
+}
+
+async function getDhcpSubnetHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const subnetId = typeof args.subnet_id === 'number' ? args.subnet_id : Number(args.subnet_id);
+  if (!Number.isFinite(subnetId)) return { ok: false, error: 'subnet_id is required (number)' };
+
+  const dashboard = await getDhcpDashboard();
+  const pool = dashboard.pools.find((p) => p.subnetId === subnetId);
+  if (!pool) return { ok: true, preview: { subnetId, found: false } };
+
+  const leases = await listDhcpLeases(subnetId);
+  return {
+    ok: true,
+    preview: {
+      subnetId,
+      found: true,
+      name: pool.name,
+      site: pool.site,
+      vlan: pool.vlan,
+      subnet: pool.subnet,
+      pool: pool.pool,
+      gateway: pool.gateway,
+      dns: pool.dns,
+      utilization: pool.utilization,
+      leases: {
+        total: leases.length,
+        active: leases.filter((l) => l.stateLabel === 'default' || l.stateLabel === 'static').length,
+        reserved: leases.filter((l) => l.reserved).length,
+      },
+    },
+  };
+}
+
+async function getJobDetailHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const id = String(args.job_id ?? '').trim();
+  if (!id) return { ok: false, error: 'job_id is required' };
+  const job = await prisma.job.findUnique({
+    where: { id },
+    include: {
+      device: { select: { name: true, ip: true, site: true, vendor: true } },
+      createdBy: { select: { username: true } },
+    },
+  });
+  if (!job) return { ok: true, preview: { jobId: id, found: false } };
+  return {
+    ok: true,
+    preview: {
+      jobId: job.id,
+      type: job.type,
+      status: job.status,
+      priority: job.priority,
+      device: job.device?.name ?? null,
+      deviceIp: job.device?.ip ?? null,
+      createdBy: job.createdBy?.username ?? null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      error: job.error ? job.error.slice(0, 500) : null,
+      payload: clip(job.payload),
+      result: clip(job.result),
+    },
+  };
+}
+
+async function listAlertRulesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const includeDisabled = args.include_disabled === true;
+  const rules = await listAlertRules(includeDisabled);
+  return {
+    ok: true,
+    preview: {
+      total: rules.length,
+      rules: rules.map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        deviceId: r.deviceId,
+        minSeverity: r.minSeverity,
+        messagePattern: r.messagePattern,
+        facility: r.facility,
+        enabled: r.enabled,
+        alertCount: r.alertCount,
+        unacknowledgedCount: r.unacknowledgedCount,
+        createdAt: r.createdAt,
+      })),
+    },
+  };
+}
+
+async function listUsersHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const users = await prisma.user.findMany({
+    select: {
+      id: true, username: true, email: true, role: true, active: true,
+      lastLoginAt: true, lastLoginIp: true, createdAt: true,
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  return {
+    ok: true,
+    preview: {
+      total: users.length,
+      users: users.map((u) => ({
+        id: u.id,
+        username: u.username,
+        email: u.email,
+        role: u.role,
+        active: u.active,
+        lastLoginAt: u.lastLoginAt,
+        lastLoginIp: u.lastLoginIp,
+        createdAt: u.createdAt,
+      })),
+    },
+  };
+}
+
+async function getConfigHistoryHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 30, 150);
+  const entryTypeFilter = String(args.entry_type ?? 'all');
+
+  // Reuse the route logic inline — we need the same merge (audit + snapshots).
+  const auditRows = await prisma.configAuditLog.findMany({
+    where: { deviceId: device.id },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+  const snapshotJobs = await prisma.job.findMany({
+    where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
+    orderBy: { updatedAt: 'desc' },
+    take: 100,
+    select: {
+      id: true, updatedAt: true, result: true,
+      createdBy: { select: { username: true } },
+    },
+  });
+
+  type Entry = {
+    id: string;
+    label: string;
+    timestamp: string;
+    entryType: 'apply' | 'snapshot';
+    username: string | null;
+    source: string | null;
+    configRole: string | null;
+    lineCount: number;
+  };
+  const entries: Entry[] = [];
+  for (const row of auditRows) {
+    entries.push({
+      id: row.jobId,
+      label: `Apply · ${row.createdAt.toISOString().slice(0, 16).replace('T', ' ')} · ${row.username ?? 'system'}`,
+      timestamp: row.createdAt.toISOString(),
+      entryType: 'apply',
+      username: row.username,
+      source: row.source,
+      configRole: row.configRole,
+      lineCount: row.lineCount,
+    });
+  }
+  for (const job of snapshotJobs) {
+    const result = (job.result ?? {}) as Record<string, unknown>;
+    const config = typeof result.config === 'string' ? result.config : '';
+    if (!config) continue;
+    entries.push({
+      id: job.id,
+      label: `Snapshot · ${job.updatedAt.toISOString().slice(0, 16).replace('T', ' ')} · ${job.createdBy?.username ?? 'CLI/scheduler'}`,
+      timestamp: job.updatedAt.toISOString(),
+      entryType: 'snapshot',
+      username: job.createdBy?.username ?? null,
+      source: null,
+      configRole: null,
+      lineCount: config.split('\n').length,
+    });
+  }
+  const filtered = entryTypeFilter === 'all' ? entries : entries.filter((e) => e.entryType === entryTypeFilter);
+  filtered.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      total: filtered.length,
+      returned: Math.min(filtered.length, limit),
+      entries: filtered.slice(0, limit),
+    },
+  };
+}
+
+async function getConfigDiffHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  const fromId = String(args.from_id ?? '').trim();
+  const toId = String(args.to_id ?? '').trim();
+  if (!name || !fromId || !toId) {
+    return { ok: false, error: 'device_name, from_id, to_id are all required' };
+  }
+  if (fromId === toId) return { ok: false, error: 'from_id and to_id must be different' };
+  const maxLines = Math.min(typeof args.max_lines === 'number' ? args.max_lines : 200, 2000);
+
+  async function loadConfig(id: string): Promise<{ content: string; label: string; entryType: string } | null> {
+    const audit = await prisma.configAuditLog.findUnique({ where: { jobId: id } });
+    if (audit) {
+      return { content: audit.config, label: `Apply · ${audit.createdAt.toISOString().slice(0, 16)} · ${audit.username ?? 'system'}`, entryType: 'apply' };
+    }
+    const content = await getSnapshotConfig(id);
+    if (content !== null) {
+      const job = await prisma.job.findUnique({
+        where: { id },
+        select: { updatedAt: true, createdBy: { select: { username: true } } },
+      });
+      return {
+        content,
+        label: `Snapshot · ${job?.updatedAt?.toISOString().slice(0, 16) ?? '?'} · ${job?.createdBy?.username ?? 'scheduler'}`,
+        entryType: 'snapshot',
+      };
+    }
+    return null;
+  }
+
+  const [from, to] = await Promise.all([loadConfig(fromId), loadConfig(toId)]);
+  if (!from) return { ok: false, error: `Entry "${fromId}" not found` };
+  if (!to) return { ok: false, error: `Entry "${toId}" not found` };
+
+  const diff = diffConfigs(from.content, to.content);
+  const totalLines = diff.lines.length;
+  const lines = diff.lines.slice(0, maxLines);
+  const truncated = totalLines > maxLines;
+
+  return {
+    ok: true,
+    preview: {
+      device: name,
+      from: { id: fromId, label: from.label, entryType: from.entryType },
+      to: { id: toId, label: to.label, entryType: to.entryType },
+      added: diff.added,
+      removed: diff.removed,
+      unchanged: diff.unchanged,
+      totalDiffLines: totalLines,
+      truncated,
+      diffLines: lines,
+    },
+  };
+}
+
+async function applyConfigDryRunHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    include: { savedConfig: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+
+  // Resolve target content: arg override > DeviceSavedConfig.content
+  const targetContent = typeof args.content === 'string' && args.content.trim()
+    ? args.content
+    : device.savedConfig?.content ?? '';
+  if (!targetContent.trim()) {
+    return { ok: false, error: 'Không có config để so sánh. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+  }
+
+  // Fetch latest running config (GET_CONFIG SUCCESS) for diff baseline.
+  const latest = await prisma.job.findFirst({
+    where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
+    orderBy: { updatedAt: 'desc' },
+    select: { result: true, updatedAt: true },
+  });
+  const result = (latest?.result ?? {}) as Record<string, unknown>;
+  const running = typeof result.config === 'string' ? result.config : '';
+
+  const diff = diffConfigs(running, targetContent);
+  const maxLines = Math.min(typeof args.max_lines === 'number' ? args.max_lines : 100, 1000);
+  const lines = diff.lines.slice(0, maxLines);
+
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      role: device.savedConfig?.role ?? 'custom',
+      runningCollectedAt: latest?.updatedAt ?? null,
+      added: diff.added,
+      removed: diff.removed,
+      unchanged: diff.unchanged,
+      truncated: diff.lines.length > maxLines,
+      diffLines: lines,
+      warning: diff.added + diff.removed > 200
+        ? 'Diff > 200 dòng — cẩn thận khi apply, có thể ảnh hưởng lớn đến thiết bị.'
+        : null,
+    },
+  };
+}
+
+async function listDiscoveryScansHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 100);
+  const scans = await prisma.discoveryScan.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    include: { _count: { select: { results: true } } },
+  });
+  return {
+    ok: true,
+    preview: {
+      total: scans.length,
+      scans: scans.map((s) => ({
+        id: s.id,
+        subnet: s.subnet,
+        site: s.site,
+        floor: s.floor,
+        status: s.status,
+        totalHosts: s.totalHosts,
+        scanned: s.scanned,
+        reachable: s.reachable,
+        discovered: s.discovered,
+        resultCount: s._count.results,
+        error: s.error,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+      })),
+    },
+  };
+}
+
+async function getDiscoveryScanHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const id = String(args.scan_id ?? '').trim();
+  if (!id) return { ok: false, error: 'scan_id is required' };
+  const scan = await prisma.discoveryScan.findUnique({
+    where: { id },
+    include: { results: { orderBy: [{ status: 'asc' }, { ip: 'asc' }] } },
+  });
+  if (!scan) return { ok: true, preview: { scanId: id, found: false } };
+  return {
+    ok: true,
+    preview: {
+      id: scan.id,
+      subnet: scan.subnet,
+      site: scan.site,
+      floor: scan.floor,
+      status: scan.status,
+      totalHosts: scan.totalHosts,
+      scanned: scan.scanned,
+      reachable: scan.reachable,
+      discovered: scan.discovered,
+      error: scan.error,
+      createdAt: scan.createdAt,
+      updatedAt: scan.updatedAt,
+      resultCount: scan.results.length,
+      results: scan.results.slice(0, 200).map((r) => ({
+        id: r.id,
+        ip: r.ip,
+        status: r.status,
+        name: r.name,
+        vendor: r.vendor,
+        model: r.model,
+        version: r.version,
+        pingOk: r.pingOk,
+        pingMs: r.pingMs,
+        sshOk: r.sshOk,
+        serial: r.serial,
+      })),
+    },
+  };
+}
+
+// ── WRITE handlers (new) ────────────────────────────────────────────────────
+
+async function queueApplyConfigHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    include: { savedConfig: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+  if (device.status !== 'MANAGED') {
+    return { ok: false, error: `Thiết bị phải MANAGED trước khi commit (hiện tại: ${device.status})` };
+  }
+
+  // Resolve content.
+  const content = typeof args.content === 'string' && args.content.trim()
+    ? args.content
+    : device.savedConfig?.content ?? '';
+  if (!content.trim()) return { ok: false, error: 'Không có config để commit. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+
+  // Vendor validation (mirror routes/generateConfig.ts::validateConfigPayload).
+  if (content.includes('\u0000')) {
+    return { ok: false, error: 'Config chứa ký tự NULL (0x00) — không hợp lệ' };
+  }
+  if (/<\s*script\b/i.test(content) || /<\?xml/i.test(content)) {
+    return { ok: false, error: 'Config chứa markup HTML/XML — không gửi được xuống thiết bị' };
+  }
+  if (device.vendor.toLowerCase() === 'juniper') {
+    if (/\/\*/.test(content) || /\*\//.test(content)) {
+      return {
+        ok: false,
+        error:
+          'Juniper không chấp nhận comment C-style (/* ... */). Dùng # hoặc xoá comment đó trước khi commit.',
+      };
+    }
+  }
+
+  // Compute diff for safety net + threshold check.
+  const latest = await prisma.job.findFirst({
+    where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
+    orderBy: { updatedAt: 'desc' },
+    select: { result: true },
+  });
+  const runningConfig = ((latest?.result ?? {}) as { config?: string }).config ?? '';
+  const diff = diffConfigs(runningConfig, content);
+  const totalChanges = diff.added + diff.removed;
+
+  // dry_run_first: refuse if diff is too large; user must explicitly force.
+  if (args.dry_run_first !== false && totalChanges > 200) {
+    return {
+      ok: false,
+      error:
+        `Diff quá lớn (${diff.added} added, ${diff.removed} removed, ${totalChanges} total). ` +
+        'Nếu chắc chắn muốn apply, gọi lại với dry_run_first=false để force.',
+    };
+  }
+
+  // Persist DeviceSavedConfig (mirrors routes/generateConfig.ts).
+  const role = (typeof args.role === 'string' ? args.role : device.savedConfig?.role ?? 'custom') as string;
+  await prisma.deviceSavedConfig.upsert({
+    where: { deviceId: device.id },
+    create: { deviceId: device.id, role, content },
+    update: { role, content },
+  });
+
+  // Queue job.
+  const outcome = await prisma.$transaction((tx) =>
+    tryCreateDeviceJob(tx, device.id, JobType.APPLY_CONFIG, ctx.userId, {
+      config: content,
+      role,
+      previous: runningConfig,
+    }),
+  );
+  if (outcome.kind === 'busy') {
+    return {
+      ok: false,
+      error: `Device busy — ${outcome.error.blockingJob.type} ${outcome.error.blockingJob.status}. Try again in a moment.`,
+    };
+  }
+
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      role,
+      added: diff.added,
+      removed: diff.removed,
+      unchanged: diff.unchanged,
+      jobId: outcome.job.id,
+      jobStatus: outcome.job.status,
+      message: `Apply config queued (added=${diff.added} removed=${diff.removed}). Worker sẽ commit trong vài giây.`,
+    },
+  };
+}
+
+async function queueRollbackConfigHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    include: { savedConfig: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+
+  const rollbackContent = device.savedConfig?.rollbackContent;
+  if (!rollbackContent) {
+    return { ok: false, error: 'Không có rollbackContent. Không thể rollback.' };
+  }
+
+  const outcome = await prisma.$transaction((tx) =>
+    tryCreateDeviceJob(tx, device.id, JobType.ROLLBACK_CONFIG, ctx.userId, {
+      rollback: 1,
+      previous: rollbackContent,
+    }),
+  );
+  if (outcome.kind === 'busy') {
+    return { ok: false, error: `Device busy — ${outcome.error.blockingJob.type} ${outcome.error.blockingJob.status}.` };
+  }
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      jobId: outcome.job.id,
+      jobStatus: outcome.job.status,
+      message: 'Rollback queued. Worker sẽ chạy trong vài giây.',
+    },
+  };
+}
+
+async function createDeviceHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const required = ['name', 'ip', 'vendor', 'model', 'version', 'serial', 'site', 'floor'];
+  for (const field of required) {
+    if (typeof args[field] !== 'string' || !(args[field] as string).trim()) {
+      return { ok: false, error: `${field} is required` };
+    }
+  }
+  try {
+    const device = await prisma.device.create({
+      data: {
+        name: String(args.name).trim(),
+        ip: String(args.ip).trim(),
+        vendor: String(args.vendor).trim(),
+        model: String(args.model).trim(),
+        version: String(args.version).trim(),
+        serial: String(args.serial).trim(),
+        site: String(args.site).trim(),
+        floor: String(args.floor).trim(),
+        description: typeof args.description === 'string' && (args.description as string).trim()
+          ? String(args.description).trim() : null,
+        rack: typeof args.rack === 'string' && (args.rack as string).trim() ? String(args.rack).trim() : null,
+        unit: typeof args.unit === 'string' && (args.unit as string).trim() ? String(args.unit).trim() : null,
+        status: 'UNKNOWN',
+      },
+    });
+    // Fire-and-forget probe
+    void pingAndUpdateDevice(device.id).catch((err) => console.error('[assistant] ping failed', err));
+    return {
+      ok: true,
+      preview: {
+        deviceId: device.id,
+        name: device.name,
+        ip: device.ip,
+        message: 'Đã tạo thiết bị. Probe MANAGED_CHECK tự động đang chạy.',
+      },
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'unknown error';
+    if (msg.includes('Unique constraint') || msg.includes('unique')) {
+      return { ok: false, error: 'IP hoặc serial đã tồn tại trong inventory' };
+    }
+    return { ok: false, error: msg };
+  }
+}
+
+async function updateDeviceHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+
+  const data: Record<string, unknown> = {};
+  for (const field of ['name', 'ip', 'vendor', 'model', 'version', 'serial', 'site', 'floor', 'description', 'rack', 'unit']) {
+    if (typeof args[field] === 'string' && (args[field] as string).trim()) {
+      data[field] = (args[field] as string).trim();
+    }
+  }
+  if (Object.keys(data).length === 0) {
+    return { ok: false, error: 'Không có field nào để update' };
+  }
+  try {
+    const updated = await prisma.device.update({ where: { id: device.id }, data });
+    return {
+      ok: true,
+      preview: {
+        deviceId: updated.id,
+        name: updated.name,
+        changedFields: Object.keys(data),
+        message: 'Đã cập nhật thiết bị.',
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function deleteDeviceHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true, ip: true, site: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+  try {
+    await prisma.device.delete({ where: { id: device.id } });
+    return {
+      ok: true,
+      preview: {
+        deleted: { name: device.name, ip: device.ip, site: device.site },
+        message: 'Đã xoá thiết bị (cascade jobs, logs, snapshots).',
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function setDeviceStatusHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  const status = String(args.status ?? '').toUpperCase();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  if (status !== 'MAINTENANCE' && status !== 'UNKNOWN') {
+    return { ok: false, error: 'status chỉ chấp nhận MAINTENANCE hoặc UNKNOWN' };
+  }
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true, status: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+  await prisma.device.update({ where: { id: device.id }, data: { status: status as 'MAINTENANCE' | 'UNKNOWN' } });
+  return {
+    ok: true,
+    preview: { device: device.name, previousStatus: device.status, newStatus: status, message: 'Đã đổi status.' },
+  };
+}
+
+async function queueCollectHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  const typeStr = String(args.collect_type ?? '').toUpperCase();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  if (!['ARP', 'MAC', 'CONFIG', 'INTERFACES'].includes(typeStr)) {
+    return { ok: false, error: 'collect_type phải là ARP / MAC / CONFIG / INTERFACES' };
+  }
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+
+  const jobType = ({
+    ARP: JobType.GET_ARP,
+    MAC: JobType.GET_MAC,
+    CONFIG: JobType.GET_CONFIG,
+    INTERFACES: JobType.GET_INTERFACES,
+  } as const)[typeStr as 'ARP' | 'MAC' | 'CONFIG' | 'INTERFACES'];
+
+  let result: { queued: boolean; job?: { id: string; status: string }; data?: unknown };
+  try {
+    if (jobType === JobType.GET_ARP) {
+      result = await collectArpForDevice(device.id, ctx.userId);
+    } else if (jobType === JobType.GET_MAC) {
+      result = await collectMacForDevice(device.id, ctx.userId);
+    } else if (jobType === JobType.GET_CONFIG) {
+      result = await collectDeviceConfig(device.id, ctx.userId);
+    } else {
+      // GET_INTERFACES
+      const outcome = await prisma.$transaction((tx) =>
+        tryCreateDeviceJob(tx, device.id, JobType.GET_INTERFACES, ctx.userId, {}),
+      );
+      if (outcome.kind === 'busy') {
+        return { ok: false, error: `Device busy — ${outcome.error.blockingJob.type} ${outcome.error.blockingJob.status}.` };
+      }
+      result = { queued: true, job: outcome.job };
+    }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+  if (!result.queued) {
+    return {
+      ok: true,
+      preview: {
+        device: device.name,
+        collectType: typeStr,
+        queued: false,
+        message: 'Đã có snapshot gần đây (không cần collect lại).',
+      },
+    };
+  }
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      collectType: typeStr,
+      jobId: result.job?.id,
+      jobStatus: result.job?.status,
+      message: `Collect ${typeStr} queued.`,
+    },
+  };
+}
+
+async function addDhcpReservationHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const ip = String(args.ip ?? '').trim();
+  const mac = String(args.mac ?? '').trim();
+  const subnetId = Number(args.subnet_id);
+  const hostname = typeof args.hostname === 'string' ? args.hostname : undefined;
+  if (!ip || !mac || !Number.isFinite(subnetId)) {
+    return { ok: false, error: 'ip, mac, subnet_id are required' };
+  }
+  try {
+    const result = await addDhcpReservation({ ip, mac, subnetId, hostname });
+    return {
+      ok: true,
+      preview: { ip, mac, subnetId, result, message: `Đã thêm DHCP lease ${mac} → ${ip}.` },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function deleteDhcpLeaseHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const ip = String(args.ip ?? '').trim();
+  if (!ip) return { ok: false, error: 'ip is required' };
+  try {
+    const result = await deleteDhcpLease(ip);
+    return { ok: true, preview: { ip, result, message: `Đã xoá DHCP lease ${ip}.` } };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function fixStaticReservationHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const ip = String(args.ip ?? '').trim();
+  const mac = String(args.mac ?? '').trim();
+  const subnetId = Number(args.subnet_id);
+  const hostname = typeof args.hostname === 'string' ? args.hostname : undefined;
+  const note = typeof args.note === 'string' ? args.note : undefined;
+  if (!ip || !mac || !Number.isFinite(subnetId)) {
+    return { ok: false, error: 'ip, mac, subnet_id are required' };
+  }
+  try {
+    const result = await fixStaticReservation({ ip, mac, subnetId, hostname, note });
+    return {
+      ok: true,
+      preview: { ip, mac, subnetId, result, message: `Đã ghim static ${mac} → ${ip}.` },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function wipeDhcpSubnetHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const subnetId = Number(args.subnet_id);
+  if (!Number.isFinite(subnetId)) return { ok: false, error: 'subnet_id is required' };
+  try {
+    const result = await wipeDhcpSubnet(subnetId);
+    return { ok: true, preview: { subnetId, result, message: `Đã WIPE tất cả lease trong subnet ${subnetId}.` } };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function addDhcpSubnetHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const subnetId = Number(args.subnet_id);
+  const subnet = String(args.subnet ?? '').trim();
+  const poolStart = String(args.pool_start ?? '').trim();
+  const poolEnd = String(args.pool_end ?? '').trim();
+  const gateway = String(args.gateway ?? '').trim();
+  if (!Number.isFinite(subnetId) || !subnet || !poolStart || !poolEnd || !gateway) {
+    return { ok: false, error: 'subnet_id, subnet, pool_start, pool_end, gateway are required' };
+  }
+  try {
+    const dns = Array.isArray(args.dns) ? (args.dns as unknown[]).filter((d): d is string => typeof d === 'string') : undefined;
+    const result = await addDhcpSubnet({
+      subnetId, subnet, poolStart, poolEnd, gateway, dns,
+      site: typeof args.site === 'string' ? args.site : undefined,
+      vlan: typeof args.vlan === 'number' ? args.vlan : undefined,
+      name: typeof args.name === 'string' ? args.name : undefined,
+    });
+    return {
+      ok: true,
+      preview: {
+        subnetId, subnet, poolStart, poolEnd, gateway, result,
+        message: `Đã thêm subnet ${subnetId} (${subnet}) vào Kea config.`,
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function startDiscoveryScanHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const subnet = String(args.subnet ?? '').trim();
+  if (!subnet) return { ok: false, error: 'subnet is required (CIDR)' };
+  try {
+    const scan = await startDiscoveryScan({
+      subnet,
+      site: typeof args.site === 'string' ? args.site : undefined,
+      floor: typeof args.floor === 'string' ? args.floor : undefined,
+    });
+    return {
+      ok: true,
+      preview: {
+        scanId: scan.id,
+        subnet,
+        status: scan.status,
+        message: 'Discovery scan đã bắt đầu. Theo dõi bằng list_discovery_scans.',
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function syncDiscoveryResultsHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const scanId = String(args.scan_id ?? '').trim();
+  const resultIds = Array.isArray(args.result_ids) ? (args.result_ids as unknown[]).filter((r): r is string => typeof r === 'string') : [];
+  if (!scanId || resultIds.length === 0) {
+    return { ok: false, error: 'scan_id and result_ids (array) are required' };
+  }
+  try {
+    const summary = await syncDiscoveryResults(scanId, resultIds, {
+      site: typeof args.site === 'string' ? args.site : undefined,
+      floor: typeof args.floor === 'string' ? args.floor : undefined,
+    });
+    return {
+      ok: true,
+      preview: { ...summary, message: `Đã sync ${resultIds.length} result thành Device.` },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
+  }
+}
+
+async function acknowledgeAlertHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const id = String(args.alert_id ?? '').trim();
+  if (!id) return { ok: false, error: 'alert_id is required' };
+  const ok = await acknowledgeAlert(id);
+  return { ok, preview: { alertId: id, acknowledged: ok, message: ok ? 'Đã acknowledge alert.' : 'Alert không tồn tại.' } };
+}
+
+async function syncToNetboxHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+  const outcome = await prisma.$transaction((tx) =>
+    tryCreateDeviceJob(tx, device.id, JobType.NETBOX_SYNC_DEVICE, ctx.userId, {}),
+  );
+  if (outcome.kind === 'busy') {
+    return { ok: false, error: `Device busy — ${outcome.error.blockingJob.type} ${outcome.error.blockingJob.status}.` };
+  }
+  return {
+    ok: true,
+    preview: { device: device.name, jobId: outcome.job.id, message: 'NETBOX_SYNC_DEVICE job queued.' },
+  };
+}
+
+async function syncAllToNetboxHandler(
+  _args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  if (!ctx.userId) return { ok: false, error: 'Authentication required' };
+  const job = await prisma.job.create({
+    data: {
+      deviceId: null,
+      type: JobType.NETBOX_SYNC_ALL,
+      status: JobStatus.PENDING,
+      priority: 0,
+      createdById: ctx.userId,
+    },
+  });
+  return {
+    ok: true,
+    preview: { jobId: job.id, message: 'NETBOX_SYNC_ALL job queued. Worker sẽ sync toàn bộ thiết bị.' },
+  };
+}
+
+// ── Admin user handlers ─────────────────────────────────────────────────────
+
+async function createUserHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const username = String(args.username ?? '').trim();
+  const email = String(args.email ?? '').trim();
+  const password = String(args.password ?? '');
+  const role = String(args.role ?? '').toUpperCase();
+  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
+    return { ok: false, error: 'Username phải 3-32 chars (a-z, 0-9, ._ -)' };
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return { ok: false, error: 'Email không hợp lệ' };
+  }
+  if (password.length < 8 || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) {
+    return { ok: false, error: 'Password >= 8 chars, có chữ hoa, thường, số' };
+  }
+  if (!['ADMIN', 'OPERATOR', 'VIEWER'].includes(role)) {
+    return { ok: false, error: 'Role phải là ADMIN, OPERATOR hoặc VIEWER' };
+  }
+  const existing = await prisma.user.findFirst({ where: { OR: [{ username }, { email }] } });
+  if (existing) return { ok: false, error: 'Username hoặc email đã tồn tại' };
+  const hashed = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const user = await prisma.user.create({
+    data: { username, email, password: hashed, role: role as 'ADMIN' | 'OPERATOR' | 'VIEWER' },
+    select: { id: true, username: true, email: true, role: true, createdAt: true },
+  });
+  return { ok: true, preview: { user, message: `Đã tạo user ${username} (${role}).` } };
+}
+
+async function updateUserRoleHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const username = String(args.username ?? '').trim();
+  const role = String(args.role ?? '').toUpperCase();
+  if (!['ADMIN', 'OPERATOR', 'VIEWER'].includes(role)) {
+    return { ok: false, error: 'Role không hợp lệ' };
+  }
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return { ok: false, error: `User not found: ${username}` };
+  if (user.id === ctx.userId && role !== 'ADMIN') {
+    return { ok: false, error: 'Không thể tự demote chính mình' };
+  }
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: { role: role as 'ADMIN' | 'OPERATOR' | 'VIEWER' },
+    select: { id: true, username: true, email: true, role: true },
+  });
+  return { ok: true, preview: { user: updated, message: `Đã đổi role ${username} → ${role}.` } };
+}
+
+async function setUserActiveHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const username = String(args.username ?? '').trim();
+  const active = args.active === true;
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return { ok: false, error: `User not found: ${username}` };
+  if (user.id === ctx.userId && !active) {
+    return { ok: false, error: 'Không thể tự deactivate chính mình' };
+  }
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: { active },
+    select: { id: true, username: true, email: true, role: true, active: true },
+  });
+  return {
+    ok: true,
+    preview: { user: updated, message: `Đã ${active ? 'activate' : 'deactivate'} user ${username}.` },
+  };
+}
+
+async function resetUserPasswordHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const username = String(args.username ?? '').trim();
+  const newPassword = String(args.new_password ?? '');
+  if (newPassword.length < 8 || !/[A-Z]/.test(newPassword) || !/[a-z]/.test(newPassword) || !/[0-9]/.test(newPassword)) {
+    return { ok: false, error: 'Password >= 8 chars, có chữ hoa, thường, số' };
+  }
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return { ok: false, error: `User not found: ${username}` };
+  const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  await prisma.user.update({ where: { id: user.id }, data: { password: hashed } });
+  return { ok: true, preview: { username, message: `Đã reset password cho ${username}. Truyền password tạm qua kênh secure (1 lần).` } };
+}
+
+async function deleteUserHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const username = String(args.username ?? '').trim();
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user) return { ok: false, error: `User not found: ${username}` };
+  if (user.id === ctx.userId) return { ok: false, error: 'Không thể tự xoá chính mình' };
+  await prisma.user.delete({ where: { id: user.id } });
+  return { ok: true, preview: { username, message: `Đã xoá user ${username} (KHÔNG UNDO).` } };
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -569,6 +1703,7 @@ function parseSeverityFloor(min: string): ('EMERGENCY' | 'ALERT' | 'CRITICAL' | 
 // ── dispatch table ────────────────────────────────────────────────────────────
 
 export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
+  // Original READ
   lookup_mac: lookupMacHandler,
   get_device: getDeviceHandler,
   get_device_interfaces: getDeviceInterfacesHandler,
@@ -578,9 +1713,45 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   search_recent_jobs: searchRecentJobsHandler,
   get_recent_logs: getRecentLogsHandler,
   get_unacknowledged_alerts: getUnacknowledgedAlertsHandler,
+  // Original WRITE
   queue_interface_action: queueInterfaceActionHandler,
   queue_log_collect: queueLogCollectHandler,
   queue_managed_check: queueManagedCheckHandler,
+  // New READ
+  list_devices: listDevicesHandler,
+  list_dhcp_subnets: listDhcpSubnetsHandler,
+  get_dhcp_subnet: getDhcpSubnetHandler,
+  get_job_detail: getJobDetailHandler,
+  list_alert_rules: listAlertRulesHandler,
+  list_users: listUsersHandler,
+  get_config_history: getConfigHistoryHandler,
+  get_config_diff: getConfigDiffHandler,
+  apply_config_dry_run: applyConfigDryRunHandler,
+  list_discovery_scans: listDiscoveryScansHandler,
+  get_discovery_scan: getDiscoveryScanHandler,
+  // New WRITE
+  queue_apply_config: queueApplyConfigHandler,
+  queue_rollback_config: queueRollbackConfigHandler,
+  create_device: createDeviceHandler,
+  update_device: updateDeviceHandler,
+  delete_device: deleteDeviceHandler,
+  set_device_status: setDeviceStatusHandler,
+  queue_collect: queueCollectHandler,
+  add_dhcp_reservation: addDhcpReservationHandler,
+  delete_dhcp_lease: deleteDhcpLeaseHandler,
+  fix_static_reservation: fixStaticReservationHandler,
+  wipe_dhcp_subnet: wipeDhcpSubnetHandler,
+  add_dhcp_subnet: addDhcpSubnetHandler,
+  start_discovery_scan: startDiscoveryScanHandler,
+  sync_discovery_results: syncDiscoveryResultsHandler,
+  acknowledge_alert: acknowledgeAlertHandler,
+  sync_to_netbox: syncToNetboxHandler,
+  sync_all_to_netbox: syncAllToNetboxHandler,
+  create_user: createUserHandler,
+  update_user_role: updateUserRoleHandler,
+  set_user_active: setUserActiveHandler,
+  reset_user_password: resetUserPasswordHandler,
+  delete_user: deleteUserHandler,
 };
 
 /** Map backend UserRole → assistant role. Worker = VIEWER + specific tools. */

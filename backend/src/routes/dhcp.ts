@@ -1,13 +1,16 @@
 import { Router } from 'express';
 import {
   addDhcpReservation,
+  addDhcpSubnet,
   deleteDhcpLease,
+  deleteDhcpSubnet,
   fixStaticReservation,
   getDhcpDashboard,
   listDhcpLeases,
   unfixStaticReservation,
   wipeDhcpSubnet,
 } from '../services/keaDhcp.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 
 export const dhcpRouter = Router();
 
@@ -153,6 +156,62 @@ dhcpRouter.post('/leases/:ip/unfix-static', async (req, res) => {
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to unfix static IP',
+    });
+  }
+});
+
+// POST /api/dhcp/subnets — add a new subnet to Kea config (ADMIN only)
+dhcpRouter.post('/subnets', authMiddleware, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const body = req.body as {
+      subnetId?: number;
+      subnet?: string;
+      poolStart?: string;
+      poolEnd?: string;
+      gateway?: string;
+      dns?: string[];
+      site?: string;
+      vlan?: number;
+      name?: string;
+    };
+    if (!body.subnetId || !body.subnet || !body.poolStart || !body.poolEnd || !body.gateway) {
+      res.status(400).json({
+        error: 'subnetId, subnet (CIDR), poolStart, poolEnd, gateway are required',
+      });
+      return;
+    }
+    const result = await addDhcpSubnet({
+      subnetId: Number(body.subnetId),
+      subnet: body.subnet,
+      poolStart: body.poolStart,
+      poolEnd: body.poolEnd,
+      gateway: body.gateway,
+      dns: body.dns,
+      site: body.site,
+      vlan: body.vlan,
+      name: body.name,
+    });
+    res.status(201).json({ ok: true, ...result });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'Failed to add subnet',
+    });
+  }
+});
+
+// DELETE /api/dhcp/subnets/:subnetId — remove a subnet entirely (ADMIN only)
+dhcpRouter.delete('/subnets/:subnetId', authMiddleware, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const subnetId = Number(req.params.subnetId);
+    if (!Number.isFinite(subnetId)) {
+      res.status(400).json({ error: 'Invalid subnetId' });
+      return;
+    }
+    const result = await deleteDhcpSubnet(subnetId);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'Failed to delete subnet',
     });
   }
 });

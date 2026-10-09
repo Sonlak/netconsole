@@ -22,20 +22,53 @@ export type AssistantToolMessage = Extract<AssistantMessage, { role: 'tool' }>;
 
 /** Anything that the LLM can call. */
 export type AssistantToolName =
-  // READ
+  // READ — devices + inventory
   | 'lookup_mac'
   | 'get_device'
   | 'get_device_interfaces'
+  | 'list_devices'
   | 'list_dhcp_leases'
   | 'get_dhcp_pool_status'
+  | 'list_dhcp_subnets'
+  | 'get_dhcp_subnet'
   | 'get_fabric_topology'
   | 'search_recent_jobs'
+  | 'get_job_detail'
   | 'get_recent_logs'
   | 'get_unacknowledged_alerts'
+  | 'list_alert_rules'
+  | 'list_users'
+  | 'get_config_history'
+  | 'get_config_diff'
+  | 'list_discovery_scans'
+  | 'get_discovery_scan'
   // WRITE — emit confirmation_required
   | 'queue_interface_action'
   | 'queue_log_collect'
-  | 'queue_managed_check';
+  | 'queue_managed_check'
+  | 'queue_apply_config'
+  | 'queue_rollback_config'
+  | 'apply_config_dry_run'
+  | 'create_device'
+  | 'update_device'
+  | 'delete_device'
+  | 'set_device_status'
+  | 'queue_collect'
+  | 'add_dhcp_reservation'
+  | 'delete_dhcp_lease'
+  | 'fix_static_reservation'
+  | 'wipe_dhcp_subnet'
+  | 'add_dhcp_subnet'
+  | 'start_discovery_scan'
+  | 'sync_discovery_results'
+  | 'acknowledge_alert'
+  | 'sync_to_netbox'
+  | 'sync_all_to_netbox'
+  | 'create_user'
+  | 'update_user_role'
+  | 'set_user_active'
+  | 'reset_user_password'
+  | 'delete_user';
 
 /** Roles a user can have. Viewers can use READ tools only. */
 export type AssistantRole = 'ADMIN' | 'OPERATOR' | 'VIEWER' | 'WORKER';

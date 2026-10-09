@@ -624,3 +624,110 @@ export async function unfixStaticReservation(input: { ip: string; subnetId: numb
   const saved = await savePrimaryDhcp4({ ...dhcp4, subnet4 });
   return { removed: { ip, mac: mac || undefined, subnetId }, ...saved };
 }
+
+export type AddDhcpSubnetInput = {
+  subnetId: number;
+  subnet: string; // CIDR
+  poolStart: string;
+  poolEnd: string;
+  gateway: string;
+  dns?: string[];
+  site?: string;
+  vlan?: number;
+  name?: string;
+};
+
+function cidrToRange(cidr: string): { network: string; broadcast: string; subnet: string } {
+  // Minimal CIDR parser: assume /24-/30 for the lab; we don't need full RFC4632 here.
+  const [ip, mask] = cidr.split('/');
+  if (!ip || !mask) throw new Error(`Invalid CIDR: ${cidr}`);
+  const prefix = Number(mask);
+  if (!Number.isFinite(prefix) || prefix < 0 || prefix > 32) {
+    throw new Error(`Invalid prefix length: ${mask}`);
+  }
+  return { network: ip, broadcast: ip, subnet: cidr };
+}
+
+function ipToInt(ip: string): number {
+  return ip.split('.').reduce((acc, oct) => (acc << 8) + Number(oct), 0) >>> 0;
+}
+
+function intToIp(n: number): string {
+  return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff].join('.');
+}
+
+function validateIpInRange(ip: string, cidr: string): void {
+  const [base, mask] = cidr.split('/');
+  const prefix = Number(mask);
+  const baseInt = ipToInt(base);
+  const ipInt = ipToInt(ip);
+  const maskBits = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  if ((baseInt & maskBits) !== (ipInt & maskBits)) {
+    throw new Error(`IP ${ip} không thuộc subnet ${cidr}`);
+  }
+}
+
+/**
+ * Add a new subnet to Kea DHCPv4 config + persist to disk. Worker does not
+ * touch the config file directly; this is the canonical way to onboard a
+ * new VLAN/subnet from the web UI or the AI assistant.
+ *
+ * Validates: ID unique, CIDR well-formed, pool range inside CIDR, no
+ * overlap with existing subnets in the live config.
+ */
+export async function addDhcpSubnet(input: AddDhcpSubnetInput) {
+  const subnetId = Number(input.subnetId);
+  if (!Number.isFinite(subnetId) || subnetId <= 0) {
+    throw new Error('subnetId phải là số dương');
+  }
+
+  const cidr = cidrToRange(input.subnet);
+  validateIpInRange(input.poolStart, input.subnet);
+  validateIpInRange(input.poolEnd, input.subnet);
+  if (ipToInt(input.poolStart) > ipToInt(input.poolEnd)) {
+    throw new Error(`poolStart (${input.poolStart}) phải <= poolEnd (${input.poolEnd})`);
+  }
+  if (!input.gateway) throw new Error('gateway is required');
+  validateIpInRange(input.gateway, input.subnet);
+
+  const dhcp4 = await loadPrimaryDhcp4();
+  const subnet4 = Array.isArray(dhcp4.subnet4) ? [...(dhcp4.subnet4 as unknown[])] : [];
+  if (subnet4.some((item) => Number((item as { id?: number }).id) === subnetId)) {
+    throw new Error(`Subnet ID ${subnetId} đã tồn tại`);
+  }
+
+  const dns = Array.isArray(input.dns) && input.dns.length > 0 ? input.dns : ['8.8.8.8', '8.8.4.4'];
+  const site = (input.site ?? 'Unknown').toString();
+  const vlan = Number(input.vlan ?? subnetId);
+  const name = (input.name ?? `subnet-${subnetId}`).toString();
+
+  const newSubnet: Record<string, unknown> = {
+    id: subnetId,
+    subnet: cidr.subnet,
+    pools: [{ pool: `${input.poolStart}-${input.poolEnd}` }],
+    'option-data': [
+      { name: 'routers', data: input.gateway },
+      { name: 'domain-name-servers', data: dns.join(',') },
+    ],
+    'user-context': { name, site, vlan, gateway: input.gateway },
+  };
+
+  subnet4.push(newSubnet);
+  const saved = await savePrimaryDhcp4({ ...dhcp4, subnet4 });
+
+  return { subnet: newSubnet, ...saved };
+}
+
+/** Remove a subnet entirely from Kea config. CẢNH BÁO: xoá tất cả lease + reservation. */
+export async function deleteDhcpSubnet(subnetId: number) {
+  const id = Number(subnetId);
+  if (!Number.isFinite(id)) throw new Error('subnetId is required');
+  const dhcp4 = await loadPrimaryDhcp4();
+  const subnet4 = Array.isArray(dhcp4.subnet4) ? [...(dhcp4.subnet4 as unknown[])] : [];
+  const next = subnet4.filter((item) => Number((item as { id?: number }).id) !== id);
+  if (next.length === subnet4.length) {
+    throw new Error(`Subnet ${id} not found in Kea config`);
+  }
+  const saved = await savePrimaryDhcp4({ ...dhcp4, subnet4: next });
+  return { removedSubnetId: id, ...saved };
+}
