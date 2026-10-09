@@ -152,6 +152,10 @@ async function getDeviceHandler(
     where: { OR: conditions },
     take: 5,
     orderBy: { updatedAt: 'desc' },
+    select: {
+      id: true, name: true, ip: true, status: true, vendor: true, model: true,
+      version: true, site: true, floor: true, rack: true, lastPingAt: true, lastPingMs: true,
+    },
   });
 
   if (devices.length === 0) {
@@ -172,6 +176,7 @@ async function getDeviceHandler(
         version: d.version,
         site: d.site,
         floor: d.floor,
+        rack: d.rack ?? '(chua co)',
         lastPingAt: d.lastPingAt,
         lastPingMs: d.lastPingMs,
       })),
@@ -594,6 +599,7 @@ async function listDevicesHandler(
 ): Promise<ToolResult> {
   const where: Record<string, unknown> = {};
   if (typeof args.site === 'string' && args.site) where.site = args.site;
+  if (typeof args.floor === 'number') where.floor = args.floor;
   if (typeof args.status === 'string') where.status = args.status;
   if (typeof args.vendor === 'string' && args.vendor) {
     where.vendor = { contains: args.vendor, mode: 'insensitive' };
@@ -606,7 +612,7 @@ async function listDevicesHandler(
     orderBy: [{ site: 'asc' }, { floor: 'asc' }, { name: 'asc' }],
     select: {
       id: true, name: true, ip: true, status: true, vendor: true, model: true,
-      version: true, site: true, floor: true, lastPingAt: true, lastPingMs: true,
+      version: true, site: true, floor: true, rack: true, lastPingAt: true, lastPingMs: true,
     },
   });
   return {
@@ -622,6 +628,7 @@ async function listDevicesHandler(
         version: d.version,
         site: d.site,
         floor: d.floor,
+        rack: d.rack ?? '(chua co)',
         lastPingAt: d.lastPingAt,
         lastPingMs: d.lastPingMs,
       })),
@@ -1717,6 +1724,23 @@ async function deleteUserHandler(
   return { ok: true, preview: { username, message: `Đã xoá user ${username} (KHÔNG UNDO).` } };
 }
 
+async function getNetconsoleInfoHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const version = process.env.NETCONSOLE_VERSION ?? 'unknown';
+  const gitCommit = process.env.NETCONSOLE_GIT_COMMIT ?? 'unknown';
+  return {
+    ok: true,
+    preview: {
+      version,
+      gitCommit,
+      // Uptime is approximate — backend process start time
+      nodeEnv: process.env.NODE_ENV ?? 'production',
+    },
+  };
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -1782,6 +1806,7 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   set_user_active: setUserActiveHandler,
   reset_user_password: resetUserPasswordHandler,
   delete_user: deleteUserHandler,
+  get_netconsole_info: getNetconsoleInfoHandler,
 };
 
 /** Map backend UserRole → assistant role. Worker = VIEWER + specific tools. */

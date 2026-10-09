@@ -199,6 +199,9 @@ app.get('/api/health', (_req, res) => {
     keaApiUrl: process.env.KEA_API_URL || null,
     netboxEnabled: netboxSyncIntervalSeconds > 0,
     netboxSyncIntervalSeconds: netboxSyncIntervalSeconds > 0 ? netboxSyncIntervalSeconds : null,
+    // Read version from package.json (written at build time by docker-compose)
+    version: process.env.NETCONSOLE_VERSION || null,
+    gitCommit: process.env.NETCONSOLE_GIT_COMMIT || null,
   });
 });
 

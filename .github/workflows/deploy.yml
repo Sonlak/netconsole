@@ -587,6 +587,9 @@ jobs:
           # to export cache-mount content as a layer (which it isn't)
           # and the build fails with a cache-key computation error.
           cache-to: type=gha,mode=min
+          build-args: |
+            NETCONSOLE_VERSION=${{ github.ref_name }}
+            NETCONSOLE_GIT_COMMIT=${{ github.sha }}
 
       - name: Summary
         if: ${{ matrix.service == 'backend' }}

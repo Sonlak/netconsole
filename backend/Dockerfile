@@ -5,6 +5,9 @@
 # ---- Stage 1: build (compile TS + generate prisma client + prune) ----
 FROM node:22-bookworm-slim AS build
 
+ARG NETCONSOLE_VERSION=unknown
+ARG NETCONSOLE_GIT_COMMIT=unknown
+
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -43,6 +46,10 @@ COPY --from=build /app/package.json ./package.json
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ARG NETCONSOLE_VERSION=unknown
+ARG NETCONSOLE_GIT_COMMIT=unknown
+ENV NETCONSOLE_VERSION=${NETCONSOLE_VERSION}
+ENV NETCONSOLE_GIT_COMMIT=${NETCONSOLE_GIT_COMMIT}
 
 EXPOSE 3000
 

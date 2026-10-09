@@ -108,6 +108,9 @@ services:
   backend:
     build:
       context: ./backend
+      args:
+        NETCONSOLE_VERSION: "${NETCONSOLE_VERSION:-unknown}"
+        NETCONSOLE_GIT_COMMIT: "${NETCONSOLE_GIT_COMMIT:-unknown}"
     container_name: netconsole-backend
     restart: unless-stopped
     depends_on:

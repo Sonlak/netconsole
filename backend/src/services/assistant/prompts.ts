@@ -30,7 +30,8 @@ Bạn là trợ lý AI cho **NetConsole** — console quản lý mạng nội b�
 Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/router, DHCP, người dùng.
 
 ## Capabilities (READ — chạy được ngay, không cần xác nhận)
-- Tra cứu thiết bị, interfaces, MAC, ARP, DHCP lease, fabric topology
+- Tra cứu thiết bị (filter theo site / floor / vendor / status), interfaces, MAC, ARP, DHCP lease, fabric topology
+- Xem version NetConsole đang chạy (dùng get_netconsole_info)
 - Xem config history + diff giữa 2 phiên bản config (ai commit, lúc nào, thay đổi gì)
 - Tìm job gần đây, xem chi tiết job (payload, result, error)
 - Xem log/syslog, alert chưa acknowledge, danh sách alert rules
@@ -541,13 +542,15 @@ const listDevices: CatalogEntry = {
   function: {
     name: 'list_devices',
     description:
-      'Liệt kê thiết bị trong hệ thống. Có thể filter theo site, status, vendor. ' +
-      'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN" hoặc "switch nào OFFLINE".',
+      'Liệt kê thiết bị trong hệ thống. Có thể filter theo site, floor, status, vendor. ' +
+      'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN", "thiết bị tầng 6", "switch nào OFFLINE". ' +
+      'Lưu ý: floor là số tầng (1-99), KHÔNG phải site. "tầng 6" = floor=6.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        site: { type: 'string', description: 'Filter theo site (exact match). Tùy chọn.' },
+        site: { type: 'string', description: 'Filter theo site (VD: "LAB", "PROD"). Tùy chọn.' },
+        floor: { type: 'number', description: 'Filter theo số tầng (VD: 6 = tầng 6). Tùy chọn.' },
         status: strEnum(['ONLINE', 'OFFLINE', 'MANAGED', 'MAINTENANCE', 'UNKNOWN']),
         vendor: { type: 'string', description: 'Filter theo vendor (juniper/arista/cisco). Tùy chọn.' },
         limit: { type: 'number', description: 'Mặc định 50, tối đa 500.' },
@@ -1335,6 +1338,25 @@ const deleteUser: CatalogEntry = {
   confirmSummary: (args) => `Xoá user ${args.username ?? '?'} (KHÔNG UNDO)`,
 };
 
+const getNetconsoleInfo: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'get_netconsole_info',
+    description:
+      'Lấy thông tin hệ thống NetConsole: version, git commit, uptime. ' +
+      'Dùng khi user hỏi "version", "phiên bản", "đang chạy phiên bản nào". ' +
+      'Tool này đọc trực tiếp từ backend env, không cần gọi HTTP request.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
 /** All tools, in the order the LLM should consider them. */
 export const TOOL_CATALOG: CatalogEntry[] = [
   // READ (executed inline)
@@ -1384,6 +1406,7 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   setUserActive,
   resetUserPassword,
   deleteUser,
+  getNetconsoleInfo,
 ];
 
 /** Just the OpenAI tool definitions (drops our metadata). */

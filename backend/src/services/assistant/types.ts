@@ -42,6 +42,7 @@ export type AssistantToolName =
   | 'get_config_diff'
   | 'list_discovery_scans'
   | 'get_discovery_scan'
+  | 'get_netconsole_info'
   // WRITE — emit confirmation_required
   | 'queue_interface_action'
   | 'queue_log_collect'
