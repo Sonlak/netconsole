@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => {
   const deviceFindMany = vi.fn();
   const jobCreate = vi.fn();
   const jobFindMany = vi.fn();
+  const getLatestInterfacesJob = vi.fn();
   const sessionCreate = vi.fn(async ({ data }: { data: { userId: string | null; model: string; title: string } }) => ({
     id: 'sess-test',
     userId: data.userId,
@@ -45,6 +46,7 @@ const mocks = vi.hoisted(() => {
     deviceFindMany,
     jobCreate,
     jobFindMany,
+    getLatestInterfacesJob,
     sessionCreate,
     sessionFindUnique,
     messageCreate,
@@ -97,7 +99,7 @@ vi.mock('../../src/services/logAlerts.js', () => ({
   listAlerts: vi.fn(async () => []),
 }));
 vi.mock('../../src/services/interfaces.js', () => ({
-  getLatestInterfacesJob: vi.fn(async () => null),
+  getLatestInterfacesJob: (...args: unknown[]) => mocks.getLatestInterfacesJob(...args),
   queueInterfaceAction: vi.fn(async () => ({
     kind: 'created',
     job: { id: 'job-x', type: 'INTERFACE_ACTION', status: 'PENDING', createdAt: new Date(), deviceId: 'dev-1', payload: { action: 'shut', interface: 'ge-0/0/5' } },
@@ -339,6 +341,100 @@ describe('POST /api/assistant', () => {
     const idxToolResult = recursiveArgs.messages.findIndex((m) => m.role === 'tool');
     expect(idxToolCall).toBeGreaterThanOrEqual(0);
     expect(idxToolResult).toBeGreaterThan(idxToolCall);
+  });
+
+  it('handles multiple tool_calls in one LLM turn (fan-out)', async () => {
+    // First LLM call emits TWO read tools (get_device + get_device_interfaces).
+    // Bug seen 2026-10-09: only the first tool result was appended to
+    // the conversation, so the second tool_call_id had no matching
+    // `tool` message and OpenAI returned 400.
+    mocks.deviceFindMany.mockResolvedValueOnce([
+      {
+        id: 'dev-2',
+        name: 'LAB-F6-DS-01',
+        ip: '10.10.20.6',
+        status: 'ONLINE',
+        vendor: 'juniper',
+        model: 'EX3400',
+        version: '23.4R2',
+        site: 'NKKN',
+        floor: 'F6',
+        lastPingAt: new Date(),
+        lastPingMs: 4,
+      },
+    ]);
+    mocks.getLatestInterfacesJob.mockResolvedValueOnce({
+      id: 'job-1',
+      updatedAt: new Date(),
+      result: { interfaces: [{ name: 'ge-0/0/0', adminStatus: 'up', operStatus: 'up' }] },
+    });
+
+    createCompletionMock.mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: 'tool_calls',
+          message: {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              {
+                id: 'call-A',
+                type: 'function',
+                function: { name: 'get_device', arguments: JSON.stringify({ query: 'LAB-F6-DS-01' }) },
+              },
+              {
+                id: 'call-B',
+                type: 'function',
+                function: { name: 'get_device_interfaces', arguments: JSON.stringify({ device_name: 'LAB-F6-DS-01' }) },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 200, completion_tokens: 30, total_tokens: 230, prompt_tokens_details: { cached_tokens: 100 } },
+    });
+    createCompletionMock.mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: 'stop',
+          message: { role: 'assistant', content: 'LAB-F6-DS-01 đang ONLINE, có 1 interface up.' },
+        },
+      ],
+      usage: { prompt_tokens: 400, completion_tokens: 20, total_tokens: 420, prompt_tokens_details: { cached_tokens: 300 } },
+    });
+
+    const res = await fetch(baseUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${makeAdminToken()}` },
+      body: JSON.stringify({
+        userMessage: 'LAB-F6-DS-01 status + interfaces?',
+        messages: [{ role: 'user', content: 'LAB-F6-DS-01 status + interfaces?' }],
+      }),
+    });
+    if (res.status !== 200) {
+      const body = await res.text();
+      throw new Error(`Expected 200, got ${res.status}: ${body}`);
+    }
+    const events = await collectEvents(res);
+    const toolResults = events.filter((e) => e.type === 'tool_result') as Array<{ id: string }>;
+    expect(toolResults.length).toBe(2);
+    const ids = toolResults.map((tr) => tr.id).sort();
+    expect(ids).toEqual(['call-A', 'call-B']);
+
+    // The recursive LLM call must receive BOTH tool result messages
+    // immediately after the assistant(tool_calls) row. Otherwise
+    // OpenAI returns 400 ("did not have response messages").
+    expect(createCompletionMock).toHaveBeenCalledTimes(2);
+    const recursiveArgs = createCompletionMock.mock.calls[1][0] as {
+      messages: Array<{ role: string; tool_calls?: Array<{ id: string }>; tool_call_id?: string }>;
+    };
+    const assistantIdx = recursiveArgs.messages.findIndex((m) => Array.isArray(m.tool_calls));
+    expect(assistantIdx).toBeGreaterThanOrEqual(0);
+    const toolMessages = recursiveArgs.messages
+      .slice(assistantIdx + 1)
+      .filter((m) => m.role === 'tool');
+    const toolIds = toolMessages.map((m) => m.tool_call_id).sort();
+    expect(toolIds).toEqual(['call-A', 'call-B']);
   });
 
   it('emits confirmation_required for a WRITE tool and does NOT execute', async () => {

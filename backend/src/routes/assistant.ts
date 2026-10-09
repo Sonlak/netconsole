@@ -274,8 +274,16 @@ async function callAndStream(
     return;
   }
 
-  // Process tool calls. WRITE tools stop the loop; READ tools
-  // execute inline and recurse for the final answer.
+  // Process tool calls. WRITE tools stop the loop (and the rest
+  // are abandoned); READ tools execute inline and we recurse once
+  // for the LLM's final answer with the data in context.
+  //
+  // Multi-tool fan-out: if the LLM emits multiple tool_calls in
+  // one turn (e.g. get_device + get_device_interfaces), we execute
+  // them all and append a tool message for each. We do NOT
+  // interleave recurses — that would break the OpenAI "tool message
+  // must immediately follow assistant(tool_calls)" invariant.
+  const toolResults: AssistantMessage[] = [];
   for (const tc of response.toolCalls) {
     const name = tc.function.name as AssistantToolName;
     let args: Record<string, unknown> = {};
@@ -289,6 +297,17 @@ async function callAndStream(
         ok: false,
         preview: {},
         error: 'Invalid JSON in tool arguments',
+      });
+      toolResults.push({
+        role: 'tool' as const,
+        tool_call_id: tc.id,
+        content: JSON.stringify({ error: 'invalid_json' }),
+      });
+      await appendMessage(ctx.sessionId, 'tool', {
+        content: JSON.stringify({ error: 'invalid_json' }),
+        toolCallId: tc.id,
+        toolName: name,
+        metadata: { ok: false, error: 'invalid_json' },
       });
       continue;
     }
@@ -305,6 +324,11 @@ async function callAndStream(
         preview: {},
         error: `Role ${ctx.role} cannot run tool ${name} (requires ${tool.requiresRole})`,
       });
+      toolResults.push({
+        role: 'tool' as const,
+        tool_call_id: tc.id,
+        content: JSON.stringify({ error: 'permission_denied' }),
+      });
       await appendMessage(ctx.sessionId, 'tool', {
         content: JSON.stringify({ error: 'permission_denied' }),
         toolCallId: tc.id,
@@ -314,57 +338,63 @@ async function callAndStream(
       continue;
     }
 
-    if (tool.readonly) {
-      // READ: execute, persist result, recurse for the LLM's final
-      // answer with the data in context.
-      const handler = HANDLERS[name];
-      const result = await handler(args, ctx);
+    if (!tool.readonly) {
+      // WRITE: emit confirmation and STOP. We deliberately do not
+      // execute any subsequent tools in the batch (a confirmation
+      // card is a hard pause — the user must accept before more
+      // changes run).
       sseSend(res, {
-        type: 'tool_result',
+        type: 'confirmation_required',
         id: tc.id,
         name,
-        ok: result.ok,
-        preview: result.preview,
-        ...(result.error ? { error: result.error } : {}),
+        arguments: args,
+        summary: tool.confirmSummary(args),
       });
-      await appendMessage(ctx.sessionId, 'tool', {
-        content: JSON.stringify(result.preview ?? {}),
-        toolCallId: tc.id,
-        toolName: name,
-        metadata: { ok: result.ok, error: result.error ?? null },
-      });
-
-      const nextMessages: AssistantMessage[] = [
-        ...messages,
-        // Always include the assistant turn so the tool message below has
-        // a valid preceding message with `tool_calls`. The OpenAI API
-        // requires this — emitting a `tool` role message without a
-        // matching `assistant` `tool_calls` returns 400. The assistant
-        // content can be null when the LLM only emitted tool calls.
-        {
-          role: 'assistant' as const,
-          content: response.text,
-          tool_calls: response.toolCalls ?? undefined,
-        },
-        { role: 'tool' as const, tool_call_id: tc.id, content: JSON.stringify(result.preview ?? {}) },
-      ];
-      // Recurse for the first read tool in the batch (multi-tool
-      // fan-out is rare — keeps the loop simple for v1).
-      await callAndStream(nextMessages, ctx, model, res, 'continuation');
       return;
     }
 
-    // WRITE: emit confirmation and STOP. The next request from
-    // the client will carry `confirmedToolCall` and re-enter
-    // through `runConfirmation`.
+    // READ: execute, persist, queue the tool result for the next
+    // LLM call. We do NOT recurse here — collect all results first,
+    // then recurse once at the end of the loop.
+    const handler = HANDLERS[name];
+    const result = await handler(args, ctx);
     sseSend(res, {
-      type: 'confirmation_required',
+      type: 'tool_result',
       id: tc.id,
       name,
-      arguments: args,
-      summary: tool.confirmSummary(args),
+      ok: result.ok,
+      preview: result.preview,
+      ...(result.error ? { error: result.error } : {}),
     });
-    return;
+    toolResults.push({
+      role: 'tool' as const,
+      tool_call_id: tc.id,
+      content: JSON.stringify(result.preview ?? {}),
+    });
+    await appendMessage(ctx.sessionId, 'tool', {
+      content: JSON.stringify(result.preview ?? {}),
+      toolCallId: tc.id,
+      toolName: name,
+      metadata: { ok: result.ok, error: result.error ?? null },
+    });
+  }
+
+  if (toolResults.length > 0) {
+    const nextMessages: AssistantMessage[] = [
+      ...messages,
+      // Always include the assistant turn so every tool message below
+      // has a valid preceding message with `tool_calls`. The OpenAI
+      // API requires this — emitting a `tool` role message without a
+      // matching `assistant` `tool_calls` returns 400. The assistant
+      // content can be null when the LLM only emitted tool calls.
+      {
+        role: 'assistant' as const,
+        content: response.text,
+        tool_calls: response.toolCalls ?? undefined,
+      },
+      ...toolResults,
+    ];
+    await callAndStream(nextMessages, ctx, model, res, 'continuation');
   }
 }
 
