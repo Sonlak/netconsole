@@ -599,7 +599,7 @@ async function listDevicesHandler(
 ): Promise<ToolResult> {
   const where: Record<string, unknown> = {};
   if (typeof args.site === 'string' && args.site) where.site = args.site;
-  if (typeof args.floor === 'number') where.floor = args.floor;
+  if (typeof args.floor === 'number') where.floor = String(args.floor);
   if (typeof args.status === 'string') where.status = args.status;
   if (typeof args.vendor === 'string' && args.vendor) {
     where.vendor = { contains: args.vendor, mode: 'insensitive' };
