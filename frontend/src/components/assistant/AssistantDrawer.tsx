@@ -331,7 +331,33 @@ export function AssistantDrawer({ open, onClose }: Props) {
       onClose={onClose}
       closeIcon={<CloseOutlined />}
       styles={{
-        body: { padding: 0, display: 'flex', flexDirection: 'column', height: '100%' },
+        body: {
+          padding: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          height: '100%',
+          // Make the drawer body follow the active theme instead of the
+          // AntD default (always light). Without this, the chat scroll
+          // area ends up stuck on a white surface in dark mode and the
+          // assistant bubble's --ant-color-bg-elevated contrast is wrong.
+          background: 'var(--ant-color-bg-container, #ffffff)',
+        },
+        // Header is dark-by-default in AntD's Drawer; align it to the
+        // same container color so the top edge doesn't read as a stripe.
+        header: {
+          background: 'var(--ant-color-bg-container, #ffffff)',
+          borderBottom: '1px solid var(--ant-color-border-secondary)',
+        },
+        // Footer/content panels inside the drawer should also follow
+        // the theme (the Input.TextArea wrapper sits in `footer` in
+        // older AntD; safe to set on both for future-proofing).
+        footer: {
+          background: 'var(--ant-color-bg-container, #ffffff)',
+        },
+        content: {
+          background: 'var(--ant-color-bg-container, #ffffff)',
+        },
+        mask: { background: 'rgba(0, 0, 0, 0.55)' },
       }}
       extra={
         <Space>
