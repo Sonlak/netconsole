@@ -194,7 +194,7 @@ const getDevice: CatalogEntry = {
     description:
       'Tra cứu thiết bị theo tên (case-insensitive) hoặc IP (prefix match). ' +
       'Trả về status (ONLINE/OFFLINE/MANAGED/MAINTENANCE/UNKNOWN), vendor, ' +
-      'model, version, site, floor, last ping. Dùng tool này TRƯỚC mọi write op.',
+      'model, version, site, floor, rack, unit, last ping. Dùng tool này TRƯỚC mọi write op.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -542,15 +542,19 @@ const listDevices: CatalogEntry = {
   function: {
     name: 'list_devices',
     description:
-      'Liệt kê thiết bị trong hệ thống. Có thể filter theo site, floor, status, vendor. ' +
-      'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN", "thiết bị tầng 6", "switch nào OFFLINE". ' +
-      'Lưu ý: floor là số tầng (1-99), KHÔNG phải site. "tầng 6" = floor=6.',
+      'Liệt kê thiết bị trong hệ thống. Có thể filter theo site, floor, rack, unit, status, vendor. ' +
+      'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN", "thiết bị tầng 6", "thiết bị ở rack V4", ' +
+      '"switch nào OFFLINE", "juniper nào cùng vendor". ' +
+      'Lưu ý: floor là số tầng (1-99), KHÔNG phải site. "tầng 6" = floor=6. ' +
+      'Mỗi device trả về các field: name, ip, status, vendor, model, version, site, floor, rack, unit, description, lastPingAt, lastPingMs.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         site: { type: 'string', description: 'Filter theo site (VD: "LAB", "PROD"). Tùy chọn.' },
         floor: { type: 'number', description: 'Filter theo số tầng (VD: 6 = tầng 6). Tùy chọn.' },
+        rack: { type: 'string', description: 'Filter theo rack (VD: "V4"). Tùy chọn.' },
+        unit: { type: 'string', description: 'Filter theo unit trong rack (VD: "11"). Tùy chọn.' },
         status: strEnum(['ONLINE', 'OFFLINE', 'MANAGED', 'MAINTENANCE', 'UNKNOWN']),
         vendor: { type: 'string', description: 'Filter theo vendor (juniper/arista/cisco). Tùy chọn.' },
         limit: { type: 'number', description: 'Mặc định 50, tối đa 500.' },

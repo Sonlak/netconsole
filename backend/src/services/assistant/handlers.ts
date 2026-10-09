@@ -152,10 +152,7 @@ async function getDeviceHandler(
     where: { OR: conditions },
     take: 5,
     orderBy: { updatedAt: 'desc' },
-    select: {
-      id: true, name: true, ip: true, status: true, vendor: true, model: true,
-      version: true, site: true, floor: true, rack: true, lastPingAt: true, lastPingMs: true,
-    },
+    select: deviceOutputSelect(),
   });
 
   if (devices.length === 0) {
@@ -166,20 +163,7 @@ async function getDeviceHandler(
     ok: true,
     preview: {
       found: devices.length,
-      devices: devices.map((d) => ({
-        id: d.id,
-        name: d.name,
-        ip: d.ip,
-        status: d.status,
-        vendor: d.vendor,
-        model: d.model,
-        version: d.version,
-        site: d.site,
-        floor: d.floor,
-        rack: d.rack ?? '(chua co)',
-        lastPingAt: d.lastPingAt,
-        lastPingMs: d.lastPingMs,
-      })),
+      devices: devices.map(deviceToPreview),
     },
   };
 }
@@ -593,13 +577,59 @@ async function queueManagedCheckHandler(
 
 // ── READ handlers (new) ──────────────────────────────────────────────────────
 
+/**
+ * Single source of truth for which Device scalar fields the assistant
+ * tools expose. Three places use this constant:
+ *   1. `getDeviceHandler` select + preview mapping
+ *   2. `listDevicesHandler` select + preview mapping
+ *   3. Tool description in `prompts.ts` (via TOOL_FIELD_LIST helper)
+ *
+ * Why: every time a new location field is added to the Prisma schema
+ * (e.g. `unit` added after `rack`), it's easy to forget to update one
+ * of these spots — the LLM then can't see the field and gives wrong
+ * answers like "no rack info" or "no unit info" even though the DB
+ * has the data. This constant + helper forces all three places to
+ * stay in sync.
+ */
+const DEVICE_OUTPUT_FIELDS = [
+  'id', 'name', 'ip', 'status', 'vendor', 'model', 'version',
+  'site', 'floor', 'rack', 'unit',
+  'description', 'lastPingAt', 'lastPingMs',
+] as const;
+
+type DeviceOutputField = (typeof DEVICE_OUTPUT_FIELDS)[number];
+
+/**
+ * Build a Prisma `select` object that pulls exactly the fields in
+ * DEVICE_OUTPUT_FIELDS. Used by both `getDevice` and `listDevices`.
+ */
+function deviceOutputSelect() {
+  const out: Record<string, true> = {};
+  for (const f of DEVICE_OUTPUT_FIELDS) out[f] = true;
+  return out;
+}
+
+/** Render a device row to the assistant's preview shape. */
+function deviceToPreview(d: Record<string, unknown>) {
+  const out: Record<string, unknown> = {};
+  for (const f of DEVICE_OUTPUT_FIELDS) {
+    out[f] = d[f] ?? null;
+  }
+  return out;
+}
+
 async function listDevicesHandler(
   args: Record<string, unknown>,
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   const where: Record<string, unknown> = {};
   if (typeof args.site === 'string' && args.site) where.site = args.site;
+  // floor/unit are String columns in Prisma — coerce numbers to strings
+  // (the LLM may pass either depending on the conversation phrasing).
   if (typeof args.floor === 'number') where.floor = String(args.floor);
+  if (typeof args.floor === 'string' && args.floor) where.floor = args.floor;
+  if (typeof args.rack === 'string' && args.rack) where.rack = args.rack;
+  if (typeof args.unit === 'string' && args.unit) where.unit = args.unit;
   if (typeof args.status === 'string') where.status = args.status;
   if (typeof args.vendor === 'string' && args.vendor) {
     where.vendor = { contains: args.vendor, mode: 'insensitive' };
@@ -610,28 +640,13 @@ async function listDevicesHandler(
     where,
     take: limit,
     orderBy: [{ site: 'asc' }, { floor: 'asc' }, { name: 'asc' }],
-    select: {
-      id: true, name: true, ip: true, status: true, vendor: true, model: true,
-      version: true, site: true, floor: true, rack: true, lastPingAt: true, lastPingMs: true,
-    },
+    select: deviceOutputSelect(),
   });
   return {
     ok: true,
     preview: {
       total: devices.length,
-      devices: devices.map((d) => ({
-        name: d.name,
-        ip: d.ip,
-        status: d.status,
-        vendor: d.vendor,
-        model: d.model,
-        version: d.version,
-        site: d.site,
-        floor: d.floor,
-        rack: d.rack ?? '(chua co)',
-        lastPingAt: d.lastPingAt,
-        lastPingMs: d.lastPingMs,
-      })),
+      devices: devices.map(deviceToPreview),
     },
   };
 }
