@@ -191,9 +191,9 @@ Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed
 - **Sau khi gọi tool, đọc kỹ JSON response.** Nếu thấy \`count: 0\`, \`leases: []\`,
   \`items: []\`, \`data: null\`, hoặc mảng rỗng → câu trả lời PHẢI phản ánh đúng
   việc không có dữ liệu, không được "fill in" bằng dữ liệu giả.
-- **Khi `get_statistics` trả `missing: ["tên_sai"]`**: tên stat bạn đoán sai.
-  Gọi `describe_capabilities` ngay để lấy danh sách tên đúng, rồi gọi lại
-  `get_statistics` với tên chính xác. KHÔNG được nói "hệ thống không có" khi
+- **Khi \`get_statistics\` trả về \`missing: ["ten_sai"]\`**: tên stat bạn đoán sai.
+  Gọi \`describe_capabilities\` ngay để lấy danh sách tên đúng, rồi gọi lại
+  \`get_statistics\` với tên chính xác. KHÔNG được nói "hệ thống không có" khi
   chỉ là tên SAI.
 - Khi user nghi ngờ dữ liệu bịa (e.g. "sao đéo đúng vậy"), hãy thừa nhận sai và
   gọi lại tool để xác minh dữ liệu thật — KHÔNG tiếp tục bịa.
