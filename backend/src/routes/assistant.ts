@@ -516,6 +516,85 @@ async function callAndStream(
 
 // ─── LLM call (non-streaming) ─────────────────────────────────────────────────
 
+/**
+ * Sanitize a message array for OpenAI's strict tool_calls invariant:
+ *
+ *   "An assistant message with 'tool_calls' must be followed by tool
+ *    messages responding to each 'tool_call_id' before the next
+ *    non-tool message."
+ *
+ * Why we need this:
+ *
+ *   The frontend flattens the view state into the wire by appending
+ *   a `tool` role row for each assistant tool_call that has a
+ *   `result` defined. A tool_call without a `result` is one that
+ *   never ran — typically a WRITE action paused for confirmation
+ *   that the user abandoned (typed a new question instead of
+ *   clicking Confirm).
+ *
+ *   If the LLM emitted N tool_calls in one turn and only M < N
+ *   were executed (because one of them was a WRITE that paused),
+ *   the resulting wire is:
+ *
+ *     [..., assistant(tool_calls=[A, B, C]), tool(A), tool(C), user_q2, ...]
+ *
+ *   OpenAI's API rejects this with 400: "An assistant message with
+ *   'tool_calls' must be followed by tool messages responding to
+ *   each 'tool_call_id'. The following tool_call_ids did not have
+ *   response messages: <B>."
+ *
+ * Fix: for every assistant message with non-empty tool_calls, look
+ * at the immediately-following tool rows. Any tool_call_id that
+ * doesn't have a matching tool row is "unfulfilled". We strip
+ * unfulfilled ids from the assistant's tool_calls. If that leaves
+ * zero tool_calls on the assistant, we drop the `tool_calls` field
+ * entirely so the LLM sees a normal text-only assistant turn —
+ * which is the cleanest representation of an abandoned tool call.
+ *
+ * This is purely defensive: in the happy path (every tool_call has
+ * a tool result) the function is a no-op pass-through. The only
+ * observable change is when the user abandons a pending WRITE.
+ *
+ * The recursion in `callAndStream` and the confirmation path in
+ * `runConfirmation` already maintain the invariant for newly
+ * constructed tool_calls — this sanitizer closes the gap for
+ * client-supplied history.
+ */
+function sanitizeForOpenAI(messages: AssistantMessage[]): AssistantMessage[] {
+  const out: AssistantMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const expectedIds = new Set(m.tool_calls.map((tc) => tc.id));
+      const providedIds = new Set<string>();
+      let j = i + 1;
+      while (j < messages.length && (messages[j] as { role?: string }).role === 'tool') {
+        providedIds.add((messages[j] as AssistantToolMessage).tool_call_id);
+        j++;
+      }
+      const missing = [...expectedIds].filter((id) => !providedIds.has(id));
+      if (missing.length > 0) {
+        if (missing.length === expectedIds.size) {
+          // All tool_calls were abandoned. Drop the field so the
+          // LLM sees a plain text turn. (content may be "" or null
+          // depending on whether the LLM streamed any text — both
+          // are valid.)
+          out.push({ ...m, tool_calls: undefined });
+        } else {
+          // Mixed: keep the fulfilled tool_calls, drop the rest.
+          const fulfilled = m.tool_calls.filter((tc) => !missing.includes(tc.id));
+          out.push({ ...m, tool_calls: fulfilled });
+        }
+      } else {
+        out.push(m);
+      }
+    } else {
+      out.push(m);
+    }
+  }
+  return out;
+}
+
 async function callLlm(params: { model: AssistantModel; messages: AssistantMessage[] }): Promise<LlmResponse> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -524,11 +603,20 @@ async function callLlm(params: { model: AssistantModel; messages: AssistantMessa
   const client = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 1 });
   const startedAt = Date.now();
 
+  // Sanitize the client-supplied history so any tool_calls that
+  // never got a corresponding `tool` row (typically WRITE actions
+  // the user abandoned by typing a new question) are stripped
+  // before hitting OpenAI. Without this, a 2nd-turn question on
+  // top of a still-pending WRITE would 400 with:
+  //   "An assistant message with 'tool_calls' must be followed
+  //    by tool messages responding to each 'tool_call_id'."
+  const safeMessages = sanitizeForOpenAI(params.messages);
+
   const res = await client.chat.completions.create({
     model: params.model,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
-      ...(params.messages as never[]),
+      ...(safeMessages as never[]),
     ],
     tools: OPENAI_TOOLS as never[],
     max_tokens: 1024,
