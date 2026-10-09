@@ -1775,6 +1775,11 @@ async function getNetconsoleInfoHandler(
  * Returns:
  *  - `computed: Record<name, value>` — the stats
  *  - `missing: string[]` — names asked for but not in the registry
+ *  - `availableStats?: string[]` — when `missing` is non-empty, list the
+ *    valid names so the LLM can self-correct (instead of giving up and
+ *    saying "hệ thống không có thống kê này"). This is automatic
+ *    self-correction at the handler level — gpt-4.1-mini does NOT
+ *    reliably call describe_capabilities on its own when names mismatch.
  */
 async function getStatisticsHandler(
   args: Record<string, unknown>,
@@ -1793,6 +1798,12 @@ async function getStatisticsHandler(
   };
 
   const { computed, missing } = await computeStatistics(names, ctx);
+
+  // When the LLM guesses a wrong name, surface the correct ones
+  // so it can retry without needing a second tool call.
+  const availableStats =
+    missing.length > 0 ? listStatDescriptors().map((s) => s.name) : undefined;
+
   return {
     ok: true,
     preview: {
@@ -1801,6 +1812,11 @@ async function getStatisticsHandler(
       requested: names ?? 'all',
       statCount: Object.keys(computed).length,
       missing,
+      availableStats,
+      hint:
+        missing.length > 0
+          ? `Tên stat bạn yêu cầu không tồn tại. Đây là các tên hợp lệ — gọi lại get_statistics với tên chính xác từ availableStats.`
+          : undefined,
       stats: computed,
     },
   };
