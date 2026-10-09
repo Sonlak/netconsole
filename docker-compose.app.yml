@@ -191,6 +191,13 @@ services:
       SEED_DISABLED: "false"
       CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
       JWT_SECRET: "d97aklKZ_BKmRrHtXH6fLSZs48AlwJpAU8_RdcuCKqBm_0Jufe8Rx-FkpGhQT-cu"
+      # AI Assistant (OpenAI). Set OPENAI_API_KEY in the GitHub Actions
+      # deploy.yml environment block (or in /opt/netconsole/backend/.env
+      # on the VPS) before this will return anything other than 503.
+      # Get a key at https://platform.openai.com/api-keys.
+      # gpt-4.1-mini + prompt caching = ~$1.5/dev/month at 30 queries/day.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_MODEL: "gpt-4.1-mini"
     networks:
       netconsole:
         ipv4_address: 172.31.0.3

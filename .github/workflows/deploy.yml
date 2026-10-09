@@ -243,6 +243,15 @@ jobs:
           docker compose -p "$COMPOSE_PROJECT" \
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
             pull $DEPLOY_SERVICES
+          # Pull OPENAI_API_KEY from the GitHub Actions secret store and pass
+          # it to docker compose via the .env substitution. The compose file
+          # uses `${OPENAI_API_KEY:-}` so a missing secret keeps the assistant
+          # endpoint disabled (returns 503 with a clear error) rather than
+          # crashing the backend on startup. The cost is a 2-line change in
+          # docker-compose.app.yml — the backend already checks for the env
+          # var at first request, not at process start.
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
+          echo "OPENAI_MODEL=gpt-4.1-mini" >> "$DEPLOY_DIR/.env"
           echo "==> Starting fresh containers..."
           # NOTE: NO --build flag. Images are built in CI (push-images job)
           # and pulled here. This is Phase 3 of the deploy-pipeline perf plan:
@@ -250,6 +259,7 @@ jobs:
           # pulls a pre-baked image and restarts the container.
           docker compose -p "$COMPOSE_PROJECT" \
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
+            --env-file "$DEPLOY_DIR/.env" \
             up -d --no-deps $DEPLOY_SERVICES
 
           # ── NetBox stack ────────────────────────────────────────────

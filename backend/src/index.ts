@@ -33,6 +33,7 @@ import { auditLogRouter } from './routes/auditLog.js';
 import { searchRouter } from './routes/search.js';
 import { terminalRouter } from './routes/terminal.js';
 import { interfaceCountersRouter } from './routes/interfaceCounters.js';
+import { assistantRouter } from './routes/assistant.js';
 import { startTerminalWebSocket } from './websocket/terminal.js';
 import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
@@ -184,6 +185,7 @@ app.get('/api/health', (_req, res) => {
       'auth',
       'audit-log',
       'terminal',
+      'assistant',
     ],
     pingIntervalSeconds,
     macCollectIntervalSeconds,
@@ -224,6 +226,7 @@ app.use('/api/audit-log', authMiddleware, strictRateLimit, auditLogRouter);
 app.use('/api/search', authMiddleware, strictRateLimit, searchRouter);
 app.use('/api/terminal', authMiddleware, strictRateLimit, terminalRouter);
 app.use('/api/devices', authMiddleware, moderateRateLimit, interfaceCountersRouter);
+app.use('/api/assistant', assistantRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {

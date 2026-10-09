@@ -497,3 +497,90 @@ model TerminalCommand {
 
   @@index([sessionId])
 }
+
+// ─── AI Assistant (NetConsole Assistant) ───────────────────────────────────────
+//
+// Append-only conversation + usage log. The LLM (gpt-4.1-mini) is
+// stateless from its own perspective — the frontend re-sends the
+// message history on every turn — so we keep a permanent server-side
+// record for audit + replay + cost tracking.
+//
+// Sessions are owned by a user (nullable for system/worker-initiated
+// sessions, though v1 has no such call path).
+model AssistantSession {
+  id        String   @id @default(uuid())
+  userId    String?
+  // Auto-generated from the first user message (first 60 chars). Stored
+  // so the Sessions page can show a friendly label without re-running
+  // the LLM.
+  title     String?
+  // Model used for the session. Stamped at session creation from the
+  // server env. Locked after the first message so swapping the env var
+  // doesn't make historical sessions bill against the new model.
+  model     String   @default("gpt-4.1-mini")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages AssistantMessage[]
+  usages   AssistantUsageLog[]
+
+  @@index([userId, updatedAt])
+}
+
+// One row per chat turn. role mirrors the OpenAI Chat Completions role
+// ("user" / "assistant" / "tool" / "system"). toolCallId is set on
+// `tool` rows so the frontend can pair a tool result with the
+// originating tool_call. For `assistant` rows, toolCalls holds the
+// raw OpenAI tool_calls array (so replay reproduces the exact LLM
+// behaviour, not a re-summarised version).
+model AssistantMessage {
+  id        String   @id @default(uuid())
+  sessionId String
+  session   AssistantSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role      String   // 'user' | 'assistant' | 'tool' | 'system'
+  content   String?
+  toolCalls Json?
+  toolCallId String?
+  toolName   String?
+  // metadata: { latencyMs, finishReason, model, promptTokens, ... }
+  // Free-form JSON so we can add fields without schema changes.
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt])
+  @@index([toolCallId])
+}
+
+// Append-only per-LLM-call usage + cost log. One row per
+// `chat.completions.create` call (i.e. one per turn, plus one per
+// confirmation continuation). The dashboard reads this for cost
+// reporting — we never read the raw OpenAI invoice.
+//
+// costMicrodollars = (input * inRate + cachedInput * cachedRate +
+//                     output * outRate) all in microdollars
+// (1 USD = 1,000,000 microdollars). Storing the rate inline lets
+// us back-fill old sessions if pricing changes.
+model AssistantUsageLog {
+  id                 String   @id @default(uuid())
+  sessionId          String?
+  session            AssistantSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  userId             String?
+  username           String?
+  // Token counts from openai.chat.completions.usage
+  inputTokens        Int      @default(0)
+  cachedInputTokens  Int      @default(0)
+  outputTokens       Int      @default(0)
+  totalTokens        Int      @default(0)
+  // USD cost in micro-dollars (1 USD = 1,000,000)
+  costMicrodollars   Int      @default(0)
+  // Wall-clock latency from the LLM's perspective
+  latencyMs          Int      @default(0)
+  // Model + reason
+  model              String
+  reason             String   // 'turn' | 'continuation' | 'confirmation'
+  createdAt          DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([sessionId, createdAt])
+  @@index([model, createdAt])
+}

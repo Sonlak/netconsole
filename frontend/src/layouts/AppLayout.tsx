@@ -13,6 +13,7 @@ import {
   MenuUnfoldOutlined,
   MoonOutlined,
   RadarChartOutlined,
+  RobotOutlined,
   SearchOutlined,
   SettingOutlined,
   SunOutlined,
@@ -21,7 +22,7 @@ import {
   UserOutlined,
   WifiOutlined,
 } from '@ant-design/icons';
-import { App as AntApp, Avatar, Breadcrumb, Button, Dropdown, Flex, Input, type InputRef, Layout, Menu, Select, Skeleton, Space, Tag, Tooltip, Typography, theme } from 'antd';
+import { App as AntApp, Avatar, Badge, Breadcrumb, Button, Dropdown, Flex, Input, type InputRef, Layout, Menu, Select, Skeleton, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type { MenuProps } from 'antd';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { useSite, SITE_OPTIONS } from '@/components/site-provider';
@@ -29,6 +30,7 @@ import { useTheme } from '@/components/theme-provider';
 import { useAuth } from '@/hooks/useAuth';
 import { setNotifierApi } from '@/lib/jobNotifier';
 import { globalSearch, type SearchResultGroup } from '@/api/search';
+import { AssistantDrawer } from '@/components/assistant/AssistantDrawer';
 
 const { Header, Sider, Content } = Layout;
 
@@ -398,6 +400,7 @@ export default function AppLayout() {
   }, [notification, message]);
 
   const [collapsed, setCollapsed] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   const searchInputRef = useRef<InputRef>(null);
   const current = pageMeta(location.pathname);
   const isDark = colorMode === 'dark';
@@ -513,6 +516,16 @@ export default function AppLayout() {
               onChange={setSite}
             />
             <InlineSearch forwardedRef={searchInputRef} />
+            <Tooltip title="NetConsole Assistant (AI)">
+              <Badge dot color="blue" offset={[-2, 2]}>
+                <Button
+                  type="text"
+                  aria-label="Open AI Assistant"
+                  icon={<RobotOutlined />}
+                  onClick={() => setAssistantOpen(true)}
+                />
+              </Badge>
+            </Tooltip>
             <Tooltip title={isDark ? 'Light theme' : 'Dark theme'}>
               <Button type="text" aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'} icon={isDark ? <SunOutlined /> : <MoonOutlined />} onClick={toggle} />
             </Tooltip>
@@ -569,6 +582,7 @@ export default function AppLayout() {
         <div className="nc-app-footer-version">NetConsole 1.2.0</div>
         <div className="nc-app-footer-copy">© 2026 SonLak.</div>
       </footer>
+      <AssistantDrawer open={assistantOpen} onClose={() => setAssistantOpen(false)} />
       </Layout>
     </AntApp>
   );
