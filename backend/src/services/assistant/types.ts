@@ -69,7 +69,10 @@ export type AssistantToolName =
   | 'update_user_role'
   | 'set_user_active'
   | 'reset_user_password'
-  | 'delete_user';
+  | 'delete_user'
+  // Stats + meta
+  | 'get_statistics'
+  | 'describe_capabilities';
 
 /** Roles a user can have. Viewers can use READ tools only. */
 export type AssistantRole = 'ADMIN' | 'OPERATOR' | 'VIEWER' | 'WORKER';

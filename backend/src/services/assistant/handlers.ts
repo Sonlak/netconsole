@@ -56,6 +56,7 @@ import { diffConfigs, getDeviceSnapshots, getSnapshotConfig } from '../configCom
 import { startDiscoveryScan, syncDiscoveryResults } from '../discoveryScan.js';
 import { pingAndUpdateDevice } from '../devicePing.js';
 import bcrypt from 'bcryptjs';
+import { computeStatistics, listStatDescriptors, type StatContext } from './statistics.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -1756,6 +1757,109 @@ async function getNetconsoleInfoHandler(
   };
 }
 
+// ── Statistics + capabilities (meta) ─────────────────────────────────────────
+
+/**
+ * Compute one or more named statistics.
+ *
+ * Why a registry (see `./statistics.ts`):
+ *  - Adding a new stat is a 1-line change — no handler edits, no test rewrites.
+ *  - `describe_capabilities` can list everything automatically.
+ *  - Each stat is independently testable.
+ *
+ * Args:
+ *  - `names?: string[]` — list of stat names to compute. Omit/empty = all.
+ *  - `scope?: { site, vendor, status }` — filter Device-based stats.
+ *  - `window_hours?: number` — time window for time-series stats (default 24).
+ *
+ * Returns:
+ *  - `computed: Record<name, value>` — the stats
+ *  - `missing: string[]` — names asked for but not in the registry
+ */
+async function getStatisticsHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const names = Array.isArray(args.names)
+    ? (args.names.filter((n): n is string => typeof n === 'string' && n.length > 0))
+    : undefined;
+  const scope: StatContext['scope'] = {};
+  if (typeof args.site === 'string' && args.site) scope.site = args.site;
+  if (typeof args.vendor === 'string' && args.vendor) scope.vendor = args.vendor;
+  if (typeof args.status === 'string' && args.status) scope.status = args.status;
+  const ctx: StatContext = {
+    scope: Object.keys(scope).length > 0 ? scope : undefined,
+    windowHours: typeof args.window_hours === 'number' ? args.window_hours : undefined,
+  };
+
+  const { computed, missing } = await computeStatistics(names, ctx);
+  return {
+    ok: true,
+    preview: {
+      scope: ctx.scope ?? 'all',
+      windowHours: ctx.windowHours ?? 24,
+      requested: names ?? 'all',
+      statCount: Object.keys(computed).length,
+      missing,
+      stats: computed,
+    },
+  };
+}
+
+/**
+ * Meta-tool: list every tool and every stat the assistant can call.
+ *
+ * The LLM should call this when unsure what data is available or how
+ * a tool's result is shaped. Returns:
+ *  - `tools`: list of tool names (no params, just names + categories)
+ *  - `stats`: full stat registry with description + category
+ */
+async function describeCapabilitiesHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  // Group stats by category for the LLM's mental map.
+  const stats = listStatDescriptors();
+  const byCategory: Record<string, typeof stats> = {};
+  for (const s of stats) {
+    if (!byCategory[s.category]) byCategory[s.category] = [];
+    byCategory[s.category].push(s);
+  }
+  return {
+    ok: true,
+    preview: {
+      toolCount: Object.keys(HANDLERS).length,
+      statCount: stats.length,
+      toolsByCategory: {
+        // Surface the same groupings we already document in the system prompt.
+        READ: [
+          'lookup_mac', 'get_device', 'list_devices', 'get_device_interfaces',
+          'get_dhcp_pool_status', 'list_dhcp_subnets', 'get_dhcp_subnet', 'list_dhcp_leases',
+          'get_fabric_topology', 'search_recent_jobs', 'get_job_detail',
+          'get_recent_logs', 'get_unacknowledged_alerts', 'list_alert_rules',
+          'list_users', 'get_config_history', 'get_config_diff',
+          'list_discovery_scans', 'get_discovery_scan',
+          'get_netconsole_info', 'get_statistics', 'describe_capabilities',
+        ],
+        WRITE: [
+          'queue_interface_action', 'queue_log_collect', 'queue_managed_check',
+          'queue_apply_config', 'queue_rollback_config', 'apply_config_dry_run',
+          'create_device', 'update_device', 'delete_device', 'set_device_status',
+          'queue_collect',
+          'add_dhcp_reservation', 'delete_dhcp_lease', 'fix_static_reservation',
+          'wipe_dhcp_subnet', 'add_dhcp_subnet',
+          'start_discovery_scan', 'sync_discovery_results',
+          'acknowledge_alert',
+          'sync_to_netbox', 'sync_all_to_netbox',
+          'create_user', 'update_user_role', 'set_user_active', 'reset_user_password',
+          'delete_user',
+        ],
+      },
+      statsByCategory: byCategory,
+    },
+  };
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -1822,6 +1926,8 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   reset_user_password: resetUserPasswordHandler,
   delete_user: deleteUserHandler,
   get_netconsole_info: getNetconsoleInfoHandler,
+  get_statistics: getStatisticsHandler,
+  describe_capabilities: describeCapabilitiesHandler,
 };
 
 /** Map backend UserRole → assistant role. Worker = VIEWER + specific tools. */

@@ -1464,6 +1464,62 @@ const getNetconsoleInfo: CatalogEntry = {
   confirmSummary: () => '',
 };
 
+const getStatistics: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'get_statistics',
+    description:
+      'Tính toán thống kê trên toàn bộ hệ thống. Dùng khi user hỏi ' +
+      '"có bao nhiêu thiết bị mỗi tầng", "juniper nào offline", "tỷ lệ job success", ' +
+      '"tổng MAC entries", "subnet nào đầy", "alert chưa ack", "chi phí assistant 7 ngày", v.v. ' +
+      'Returns: { scope, windowHours, statCount, missing, stats } — stats là object ' +
+      'name→value. Mỗi stat có shape riêng (xem describe_capabilities để biết). ' +
+      'KHÔNG real-time cho MAC/ARP/Interfaces — phụ thuộc lần collect gần nhất.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        names: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Danh sách tên stat cần tính. Bỏ qua = tính TẤT CẢ. ' +
+            'Ví dụ: ["devices_total", "devices_by_site", "jobs_last_24h"]. ' +
+            'Gọi describe_capabilities trước nếu không nhớ tên.',
+        },
+        site: { type: 'string', description: 'Filter Device-based stats theo site (vd "LAB"). Tùy chọn.' },
+        vendor: { type: 'string', description: 'Filter theo vendor (juniper/arista/cisco). Tùy chọn.' },
+        status: { type: 'string', description: 'Filter theo device status (ONLINE/OFFLINE/...). Tùy chọn.' },
+        window_hours: { type: 'number', description: 'Time window cho time-series stats. Mặc định 24h.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const describeCapabilities: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'describe_capabilities',
+    description:
+      'Liệt kê TẤT CẢ tool + stat mà assistant có thể dùng. ' +
+      'Dùng khi user hỏi "có thể làm gì", "có những stat nào", ' +
+      'hoặc khi không chắc tool/stat nào phù hợp. ' +
+      'Returns: { toolCount, statCount, toolsByCategory: { READ, WRITE }, statsByCategory }. ' +
+      'Mỗi stat có { name, label, description, category, scoped }.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
 /** All tools, in the order the LLM should consider them. */
 export const TOOL_CATALOG: CatalogEntry[] = [
   // READ (executed inline)
@@ -1514,6 +1570,8 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   resetUserPassword,
   deleteUser,
   getNetconsoleInfo,
+  getStatistics,
+  describeCapabilities,
 ];
 
 /** Just the OpenAI tool definitions (drops our metadata). */
