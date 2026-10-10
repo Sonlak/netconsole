@@ -378,6 +378,30 @@ describe('queue_interface_action (WRITE)', () => {
   });
 });
 
+describe('suggest_followup (UI affordance)', () => {
+  it('returns ok with trimmed suggestions when given valid array', async () => {
+    const result = await HANDLERS.suggest_followup(
+      { suggestions: ['Queue managed check F2-AS-01', 'Xem job fail 24h qua', '   ', 'Extra chip ignored'] },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { suggestions: string[] };
+    expect(preview.suggestions).toHaveLength(3);
+    expect(preview.suggestions[0]).toBe('Queue managed check F2-AS-01');
+  });
+
+  it('rejects empty array', async () => {
+    const result = await HANDLERS.suggest_followup({ suggestions: [] }, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/non-empty/);
+  });
+
+  it('rejects non-array input', async () => {
+    const result = await HANDLERS.suggest_followup({ suggestions: 'not an array' }, ctx);
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe('queue_log_collect (WRITE)', () => {
   it('passes through to queueLogsCollection with no filter', async () => {
     queueLogsCollection.mockResolvedValueOnce({ deviceCount: 12, queued: 12, message: undefined });

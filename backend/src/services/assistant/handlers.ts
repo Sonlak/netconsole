@@ -1869,10 +1869,43 @@ async function describeCapabilitiesHandler(
           'sync_to_netbox', 'sync_all_to_netbox',
           'create_user', 'update_user_role', 'set_user_active', 'reset_user_password',
           'delete_user',
+          'suggest_followup',
         ],
       },
       statsByCategory: byCategory,
     },
+  };
+}
+
+/**
+ * UI affordance: emit follow-up chips for the frontend. The LLM calls
+ * this with 1-3 short, action-oriented suggestions; the route layer
+ * surfaces them as a `suggestions` SSE event that the drawer renders
+ * as clickable chips.
+ *
+ * The handler is intentionally trivial — no DB, no logic. All the
+ * validation happens in the tool's JSON schema (minItems: 1,
+ * maxItems: 3, item type: string). If the LLM passes weird args we
+ * return an error so it can retry.
+ */
+async function suggestFollowupHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const raw = args.suggestions;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ok: false, error: 'suggestions must be a non-empty array of strings' };
+  }
+  const suggestions = raw
+    .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+    .map((s) => s.trim())
+    .slice(0, 3);
+  if (suggestions.length === 0) {
+    return { ok: false, error: 'suggestions must contain at least one non-empty string' };
+  }
+  return {
+    ok: true,
+    preview: { suggestions },
   };
 }
 
@@ -1944,6 +1977,7 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   get_netconsole_info: getNetconsoleInfoHandler,
   get_statistics: getStatisticsHandler,
   describe_capabilities: describeCapabilitiesHandler,
+  suggest_followup: suggestFollowupHandler,
 };
 
 /** Map backend UserRole → assistant role. Worker = VIEWER + specific tools. */

@@ -340,6 +340,9 @@ export function AssistantDrawer({ open, onClose }: Props) {
               updateAssistant((m) => ({ ...m, pendingConfirmation: { id, name, arguments: args, summary } }));
               setPendingConfirm({ toolCallId: id, name, arguments: args });
             },
+            onSuggestions: (suggestions) => {
+              updateAssistant((m) => ({ ...m, suggestions }));
+            },
             onUsage: (inTok, cached, outTok, cost) => {
               setTotalInputTokens((p) => p + inTok);
               setTotalCachedTokens((p) => p + cached);
@@ -551,6 +554,7 @@ export function AssistantDrawer({ open, onClose }: Props) {
               message={m}
               onConfirm={handleConfirm}
               onCancel={handleCancel}
+              onPickSuggestion={(s) => void sendMessage(s)}
               showUsage={isAdmin}
             />
           ))
@@ -716,6 +720,7 @@ type EventHandlers = {
   onToolCall: (id: string, name: string, args: Record<string, unknown>) => void;
   onToolResult: (id: string, ok: boolean, preview: unknown, error?: string) => void;
   onConfirmationRequired: (id: string, name: string, args: Record<string, unknown>, summary: string) => void;
+  onSuggestions: (suggestions: string[]) => void;
   onUsage: (inTokens: number, cached: number, outTokens: number, cost: number) => void;
   onError: (msg: string) => void;
   onDone: () => void;
@@ -737,6 +742,9 @@ function handleEvent(event: AssistantStreamEvent, h: EventHandlers): void {
       return;
     case 'confirmation_required':
       h.onConfirmationRequired(event.id, event.name, event.arguments, event.summary);
+      return;
+    case 'suggestions':
+      h.onSuggestions(event.suggestions);
       return;
     case 'usage':
       h.onUsage(event.inputTokens, event.cachedInputTokens, event.outputTokens, event.costMicrodollars);

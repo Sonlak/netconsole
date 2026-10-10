@@ -72,7 +72,9 @@ export type AssistantToolName =
   | 'delete_user'
   // Stats + meta
   | 'get_statistics'
-  | 'describe_capabilities';
+  | 'describe_capabilities'
+  // UI affordance
+  | 'suggest_followup';
 
 /** Roles a user can have. Viewers can use READ tools only. */
 export type AssistantRole = 'ADMIN' | 'OPERATOR' | 'VIEWER' | 'WORKER';
@@ -120,7 +122,8 @@ export type AssistantStreamEvent =
       outputTokens: number;
       costMicrodollars: number;
     }
-  | { type: 'done' };
+  | { type: 'done' }
+  | { type: 'suggestions'; suggestions: string[] };
 
 /** Body of POST /api/assistant. Frontend owns the conversation. */
 export type AssistantRequest = {

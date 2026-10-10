@@ -69,6 +69,12 @@ export type AssistantMessageView = {
     arguments: Record<string, unknown>;
     summary: string;
   };
+  /**
+   * Clickable follow-up chips. Set when the LLM calls
+   * `suggest_followup` to suggest 1-3 next actions. Clicking a
+   * chip sends the suggestion text as a new user message.
+   */
+  suggestions?: string[];
   isStreaming?: boolean;
 };
 
@@ -76,6 +82,7 @@ type Props = {
   message: AssistantMessageView;
   onConfirm: (toolCallId: string) => void;
   onCancel: (toolCallId: string) => void;
+  onPickSuggestion?: (suggestion: string) => void;
   showUsage: boolean;
 };
 
@@ -275,7 +282,7 @@ function TypingDots() {
   );
 }
 
-export function MessageBubble({ message, onConfirm, onCancel, showUsage: _showUsage }: Props) {
+export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, showUsage: _showUsage }: Props) {
   const { token } = theme.useToken();
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
@@ -405,6 +412,52 @@ export function MessageBubble({ message, onConfirm, onCancel, showUsage: _showUs
             <TypingDots />
           </div>
         ) : null}
+
+        {/* Clickable follow-up chips. Rendered AFTER the text card so
+            they read as "what to do next". Hide while streaming so
+            the user doesn't see half-baked suggestions. */}
+        {!message.isStreaming &&
+          message.suggestions &&
+          message.suggestions.length > 0 &&
+          onPickSuggestion && (
+            <div
+              style={{
+                marginTop: 6,
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 6,
+              }}
+            >
+              {message.suggestions.map((s, i) => (
+                <button
+                  key={`${s}-${i}`}
+                  type="button"
+                  onClick={() => onPickSuggestion(s)}
+                  style={{
+                    cursor: 'pointer',
+                    padding: '5px 12px',
+                    borderRadius: 14,
+                    fontSize: 12,
+                    fontWeight: 500,
+                    color: token.colorPrimary,
+                    background: token.colorPrimaryBg,
+                    border: `1px solid ${token.colorPrimaryBorder}`,
+                    transition: 'all 160ms ease',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = token.colorPrimary;
+                    e.currentTarget.style.color = '#fff';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = token.colorPrimaryBg;
+                    e.currentTarget.style.color = token.colorPrimary;
+                  }}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
       </div>
     </div>
   );

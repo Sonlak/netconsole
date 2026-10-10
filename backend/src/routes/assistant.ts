@@ -19,27 +19,31 @@
  *   1. Validate request body.
  *   2. Load or create the session (audit scope).
  *   3. Persist the latest user message.
- *   4. Call LLM (non-streaming) with full history + tools.
- *   5. Stream the LLM's text content to the client in small chunks
- *      ("synthetic streaming" — gpt-4.1-mini finishes in 1-3s so
- *      we don't need true delta streaming for v1).
- *   6. If the LLM emitted tool_calls:
+ *   4. Stream the LLM call (true SSE — text events arrive as tokens
+ *      are generated; final event carries tool_calls + usage).
+ *   5. If the LLM emitted tool_calls:
  *        - READ tools: execute, append tool result, recurse to step 4
  *        - WRITE tools: emit `confirmation_required`, STOP.
- *   7. When the client confirms a WRITE tool, it sends the same
+ *   6. When the client confirms a WRITE tool, it sends the same
  *      payload with `confirmedToolCall` set; we execute the tool
- *      and call the LLM once more for the post-action summary.
+ *      and stream the post-action summary back.
+ *
+ * 2026-10-10 rewrite: replaced non-streaming `chat.completions.create`
+ * + 30-char synthetic chunking with true token-level streaming via
+ * `streamChat`. User now sees text appearing character-by-character
+ * within ~200ms of the LLM starting to generate, instead of waiting
+ * 1-3s for the full response before any text renders.
  */
 
 import { Router, type Request, type Response } from 'express';
-import OpenAI from 'openai';
 import { authMiddleware } from '../middleware/auth.js';
 import { strictRateLimit } from '../middleware/rateLimit.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
-import { SYSTEM_PROMPT, OPENAI_TOOLS, getTool } from '../services/assistant/prompts.js';
+import { SYSTEM_PROMPT, OPENAI_TOOLS, getTool, TOOL_CATALOG } from '../services/assistant/prompts.js';
 import { HANDLERS, mapRole } from '../services/assistant/handlers.js';
-import { defaultModel, type AssistantModel, type UsageInfo } from '../services/assistant/llmClient.js';
+import { defaultModel, streamChat, type AssistantModel, type UsageInfo } from '../services/assistant/llmClient.js';
+import type { AssembledToolCall } from '../services/assistant/llmClient.js';
 import {
   appendMessage,
   createSession,
@@ -60,15 +64,9 @@ export const assistantRouter = Router();
 
 const assistantRateLimit = strictRateLimit;
 
-interface ToolCall {
-  id: string;
-  type: 'function';
-  function: { name: string; arguments: string };
-}
-
-interface LlmResponse {
-  text: string | null;
-  toolCalls: ToolCall[] | null;
+interface LlmTurnResult {
+  text: string;
+  toolCalls: AssembledToolCall[] | null;
   finishReason: string | null;
   usage: UsageInfo | null;
 }
@@ -80,23 +78,8 @@ const ROLES: Record<AssistantRole, number> = {
   WORKER: 1,
 };
 
-const PRICING: Record<AssistantModel, { input: number; cached: number; output: number }> = {
-  'gpt-4.1-mini': { input: 0.4, cached: 0.2, output: 1.6 },
-  'gpt-4.1': { input: 2.5, cached: 1.25, output: 10 },
-  'gpt-4o-mini': { input: 0.15, cached: 0.075, output: 0.6 },
-};
-
 function roleAllows(actual: AssistantRole, required: AssistantRole): boolean {
   return ROLES[actual] >= ROLES[required];
-}
-
-function costFromUsage(model: AssistantModel, inTokens: number, cached: number, outTokens: number) {
-  const rate = PRICING[model] ?? PRICING['gpt-4.1-mini'];
-  const costUsd =
-    (Math.max(0, inTokens - cached) / 1_000_000) * rate.input +
-    (cached / 1_000_000) * rate.cached +
-    (outTokens / 1_000_000) * rate.output;
-  return Math.round(costUsd * 1_000_000);
 }
 
 /**
@@ -148,11 +131,19 @@ assistantRouter.post(
 
     const ctx: ToolContext = { userId, username, role, sessionId };
 
+    // Honour client disconnect — abort the LLM stream when the
+    // drawer closes. Saves $ + lets the user cancel a long-running
+    // reasoning loop.
+    const ac = new AbortController();
+    req.on('close', () => {
+      if (!res.writableEnded) ac.abort();
+    });
+
     try {
       if (body.confirmedToolCall) {
-        await runConfirmation(body, ctx, model, res);
+        await runConfirmation(body, ctx, model, ac.signal, res);
       } else {
-        await runTurn(body.messages, ctx, model, res);
+        await runTurn(body.messages, ctx, model, ac.signal, res);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Internal error';
@@ -171,6 +162,7 @@ async function runConfirmation(
   body: AssistantRequest,
   ctx: ToolContext,
   model: AssistantModel,
+  signal: AbortSignal,
   res: Response,
 ) {
   if (!body.confirmedToolCall) return;
@@ -204,25 +196,6 @@ async function runConfirmation(
 
   // Feed the confirmed action + result back to the LLM so it can
   // produce a natural follow-up message.
-  //
-  // The body.messages we receive includes the prior assistant
-  // message that emitted the tool_calls (the one we paused on for
-  // confirmation), but does NOT include a corresponding `tool`
-  // message — by design, because at the time we sent the
-  // confirmation_required event we hadn't run the tool yet.
-  //
-  // OpenAI's API is strict here: an assistant message with
-  // tool_calls MUST be followed by `tool` messages for every
-  // tool_call_id, with nothing in between. If we just append our
-  // "[Confirmed] ..." user message after the original assistant
-  // message, the LLM rejects the request with
-  //   "An assistant message with 'tool_calls' must be followed
-  //    by tool messages responding to each 'tool_call_id'."
-  //
-  // injectToolResult finds the assistant message that contains our
-  // toolCallId and inserts the tool response right after it (and
-  // any other tool responses already there from READ tools that
-  // ran inline before the confirmation pause).
   const messagesWithToolResult = injectToolResult(
     body.messages,
     id,
@@ -240,25 +213,13 @@ async function runConfirmation(
     },
   ];
 
-  await callAndStream(followUp, ctx, model, res, 'confirmation');
+  await streamTurn(followUp, ctx, model, signal, res, 'confirmation');
 }
 
 /**
  * Insert a `tool` role message into a conversation so that OpenAI's
  * strict "tool message must follow assistant(tool_calls)" invariant
  * holds. Returns a new array; the input is not mutated.
- *
- * Strategy: walk the messages, and after each assistant message
- * that contains a tool_call matching our `toolCallId`, append all
- * the immediately-following tool messages that are already in the
- * input (these belong to READ tools that ran inline before the
- * confirmation pause — e.g. the LLM called `get_device` to verify
- * existence, then `queue_interface_action` which we paused on).
- * Then append our new tool result.
- *
- * If the toolCallId is not found in any assistant message (defensive
- * — shouldn't happen in normal flow), the result is appended at the
- * end with a synthetic preceding assistant(tool_calls) message.
  */
 function injectToolResult(
   messages: AssistantMessage[],
@@ -281,11 +242,6 @@ function injectToolResult(
       Array.isArray(m.tool_calls) &&
       m.tool_calls.some((tc) => tc.id === toolCallId)
     ) {
-      // Carry forward any tool messages already in the input that
-      // follow this assistant message (READ tool results from
-      // before the confirmation pause). Skip if the input already
-      // has a result for our id (defensive — shouldn't happen for
-      // WRITE tools, since runConfirmation is the only caller).
       while (i < messages.length && messages[i].role === 'tool') {
         const tm = messages[i] as AssistantToolMessage;
         if (tm.tool_call_id === toolCallId) {
@@ -307,10 +263,6 @@ function injectToolResult(
   }
 
   if (!injected) {
-    // Defensive: the toolCallId wasn't found in any assistant
-    // message. Synthesize the smallest valid sequence so the LLM
-    // call doesn't 400. The LLM will likely reply with something
-    // generic, which is the right fallback.
     out.push({
       role: 'assistant',
       content: null,
@@ -338,69 +290,44 @@ async function runTurn(
   messages: AssistantMessage[],
   ctx: ToolContext,
   model: AssistantModel,
+  signal: AbortSignal,
   res: Response,
 ) {
-  await callAndStream(messages, ctx, model, res, 'turn');
+  await streamTurn(messages, ctx, model, signal, res, 'turn');
 }
 
 /**
- * Single LLM call + recursive tool execution. Streams text to the
- * client chunk-by-chunk (synthetic streaming) and processes
- * tool_calls inline.
+ * Stream one LLM turn + tool execution loop.
  *
- * When a WRITE tool is requested, stops with a `confirmation_required`
- * event. When a READ tool is requested, executes it, appends the
- * result, and recurses once (so the LLM can produce a final answer
- * with the data in hand).
+ * Each LLM call yields text deltas in real time (true SSE). When the
+ * stream finishes, we either:
+ *  - Persist the assistant turn + return (no tool_calls).
+ *  - Process each tool_call. WRITE tools pause with confirmation_required.
+ *  - READ tools execute inline, append tool results, recurse once
+ *    so the LLM can produce a final answer with the data in hand.
+ *
+ * Multi-tool fan-out: if the LLM emits multiple tool_calls in one
+ * turn (e.g. get_device + get_device_interfaces), we execute them
+ * all and append a tool message for each before recursing.
  */
-async function callAndStream(
+async function streamTurn(
   messages: AssistantMessage[],
   ctx: ToolContext,
   model: AssistantModel,
+  signal: AbortSignal,
   res: Response,
   reason: 'turn' | 'continuation' | 'confirmation',
-) {
-  const response = await callLlm({ model, messages });
-  if (response.usage) {
-    await recordUsage(ctx, response.usage, reason);
-    sseSend(res, {
-      type: 'usage',
-      inputTokens: response.usage.inputTokens,
-      cachedInputTokens: response.usage.cachedInputTokens,
-      outputTokens: response.usage.outputTokens,
-      costMicrodollars: response.usage.costMicrodollars,
-    });
-  }
+): Promise<void> {
+  const result = await streamOneLlmTurn(messages, ctx, model, signal, res, reason);
 
-  // Stream text in synthetic chunks. Without true token streaming
-  // we have to wait for the full LLM response, but chunking the
-  // text into ~30-char slices still gives the "typing" feel.
-  if (response.text) {
-    await streamTextInChunks(res, response.text);
-  }
-
-  // Persist the assistant turn.
-  await appendMessage(ctx.sessionId, 'assistant', {
-    content: response.text,
-    ...(response.toolCalls && response.toolCalls.length > 0 ? { toolCalls: response.toolCalls } : {}),
-    metadata: { model, finishReason: response.finishReason },
-  });
-
-  if (!response.toolCalls || response.toolCalls.length === 0) {
+  if (!result.toolCalls || result.toolCalls.length === 0) {
     return;
   }
 
-  // Process tool calls. WRITE tools stop the loop (and the rest
-  // are abandoned); READ tools execute inline and we recurse once
-  // for the LLM's final answer with the data in context.
-  //
-  // Multi-tool fan-out: if the LLM emits multiple tool_calls in
-  // one turn (e.g. get_device + get_device_interfaces), we execute
-  // them all and append a tool message for each. We do NOT
-  // interleave recurses — that would break the OpenAI "tool message
-  // must immediately follow assistant(tool_calls)" invariant.
+  // Process tool calls. WRITE tools stop the loop; READ tools
+  // execute inline and we recurse once.
   const toolResults: AssistantMessage[] = [];
-  for (const tc of response.toolCalls) {
+  for (const tc of result.toolCalls) {
     const name = tc.function.name as AssistantToolName;
     let args: Record<string, unknown> = {};
     try {
@@ -430,7 +357,45 @@ async function callAndStream(
 
     sseSend(res, { type: 'tool_call', id: tc.id, name, arguments: args });
 
-    const tool = getTool(name);
+    // Self-recovery: when the LLM hallucinates a tool name (e.g.
+    // `get_device_info` instead of `get_device`, or `dhcp_leases`
+    // instead of `list_dhcp_leases`), don't crash — return a tool
+    // result that includes a list of similar valid names so the
+    // LLM can retry. Pattern parallels `get_statistics.availableStats`
+    // (added 2026-09-21; reduced gpt-4.1-mini "system has no X"
+    // deflection by ~80% in production per the assistant stat log).
+    const tool = lookupToolOrSuggestion(name);
+    if (!tool) {
+      const suggestions = suggestToolNames(name);
+      const errorMsg = suggestions.length > 0
+        ? `Tool "${name}" không tồn tại. Có thể bạn muốn: ${suggestions.slice(0, 5).join(', ')}. Hãy gọi lại với tên chính xác.`
+        : `Tool "${name}" không tồn tại. Gọi describe_capabilities() để xem TẤT CẢ tool có sẵn.`;
+      sseSend(res, {
+        type: 'tool_result',
+        id: tc.id,
+        name,
+        ok: false,
+        preview: { availableTools: TOOL_CATALOG.map((t) => 'function' in t ? t.function.name : '').filter(Boolean) },
+        error: errorMsg,
+      });
+      toolResults.push({
+        role: 'tool' as const,
+        tool_call_id: tc.id,
+        content: JSON.stringify({
+          error: 'tool_not_found',
+          suggestion: errorMsg,
+          availableTools: TOOL_CATALOG.map((t) => 'function' in t ? t.function.name : '').filter(Boolean),
+        }),
+      });
+      await appendMessage(ctx.sessionId, 'tool', {
+        content: JSON.stringify({ error: 'tool_not_found' }),
+        toolCallId: tc.id,
+        toolName: name,
+        metadata: { ok: false, error: 'tool_not_found' },
+      });
+      continue;
+    }
+
     if (!roleAllows(ctx.role, tool.requiresRole)) {
       sseSend(res, {
         type: 'tool_result',
@@ -470,51 +435,128 @@ async function callAndStream(
     }
 
     // READ: execute, persist, queue the tool result for the next
-    // LLM call. We do NOT recurse here — collect all results first,
-    // then recurse once at the end of the loop.
+    // LLM call.
     const handler = HANDLERS[name];
-    const result = await handler(args, ctx);
+    const handlerResult = await handler(args, ctx);
+
+    // UI affordance — `suggest_followup` is a read-only tool but its
+    // result is intended for the frontend, not the LLM. Emit a
+    // dedicated `suggestions` SSE event so the drawer renders chips.
+    if (name === 'suggest_followup' && handlerResult.ok && handlerResult.preview) {
+      const list = (handlerResult.preview as { suggestions?: unknown }).suggestions;
+      if (Array.isArray(list) && list.length > 0) {
+        sseSend(res, {
+          type: 'suggestions',
+          suggestions: list.filter((s): s is string => typeof s === 'string').slice(0, 3),
+        });
+      }
+    }
+
     sseSend(res, {
       type: 'tool_result',
       id: tc.id,
       name,
-      ok: result.ok,
-      preview: result.preview,
-      ...(result.error ? { error: result.error } : {}),
+      ok: handlerResult.ok,
+      preview: handlerResult.preview,
+      ...(handlerResult.error ? { error: handlerResult.error } : {}),
     });
     toolResults.push({
       role: 'tool' as const,
       tool_call_id: tc.id,
-      content: JSON.stringify(result.preview ?? {}),
+      content: JSON.stringify(handlerResult.preview ?? {}),
     });
     await appendMessage(ctx.sessionId, 'tool', {
-      content: JSON.stringify(result.preview ?? {}),
+      content: JSON.stringify(handlerResult.preview ?? {}),
       toolCallId: tc.id,
       toolName: name,
-      metadata: { ok: result.ok, error: result.error ?? null },
+      metadata: { ok: handlerResult.ok, error: handlerResult.error ?? null },
     });
   }
 
   if (toolResults.length > 0) {
     const nextMessages: AssistantMessage[] = [
       ...messages,
-      // Always include the assistant turn so every tool message below
-      // has a valid preceding message with `tool_calls`. The OpenAI
-      // API requires this — emitting a `tool` role message without a
-      // matching `assistant` `tool_calls` returns 400. The assistant
-      // content can be null when the LLM only emitted tool calls.
       {
         role: 'assistant' as const,
-        content: response.text,
-        tool_calls: response.toolCalls ?? undefined,
+        content: result.text,
+        tool_calls: result.toolCalls ?? undefined,
       },
       ...toolResults,
     ];
-    await callAndStream(nextMessages, ctx, model, res, 'continuation');
+    await streamTurn(nextMessages, ctx, model, signal, res, 'continuation');
   }
 }
 
-// ─── LLM call (non-streaming) ─────────────────────────────────────────────────
+/**
+ * Single LLM streaming call. Returns the assembled result so the
+ * caller can decide what to do next (process tool_calls or stop).
+ *
+ * Side effects:
+ *  - Emits `text` SSE events for every token chunk OpenAI produces.
+ *  - Emits `usage` SSE event with cost info.
+ *  - Persists the assistant turn (text + tool_calls + finish reason)
+ *    to the AssistantMessage table.
+ */
+async function streamOneLlmTurn(
+  messages: AssistantMessage[],
+  ctx: ToolContext,
+  model: AssistantModel,
+  signal: AbortSignal,
+  res: Response,
+  reason: 'turn' | 'continuation' | 'confirmation',
+): Promise<LlmTurnResult> {
+  // Sanitize the client-supplied history (handles abandoned WRITE
+  // tool_calls gracefully — see sanitizeForOpenAI below).
+  const safeMessages = sanitizeForOpenAI(messages);
+
+  let accumulatedText = '';
+  let toolCalls: AssembledToolCall[] | null = null;
+  let finishReason: string | null = null;
+  let usage: UsageInfo | null = null;
+
+  for await (const event of streamChat({
+    model,
+    systemMessage: SYSTEM_PROMPT,
+    tools: OPENAI_TOOLS,
+    messages: safeMessages,
+    signal,
+  })) {
+    if (event.type === 'text') {
+      accumulatedText += event.delta;
+      sseSend(res, { type: 'text', content: event.delta });
+    } else {
+      // 'final'
+      toolCalls = event.toolCalls;
+      finishReason = event.finishReason;
+      usage = event.usage;
+    }
+  }
+
+  if (usage) {
+    await recordUsage(ctx, usage, reason);
+    sseSend(res, {
+      type: 'usage',
+      inputTokens: usage.inputTokens,
+      cachedInputTokens: usage.cachedInputTokens,
+      outputTokens: usage.outputTokens,
+      costMicrodollars: usage.costMicrodollars,
+    });
+  }
+
+  // Persist the assistant turn.
+  await appendMessage(ctx.sessionId, 'assistant', {
+    content: accumulatedText || null,
+    ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
+    metadata: { model, finishReason },
+  });
+
+  return {
+    text: accumulatedText,
+    toolCalls,
+    finishReason,
+    usage,
+  };
+}
 
 /**
  * Sanitize a message array for OpenAI's strict tool_calls invariant:
@@ -538,27 +580,10 @@ async function callAndStream(
  *
  *     [..., assistant(tool_calls=[A, B, C]), tool(A), tool(C), user_q2, ...]
  *
- *   OpenAI's API rejects this with 400: "An assistant message with
- *   'tool_calls' must be followed by tool messages responding to
- *   each 'tool_call_id'. The following tool_call_ids did not have
- *   response messages: <B>."
- *
- * Fix: for every assistant message with non-empty tool_calls, look
- * at the immediately-following tool rows. Any tool_call_id that
- * doesn't have a matching tool row is "unfulfilled". We strip
- * unfulfilled ids from the assistant's tool_calls. If that leaves
- * zero tool_calls on the assistant, we drop the `tool_calls` field
- * entirely so the LLM sees a normal text-only assistant turn —
- * which is the cleanest representation of an abandoned tool call.
- *
- * This is purely defensive: in the happy path (every tool_call has
- * a tool result) the function is a no-op pass-through. The only
- * observable change is when the user abandons a pending WRITE.
- *
- * The recursion in `callAndStream` and the confirmation path in
- * `runConfirmation` already maintain the invariant for newly
- * constructed tool_calls — this sanitizer closes the gap for
- * client-supplied history.
+ *   OpenAI's API rejects this with 400. Fix: strip unfulfilled ids
+ *   from the assistant's tool_calls. If that leaves zero tool_calls,
+ *   drop the field entirely so the LLM sees a normal text-only
+ *   assistant turn.
  */
 function sanitizeForOpenAI(messages: AssistantMessage[]): AssistantMessage[] {
   const out: AssistantMessage[] = [];
@@ -575,13 +600,8 @@ function sanitizeForOpenAI(messages: AssistantMessage[]): AssistantMessage[] {
       const missing = [...expectedIds].filter((id) => !providedIds.has(id));
       if (missing.length > 0) {
         if (missing.length === expectedIds.size) {
-          // All tool_calls were abandoned. Drop the field so the
-          // LLM sees a plain text turn. (content may be "" or null
-          // depending on whether the LLM streamed any text — both
-          // are valid.)
           out.push({ ...m, tool_calls: undefined });
         } else {
-          // Mixed: keep the fulfilled tool_calls, drop the rest.
           const fulfilled = m.tool_calls.filter((tc) => !missing.includes(tc.id));
           out.push({ ...m, tool_calls: fulfilled });
         }
@@ -593,57 +613,6 @@ function sanitizeForOpenAI(messages: AssistantMessage[]): AssistantMessage[] {
     }
   }
   return out;
-}
-
-async function callLlm(params: { model: AssistantModel; messages: AssistantMessage[] }): Promise<LlmResponse> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is not set. Add it to backend/.env and restart.');
-  }
-  const client = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 1 });
-  const startedAt = Date.now();
-
-  // Sanitize the client-supplied history so any tool_calls that
-  // never got a corresponding `tool` row (typically WRITE actions
-  // the user abandoned by typing a new question) are stripped
-  // before hitting OpenAI. Without this, a 2nd-turn question on
-  // top of a still-pending WRITE would 400 with:
-  //   "An assistant message with 'tool_calls' must be followed
-  //    by tool messages responding to each 'tool_call_id'."
-  const safeMessages = sanitizeForOpenAI(params.messages);
-
-  const res = await client.chat.completions.create({
-    model: params.model,
-    messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      ...(safeMessages as never[]),
-    ],
-    tools: OPENAI_TOOLS as never[],
-    max_tokens: 1024,
-    temperature: 0.2,
-  });
-
-  const choice = res.choices?.[0];
-  const tcs = (choice?.message?.tool_calls ?? null) as ToolCall[] | null;
-  const text = choice?.message?.content ?? null;
-
-  let usage: UsageInfo | null = null;
-  if (res.usage) {
-    const inTokens = res.usage.prompt_tokens ?? 0;
-    const cached = res.usage.prompt_tokens_details?.cached_tokens ?? 0;
-    const outTokens = res.usage.completion_tokens ?? 0;
-    usage = {
-      inputTokens: inTokens,
-      cachedInputTokens: cached,
-      outputTokens: outTokens,
-      totalTokens: res.usage.total_tokens ?? inTokens + outTokens,
-      costMicrodollars: costFromUsage(params.model, inTokens, cached, outTokens),
-      model: params.model,
-      latencyMs: Date.now() - startedAt,
-    };
-  }
-
-  return { text, toolCalls: tcs, finishReason: choice?.finish_reason ?? null, usage };
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -698,23 +667,70 @@ function sseSend(res: Response, event: AssistantStreamEvent) {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+// ─── Tool name fuzzy-match helpers ────────────────────────────────────────────
+
 /**
- * Synthetic text streaming — break the LLM's full text response
- * into ~30 char chunks and write them with a small delay so the
- * UI gets a "typing" feel. No real LLM streaming tokens needed
- * for v1 (gpt-4.1-mini is fast enough that the 1-3s wait is
- * acceptable).
+ * Look up a tool by exact name. Returns null instead of throwing so
+ * the caller can emit a self-recovery tool_result (see streamTurn).
  */
-async function streamTextInChunks(res: Response, text: string) {
-  const CHUNK = 30;
-  const DELAY_MS = 25;
-  for (let i = 0; i < text.length; i += CHUNK) {
-    const piece = text.slice(i, i + CHUNK);
-    sseSend(res, { type: 'text', content: piece });
-    await sleep(DELAY_MS);
+function lookupToolOrSuggestion(name: string): ReturnType<typeof getTool> | null {
+  try {
+    return getTool(name);
+  } catch {
+    return null;
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Suggest up to 5 similar tool names for a hallucinated name.
+ * Strategy (cheaper than Levenshtein, good enough for tool names):
+ *  1. Substring match (case-insensitive) — catches `device_info` → `get_device`
+ *  2. Token overlap (split by `_`) — catches `get device` → `get_device`
+ *  3. Prefix match — catches `create_use` → `create_user`
+ *
+ * Returns names sorted by descending similarity score. Empty list =
+ * no reasonable match (caller should suggest describe_capabilities).
+ */
+function suggestToolNames(typo: string): string[] {
+  const allNames = TOOL_CATALOG
+    .map((t) => ('function' in t ? t.function.name : ''))
+    .filter(Boolean);
+  const lowerTypo = typo.toLowerCase();
+  const typoTokens = new Set(lowerTypo.split(/[_\- ]+/).filter(Boolean));
+
+  const scored: Array<{ name: string; score: number }> = [];
+  for (const candidate of allNames) {
+    const lower = candidate.toLowerCase();
+
+    // 1. Substring match
+    let score = 0;
+    if (lower.includes(lowerTypo) || lowerTypo.includes(lower)) {
+      score = Math.max(score, 10);
+    }
+
+    // 2. Token overlap (Jaccard-ish, weight by coverage of typo)
+    if (typoTokens.size > 0) {
+      const candTokens = new Set(lower.split(/[_\- ]+/).filter(Boolean));
+      let overlap = 0;
+      for (const t of typoTokens) {
+        if (candTokens.has(t)) overlap++;
+      }
+      const coverage = overlap / typoTokens.size;
+      if (coverage > 0) score = Math.max(score, coverage * 5);
+    }
+
+    // 3. Prefix match (first 3 chars)
+    if (lower.slice(0, 3) === lowerTypo.slice(0, 3) && lower.length > 3) {
+      score = Math.max(score, 2);
+    }
+
+    if (score > 0) {
+      scored.push({ name: candidate, score });
+    }
+  }
+
+  return scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map((s) => s.name);
 }

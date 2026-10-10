@@ -49,7 +49,8 @@ export type AssistantStreamEvent =
       outputTokens: number;
       costMicrodollars: number;
     }
-  | { type: 'done' };
+  | { type: 'done' }
+  | { type: 'suggestions'; suggestions: string[] };
 
 /** OpenAI Chat Completions message shape. */
 export type AssistantMessage =

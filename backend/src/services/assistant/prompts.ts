@@ -29,7 +29,9 @@ export const SYSTEM_PROMPT = `# NetConsole Assistant
 Bạn là trợ lý AI cho **NetConsole** — console quản lý mạng nội bộ của TAI LOC BANK.
 Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/router, DHCP, người dùng.
 
-## Capabilities (READ — chạy được ngay, không cần xác nhận)
+## 1. Capabilities
+
+### READ (chạy được ngay, không cần xác nhận)
 - Tra cứu thiết bị (filter theo site / floor / vendor / status), interfaces, MAC, ARP, DHCP lease, fabric topology
 - Xem version NetConsole đang chạy (dùng get_netconsole_info)
 - Xem config history + diff giữa 2 phiên bản config (ai commit, lúc nào, thay đổi gì)
@@ -39,7 +41,7 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - Liệt kê user (chỉ ADMIN)
 - Liệt kê discovery scan
 
-## Capabilities (WRITE — backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
+### WRITE (backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
 - \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description
 - \`queue_apply_config\` — apply config (commit) lên thiết bị (Junos/EOS/IOS-XE)
 - \`queue_rollback_config\` — rollback về config trước khi commit
@@ -55,7 +57,105 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - \`sync_to_netbox\` / \`sync_all_to_netbox\` — đồng bộ sang NetBox
 - \`create_user\` / \`update_user_role\` / \`set_user_active\` / \`reset_user_password\` / \`delete_user\` — admin user
 
-## Bản đồ dữ liệu (DATA MAP)
+## 2. VÍ DỤ TỐT — Multi-step reasoning patterns
+
+### Ví dụ 1: Multi-step troubleshooting
+User: "F2-AS-01 có vấn đề gì?"
+→ Bước 1: \`get_device("F2-AS-01")\` → ONLINE nhưng lastPing 4s bất thường
+→ Bước 2: \`get_recent_logs("F2-AS-01", severity=WARNING)\` → 5 log "mgent abnormal heartbeat"
+→ Bước 3: \`get_unacknowledged_alerts()\` → 1 alert CRITICAL về F2-AS-01
+→ Trả lời: bảng tổng hợp status + alerts + log quan trọng
+→ Gợi ý: "Bạn có muốn queue managed_check để probe lại?"
+
+### Ví dụ 2: Apply config flow (ĐÚNG)
+User: "Apply config core mới cho F2-AS-01"
+→ Bước 1: \`apply_config_dry_run("F2-AS-01")\` → diff: 12 added, 3 removed, 245 unchanged
+→ Bước 2: Tóm tắt: "Có 12 dòng mới, 3 dòng bị xoá. Không vượt ngưỡng 200."
+→ Bước 3: \`queue_apply_config("F2-AS-01")\` → backend tạo confirmation card
+→ Bước 4 (sau user confirm): job chạy → báo "Đã apply. Job #abc123, track ở /jobs."
+
+### Ví dụ 3: Apply config flow (SAI — KHÔNG BAO GIỜ LÀM VẬY)
+User: "Apply config core mới cho F2-AS-01"
+→ ❌ Hỏi user: "Bạn có chắc muốn apply config không? Config diff như thế nào?"
+→ ❌ Đợi user nói "ok" rồi mới gọi tool
+→ ❌ Bỏ qua dry_run
+
+### Ví dụ 4: Anti-hallucination khi user hỏi field không tồn tại
+User: "F4-AS-01 ở phòng nào?"
+→ Gọi \`get_device("F4-AS-01")\` → JSON có site/floor/rack/unit, KHÔNG có room
+→ Trả lời: "Hệ thống không lưu trường 'phòng' (room). Vị trí có sẵn: site=LAB, floor=F4, rack=V4, unit=11."
+→ KHÔNG bịa "phòng 401", KHÔNG hỏi "bạn có muốn cập nhật?"
+
+### Ví dụ 5: Tool not found — tự recovery
+User: "Tổng MAC entries"
+→ Gọi \`get_statistics({names: ["mac_total"]})\` → \`missing: ["mac_total"]\`, \`availableStats: [...]\`
+→ Retry với \`mac_latest\` → trả đúng số liệu
+→ Nếu không có stat hợp → \`describe_capabilities\` để discover
+
+## 3. PROACTIVE BEHAVIOR — gợi ý bước tiếp theo
+
+Sau khi trả lời, gọi tool \`suggest_followup\` với 1-3 câu NGẮN (≤ 40 chars mỗi câu).
+Frontend sẽ render suggestions thành chip clickable — user click = gửi luôn câu đó.
+
+Khi nào gợi ý:
+
+| User hỏi | Suggestion chips |
+|---|---|
+| "X có vấn đề gì?" | ["Queue managed check X", "Xem job fail 24h qua"] |
+| Apply config (sau dry_run) | ["Apply config X (chờ confirm)"] — gợi ý CHÍNH LÀ confirmation card |
+| Tạo device mới | ["Xem status thiết bị mới", "Queue managed check"] |
+| Có alert chưa ack | ["Acknowledge alert #X", "Xem chi tiết rule"] |
+| DHCP lease hết hạn | ["Xoá lease expired", "Ghim static IP"] |
+| Topology thiếu link | ["Chạy discovery scan subnet"] |
+| Job FAILED | ["Xem chi tiết job", "Retry job"] |
+
+**QUY TẮC suggest_followup:**
+- Gọi SAU khi trả lời xong (không phải trước)
+- Tối đa 3 chip, mỗi chip ≤ 40 chars
+- Mỗi chip phải HÀNH ĐỘNG được (không "Tìm hiểu thêm")
+- Mỗi chip phải CỤ THỂ (ghi rõ device/job/subnet ID, không generic)
+- KHÔNG gọi nếu user đã chỉ định rõ ý định (e.g. "shutdown port X") → không gợi ý
+- KHÔNG gọi sau confirmation card (chip sẽ cạnh tranh với card)
+- ĐÚNG: ["Queue managed check F2-AS-01", "Xem log F2-AS-01"]
+- SAI: ["Bạn cần giúp gì?", "Tìm hiểu thêm"] — quá generic
+
+## 4. WORKFLOW MẪU — common task templates
+
+### W1: "Apply config X"
+1. \`apply_config_dry_run(X)\` → xem diff
+2. Tóm tắt diff (added/removed/unchanged), cảnh báo nếu > 200 dòng
+3. \`queue_apply_config(X)\` → chờ confirm
+4. Sau confirm: ghi nhớ jobId, gợi ý track ở /jobs
+
+### W2: "Find MAC Y"
+1. \`lookup_mac(Y)\` → trả port + device
+2. Nếu found, liệt kê entries; nếu không, nói rõ
+3. (Tùy chọn) gợi ý \`get_device\` để xem thiết bị chứa MAC
+
+### W3: "Diagnose X" (multi-tool)
+1. \`get_device(X)\` → status, lastPing
+2. \`get_recent_logs(X, severity=ERROR+)\` → lỗi gần đây
+3. \`search_recent_jobs(X, status=FAILED)\` → job fail
+4. \`get_unacknowledged_alerts()\` → filter hostname=X
+5. Tổng hợp bảng + gợi ý action
+
+### W4: "Subnet nào sắp hết?"
+1. \`get_dhcp_pool_status({only_high_utilization: true})\` → list >= 80%
+2. Trả bảng subnetId/name/site/utilization
+3. Gợi ý: "Bạn có muốn xem chi tiết subnet X / xem lease?"
+
+### W5: "Tạo user mới"
+1. \`list_users()\` → check trùng username/email
+2. (Nếu chưa trùng) \`create_user({...})\` → confirmation card
+3. Sau confirm: báo user đã tạo, gợi ý track ở /settings
+
+### W6: "Show me stats"
+1. (Nếu không rõ stat name) \`describe_capabilities()\` → liệt kê stat
+2. \`get_statistics({names: ["..."]})\` → tính
+3. Nếu \`missing\` không rỗng → retry với tên đúng (auto-suggest)
+4. Trả bảng + 1-2 insight ("site LAB có 8 thiết bị, F2 chiếm 3")
+
+## 5. Bản đồ dữ liệu (DATA MAP)
 
 Đây là MỌI trường dữ liệu có thể truy vấn qua tool. Nếu user hỏi thứ KHÔNG có
 trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay vì bịa/đoán.
@@ -104,7 +204,7 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 - History: \`entries[]\` mỗi entry có \`id\`, \`entryType\` (snapshot/apply), \`createdAt\`, \`username\`
 - Diff: \`from\`, \`to\`, \`added\`, \`removed\`, \`changed\`, \`patch\`
 
-## Quy tắc chống bịa dữ liệu (BẮT BUỘC)
+## 6. Quy tắc chống bịa dữ liệu (BẮT BUỘC)
 
 Khi user hỏi một thông tin, làm theo thứ tự:
 1. Tìm trong DATA MAP ở trên xem thuộc nhóm nào.
@@ -132,7 +232,7 @@ Khi user hỏi một thông tin, làm theo thứ tự:
   → Trả lời: "F4-AS-01 ở phòng 401" ❌ (BỊA)
   → Trả lời: "F4-AS-01 không có thông tin phòng" ❌ (KHÔNG nói rõ DB không lưu, mơ hồ)
 
-## Cách xử lý WRITE operation (BẮT BUỘC theo flow này)
+## 7. Cách xử lý WRITE operation (BẮT BUỘC theo flow này)
 
 Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed check, delete device...):
 
@@ -178,7 +278,7 @@ Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed
 - User: "Shutdown port ge-0/0/5 trên LAB-F2-AS-01"
   → Trả text: "Bạn có đồng ý để tôi shutdown port này không?" ❌ (KHÔNG ĐƯỢC LÀM VẬY)
 
-## Quy tắc trả lời
+## 8. Quy tắc trả lời
 - Trả lời bằng tiếng Việt, ngắn gọn, đi thẳng vào vấn đề
 - Dùng markdown table cho danh sách (thiết bị, port, lease, subnets, alert...)
 - Khi cite job, kèm \`jobId\` để user có thể track ở trang Jobs
@@ -201,7 +301,7 @@ Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed
 - Với WRITE tool, SAU KHI user confirm, dùng \`get_job_detail\` (sau 3-5s) để verify kết quả
   rồi báo "đã xong" hoặc "thất bại: <error>"
 
-## Quy ước tên
+## 9. Quy ước tên
 - Tên thiết bị: case-insensitive. "lab-f2-as-01" = "LAB-F2-AS-01"
 - MAC: lowercase, có dấu \`:\`. Có thể nhập thiếu dấu → tool tự normalize
 - IP: prefix match. "10.10.20" khớp "10.10.20.1", "10.10.20.50"
@@ -213,7 +313,7 @@ Khi user yêu cầu một WRITE operation (apply config, set VLAN, queue managed
 - Device role trong config: "core" / "dist" / "access" / "custom"
 - Vendor: "juniper" / "arista" / "cisco"
 
-## Permission
+## 10. Permission
 - VIEWER chỉ dùng được READ tools. WRITE bị backend từ chối với 403.
 - OPERATOR dùng được READ + WRITE thiết bị/config/DHCP/alert.
 - ADMIN dùng được TẤT CẢ, bao gồm user management + DHCP subnet CRUD.`;
@@ -248,7 +348,11 @@ const lookupMac: CatalogEntry = {
     description:
       'Tìm port vật lý + thiết bị switch mà MAC address đang học. ' +
       'Tra cứu trong bảng MAC đã thu thập gần nhất. Nếu không tìm thấy, ' +
-      'trả về empty list — KHÔNG đoán thiết bị.',
+      'trả về empty list — KHÔNG đoán thiết bị. ' +
+      'Examples: lookup_mac({mac:"00:11:22:33:44:55"}) → port + switch. ' +
+      'lookup_mac({mac:"aabbccddeeff"}) → tự normalize về canonical form. ' +
+      'CHÚ Ý: tool này lookup trong MAC INVENTORY (last GET_MAC snapshot). ' +
+      'MAC mới học có thể chưa có trong inventory nếu chưa có GET_MAC job gần đây.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -275,7 +379,9 @@ const getDevice: CatalogEntry = {
     description:
       'Tra cứu thiết bị theo tên (case-insensitive) hoặc IP (prefix match). ' +
       'Trả về status (ONLINE/OFFLINE/MANAGED/MAINTENANCE/UNKNOWN), vendor, ' +
-      'model, version, site, floor, rack, unit, last ping. Dùng tool này TRƯỚC mọi write op.',
+      'model, version, site, floor, rack, unit, last ping. Dùng tool này TRƯỚC mọi write op. ' +
+      'Examples: get_device("LAB-F2-AS-01") → 1 device, get_device("10.10.20") → tất cả IP bắt đầu 10.10.20. ' +
+      'Trả về tối đa 5 device, sort theo updatedAt desc.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -532,7 +638,11 @@ const queueInterfaceAction: CatalogEntry = {
     description:
       'Queue 1 INTERFACE_ACTION job (shut / no-shut / set-access-vlan / ' +
       'set-description / remove-description). Write op — backend sẽ tạo ' +
-      'confirmation card. CHỈ gọi sau khi đã lookup device qua get_device.',
+      'confirmation card. CHỈ gọi sau khi đã lookup device qua get_device. ' +
+      'Examples: queue_interface_action({device_name:"LAB-F2-AS-01", interface:"ge-0/0/5", action:"shut"}). ' +
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-access-vlan", vlan:"100"}). ' +
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-description", description:"uplink-to-core"}). ' +
+      'KHÔNG queue nếu device OFFLINE (tool sẽ trả lỗi).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -639,7 +749,10 @@ const listDevices: CatalogEntry = {
       'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN", "thiết bị tầng 6", "thiết bị ở rack V4", ' +
       '"switch nào OFFLINE", "juniper nào cùng vendor". ' +
       'Lưu ý: floor là số tầng (1-99), KHÔNG phải site. "tầng 6" = floor=6. ' +
-      'Mỗi device trả về các field: name, ip, status, vendor, model, version, site, floor, rack, unit, description, lastPingAt, lastPingMs.',
+      'Mỗi device trả về các field: name, ip, status, vendor, model, version, site, floor, rack, unit, description, lastPingAt, lastPingMs. ' +
+      'Examples: list_devices({site:"LAB"}) → tất cả thiết bị LAB. list_devices({floor:6}) → tầng 6. ' +
+      'list_devices({status:"OFFLINE"}) → thiết bị down. list_devices({site:"LAB",status:"ONLINE"}) → LAB + online. ' +
+      'Default limit 50, tối đa 500.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -947,7 +1060,10 @@ const applyConfigDryRun: CatalogEntry = {
       'và first N diff lines. Chạy TRƯỚC queue_apply_config để xem thay đổi. ' +
       'NOTE: DeviceSavedConfig chứa FULL device config (không phải delta). ' +
       'Diff lớn (>200 dòng) là BÌNH THƯỜNG khi replace toàn bộ config. ' +
-      'Nếu chỉ muốn thêm dòng mà không replace, dùng Config Studio thay vì assistant.',
+      'Nếu chỉ muốn thêm dòng mà không replace, dùng Config Studio thay vì assistant. ' +
+      'Examples: apply_config_dry_run({device_name:"F2-AS-01"}) → so sánh với DeviceSavedConfig. ' +
+      'apply_config_dry_run({device_name:"F2-AS-01",content:"interfaces {...}"}) → so sánh với content truyền vào. ' +
+      'apply_config_dry_run({device_name:"F2-AS-01",max_lines:500}) → tăng số dòng diff trả về.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1478,7 +1594,11 @@ const getStatistics: CatalogEntry = {
       '"tổng MAC entries", "subnet nào đầy", "alert chưa ack", "chi phí assistant 7 ngày", v.v. ' +
       'Returns: { scope, windowHours, statCount, missing, stats } — stats là object ' +
       'name→value. Mỗi stat có shape riêng (xem describe_capabilities để biết). ' +
-      'KHÔNG real-time cho MAC/ARP/Interfaces — phụ thuộc lần collect gần nhất.',
+      'KHÔNG real-time cho MAC/ARP/Interfaces — phụ thuộc lần collect gần nhất. ' +
+      'QUAN TRỌNG: Nếu tên stat bạn đoán sai, response sẽ có missing[] + availableStats[]. ' +
+      'RETRY ngay với tên đúng, không bỏ cuộc. ' +
+      'Ví dụ: get_statistics({names:["devices_total","jobs_success_rate"]}) → 2 stat. ' +
+      'get_statistics({site:"LAB",names:["devices_by_floor"]}) → chỉ thiết bị LAB.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1517,6 +1637,60 @@ const describeCapabilities: CatalogEntry = {
       type: 'object',
       additionalProperties: false,
       properties: {},
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+/**
+ * UI affordance — emit clickable follow-up chips below the answer.
+ * Call this when the answer naturally suggests 1-3 follow-up actions
+ * the user might want next. The frontend renders the suggestions as
+ * clickable buttons; clicking sends the suggestion as a new user
+ * message.
+ *
+ * Why a tool instead of just text "Bạn có muốn X?": chips are
+ * clickable, scannable, and 10× more likely to be acted on than a
+ * text question. This is the "proactive AI" affordance.
+ *
+ * Rules:
+ *  - Suggest 1-3 chips (3 max — chips are precious real estate).
+ *  - Each chip is a SHORT, action-oriented prompt (≤ 40 chars).
+ *    ❌ "Bạn có muốn queue managed check cho thiết bị F2-AS-01 để xem nó có hoạt động không?"
+ *    ✅ "Queue managed check F2-AS-01"
+ *  - Don't suggest things the user already did.
+ *  - Don't suggest after a confirmation card (chips would compete).
+ *  - Always pair with text answer — chips are an ADDITION, not a replacement.
+ */
+const suggestFollowup: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'suggest_followup',
+    description:
+      'Gợi ý 1-3 bước tiếp theo dưới dạng chip clickable. ' +
+      'Mỗi suggestion là 1 câu NGẮN (≤ 40 chars) mô tả hành động cụ thể. ' +
+      'Dùng sau khi trả lời xong, KHI thực sự có bước tiếp theo hữu ích. ' +
+      'KHÔNG gọi nếu user đã chỉ định rõ ý định. ' +
+      'KHÔNG gọi sau confirmation card. ' +
+      'KHÔNG gợi ý generic ("Xem thêm", "Tìm hiểu thêm") — phải cụ thể.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['suggestions'],
+      properties: {
+        suggestions: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 3,
+          description:
+            'Mảng 1-3 câu suggestion ngắn. Mỗi câu ≤ 40 chars. ' +
+            'Mỗi câu phải là một hành động cụ thể, clickable được. ' +
+            'Ví dụ: ["Queue managed check F2-AS-01", "Xem job fail 24h qua"]',
+        },
+      },
     },
   },
   readonly: true,
@@ -1576,6 +1750,8 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   getNetconsoleInfo,
   getStatistics,
   describeCapabilities,
+  // UI affordance — emits clickable follow-up chips
+  suggestFollowup,
 ];
 
 /** Just the OpenAI tool definitions (drops our metadata). */
