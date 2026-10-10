@@ -687,6 +687,29 @@ class EOSBackend(DeviceBackend):
             raise RuntimeError(f"Unsupported interface action for EOS: {action}")
 
         if self.config.eos.enabled:
+            r = self._run_cmds(device, commands, fmt="text")
+            if r["ok"]:
+                output = ""
+                if r["result"]:
+                    first = r["result"][0]
+                    output = first.get("output") if isinstance(first, dict) else str(first)
+                if action == "show-run":
+                    output = _slice_eos_interface_block(output, iface)
+                return {
+                    "implemented": True,
+                    "source": "eos-api",
+                    "action": action,
+                    "interface": iface,
+                    "vlan": vlan or None,
+                    "description": description if action in ("set-description", "remove-description") else None,
+                    "commands": commands,
+                    "message": f"Interface action {action} OK on {iface}",
+                    "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
+                    "accessVlan": vlan if action == "set-access-vlan" else None,
+                    "config": output if action == "show-run" else None,
+                    "raw": r.get("raw", ""),
+                }
+            raise RuntimeError(r["error"] or f"EOS eAPI {action} failed")
 
         if self.config.ssh_enabled:
             outputs: list[dict[str, str]] = []

@@ -48,7 +48,7 @@ from netconsole_worker.parsers.interface_set import (
     is_protected_interface,
     parse_interface_descriptions_from_set,
     parse_switching_mode_from_set,
-    physical_interface_name,
+    split_interface,
     validate_interface_name,
 )
 from netconsole_worker.parsers.mac_table_rpc import parse_mac_table_rpc
