@@ -88,6 +88,52 @@ class DeviceBackend(ABC):
     ) -> dict[str, Any]:
         """shut / no-shut / show-run / set-access-vlan / set-description on a single interface."""
 
+    def interface_action_multi(
+        self,
+        device: DeviceInfo,
+        *,
+        iface: str,
+        subactions: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        """Apply multiple subactions to the same interface in ONE device commit.
+
+        Default implementation falls back to running each subaction through
+        `interface_action()` sequentially (NOT atomic on the device).
+        Vendor backends with a true atomic-commit path (Junos RESTCONF
+        `load+commit`, EOS eAPI, IOS-XE NETCONF) override this to combine
+        all subactions into a single load+commit cycle.
+
+        Each item in `subactions` has shape:
+            {"action": "set-access-vlan", "vlan": "203"}
+            {"action": "set-description",  "description": "uplink-to-core"}
+            {"action": "shut"} / {"action": "no-shut"}
+            {"action": "remove-description"}
+            {"action": "delete-interface"}
+        """
+        results: list[dict[str, Any]] = []
+        for sa in subactions:
+            action = str(sa.get("action", ""))
+            vlan_v = sa.get("vlan")
+            desc_v = sa.get("description")
+            results.append(
+                self.interface_action(
+                    device,
+                    action=action,
+                    iface=iface,
+                    vlan=str(vlan_v) if vlan_v is not None else None,
+                    description=str(desc_v) if desc_v is not None else None,
+                )
+            )
+        return {
+            "implemented": True,
+            "source": "sequential-fallback",
+            "interface": iface,
+            "subActionCount": len(subactions),
+            "subActions": subactions,
+            "results": results,
+            "message": f"Multi-action (sequential fallback) on {iface} — backend did not override interface_action_multi.",
+        }
+
     @abstractmethod
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
         """Lightweight `show version` probe for the MANAGED_CHECK job."""

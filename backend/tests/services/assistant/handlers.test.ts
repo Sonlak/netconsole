@@ -376,6 +376,83 @@ describe('queue_interface_action (WRITE)', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/Device busy/);
   });
+
+  // ── Multi-action: set VLAN + description in ONE call ───────────────────
+
+  it('queues a multi-action batch and reports subActionCount=2', async () => {
+    deviceFindFirst.mockResolvedValueOnce({ id: 'dev-1', name: 'LAB-F6-DS-01', ip: '10.10.20.6', status: 'ONLINE' });
+    parseInterfaceActionPayload.mockReturnValueOnce({
+      interface: 'xe-0/0/7',
+      actions: [
+        { action: 'set-access-vlan', vlan: '203' },
+        { action: 'set-description', description: 'sonnx_test' },
+      ],
+    });
+    queueInterfaceAction.mockResolvedValueOnce({
+      kind: 'created',
+      job: {
+        id: 'job-multi-1',
+        type: 'INTERFACE_ACTION',
+        status: 'PENDING',
+        createdAt: new Date(),
+        deviceId: 'dev-1',
+        payload: {
+          interface: 'xe-0/0/7',
+          actions: [
+            { action: 'set-access-vlan', vlan: '203' },
+            { action: 'set-description', description: 'sonnx_test' },
+          ],
+        },
+      },
+    });
+    const result = await HANDLERS.queue_interface_action(
+      {
+        device_name: 'LAB-F6-DS-01',
+        interface: 'xe-0/0/7',
+        actions: [
+          { action: 'set-access-vlan', vlan: '203' },
+          { action: 'set-description', description: 'sonnx_test' },
+        ],
+      },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { subActionCount: number; subActionSummary: string; jobId: string };
+    expect(preview.subActionCount).toBe(2);
+    expect(preview.subActionSummary).toContain('set-access-vlan 203');
+    expect(preview.subActionSummary).toContain('sonnx_test');
+    expect(preview.jobId).toBe('job-multi-1');
+  });
+
+  it('queues a single-action via multi-action shape (one subaction) without error', async () => {
+    deviceFindFirst.mockResolvedValueOnce({ id: 'dev-1', name: 'LAB-F2-AS-01', ip: '10.10.20.1', status: 'ONLINE' });
+    parseInterfaceActionPayload.mockReturnValueOnce({
+      interface: 'ge-0/0/5',
+      actions: [{ action: 'shut' }],
+    });
+    queueInterfaceAction.mockResolvedValueOnce({
+      kind: 'created',
+      job: { id: 'job-x', type: 'INTERFACE_ACTION', status: 'PENDING', createdAt: new Date(), deviceId: 'dev-1', payload: { interface: 'ge-0/0/5', actions: [{ action: 'shut' }] } },
+    });
+    const result = await HANDLERS.queue_interface_action(
+      { device_name: 'LAB-F2-AS-01', interface: 'ge-0/0/5', actions: [{ action: 'shut' }] },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { subActionCount: number };
+    expect(preview.subActionCount).toBe(1);
+  });
+
+  it('rejects when the action payload is invalid', async () => {
+    deviceFindFirst.mockResolvedValueOnce({ id: 'dev-1', name: 'LAB-F2-AS-01', ip: '10.10.20.1', status: 'ONLINE' });
+    parseInterfaceActionPayload.mockReturnValueOnce(null);
+    const result = await HANDLERS.queue_interface_action(
+      { device_name: 'LAB-F2-AS-01', interface: 'ge-0/0/5', action: 'totally-bogus' },
+      ctx,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/Invalid action payload/);
+  });
 });
 
 describe('suggest_followup (UI affordance)', () => {

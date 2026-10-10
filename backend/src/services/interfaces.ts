@@ -7,16 +7,104 @@ import { fetchInterfaceList, fetchConfigurationSet, fetchVlanInformation, parseV
 import { fetchIosxeInterfaceList } from './iosxeRest.js';
 import { fetchEosInterfaceList } from './eosApi.js';
 
-export type InterfaceAction = 'shut' | 'no-shut' | 'show-run' | 'set-access-vlan' | 'set-description' | 'remove-description';
+export type InterfaceAction =
+  | 'shut'
+  | 'no-shut'
+  | 'show-run'
+  | 'set-access-vlan'
+  | 'set-description'
+  | 'remove-description'
+  // 'delete-interface' (NEW): reset the entire interface subtree to defaults.
+  // Translates to `delete interfaces <name>` on Junos / `no interface <name>` on
+  // IOS-XE / EOS / NX-OS. Destructive — require ADMIN role in the UI gate.
+  | 'delete-interface';
 
+/**
+ * One logical change applied to an interface.
+ *
+ * Used by the new multi-action payload: queueInterfaceAction now accepts a
+ * batch of `actions: SubAction[]` so the LLM can do
+ * "set-access-vlan 203 + set-description 'sonnx_test'" in ONE job and ONE
+ * device commit instead of two separate round-trips.
+ *
+ * Each subaction carries the same fields as the legacy single-action payload
+ * but drops `interface` (it's hoisted to the top-level payload).
+ */
+export type InterfaceSubAction =
+  | { action: 'shut' }
+  | { action: 'no-shut' }
+  | { action: 'set-access-vlan'; vlan: string }
+  | { action: 'set-description'; description: string }
+  | { action: 'remove-description' }
+  | { action: 'delete-interface' };
+
+/**
+ * Stored in the Job.payload column. Two shapes are accepted:
+ *
+ *   1. Legacy single-action: { action, interface, vlan?, description? }
+ *      (kept for backward compat with existing jobs and the public REST route
+ *      /api/devices/:id/actions)
+ *
+ *   2. Multi-action (new): { interface, actions: SubAction[] }
+ *      - all subactions target the SAME interface
+ *      - all commands land in ONE device commit (atomic on the device)
+ *      - `description` on `set-description` is a non-empty string;
+ *        `remove-description` clears the description
+ *      - `delete-interface` and `shut` in the same batch is rejected
+ *        (contradictory — see validateSubActions in the worker)
+ */
 export type InterfaceActionPayload = {
-  action: InterfaceAction;
-  interface: string;
+  // Legacy single-action form
+  action?: InterfaceAction;
   vlan?: string;
   description?: string;
-};
+  // New multi-action form
+  actions?: InterfaceSubAction[];
+} & { interface: string };
 
-const ACTION_VALUES: InterfaceAction[] = ['shut', 'no-shut', 'show-run', 'set-access-vlan', 'set-description', 'remove-description'];
+const ACTION_VALUES: InterfaceAction[] = ['shut', 'no-shut', 'show-run', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface'];
+
+const SUBACTION_VALUES = new Set(['shut', 'no-shut', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface']);
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+/**
+ * Validate one subaction entry from the multi-action array.
+ *
+ * Returns the normalized subaction on success, or null on validation failure.
+ * Each subaction is self-contained — `interface` lives on the parent
+ * payload, not on each entry.
+ */
+function parseSubAction(raw: unknown): InterfaceSubAction | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const v = raw as Record<string, unknown>;
+  const action = v.action;
+  if (typeof action !== 'string' || !SUBACTION_VALUES.has(action)) return null;
+
+  if (action === 'set-access-vlan') {
+    const vlan = v.vlan;
+    if (typeof vlan !== 'string' || !/^\d{1,4}$/.test(vlan.trim())) return null;
+    const n = parseInt(vlan, 10);
+    if (n < 1 || n > 4094) return null;
+    return { action: 'set-access-vlan', vlan: vlan.trim() };
+  }
+  if (action === 'set-description') {
+    if (typeof v.description !== 'string') return null;
+    // Empty string is allowed (it'll be applied literally, but in practice
+    // the LLM should use remove-description for "clear"). We trim and
+    // require non-empty after trim so the worker doesn't accidentally
+    // send `description ""` which means something weird per-vendor.
+    const d = v.description.trim();
+    if (!d) return null;
+    return { action: 'set-description', description: d };
+  }
+  if (action === 'shut' || action === 'no-shut' || action === 'remove-description' || action === 'delete-interface') {
+    return { action } as InterfaceSubAction;
+  }
+  return null;
+}
 
 export function parseInterfaceActionPayload(body: unknown): InterfaceActionPayload | null {
   if (!body || typeof body !== 'object') {
@@ -24,19 +112,38 @@ export function parseInterfaceActionPayload(body: unknown): InterfaceActionPaylo
   }
 
   const value = body as Record<string, unknown>;
-  const action = value.action;
   const iface = value.interface;
 
-  if (typeof action !== 'string' || !ACTION_VALUES.includes(action as InterfaceAction)) {
-    return null;
-  }
   if (typeof iface !== 'string' || !iface.trim()) {
     return null;
   }
 
-  const vlan = typeof value.vlan === 'string' ? value.vlan.trim() : undefined;
-  if (action === 'set-access-vlan' && (!vlan || !/^\d{1,4}$/.test(vlan))) {
+  // Multi-action form: { interface, actions: [...] }
+  // Preferred for new code; the LLM tool should call this way so the worker
+  // can commit all changes atomically.
+  if (Array.isArray(value.actions)) {
+    if (value.actions.length === 0) return null;
+    if (value.actions.length > 16) return null; // sanity cap
+    const sub: InterfaceSubAction[] = [];
+    for (const raw of value.actions) {
+      const parsed = parseSubAction(raw);
+      if (!parsed) return null;
+      sub.push(parsed);
+    }
+    return { interface: iface.trim(), actions: sub };
+  }
+
+  // Legacy single-action form: { action, interface, vlan?, description? }
+  const action = value.action;
+  if (typeof action !== 'string' || !ACTION_VALUES.includes(action as InterfaceAction)) {
     return null;
+  }
+
+  const vlan = typeof value.vlan === 'string' ? value.vlan.trim() : undefined;
+  if (action === 'set-access-vlan') {
+    if (!vlan || !/^\d{1,4}$/.test(vlan)) return null;
+    const n = parseInt(vlan, 10);
+    if (n < 1 || n > 4094) return null;
   }
 
   // Extract `description` field. Accepts:

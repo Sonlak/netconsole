@@ -65,6 +65,38 @@ def _unquote_set_value(value: str) -> str:
     return text
 
 
+def has_vlan_members(existing_set_config: str, iface: str) -> bool:
+    """Check whether the interface currently has a `vlan members` line.
+
+    Used by the smart-delete logic in `set-access-vlan` and the
+    multi-action path. We only need to prepend `delete ... vlan members`
+    when the interface ALREADY has one or more `vlan members` lines —
+    otherwise the bare `set vlan members X` creates a fresh entry with no
+    duplicates, and the unnecessary `delete` would fail with
+    "unknown command: delete" on the SSH CLI fallback path (gotcha: SSH
+    CLI is in operational mode, not config mode).
+
+    Returns False on empty input (no config → no vlan members to worry
+    about, so the bare `set` is safe).
+    """
+    if not existing_set_config:
+        return False
+    physical = physical_interface_name(iface)
+    needle = f"set interfaces {physical} "
+    for line in existing_set_config.splitlines():
+        ls = line.strip()
+        if not ls.startswith(needle):
+            continue
+        if "ethernet-switching vlan members" in ls:
+            return True
+    return False
+
+
+# Backwards-compat alias for existing callers that imported the private
+# name; new code should use the public `has_vlan_members`.
+_has_vlan_members = has_vlan_members
+
+
 def physical_interface_name(name: str) -> str:
     text = (name or "").strip()
     if "." in text and not text.lower().startswith("irb."):
@@ -208,8 +240,18 @@ def commands_for_action(action: str, iface: str, vlan: str = "", description: st
             raise ValueError("VLAN must be 1–4094")
         unit_id = unit or "0"
         target = f"interfaces {physical} unit {unit_id} family ethernet-switching"
+        # NOTE: we DO NOT pre-pend `delete ... vlan members` here. That
+        # used to be unconditional but failed with "unknown command: delete"
+        # on the SSH CLI fallback path when the interface had no
+        # `ethernet-switching` configured yet (the rest_error text was
+        # overshadowed by the SSH fallback's "unknown command: delete"
+        # after RESTCONF load returned an error for a different reason).
+        #
+        # Instead, callers (juniper.py::interface_action) read the current
+        # `set interfaces X ...` config and prepend the delete only if
+        # the target line is present. If it isn't, `set vlan members X`
+        # alone is enough — Junos creates a new entry, no duplicate.
         return [
-            f"delete {target} vlan members",
             f"set {target} interface-mode access",
             f"set {target} vlan members {vlan}",
         ]
@@ -225,4 +267,10 @@ def commands_for_action(action: str, iface: str, vlan: str = "", description: st
         if unit:
             return [f"delete interfaces {physical2} unit {unit} description"]
         return [f"delete interfaces {physical2} description"]
+    if action == "delete-interface":
+        # Reset the entire interface subtree to defaults. Destructive —
+        # caller (queueInterfaceActionHandler in assistant) must require
+        # ADMIN role and show a strong confirmation card.
+        physical3, _unit3 = split_interface(iface)
+        return [f"delete interfaces {physical3}"]
     raise ValueError(f"Unsupported interface action: {action}")

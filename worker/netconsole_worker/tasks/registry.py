@@ -182,9 +182,32 @@ class InterfaceActionTask(BaseTask):
     job_type = "INTERFACE_ACTION"
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
+        """
+        Supports two payload shapes:
+
+        1. Legacy single-action: { action, interface, vlan?, description? }
+           → backend parses InterfaceActionPayload.action and dispatches.
+
+        2. Multi-action: { interface, actions: [{action, ...}, ...] }
+           → build commands for every subaction in order, then commit
+           ALL of them in ONE device commit. This is atomic on the device:
+           either every change lands together or none do.
+
+        Reject contradictory batches (e.g. shut + no-shut) with a clear
+        error so the operator gets a useful message instead of "commit
+        failed with X syntax error".
+        """
         payload = job.payload or {}
-        action = str(payload.get("action") or "").strip()
         iface = str(payload.get("interface") or "").strip()
+        if not iface:
+            raise RuntimeError("Missing 'interface' in job payload")
+
+        subactions_raw = payload.get("actions")
+        if isinstance(subactions_raw, list) and len(subactions_raw) > 0:
+            return self._run_multi_action(device, iface, subactions_raw)
+
+        # Legacy single-action path
+        action = str(payload.get("action") or "").strip()
         vlan = payload.get("vlan")
         description = payload.get("description")
 
@@ -215,6 +238,98 @@ class InterfaceActionTask(BaseTask):
             vlan=str(vlan) if vlan is not None else None,
             description=effective_description,
         )
+
+    def _run_multi_action(
+        self,
+        device: DeviceInfo,
+        iface: str,
+        subactions_raw: list[object],
+    ) -> dict[str, Any]:
+        """
+        Build one combined command list from the subactions and dispatch
+        via a NEW single backend call (`interface_action_multi`) that
+        commits all of them in one load+commit on the device.
+
+        For Junos this means ONE `<load-configuration>` RPC and ONE
+        `<commit-configuration>` RPC, even if 3 subactions were requested.
+        """
+        # Parse + validate the batch.
+        subactions: list[dict[str, object]] = []
+        for i, raw in enumerate(subactions_raw):
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"actions[{i}] is not an object")
+            sa = self._normalize_subaction(iface, raw)
+            subactions.append(sa)
+
+        if not subactions:
+            raise RuntimeError("Empty actions list")
+
+        # Reject contradictory pairs.
+        actions = {s["action"] for s in subactions}
+        if "shut" in actions and "no-shut" in actions:
+            raise RuntimeError("Contradictory batch: 'shut' and 'no-shut' on the same interface in one commit")
+        if "delete-interface" in actions and len(actions) > 1:
+            raise RuntimeError(
+                "'delete-interface' must be the only subaction in the batch "
+                "(combining it with set-vlan/description is contradictory — "
+                "delete clears everything anyway)"
+            )
+
+        backend = _backend(device)
+        multi = getattr(backend, "interface_action_multi", None)
+        if multi is None:
+            # Older backend without the new method — fall back to running
+            # each subaction sequentially through the legacy single-action
+            # path. NOT atomic (each subaction is its own commit), but at
+            # least the operator's change isn't rejected outright.
+            results = []
+            for sa in subactions:
+                results.append(
+                    backend.interface_action(
+                        device,
+                        action=str(sa["action"]),
+                        iface=iface,
+                        vlan=str(sa.get("vlan", "")) if sa.get("vlan") is not None else None,
+                        description=str(sa.get("description", "")) if sa.get("description") is not None else None,
+                    )
+                )
+            return {
+                "implemented": True,
+                "source": "sequential",
+                "interface": iface,
+                "subActionCount": len(subactions),
+                "subActions": subactions,
+                "results": results,
+                "message": f"Multi-action fallback (sequential commits) on {iface} — backend lacks atomic multi method.",
+            }
+        return backend.interface_action_multi(device, iface=iface, subactions=subactions)
+
+    def _normalize_subaction(
+        self,
+        iface: str,
+        raw: dict[str, object],
+    ) -> dict[str, object]:
+        """Mirror parseInterfaceActionPayload's parseSubAction in TS."""
+        action = raw.get("action")
+        if not isinstance(action, str) or action not in {
+            "shut", "no-shut", "set-access-vlan", "set-description",
+            "remove-description", "delete-interface",
+        }:
+            raise RuntimeError(f"Invalid subaction action: {action!r}")
+        out: dict[str, object] = {"action": action}
+        if action == "set-access-vlan":
+            vlan = raw.get("vlan")
+            if not isinstance(vlan, str) or not vlan.strip():
+                raise RuntimeError("set-access-vlan requires non-empty vlan")
+            if not vlan.isdigit() or not (1 <= int(vlan) <= 4094):
+                raise RuntimeError(f"vlan out of range (1-4094): {vlan!r}")
+            out["vlan"] = vlan.strip()
+        elif action == "set-description":
+            d = raw.get("description")
+            if not isinstance(d, str) or not d.strip():
+                raise RuntimeError("set-description requires non-empty description")
+            out["description"] = d.strip()
+        return out
 
 
 class GetLogsTask(BaseTask):

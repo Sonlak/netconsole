@@ -665,6 +665,17 @@ class EOSBackend(DeviceBackend):
                 "no description",
                 "end",
             ]
+        elif action == "delete-interface":
+            # Reset interface to defaults (DESTRUCTIVE — caller must gate).
+            # EOS has no `default interface <name>`; the safest is `no
+            # interface <name>` (which also removes the logical unit /
+            # sub-ifs under it) and let the operator recreate as needed.
+            commands = [
+                "enable",
+                "configure terminal",
+                f"no interface {iface}",
+                "end",
+            ]
         elif action == "show-run":
             # EOS does not accept `show running-config interface <name>`
             # the way Junos / IOS-XE do. We pull the whole `interface`
@@ -676,29 +687,6 @@ class EOSBackend(DeviceBackend):
             raise RuntimeError(f"Unsupported interface action for EOS: {action}")
 
         if self.config.eos.enabled:
-            r = self._run_cmds(device, commands, fmt="text")
-            if r["ok"]:
-                output = ""
-                if r["result"]:
-                    first = r["result"][0]
-                    output = first.get("output") if isinstance(first, dict) else str(first)
-                if action == "show-run":
-                    output = _slice_eos_interface_block(output, iface)
-                return {
-                    "implemented": True,
-                    "source": "eos-api",
-                    "action": action,
-                    "interface": iface,
-                    "vlan": vlan or None,
-                    "description": description if action in ("set-description", "remove-description") else None,
-                    "commands": commands,
-                    "message": f"Interface action {action} OK on {iface}",
-                    "adminStatus": "down" if action == "shut" else "up" if action == "no-shut" else None,
-                    "accessVlan": vlan if action == "set-access-vlan" else None,
-                    "config": output if action == "show-run" else None,
-                    "raw": r.get("raw", ""),
-                }
-            raise RuntimeError(r["error"] or f"EOS eAPI {action} failed")
 
         if self.config.ssh_enabled:
             outputs: list[dict[str, str]] = []
@@ -801,6 +789,91 @@ class EOSBackend(DeviceBackend):
             "neighbors": [],
             "message": rest_error or "Enable EOS_API or LAB_SSH for LLDP",
             "restError": rest_error,
+        }
+
+    def interface_action_multi(
+        self,
+        device: DeviceInfo,
+        *,
+        iface: str,
+        subactions: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        """
+        EOS multi-action: combine all subactions into ONE `configure terminal`
+        session so the device applies them in a single config batch.
+        """
+        script: list[str] = ["enable", "configure terminal"]
+        summaries: list[str] = []
+        for sa in subactions:
+            action = str(sa.get("action", "")).strip()
+            vlan_v = sa.get("vlan")
+            desc_v = sa.get("description")
+            if action == "shut":
+                script += [f"interface {iface}", "shutdown"]
+                summaries.append("shut")
+            elif action == "no-shut":
+                script += [f"interface {iface}", "no shutdown"]
+                summaries.append("no-shut")
+            elif action == "set-access-vlan":
+                if not vlan_v:
+                    raise RuntimeError("set-access-vlan requires a vlan argument")
+                script += [f"interface {iface}", f"switchport access vlan {vlan_v}"]
+                summaries.append(f"set-access-vlan {vlan_v}")
+            elif action == "set-description":
+                if not desc_v:
+                    raise RuntimeError("set-description requires a description argument")
+                script += [f"interface {iface}", f"description {desc_v}"]
+                summaries.append(f"set-description {desc_v!r}")
+            elif action == "remove-description":
+                script += [f"interface {iface}", "no description"]
+                summaries.append("remove-description")
+            elif action == "delete-interface":
+                # Cancel the per-subaction `interface X` prefix; the whole
+                # sub-interface block is being removed.
+                script += [f"no interface {iface}"]
+                summaries.append("delete-interface")
+            else:
+                raise RuntimeError(f"Unsupported EOS subaction: {action}")
+        script.append("end")
+
+        if not self.config.eos.enabled:
+            if not self.config.ssh_enabled:
+                raise RuntimeError("Multi-action requires EOS_API or LAB_SSH")
+            outputs: list[dict[str, str]] = []
+            for cmd in script:
+                r = run_ssh_command(
+                    host=device.ip, username=self.config.ssh_user,
+                    password=self.config.ssh_password, port=self.config.ssh_port,
+                    command=cmd,
+                )
+                if not r["sshOk"]:
+                    raise RuntimeError(r.get("error") or f"EOS SSH failed on: {cmd}")
+                outputs.append({"command": cmd, "output": r.get("output") or ""})
+            return {
+                "implemented": True,
+                "source": "ssh-cli",
+                "interface": iface,
+                "subActionCount": len(subactions),
+                "subActions": subactions,
+                "subActionSummary": " + ".join(summaries),
+                "commands": script,
+                "outputs": outputs,
+                "message": f"EOS multi-action OK on {iface} ({len(subactions)} sub).",
+            }
+
+        r = self._run_cmds(device, script, fmt="text")
+        if not r["ok"]:
+            raise RuntimeError(r.get("error") or "EOS multi-action eAPI failed")
+        return {
+            "implemented": True,
+            "source": "eos-api",
+            "interface": iface,
+            "subActionCount": len(subactions),
+            "subActions": subactions,
+            "subActionSummary": " + ".join(summaries),
+            "commands": script,
+            "raw": r.get("raw", ""),
+            "message": f"EOS multi-action OK on {iface} ({len(subactions)} sub, 1 eAPI session).",
         }
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:

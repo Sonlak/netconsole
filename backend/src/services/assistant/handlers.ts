@@ -469,14 +469,29 @@ async function queueInterfaceActionHandler(
     return { ok: false, error: `Device ${device.name} is OFFLINE — cannot queue interface action. Wait for managed check to mark it online again.` };
   }
 
-  const payload = parseInterfaceActionPayload({
-    action: args.action,
-    interface: args.interface,
-    vlan: args.vlan,
-    description: args.description,
-  });
+  // Build the payload. Support two shapes:
+  //   1. Multi-action: { actions: [{action, vlan?|description?}, ...] }
+  //      → ONE job, ONE device commit (atomic on the device). LLM should
+  //      prefer this when applying multiple changes to the same interface
+  //      (e.g. "set VLAN 203 AND description 'sonnx_test'").
+  //   2. Legacy single-action: { action, vlan?, description? }
+  //      → kept for backward compat with one-off calls.
+  let payload;
+  if (Array.isArray(args.actions) && args.actions.length > 0) {
+    payload = parseInterfaceActionPayload({
+      interface: args.interface,
+      actions: args.actions,
+    });
+  } else {
+    payload = parseInterfaceActionPayload({
+      action: args.action,
+      interface: args.interface,
+      vlan: args.vlan,
+      description: args.description,
+    });
+  }
   if (!payload) {
-    return { ok: false, error: 'Invalid action payload (action, interface, and (vlan|description) as appropriate are required)' };
+    return { ok: false, error: 'Invalid action payload. Either pass a single `action` (+vlan/description), or an `actions: [...]` array of subactions targeting the same interface.' };
   }
 
   const result = await queueInterfaceAction(device.id, payload, ctx.userId);
@@ -489,17 +504,36 @@ async function queueInterfaceActionHandler(
       error: `Device busy — another job is in flight (${result.error.blockingJob.type}, status ${result.error.blockingJob.status}). Try again in a moment.`,
     };
   }
+
+  // Build a human-friendly summary for the preview.
+  const subCount = Array.isArray(payload.actions) ? payload.actions.length : 1;
+  const subSummary = Array.isArray(payload.actions)
+    ? payload.actions.map((s) => {
+        if (s.action === 'set-access-vlan') return `set-access-vlan ${s.vlan}`;
+        if (s.action === 'set-description') return `set-description "${s.description}"`;
+        return s.action;
+      }).join(' + ')
+    : (() => {
+        if (payload.action === 'set-access-vlan') return `set-access-vlan ${payload.vlan ?? '?'}`;
+        if (payload.action === 'set-description') return `set-description "${payload.description ?? ''}"`;
+        return String(payload.action ?? '?');
+      })();
+
   return {
     ok: true,
     preview: {
-      action: payload.action,
+      action: payload.action ?? 'multi',
       device: device.name,
       interface: payload.interface,
       vlan: payload.vlan ?? null,
       description: payload.description ?? null,
+      subActionCount: subCount,
+      subActionSummary: subSummary,
       jobId: result.job.id,
       jobStatus: result.job.status,
-      message: 'Đã queue INTERFACE_ACTION job. Worker sẽ chạy trong vài giây. Track ở /jobs.',
+      message: subCount > 1
+        ? `Đã queue INTERFACE_ACTION multi-job (${subCount} subactions trên ${payload.interface}). Worker sẽ commit 1 lần trên thiết bị. Track ở /jobs.`
+        : 'Đã queue INTERFACE_ACTION job. Worker sẽ chạy trong vài giây. Track ở /jobs.',
     },
   };
 }

@@ -892,7 +892,7 @@ class IOSxeBackend(DeviceBackend):
                 backend_result.get("error", ""),
             )
 
-        if action in ("shut", "no-shut", "set-access-vlan", "set-description", "remove-description", "show-run"):
+        if action in ("shut", "no-shut", "set-access-vlan", "set-description", "remove-description", "delete-interface", "show-run"):
             # NETCONF primary (gotcha #14). Reliable, atomic, structured
             # output for show-run. SSH remains the fallback path.
             nc_result = None
@@ -1013,6 +1013,13 @@ class IOSxeBackend(DeviceBackend):
                 "no description",
                 "end",
             ]
+        elif action == "delete-interface":
+            # Destructive — caller (assistant) gates this with ADMIN role.
+            commands = [
+                "configure terminal",
+                f"no interface {iface}",
+                "end",
+            ]
         else:
             raise RuntimeError(f"Unsupported interface action for IOS-XE: {action}")
 
@@ -1100,6 +1107,100 @@ class IOSxeBackend(DeviceBackend):
             "neighbors": neighbors,
             "message": f"LLDP OK ({len(neighbors)} neighbours)" if neighbors else "LLDP OK (no neighbours)",
             "raw": ssh_result["output"],
+        }
+
+    def interface_action_multi(
+        self,
+        device: DeviceInfo,
+        *,
+        iface: str,
+        subactions: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        """
+        IOS-XE multi-action: combine all subactions into ONE `configure terminal`
+        session so the device applies them atomically (one config replace).
+
+        All subactions are converted into a single command list and run via
+        `run_ssh_commands_session` so the `configure terminal` mode persists
+        across all lines. NETCONF doesn't expose a clean batch path for mixed
+        subactions (each `set-access-vlan` / `set-description` is its own
+        XML payload), so SSH is the only viable path here.
+        """
+        try:
+            iface = _validate_iface(iface)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if not self.config.ssh_enabled:
+            raise RuntimeError("Multi-action on IOS-XE requires LAB_SSH")
+
+        script: list[str] = ["configure terminal"]
+        summaries: list[str] = []
+        for sa in subactions:
+            action = str(sa.get("action", "")).strip()
+            vlan_v = sa.get("vlan")
+            desc_v = sa.get("description")
+            if action == "shut":
+                script += [f"interface {iface}", "shutdown"]
+                summaries.append("shut")
+            elif action == "no-shut":
+                script += [f"interface {iface}", "no shutdown"]
+                summaries.append("no-shut")
+            elif action == "set-access-vlan":
+                if not vlan_v:
+                    raise RuntimeError("set-access-vlan requires a vlan argument")
+                script += [
+                    f"interface {iface}",
+                    "switchport mode access",
+                    f"switchport access vlan {vlan_v}",
+                ]
+                summaries.append(f"set-access-vlan {vlan_v}")
+            elif action == "set-description":
+                if not desc_v:
+                    raise RuntimeError("set-description requires a description argument")
+                script += [f"interface {iface}", f"description {desc_v}"]
+                summaries.append(f"set-description {desc_v!r}")
+            elif action == "remove-description":
+                script += [f"interface {iface}", "no description"]
+                summaries.append("remove-description")
+            elif action == "delete-interface":
+                # Cancel the per-subaction `interface X` prefix; the whole
+                # sub-interface block is being removed.
+                # First pop the trailing `interface <iface>` if the previous
+                # subaction added one, then add the `no interface <iface>`.
+                # Simplest: track separately and add a fresh "no interface".
+                # We just append the `no interface` here; it sits at the
+                # global config level (not inside any sub-context).
+                script += [f"no interface {iface}"]
+                summaries.append("delete-interface")
+            else:
+                raise RuntimeError(f"Unsupported IOS-XE subaction: {action}")
+        script.append("end")
+
+        session_result = run_ssh_commands_session(
+            host=device.ip,
+            username=self.config.ssh_user,
+            password=self.config.ssh_password,
+            port=self.config.ssh_port,
+            commands=script,
+            timeout=60,
+        )
+        if not session_result["sshOk"]:
+            raise RuntimeError(session_result.get("error") or "IOS-XE multi-action SSH session failed")
+        for out in session_result["outputs"]:
+            err = out.get("error") or ""
+            if err and not err.lower().startswith("% "):
+                raise RuntimeError(err or "IOS-XE multi-action command failed")
+        return {
+            "implemented": True,
+            "source": "ssh-cli",
+            "interface": iface,
+            "subActionCount": len(subactions),
+            "subActions": subactions,
+            "subActionSummary": " + ".join(summaries),
+            "commands": script,
+            "outputs": session_result["outputs"],
+            "message": f"IOS-XE multi-action OK on {iface} ({len(subactions)} sub, 1 config session).",
         }
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:

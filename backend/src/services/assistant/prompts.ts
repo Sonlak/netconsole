@@ -42,7 +42,8 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - Liệt kê discovery scan
 
 ### WRITE (backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
-- \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description
+- \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description / remove-description / **delete-interface (reset toàn bộ config)**
+  - Hỗ trợ **multi-action**: truyền \`actions: [{action, vlan?|description?}, ...]\` để apply nhiều thay đổi trên CÙNG interface trong 1 commit (atomic). Đây là cách đúng khi user yêu cầu >1 thay đổi cùng lúc (ví dụ "set VLAN 203 VÀ description sonnx_test"). Ưu tiên multi-action hơn queue nhiều job riêng.
 - \`queue_apply_config\` — apply config (commit) lên thiết bị (Junos/EOS/IOS-XE)
 - \`queue_rollback_config\` — rollback về config trước khi commit
 - \`apply_config_dry_run\` — tính diff (thêm/xoá/sửa dòng) mà KHÔNG commit
@@ -636,28 +637,72 @@ const queueInterfaceAction: CatalogEntry = {
   function: {
     name: 'queue_interface_action',
     description:
-      'Queue 1 INTERFACE_ACTION job (shut / no-shut / set-access-vlan / ' +
-      'set-description / remove-description). Write op — backend sẽ tạo ' +
+      'Queue 1 INTERFACE_ACTION job. Write op — backend sẽ tạo ' +
       'confirmation card. CHỈ gọi sau khi đã lookup device qua get_device. ' +
-      'Examples: queue_interface_action({device_name:"LAB-F2-AS-01", interface:"ge-0/0/5", action:"shut"}). ' +
+      '\n\n' +
+      '## Hai cách gọi (ưu tiên multi-action khi apply >1 thay đổi)\n' +
+      '\n' +
+      '### Cách 1: Multi-action (PREFERRED cho >1 thay đổi)\n' +
+      'Truyền `actions: [...]` array. Tất cả subactions target CÙNG 1 interface, ' +
+      'commit 1 LẦN trên thiết bị (atomic, không có trạng thái "đã set VLAN nhưng chưa set description"). ' +
+      'Đây là cách đúng khi user yêu cầu "set VLAN 203 VÀ description sonnx_test" cùng lúc. ' +
+      'Examples: \n' +
+      '  queue_interface_action({device_name:"LAB-F6-DS-01", interface:"xe-0/0/7", ' +
+      '    actions: [\n' +
+      '      {action:"set-access-vlan", vlan:"203"},\n' +
+      '      {action:"set-description", description:"sonnx_test"}\n' +
+      '    ]}) — set VLAN + description trong 1 commit\n' +
+      '  queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", ' +
+      '    actions: [{action:"shut"}]}) — shut, tương đương single-action\n' +
+      '\n' +
+      '### Cách 2: Single-action (legacy, chỉ dùng cho 1 thay đổi đơn lẻ)\n' +
+      'Truyền `action` (+ `vlan` hoặc `description` nếu cần). ' +
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/5", action:"shut"}). ' +
       'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-access-vlan", vlan:"100"}). ' +
-      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-description", description:"uplink-to-core"}). ' +
-      'KHÔNG queue nếu device OFFLINE (tool sẽ trả lỗi).',
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-description", description:"uplink-to-core"}). \n' +
+      '\n' +
+      '## Quy tắc\n' +
+      '- KHÔNG queue 2 jobs riêng cho cùng interface khi có thể gộp (dùng multi-action).\n' +
+      '- KHÔNG queue nếu device OFFLINE (tool sẽ trả lỗi).\n' +
+      '- action=`delete-interface`: XÓA TOÀN BỘ cấu hình của interface (reset về default). ' +
+      'Dùng multi-action kèm với shut/no-shut nếu cần, không dùng kèm set-access-vlan (mâu thuẫn).',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['device_name', 'interface', 'action'],
+      required: ['device_name', 'interface'],
       properties: {
         device_name: { type: 'string', description: 'Tên thiết bị (case-insensitive)' },
-        interface: { type: 'string', description: 'Tên interface (vendor-specific)' },
-        action: strEnum(['shut', 'no-shut', 'set-access-vlan', 'set-description', 'remove-description']),
+        interface: { type: 'string', description: 'Tên interface (vendor-specific, ví dụ xe-0/0/7, ge-0/0/5, Ethernet1/1)' },
+        // Multi-action path
+        actions: {
+          type: 'array',
+          description: 'Danh sách subactions áp dụng lên CÙNG interface, commit 1 lần. ' +
+            'Ưu tiên dùng khi >1 thay đổi. Mỗi subaction có `action` (+ `vlan` hoặc `description` nếu cần). ' +
+            'Tối đa 16 subactions / call.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['action'],
+            properties: {
+              action: strEnum(['shut', 'no-shut', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface']),
+              vlan: { type: 'string', description: 'VLAN ID (1-4094). Bắt buộc khi sub-action action="set-access-vlan".' },
+              description: { type: 'string', description: 'Mô tả mới (non-empty). Bắt buộc khi sub-action action="set-description".' },
+            },
+          },
+        },
+        // Legacy single-action path (kept for backward compat)
+        action: {
+          type: 'string',
+          enum: ['shut', 'no-shut', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface'],
+          description: 'LEGACY: chỉ dùng khi 1 thay đổi đơn lẻ. Khi có `actions` array thì bỏ qua field này.',
+        },
         vlan: {
           type: 'string',
-          description: 'VLAN ID (1-4094). Bắt buộc khi action="set-access-vlan".',
+          description: 'LEGACY: VLAN ID (1-4094). Bắt buộc khi action="set-access-vlan".',
         },
         description: {
           type: 'string',
-          description: 'Mô tả mới. Bắt buộc khi action="set-description".',
+          description: 'LEGACY: Mô tả mới. Bắt buộc khi action="set-description".',
         },
       },
     },
@@ -665,9 +710,22 @@ const queueInterfaceAction: CatalogEntry = {
   readonly: false,
   requiresRole: 'OPERATOR',
   confirmSummary: (args) => {
-    const a = String(args.action ?? '?');
     const i = String(args.interface ?? '?');
     const d = String(args.device_name ?? '?');
+    // Multi-action path: list all subactions joined
+    if (Array.isArray(args.actions) && args.actions.length > 0) {
+      const parts = (args.actions as Array<Record<string, unknown>>).map((s) => {
+        const a = String(s.action ?? '?');
+        if (a === 'set-access-vlan') return `set VLAN ${s.vlan ?? '?'}`;
+        if (a === 'set-description') return `set desc "${s.description ?? ''}"`;
+        if (a === 'remove-description') return 'xóa desc';
+        if (a === 'delete-interface') return 'XÓA TOÀN BỘ cấu hình';
+        return a;
+      });
+      return `${parts.join(' + ')} trên ${i} (${d})`;
+    }
+    // Legacy single-action
+    const a = String(args.action ?? '?');
     if (a === 'set-access-vlan') {
       return `Set VLAN ${args.vlan ?? '?'} trên ${i} (${d})`;
     }
@@ -676,6 +734,9 @@ const queueInterfaceAction: CatalogEntry = {
     }
     if (a === 'remove-description') {
       return `Xóa description trên ${i} (${d})`;
+    }
+    if (a === 'delete-interface') {
+      return `⚠️ XÓA TOÀN BỘ cấu hình ${i} trên ${d} (reset về default)`;
     }
     if (a === 'shut') return `Shutdown port ${i} trên ${d}`;
     if (a === 'no-shut') return `No-shutdown port ${i} trên ${d}`;

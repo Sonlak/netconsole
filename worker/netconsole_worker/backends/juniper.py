@@ -44,9 +44,11 @@ from netconsole_worker.parsers.interface_set import (
     apply_switching_modes,
     commands_for_action,
     filter_interface_set_lines,
+    has_vlan_members,
     is_protected_interface,
     parse_interface_descriptions_from_set,
     parse_switching_mode_from_set,
+    physical_interface_name,
     validate_interface_name,
 )
 from netconsole_worker.parsers.mac_table_rpc import parse_mac_table_rpc
@@ -82,6 +84,7 @@ def _rest_creds(config: Any) -> dict[str, Any]:
 
 
 def _set_commands(config: str) -> list[str]:
+    """Strip C-style and shell comments from config, drop blank lines, return ordered commands."""
     """Turn a free-form config string into Junos `set` / `delete` lines.
 
     Junos only accepts lines that start with `set`, `delete`, `deactivate`,
@@ -716,9 +719,24 @@ class JuniperBackend(DeviceBackend):
         elif action == "show-run":
             commands = [f"show configuration interfaces {iface}"]
         elif action == "set-access-vlan":
+            # Smart delete: only prepend `delete ... vlan members` if the
+            # interface currently has ethernet-switching with a vlan members
+            # line. The previous unconditional `delete` was the root cause
+            # of the "unknown command: delete" failures on the SSH CLI
+            # fallback — the first Junos command in operational mode is
+            # always `delete` which the device doesn't recognise there.
             commands = commands_for_action(action, iface, vlan or "")
+            existing = self._read_interface_set(device, iface, creds)
+            if existing and has_vlan_members(existing, iface):
+                physical, unit = split_interface(iface)
+                unit_id = unit or "0"
+                target = f"interfaces {physical} unit {unit_id} family ethernet-switching"
+                delete_line = f"delete {target} vlan members"
+                commands = [delete_line] + commands
         elif action == "set-description" or action == "remove-description":
             commands = commands_for_action(action, iface, "", description or "")
+        elif action == "delete-interface":
+            commands = commands_for_action(action, iface)
         else:
             raise RuntimeError(f"Unsupported interface action: {action}")
 
@@ -732,7 +750,18 @@ class JuniperBackend(DeviceBackend):
                 command=command,
             )
             if not ssh_result["sshOk"]:
-                raise RuntimeError(ssh_result["error"] or rest_error or f"SSH failed on: {command}")
+                # Surface BOTH the RESTCONF error (if any) and the SSH error
+                # so the operator can tell "RESTCONF said X, then SSH also
+                # failed with Y" instead of "unknown command: delete" with
+                # no context.
+                detail_parts = []
+                if rest_error:
+                    detail_parts.append(f"RESTCONF: {rest_error}")
+                if ssh_result.get("error"):
+                    detail_parts.append(f"SSH: {ssh_result['error']}")
+                if not detail_parts:
+                    detail_parts.append(f"SSH failed on: {command}")
+                raise RuntimeError(" | ".join(detail_parts))
 
             output = ssh_result["output"] or ""
             outputs.append({"command": command, "output": output})
@@ -741,7 +770,11 @@ class JuniperBackend(DeviceBackend):
                 lowered.startswith(("error:", "unknown command"))
                 or "traceback (most recent call last)" in lowered
             ):
-                raise RuntimeError(output.strip() or f"Command failed: {command}")
+                detail_parts = []
+                if rest_error:
+                    detail_parts.append(f"RESTCONF (earlier): {rest_error}")
+                detail_parts.append(output.strip() or f"Command failed: {command}")
+                raise RuntimeError(" | ".join(detail_parts))
 
         return {
             "implemented": True,
@@ -759,6 +792,208 @@ class JuniperBackend(DeviceBackend):
             "restError": rest_error,
             "netconfError": netconf_error,
         }
+
+    def interface_action_multi(
+        self,
+        device: DeviceInfo,
+        *,
+        iface: str,
+        subactions: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        """
+        Multi-subaction on the same interface in ONE device commit.
+
+        Why this matters: doing "set VLAN 203 + set description sonnx_test"
+        via two separate jobs produces a window where VLAN is set but
+        description is not. With multi-action, all commands land in a
+        single `<load-configuration>` + `<commit-configuration>` pair, so
+        the device either sees both changes or none.
+
+        Strategy:
+        1. Pre-compute the command list for every subaction (in order).
+           For `set-access-vlan`, also pre-read the current config and
+           prepend the `delete ... vlan members` line if needed.
+        2. Build ONE load body and ONE commit RPC via RESTCONF.
+        3. On RESTCONF failure, fall back to running the commands via SSH
+           CLI sequentially (NOT atomic, but at least visible).
+        """
+        try:
+            iface = validate_interface_name(iface)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if any(s.get("action") in {"shut", "set-access-vlan", "delete-interface"} for s in subactions) and is_protected_interface(iface):
+            raise RuntimeError(f"Refusing destructive action on management/internal interface {iface}")
+
+        creds = _rest_creds(self.config)
+
+        # 1. Build commands.
+        all_commands: list[str] = []
+        sub_summaries: list[str] = []
+        for sa in subactions:
+            action = str(sa.get("action", "")).strip()
+            vlan_v = sa.get("vlan")
+            desc_v = sa.get("description")
+            cmds = commands_for_action(
+                action, iface,
+                str(vlan_v) if vlan_v is not None else "",
+                str(desc_v) if desc_v is not None else "",
+            )
+            if action == "set-access-vlan":
+                # Smart delete: prepend `delete ... vlan members` only if
+                # the interface already has a vlan members line.
+                existing = self._read_interface_set(device, iface, creds)
+                if existing and has_vlan_members(existing, iface):
+                    physical, unit = split_interface(iface)
+                    unit_id = unit or "0"
+                    target = f"interfaces {physical} unit {unit_id} family ethernet-switching"
+                    cmds = [f"delete {target} vlan members"] + cmds
+            all_commands.extend(cmds)
+            sub_summaries.append(
+                f"{action}"
+                + (f"(vlan={vlan_v})" if action == "set-access-vlan" else "")
+                + (f"(desc={desc_v!r})" if action == "set-description" else "")
+            )
+
+        if not all_commands:
+            raise RuntimeError("No commands to apply (empty subaction list)")
+
+        # 2. RESTCONF primary path.
+        rest_error: str | None = None
+        applied: dict[str, Any] | None = None
+        if self.config.juniper.enabled:
+            applied_obj = rest_apply_set_configuration(
+                device.ip, all_commands,
+                log=f"NetConsole multi-action {iface} ({len(subactions)} sub)",
+                **creds,
+            )
+            if applied_obj["ok"]:
+                applied = applied_obj
+            else:
+                rest_error = applied_obj.get("error") or "Junos REST configure failed"
+
+        if applied is not None:
+            return {
+                "implemented": True,
+                "source": "junos-rest",
+                "interface": iface,
+                "subActionCount": len(subactions),
+                "subActions": subactions,
+                "subActionSummary": " + ".join(sub_summaries),
+                "commands": all_commands,
+                "loadMs": applied.get("loadMs"),
+                "commitMs": applied.get("commitMs"),
+                "raw": compact_raw(applied.get("raw") or ""),
+                "message": f"Multi-action OK on {iface} ({len(subactions)} subactions, 1 commit).",
+            }
+
+        # 3. SSH CLI fallback (NOT atomic, but visible).
+        if not self.config.ssh_enabled:
+            raise RuntimeError(
+                (rest_error and f"RESTCONF: {rest_error} ")
+                or "Interface multi-action requires JUNOS_REST or LAB_SSH"
+            )
+
+        outputs: list[dict[str, str]] = []
+        for cmd in all_commands:
+            ssh = run_ssh_command(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                command=cmd,
+            )
+            if not ssh["sshOk"]:
+                detail_parts = []
+                if rest_error:
+                    detail_parts.append(f"RESTCONF (earlier): {rest_error}")
+                detail_parts.append(ssh.get("error") or f"SSH failed on: {cmd}")
+                raise RuntimeError(" | ".join(detail_parts))
+            out = ssh.get("output") or ""
+            outputs.append({"command": cmd, "output": out})
+            lowered = out.lower().strip()
+            if (
+                lowered.startswith(("error:", "unknown command"))
+                or "traceback (most recent call last)" in lowered
+            ):
+                detail_parts = []
+                if rest_error:
+                    detail_parts.append(f"RESTCONF (earlier): {rest_error}")
+                detail_parts.append(out.strip() or f"Command failed: {cmd}")
+                raise RuntimeError(" | ".join(detail_parts))
+
+        return {
+            "implemented": True,
+            "source": "ssh-cli",
+            "interface": iface,
+            "subActionCount": len(subactions),
+            "subActions": subactions,
+            "subActionSummary": " + ".join(sub_summaries),
+            "commands": all_commands,
+            "outputs": outputs,
+            "restError": rest_error,
+            "message": f"Multi-action OK on {iface} (sequential SSH CLI commits — not atomic).",
+        }
+
+    def _read_interface_set(
+        self,
+        device: DeviceInfo,
+        iface: str,
+        creds: dict[str, str],
+    ) -> str:
+        """Read current `set`-format config lines for an interface.
+
+        Used by the smart-delete logic: if the interface has a
+        `vlan members` line, we need to `delete` it first; otherwise a
+        bare `set vlan members X` is enough (no duplicate line, no error).
+
+        Tries RESTCONF scoped fetch first (fast), then NETCONF SSH scoped,
+        then full NETCONF SSH, then SSH CLI. Returns empty string if all
+        transports fail — caller treats empty as "no existing config"
+        which is the safe default.
+        """
+        try:
+            filtered = fetch_interface_configuration(device.ip, iface, **creds)
+            if filtered.get("ok"):
+                cfg = parse_configuration_set(filtered.get("payload") or filtered.get("raw") or "")
+                if cfg:
+                    return cfg
+        except Exception:
+            pass
+
+        if self.config.junos_netconf_ssh:
+            try:
+                nc_filtered = nc_fetch_interface_configuration(
+                    device.ip, iface,
+                    username=creds["username"], password=creds["password"],
+                    port=self.config.junos_netconf_ssh_port,
+                )
+                if nc_filtered.get("ok"):
+                    cfg = netconf_get_configuration_to_set(nc_filtered.get("payload") or nc_filtered.get("raw") or "")
+                    if cfg:
+                        return cfg
+            except Exception:
+                pass
+
+        if self.config.ssh_enabled:
+            try:
+                ssh = run_ssh_command(
+                    host=device.ip,
+                    username=self.config.ssh_user,
+                    password=self.config.ssh_password,
+                    port=self.config.ssh_port,
+                    command=f"show configuration interfaces {iface}",
+                )
+                if ssh.get("sshOk"):
+                    out = ssh.get("output") or ""
+                    lines = [
+                        ln for ln in out.splitlines()
+                        if ln.strip() and not ln.strip().startswith(("[edit", "{master:"))
+                    ]
+                    return "\n".join(lines).strip()
+            except Exception:
+                pass
+        return ""
 
     def probe_identity(self, device: DeviceInfo) -> dict[str, Any]:
         # Managed check is now a lightweight TCP probe (see probe.py).
