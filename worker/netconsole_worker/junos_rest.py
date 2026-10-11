@@ -653,6 +653,88 @@ def apply_set_configuration(
         ok = commit["ok"] and "<commit-success" in commit_raw
         return ok, commit_raw, commit_ms
 
+    def _verify_commit_landed(
+        client: httpx.Client,
+        host: str,
+        scheme: str,
+        port: int,
+        commands: list[str],
+    ) -> bool:
+        """Verify the commit landed by reading running-config and checking
+        at least one of the loaded commands is present.
+
+        `set` commands render in the running config in their
+        hierarchical form, e.g. `set protocols ospf area 0.0.0.100`
+        becomes the path `protocols/ospf/area[name='0.0.0.100']` in the
+        XML readback. We just check substring match against the raw
+        response — fast, no XML parsing — and require at least one
+        unique keyword (e.g. `0.0.0.100`) to appear in the readback.
+
+        Returns True if at least one command's distinguishing token
+        appears in the readback. False if none appear (commit did NOT
+        land) or the readback itself fails (network error → assume
+        not landed, force the retry path).
+
+        This is a best-effort sanity check, not a cryptographic
+        guarantee. The false-negative rate is bounded: Junos cRPD's
+        `<get-configuration/>` rarely returns empty for a working
+        device, and the candidate database is unchanged by the
+        readback so a retry path will see the same load state.
+        """
+        import re as _re
+
+        # Pick a high-signal token from each command. Skip set/delete
+        # verbs and bracket qualifiers; grab the most-specific path
+        # component (e.g. "0.0.0.100", "ge-0/0/4").
+        tokens: list[str] = []
+        for cmd in commands:
+            stripped = cmd.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            # strip leading set / delete / activate / deactivate
+            words = stripped.split()
+            if words and words[0] in ("set", "delete", "activate", "deactivate"):
+                words = words[1:]
+            # the LAST non-bracket word is usually the most specific
+            # value (vlan id, area id, interface name, ...). Use it.
+            for w in reversed(words):
+                w_clean = w.strip("'\";")
+                if not w_clean or "[" in w_clean or "<" in w_clean:
+                    continue
+                if _re.match(r"^[A-Za-z0-9._/-]{2,}$", w_clean):
+                    tokens.append(w_clean)
+                    break
+
+        if not tokens:
+            logger.debug("junos %s: no distinguishing tokens to verify against", host)
+            return False
+
+        try:
+            resp = post_junos_rpc(
+                host,
+                "<get-configuration><configuration><protocols/></configuration></get-configuration>",
+                client=client, scheme=scheme, port=port,
+            )
+        except Exception as exc:
+            logger.warning("junos %s: commit verification readback failed: %s", host, exc)
+            return False
+
+        raw = (resp.get("raw") or "").strip()
+        if not raw:
+            logger.warning("junos %s: commit verification readback returned empty body", host)
+            return False
+
+        for tok in tokens:
+            if tok in raw:
+                logger.debug("junos %s: verification token %r found in readback", host, tok)
+                return True
+
+        logger.debug(
+            "junos %s: verification tokens %r NOT found in readback (len=%d)",
+            host, tokens, len(raw),
+        )
+        return False
+
     # First attempt
     load_ok, load_raw, load_ms = _load(client)
     if not load_ok:
@@ -737,30 +819,104 @@ def apply_set_configuration(
                 "loadMs": load_ms2,
                 "commitMs": commit_ms2,
             }
-        # An empty response body (len=0) on HTTP 200 is a classic stale-socket
-        # symptom: the commit landed on the device but the response was lost.
-        # On Junos cRPD, the commit RPC returns the response only AFTER the
-        # database is updated, so an empty body almost always means the
-        # commit landed -- the caller just lost the response on the wire.
-        # Treat it as success and let the next caller verify via show config.
-        # This is safer than the retry path because (a) the retry's _load
-        # call often fails too (same pool entry just got invalidated), and
-        # (b) re-running the load RPC would re-apply commands that are
-        # already in the candidate db.
+        # An empty response body (len=0) on HTTP 200 used to be treated
+        # as "stale socket, commit must have landed" — but verified
+        # 2026-10-11 against LAB-F6-CORE-02 (junos-rest APPLY_CONFIG
+        # 22adada7...) that the commit actually did NOT land and the
+        # device's running config was unchanged. The previous "trust
+        # the lost response" path was a false-positive.
+        #
+        # New behaviour: do a <get-configuration> read of one of the
+        # commands we just loaded. If the command is in the running db,
+        # commit landed — treat as success and invalidate the pool (the
+        # pooled socket is clearly stale, future calls will reopen). If
+        # the command is NOT in the running db, the commit did not land
+        # and we need to retry on a fresh socket.
         if not commit_raw:
             logger.warning(
-                "junos %s: commit returned empty body (stale socket suspected); "
-                "treating as success and invalidating the pool",
+                "junos %s: commit returned empty body; verifying with "
+                "<get-configuration/> read before declaring success",
                 host,
             )
+            verified = _verify_commit_landed(
+                client, host, scheme, port, commands,
+            )
+            if verified:
+                logger.info(
+                    "junos %s: commit verified by readback (new commands "
+                    "present in running config)",
+                    host,
+                )
+                _pool.invalidate(host, port, username, scheme)
+                return {
+                    "ok": True,
+                    "stage": "commit",
+                    "error": None,
+                    "raw": f"{load_raw}\n(recovered: empty commit response, verified by readback)",
+                    "loadMs": load_ms,
+                    "commitMs": commit_ms,
+                }
+            # Verification read says commit did NOT land. The candidate
+            # database may still hold the new commands. Run
+            # <discard-changes/> so the next attempt starts from a
+            # known-clean state, then retry the whole load+commit cycle
+            # on a fresh socket.
+            logger.warning(
+                "junos %s: commit verification readback did NOT find the new "
+                "commands in running config; discarding candidate and retrying "
+                "load+commit on a fresh socket",
+                host,
+            )
+            post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
             _pool.invalidate(host, port, username, scheme)
+            client = _pool.borrow(host, port, username, password, scheme, verify_tls, timeout=timeout)
+            load_ok3, load_raw3, load_ms3 = _load(client)
+            if not load_ok3:
+                detail = format_junos_rpc_error(load_raw3) or "load failed on retry"
+                return {
+                    "ok": False,
+                    "stage": "load-retry-after-empty-commit",
+                    "error": f"load failed (after empty-commit retry): {detail}",
+                    "raw": load_raw3,
+                    "loadMs": load_ms3,
+                    "commitMs": commit_ms,
+                }
+            commit_ok3, commit_raw3, commit_ms3 = _commit(client)
+            if not commit_raw3:
+                # Still empty after fresh-socket retry. We can't tell
+                # whether the commit landed. Surface as FAILED with a
+                # clear message so the operator knows to verify on the
+                # device — do NOT silently report success.
+                return {
+                    "ok": False,
+                    "stage": "commit-retry-after-empty-commit",
+                    "error": (
+                        "commit RPC returned empty body on the retry socket too. "
+                        "Cannot determine if the commit landed. Verify the device "
+                        "running-config and re-queue if needed."
+                    ),
+                    "raw": load_raw3,
+                    "loadMs": load_ms3,
+                    "commitMs": commit_ms3,
+                }
+            if not commit_ok3:
+                detail = format_junos_rpc_error(commit_raw3) or "commit failed on retry"
+                post_junos_rpc(host, "<discard-changes/>", client=client, scheme=scheme, port=port)
+                return {
+                    "ok": False,
+                    "stage": "commit-retry-after-empty-commit",
+                    "error": f"commit failed (after empty-commit retry): {detail}",
+                    "raw": commit_raw3,
+                    "loadMs": load_ms3,
+                    "commitMs": commit_ms3,
+                }
             return {
                 "ok": True,
                 "stage": "commit",
                 "error": None,
-                "raw": f"{load_raw}\n(recovered: empty commit response, assuming commit landed)",
-                "loadMs": load_ms,
-                "commitMs": commit_ms,
+                "raw": f"{load_raw3}\n{commit_raw3}\n(recovered after empty-commit + fresh-socket retry)",
+                "loadMs": load_ms3,
+                "commitMs": commit_ms3,
             }
         # Non-recoverable commit error: discard the bad change so the next
         # job starts from a clean database, then report the real failure.
