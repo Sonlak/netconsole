@@ -47,9 +47,9 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
   - Hỗ trợ **multi-action cross-interface**: truyền \`actions: [{interface, action, vlan?|description?}, ...]\` — mỗi subaction có \`interface\` riêng, worker group theo interface, commit mỗi group 1 lần. Đây là cách đúng khi user muốn làm NHIỀU THAY ĐỔI TRÊN NHIỀU CỔNG cùng lúc (ví dụ "xoá + set VLAN + set desc trên cả cổng 8 và 9"). Ưu tiên multi-action cross-interface hơn queue nhiều job riêng.
   - Cũng hỗ trợ **multi-action same-interface**: truyền \`interface\` ở top-level + \`actions: [{action, ...}, ...]\` — atomic 1 commit trên 1 cổng.
   - Pattern KHẢ THI: \`delete-interface\` + \`set-access-vlan\` + \`set-description\` trên cùng 1 interface trong 1 batch (worker xử lý theo thứ tự, Junos commit 1 lần → interface sạch + chỉ giữ VLAN/desc mới).
-- \`queue_apply_config\` — apply config (commit) lên thiết bị (Junos/EOS/IOS-XE)
+- \`queue_apply_config\` — apply config (commit) lên thiết bị (Junos/EOS/IOS-XE). Có 2 mode: \`mode="replace"\` (mặc định, full config) hoặc \`mode="merge"\` (chỉ apply delta, không touch DeviceSavedConfig)
 - \`queue_rollback_config\` — rollback về config trước khi commit
-- \`apply_config_dry_run\` — tính diff (thêm/xoá/sửa dòng) mà KHÔNG commit
+- \`apply_config_dry_run\` — tính diff (thêm/xoá/sửa dòng) mà KHÔNG commit. \`mode="replace"\` (mặc định) hoặc \`mode="merge"\` (delta)
 - \`queue_managed_check\` — chạy probe (ping + RESTCONF) cho 1 thiết bị
 - \`queue_log_collect\` — trigger collect logs ngay
 - \`queue_collect\` — collect on-demand: ARP / MAC / CONFIG / INTERFACES cho 1 thiết bị
@@ -78,6 +78,13 @@ User: "Apply config core mới cho F2-AS-01"
 → Bước 2: Tóm tắt: "Có 12 dòng mới, 3 dòng bị xoá. Không vượt ngưỡng 200."
 → Bước 3: \`queue_apply_config("F2-AS-01")\` → backend tạo confirmation card
 → Bước 4 (sau user confirm): job chạy → báo "Đã apply. Job #abc123, track ở /jobs."
+
+### Ví dụ 2b: Merge delta flow (dùng khi user chỉ muốn THÊM vài dòng)
+User: "Thêm area 0.0.0.100 vào OSPF trên F6-CORE-02"
+→ Bước 1: \`apply_config_dry_run({device_name:"F6-CORE-02", mode:"merge", content:"set protocols ospf area 0.0.0.100\\nset protocols ospf area 0.0.0.10 interface ge-0/0/4"})\` → diff: 2 added, 0 removed
+→ Bước 2: Tóm tắt: "MERGE 2 dòng mới, không xoá dòng nào."
+→ Bước 3: \`queue_apply_config({device_name:"F6-CORE-02", mode:"merge", content:"..."})\` → confirmation card
+→ Bước 4: job chạy → device commit delta → báo "Đã merge. Job #xyz789."
 
 ### Ví dụ 3: Apply config flow (SAI — KHÔNG BAO GIỜ LÀM VẬY)
 User: "Apply config core mới cho F2-AS-01"
@@ -198,7 +205,10 @@ Khi nào gợi ý:
 5. \`queue_apply_config({device_name: X, content: <full-config-snippet>})\` → confirmation card
 6. Sau confirm: ghi nhớ jobId, gợi ý track ở /jobs
 
-⚠️ QUAN TRỌNG: khi user hỏi "thêm OSPF cho cổng mới", LLM phải generate FULL config (replace) — đây là behavior của \`queue_apply_config\`. Nếu user muốn merge chứ không replace, hướng dẫn dùng Config Studio.
+⚠️ QUAN TRỌNG: khi user hỏi "thêm OSPF cho cổng mới" (chỉ THÊM delta, KHÔNG thay đổi phần còn lại), LUÔN dùng \`mode="merge"\`:
+→ Gọi \`apply_config_dry_run({device_name: X, mode: "merge", content: "<delta>"})\`
+→ Sau đó \`queue_apply_config({device_name: X, mode: "merge", content: "<delta>"})\`
+\`content\` trong merge mode chỉ chứa CÁC DÒNG CẦN THÊM (set/interface/static route/...), KHÔNG chứa full config. Backend sẽ chỉ apply delta, không touch config cũ. Chỉ dùng \`mode="replace"\` (mặc định) khi user thực sự muốn thay thế toàn bộ config.
 
 ⚠️ KHÔNG dùng \`run_cli_command\` cho thay đổi CONFIG — chỉ dùng cho lệnh operational/show.
 
@@ -1127,23 +1137,41 @@ const queueApplyConfig: CatalogEntry = {
   function: {
     name: 'queue_apply_config',
     description:
-      'Queue APPLY_CONFIG job: commit config mới lên thiết bị (Junos/EOS/IOS-XE). ' +
-      'Mặc định dùng DeviceSavedConfig.content (config đã lưu trên web). ' +
-      'Nếu truyền content, sẽ dùng content đó (sau khi validate). ' +
-      'Config Studio GHI ĐÈN toàn bộ running-config = full config replacement. ' +
-      'Diff lớn là BÌNH THƯỜNG — không phải lỗi. ' +
-      'Nếu chỉ muốn thêm dòng (merge chứ không replace), dùng Config Studio.',
+      'Queue APPLY_CONFIG job: commit config lên thiết bị (Junos/EOS/IOS-XE). ' +
+      'Có 2 mode:\n' +
+      '- mode="replace" (mặc định): dùng DeviceSavedConfig.content (full config đã lưu). ' +
+      'Nếu truyền content, dùng content đó và CẬP NHẬT DeviceSavedConfig trước khi commit. ' +
+      'Đây là Config Studio path — replace toàn bộ config.\n' +
+      '- mode="merge": chỉ apply CÁC DÒNG trong content (delta/additive). ' +
+      'KHÔNG touch DeviceSavedConfig. KHÔNG xoá dòng nào trên thiết bị. ' +
+      'Dùng khi user muốn thêm 1-2 dòng (new area, new interface, new static route) ' +
+      'mà KHÔNG thay đổi phần còn lại của running config. ' +
+      'Bắt buộc truyền content (không fallback DeviceSavedConfig).\n\n' +
+      'Lưu ý: device-side operation luôn là MERGE cho mọi mode ' +
+      '(Junos `load set`, IOS-XE `conf t`, EOS `session.config` đều merge). ' +
+      'Mode="replace" chỉ khác ở chỗ backend persist full config vào DeviceSavedConfig ' +
+      'và dry-run diff cả 47 dòng. Mode="merge" dry-run chỉ diff delta nhỏ.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['device_name'],
       properties: {
         device_name: { type: 'string', description: 'Tên thiết bị' },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description:
+            '"replace" (mặc định): full config, persist DeviceSavedConfig. ' +
+            '"merge": chỉ apply delta trong content, không touch DeviceSavedConfig. ' +
+            'Bắt buộc truyền content khi mode="merge".',
+        },
         content: {
           type: 'string',
           description:
-            'Tùy chọn. Nếu bỏ qua, dùng DeviceSavedConfig.content (đã lưu trên web). ' +
-            'Nếu truyền, dùng content này và CẬP NHẬT DeviceSavedConfig trước khi commit.',
+            'mode="replace" + bỏ qua: dùng DeviceSavedConfig.content. ' +
+            'mode="replace" + truyền: dùng content này và CẬP NHẬT DeviceSavedConfig. ' +
+            'mode="merge" + truyền: dùng content này (BẮT BUỘC, chỉ chứa delta). ' +
+            'mode="merge" + bỏ qua: trả lỗi.',
         },
         role: strEnum(['core', 'dist', 'access', 'custom']),
       },
@@ -1153,8 +1181,9 @@ const queueApplyConfig: CatalogEntry = {
   requiresRole: 'OPERATOR',
   confirmSummary: (args) => {
     const d = String(args.device_name ?? '?');
+    const m = args.mode === 'merge' ? ' [MERGE delta]' : ' [REPLACE full]';
     const r = args.role ? ` (role=${args.role})` : '';
-    return `Apply config lên ${d}${r}`;
+    return `Apply config lên ${d}${m}${r}`;
   },
 };
 
@@ -1184,14 +1213,18 @@ const applyConfigDryRun: CatalogEntry = {
   function: {
     name: 'apply_config_dry_run',
     description:
-      'Tính diff giữa config hiện tại (running) và config sẽ apply (DeviceSavedConfig.content ' +
-      'hoặc content truyền vào). KHÔNG commit, chỉ preview. Trả về added/removed/unchanged count ' +
-      'và first N diff lines. Chạy TRƯỚC queue_apply_config để xem thay đổi. ' +
-      'NOTE: DeviceSavedConfig chứa FULL device config (không phải delta). ' +
-      'Diff lớn (>200 dòng) là BÌNH THƯỜNG khi replace toàn bộ config. ' +
-      'Nếu chỉ muốn thêm dòng mà không replace, dùng Config Studio thay vì assistant. ' +
-      'Examples: apply_config_dry_run({device_name:"F2-AS-01"}) → so sánh với DeviceSavedConfig. ' +
-      'apply_config_dry_run({device_name:"F2-AS-01",content:"interfaces {...}"}) → so sánh với content truyền vào. ' +
+      'Tính diff giữa config hiện tại (running) và config sẽ apply. KHÔNG commit, chỉ preview. ' +
+      'Có 2 mode:\n' +
+      '- mode="replace" (mặc định): so sánh với DeviceSavedConfig.content (full config) ' +
+      'hoặc content truyền vào. Diff lớn (>200 dòng) là BÌNH THƯỜNG khi replace full config.\n' +
+      '- mode="merge": so sánh content truyền vào (delta) với running. ' +
+      'BẮT BUỘC truyền content. Diff sẽ là delta nhỏ (chỉ dòng mới thêm). ' +
+      'Dùng để preview merge trước khi queue.\n\n' +
+      'Chạy TRƯỚC queue_apply_config để xem thay đổi. ' +
+      'Examples: ' +
+      'apply_config_dry_run({device_name:"F2-AS-01"}) → so sánh với DeviceSavedConfig. ' +
+      'apply_config_dry_run({device_name:"F2-AS-01",content:"interfaces {...}"}) → replace với content truyền vào. ' +
+      'apply_config_dry_run({device_name:"F2-AS-01",mode:"merge",content:"set X\\nset Y"}) → preview merge delta. ' +
       'apply_config_dry_run({device_name:"F2-AS-01",max_lines:500}) → tăng số dòng diff trả về.',
     parameters: {
       type: 'object',
@@ -1199,11 +1232,19 @@ const applyConfigDryRun: CatalogEntry = {
       required: ['device_name'],
       properties: {
         device_name: { type: 'string', description: 'Tên thiết bị' },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description:
+            '"replace" (mặc định): full config vs DeviceSavedConfig/content. ' +
+            '"merge": delta (content) vs running. BẮT BUỘC truyền content khi merge.',
+        },
         content: {
           type: 'string',
           description:
-            'Tùy chọn. Nếu bỏ qua, dùng DeviceSavedConfig.content. ' +
-            'Nếu truyền, dùng để so sánh với running-config.',
+            'mode="replace" + bỏ qua: dùng DeviceSavedConfig.content. ' +
+            'mode="replace" + truyền: dùng content này. ' +
+            'mode="merge": BẮT BUỘC truyền content (delta).',
         },
         max_lines: { type: 'number', description: 'Mặc định 100, tối đa 1000.' },
       },

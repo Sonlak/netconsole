@@ -14,7 +14,10 @@ import { describe, expect, it, beforeEach, vi } from 'vitest';
 const deviceFindFirst = vi.fn();
 const deviceFindMany = vi.fn();
 const jobFindMany = vi.fn();
+const jobFindFirst = vi.fn();
 const jobCreate = vi.fn();
+const savedConfigUpsert = vi.fn();
+const txExecute = vi.fn();
 
 vi.mock('../../../src/lib/prisma.js', () => ({
   prisma: {
@@ -24,7 +27,19 @@ vi.mock('../../../src/lib/prisma.js', () => ({
     },
     job: {
       findMany: (...args: unknown[]) => jobFindMany(...args),
+      findFirst: (...args: unknown[]) => jobFindFirst(...args),
       create: (...args: unknown[]) => jobCreate(...args),
+    },
+    deviceSavedConfig: {
+      upsert: (...args: unknown[]) => savedConfigUpsert(...args),
+    },
+    // The handler does `prisma.$transaction((tx) => tryCreateDeviceJob(tx, ...))`.
+    // We unwrap the callback immediately and forward `tx` so the test
+    // can assert on the inner call.
+    $transaction: (cb: (tx: unknown) => unknown) => {
+      const fakeTx = { _isTx: true };
+      txExecute.mockImplementationOnce((tx) => cb(tx));
+      return txExecute(fakeTx);
     },
   },
 }));
@@ -39,6 +54,17 @@ const queueLogsCollection = vi.fn();
 const getLatestInterfacesJob = vi.fn();
 const queueInterfaceAction = vi.fn();
 const parseInterfaceActionPayload = vi.fn();
+
+// tryCreateDeviceJob is imported by handlers.ts. We stub it so the
+// queue_* tests can return either {kind:"created", job:...} or
+// {kind:"busy", error:...} without needing a real Postgres advisory
+// lock + INSERT round-trip.
+const tryCreateDeviceJob = vi.fn();
+vi.mock('../../../src/services/deviceOperations.js', () => ({
+  tryCreateDeviceJob: (...args: unknown[]) => tryCreateDeviceJob(...args),
+  getLatestJobResult: vi.fn(),
+  mapBlockingJob: vi.fn(),
+}));
 
 vi.mock('../../../src/services/macAddress.js', () => ({
   getMacAddressInventory: (...args: unknown[]) => getMacAddressInventory(...args),
@@ -583,5 +609,203 @@ describe('queue_managed_check (WRITE)', () => {
     expect(jobCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ type: 'MANAGED_CHECK', priority: 200 }),
     }));
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// apply_config_dry_run + queue_apply_config — merge mode
+//
+// Added 2026-10-11 to support the "add 2 lines, don't replace the rest"
+// flow. Backend must:
+//   - read args.mode (default "replace")
+//   - if merge: require args.content, skip DeviceSavedConfig, diff content
+//     vs running only
+//   - if replace: existing behaviour (DeviceSavedConfig.content / override)
+//
+// The worker's apply_config is always a merge under the hood (Junos
+// load set / IOS-XE conf t / EOS session.config), so device-side nothing
+// changes — the mode arg is just a backend UX gate.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('apply_config_dry_run', () => {
+  it('merge mode requires content arg, never falls back to DeviceSavedConfig', async () => {
+    // Even with a saved config present, merge mode must reject (no
+    // fallback). Otherwise the assistant could silently replace the
+    // user's intent ("add 2 lines") with the full saved snapshot.
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F6-CORE-02',
+      ip: '10.10.20.102',
+      vendor: 'Juniper',
+      savedConfig: { content: 'set full-saved-config-with-50-lines' },
+    });
+    const result = await HANDLERS.apply_config_dry_run(
+      { device_name: 'LAB-F6-CORE-02', mode: 'merge' /* no content */ },
+      ctx,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/merge.*content/i);
+  });
+
+  it('merge mode diffs content (delta) vs running, not against saved config', async () => {
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F6-CORE-02',
+      ip: '10.10.20.102',
+      vendor: 'Juniper',
+      // Even with a 50-line saved config present, merge mode MUST NOT
+      // touch it. If the handler fell back to savedConfig.content, the
+      // dry-run would show a 50-line diff and confuse the LLM.
+      savedConfig: { content: 'set X\nset Y\nset Z\nset A\nset B' },
+    });
+    // No GET_CONFIG SUCCESS row → running config = ''.
+    jobFindFirst.mockResolvedValueOnce(null);
+    const result = await HANDLERS.apply_config_dry_run(
+      {
+        device_name: 'LAB-F6-CORE-02',
+        mode: 'merge',
+        content: 'set protocols ospf area 0.0.0.100',
+      },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { mode: string; added: number; targetLineCount: number };
+    expect(preview.mode).toBe('merge');
+    // Target line count comes from `content` (1 line), NOT savedConfig
+    // (5 lines). This is the key assertion: merge mode's content is the
+    // delta only, even when savedConfig is huge.
+    expect(preview.targetLineCount).toBe(1);
+    // At least the new line shows as added (exact `added` count depends
+    // on the LCS diff's empty-line treatment; the important part is
+    // that no full-config comparison happened).
+    expect(preview.added).toBeGreaterThanOrEqual(1);
+  });
+
+  it('replace mode (default) uses DeviceSavedConfig.content when no content override', async () => {
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F6-CORE-02',
+      vendor: 'Juniper',
+      savedConfig: { role: 'core', content: 'set Z' },
+    });
+    jobFindFirst.mockResolvedValueOnce(null);
+    const result = await HANDLERS.apply_config_dry_run(
+      { device_name: 'LAB-F6-CORE-02' /* mode defaults to replace */ },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { mode: string; targetLineCount: number };
+    expect(preview.mode).toBe('replace');
+    expect(preview.targetLineCount).toBe(1);
+  });
+});
+
+describe('queue_apply_config — merge mode', () => {
+  it('merge mode requires content, queues APPLY_CONFIG with payload.mode=merge', async () => {
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F6-CORE-02',
+      ip: '10.10.20.102',
+      vendor: 'Juniper',
+      status: 'MANAGED',
+      savedConfig: { content: 'set full-saved-config' },
+    });
+    jobFindFirst.mockResolvedValueOnce(null); // GET_CONFIG baseline
+    tryCreateDeviceJob.mockResolvedValueOnce({
+      kind: 'created',
+      job: { id: 'job-merge-1', type: 'APPLY_CONFIG', status: 'PENDING', createdAt: new Date(), deviceId: 'dev-1' },
+    });
+
+    const result = await HANDLERS.queue_apply_config(
+      {
+        device_name: 'LAB-F6-CORE-02',
+        mode: 'merge',
+        content: 'set protocols ospf area 0.0.0.100\nset protocols ospf area 0.0.0.10 interface ge-0/0/4',
+      },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { mode: string; jobId: string; message: string };
+    expect(preview.mode).toBe('merge');
+    expect(preview.jobId).toBe('job-merge-1');
+    expect(preview.message).toMatch(/MERGE/i);
+
+    // The job payload must carry `mode: "merge"` so the worker / audit
+    // log / future replays all know the job was a delta-apply, not a
+    // full snapshot.
+    expect(tryCreateDeviceJob).toHaveBeenCalledWith(
+      expect.objectContaining({ _isTx: true }),
+      'dev-1',
+      'APPLY_CONFIG',
+      'user-1',
+      expect.objectContaining({
+        mode: 'merge',
+        config: 'set protocols ospf area 0.0.0.100\nset protocols ospf area 0.0.0.10 interface ge-0/0/4',
+      }),
+    );
+
+    // CRITICAL: merge mode MUST NOT touch DeviceSavedConfig. The saved
+    // snapshot stays as the full device config (the next Config Studio
+    // session still sees the right baseline). If it wrote, the merge
+    // delta would overwrite the saved full snapshot and the next
+    // dry-run would show a 50-line diff again.
+    expect(savedConfigUpsert).not.toHaveBeenCalled();
+  });
+
+  it('merge mode refuses to queue without content', async () => {
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F6-CORE-02',
+      vendor: 'Juniper',
+      status: 'MANAGED',
+      savedConfig: { content: 'set X' },
+    });
+    const result = await HANDLERS.queue_apply_config(
+      { device_name: 'LAB-F6-CORE-02', mode: 'merge' /* no content */ },
+      ctx,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/merge.*content/i);
+    // Must not have queued a job.
+    expect(tryCreateDeviceJob).not.toHaveBeenCalled();
+  });
+
+  it('replace mode (default) writes DeviceSavedConfig.upsert with the resolved content', async () => {
+    deviceFindFirst.mockResolvedValueOnce({
+      id: 'dev-1',
+      name: 'LAB-F2-AS-01',
+      vendor: 'Juniper',
+      status: 'MANAGED',
+      savedConfig: { role: 'core', content: 'set OLD' },
+    });
+    jobFindFirst.mockResolvedValueOnce(null);
+    tryCreateDeviceJob.mockResolvedValueOnce({
+      kind: 'created',
+      job: { id: 'job-rep-1', type: 'APPLY_CONFIG', status: 'PENDING', createdAt: new Date(), deviceId: 'dev-1' },
+    });
+    const result = await HANDLERS.queue_apply_config(
+      { device_name: 'LAB-F2-AS-01', content: 'set NEW' },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { mode: string };
+    expect(preview.mode).toBe('replace');
+    // Default replace mode DOES persist the saved config (it's the
+    // Config Studio path). Verify the upsert was called.
+    expect(savedConfigUpsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { deviceId: 'dev-1' },
+        create: expect.objectContaining({ content: 'set NEW', role: 'core' }),
+        update: expect.objectContaining({ content: 'set NEW', role: 'core' }),
+      }),
+    );
+    // Payload mode must be "replace" too (worker audit).
+    expect(tryCreateDeviceJob).toHaveBeenCalledWith(
+      expect.anything(),
+      'dev-1',
+      'APPLY_CONFIG',
+      'user-1',
+      expect.objectContaining({ mode: 'replace' }),
+    );
   });
 });

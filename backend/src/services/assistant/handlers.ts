@@ -1015,18 +1015,43 @@ async function applyConfigDryRunHandler(
   const name = String(args.device_name ?? '').trim();
   if (!name) return { ok: false, error: 'device_name is required' };
 
+  // Mode "merge" = compute diff for a delta (additive only). Content is
+  // required; DeviceSavedConfig is NOT consulted. Use when the user wants
+  // to add N lines without replacing the rest of the running config.
+  //
+  // Mode "replace" (default) = compute diff for a full config payload,
+  // either DeviceSavedConfig.content (default) or args.content override.
+  // This is the existing behaviour and the diff is informational only
+  // because the device's "load set" (Junos) / "conf t" (IOS-XE) /
+  // session.config (EOS) calls are MERGE under the hood — re-applying
+  // lines that are already on the device is a no-op.
+  const mode = args.mode === 'merge' ? 'merge' : 'replace';
+
   const device = await prisma.device.findFirst({
     where: { name: { equals: name, mode: 'insensitive' } },
     include: { savedConfig: true },
   });
   if (!device) return { ok: false, error: `Device not found: ${name}` };
 
-  // Resolve target content: arg override > DeviceSavedConfig.content
-  const targetContent = typeof args.content === 'string' && args.content.trim()
-    ? args.content
-    : device.savedConfig?.content ?? '';
-  if (!targetContent.trim()) {
-    return { ok: false, error: 'Không có config để so sánh. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+  // Resolve target content based on mode.
+  let targetContent: string;
+  if (mode === 'merge') {
+    if (typeof args.content !== 'string' || !args.content.trim()) {
+      return {
+        ok: false,
+        error:
+          'mode="merge" yêu cầu truyền `content` chứa các dòng cần thêm (set/interface/...) ' +
+          'KHÔNG dùng DeviceSavedConfig. Merge chỉ apply delta, không touch config cũ.',
+      };
+    }
+    targetContent = args.content;
+  } else {
+    targetContent = typeof args.content === 'string' && args.content.trim()
+      ? args.content
+      : device.savedConfig?.content ?? '';
+    if (!targetContent.trim()) {
+      return { ok: false, error: 'Không có config để so sánh. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+    }
   }
 
   // Fetch latest running config (GET_CONFIG SUCCESS) for diff baseline.
@@ -1042,15 +1067,16 @@ async function applyConfigDryRunHandler(
   const maxLines = Math.min(typeof args.max_lines === 'number' ? args.max_lines : 100, 1000);
   const lines = diff.lines.slice(0, maxLines);
 
-  // Threshold warning: large diff (> 200 lines) is normal for full config replacement
-  // (the saved content is the full device config, not a delta). We do NOT block —
-  // the user may intentionally want to replace the entire config. We just warn.
-  const isLargeDiff = diff.added + diff.removed > 200;
+  // Threshold warning: large diff (> 200 lines) means the call is
+  // operating on a full config payload (mode="replace" with the saved
+  // config, or a content override that's the full device config). In
+  // merge mode the diff is always a small delta so we skip the warning.
+  const isLargeDiff = mode === 'replace' && diff.added + diff.removed > 200;
   const warning = isLargeDiff
     ? `Diff > 200 dòng (${diff.added} added, ${diff.removed} removed). `
         + 'Đây là BÌNH THƯỜNG khi replace full config. '
         + 'Nếu chỉ muốn THÊM dòng mới mà không thay đổi phần còn lại, '
-        + 'dùng Config Studio để merge config thay vì thay thế toàn bộ.'
+        + 'gọi lại với mode="merge" và content chỉ chứa các dòng cần thêm.'
     : null;
 
   return {
@@ -1059,6 +1085,7 @@ async function applyConfigDryRunHandler(
       device: device.name,
       vendor: device.vendor,
       role: device.savedConfig?.role ?? 'custom',
+      mode,
       runningCollectedAt: latest?.updatedAt ?? null,
       targetLineCount: targetContent.split('\n').length,
       runningLineCount: running.split('\n').length,
@@ -1068,11 +1095,14 @@ async function applyConfigDryRunHandler(
       truncated: diff.lines.length > maxLines,
       diffLines: lines,
       warning,
-      instruction: isLargeDiff
-        ? 'Đây là config replace (thay thế toàn bộ config hiện tại). '
-            + 'Nếu muốn chỉ thêm dòng, hãy dùng Config Studio thay vì assistant. '
-            + 'Nếu muốn replace toàn bộ config, gọi queue_apply_config để queue job.'
-        : 'Có thể gọi queue_apply_config để queue job apply config.',
+      instruction: mode === 'merge'
+        ? `MERGE ${diff.added} dòng mới vào running config. Có thể gọi queue_apply_config ` +
+          `với mode="merge" và cùng content để commit.`
+        : isLargeDiff
+          ? 'Đây là config replace (thay thế toàn bộ config hiện tại). '
+              + 'Nếu muốn chỉ thêm dòng, gọi lại với mode="merge". '
+              + 'Nếu muốn replace toàn bộ config, gọi queue_apply_config để queue job.'
+          : 'Có thể gọi queue_apply_config để queue job apply config.',
     },
   };
 }
@@ -1163,6 +1193,16 @@ async function queueApplyConfigHandler(
   const name = String(args.device_name ?? '').trim();
   if (!name) return { ok: false, error: 'device_name is required' };
 
+  // Mode "merge" = apply ONLY the lines in `content` (delta). Used to
+  // add a new OSPF area / interface / static route without touching
+  // the rest of running config. DeviceSavedConfig is NOT updated.
+  //
+  // Mode "replace" (default) = full config apply. Content comes from
+  // DeviceSavedConfig.content or `args.content` override. The saved
+  // content is the full device config, so this is the existing
+  // Config Studio path.
+  const mode = args.mode === 'merge' ? 'merge' : 'replace';
+
   const device = await prisma.device.findFirst({
     where: { name: { equals: name, mode: 'insensitive' } },
     include: { savedConfig: true },
@@ -1172,11 +1212,27 @@ async function queueApplyConfigHandler(
     return { ok: false, error: `Thiết bị phải MANAGED trước khi commit (hiện tại: ${device.status})` };
   }
 
-  // Resolve content.
-  const content = typeof args.content === 'string' && args.content.trim()
-    ? args.content
-    : device.savedConfig?.content ?? '';
-  if (!content.trim()) return { ok: false, error: 'Không có config để commit. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+  // Resolve content based on mode. In merge mode the caller MUST pass
+  // `content` (the delta). In replace mode we fall back to the saved
+  // config so the LLM can re-apply what the user already approved.
+  let content: string;
+  if (mode === 'merge') {
+    if (typeof args.content !== 'string' || !args.content.trim()) {
+      return {
+        ok: false,
+        error:
+          'mode="merge" yêu cầu truyền `content` chứa các dòng cần thêm. ' +
+          'Ví dụ: queue_apply_config({device_name:"F6-CORE-02", mode:"merge", ' +
+          'content:"set protocols ospf area 0.0.0.100\\nset protocols ospf area 0.0.0.10 interface ge-0/0/4"})',
+      };
+    }
+    content = args.content;
+  } else {
+    content = typeof args.content === 'string' && args.content.trim()
+      ? args.content
+      : device.savedConfig?.content ?? '';
+    if (!content.trim()) return { ok: false, error: 'Không có config để commit. Cần truyền content hoặc lưu DeviceSavedConfig trước.' };
+  }
 
   // Vendor validation (mirror routes/generateConfig.ts::validateConfigPayload).
   if (content.includes('\u0000')) {
@@ -1195,7 +1251,9 @@ async function queueApplyConfigHandler(
     }
   }
 
-  // Compute diff for informational warning (large diff is normal for full config replace).
+  // Compute diff for informational warning. In replace mode a large
+  // diff is normal (saved config = full device config). In merge mode
+  // the diff is the actual delta the user is about to apply.
   const latest = await prisma.job.findFirst({
     where: { deviceId: device.id, type: JobType.GET_CONFIG, status: JobStatus.SUCCESS },
     orderBy: { updatedAt: 'desc' },
@@ -1203,26 +1261,32 @@ async function queueApplyConfigHandler(
   });
   const runningConfig = ((latest?.result ?? {}) as { config?: string }).config ?? '';
   const diff = diffConfigs(runningConfig, content);
-  const isLargeDiff = diff.added + diff.removed > 200;
+  const isLargeDiff = mode === 'replace' && diff.added + diff.removed > 200;
 
-  // NOTE: threshold check removed. Config Studio replaces the full config (it is
-  // intentional to send the complete device config). Large diff = normal behavior
-  // for config replace. The dry_run handler already warns the LLM; we just queue.
-
-  // Persist DeviceSavedConfig (mirrors routes/generateConfig.ts).
+  // Persist DeviceSavedConfig ONLY in replace mode. Merge mode is a
+  // one-shot delta; we deliberately do NOT touch the saved config so
+  // the next Config Studio session still sees the full device config
+  // as the baseline. The merge content lives in Job.payload.config for
+  // audit.
   const role = (typeof args.role === 'string' ? args.role : device.savedConfig?.role ?? 'custom') as string;
-  await prisma.deviceSavedConfig.upsert({
-    where: { deviceId: device.id },
-    create: { deviceId: device.id, role, content },
-    update: { role, content },
-  });
+  if (mode === 'replace') {
+    await prisma.deviceSavedConfig.upsert({
+      where: { deviceId: device.id },
+      create: { deviceId: device.id, role, content },
+      update: { role, content },
+    });
+  }
 
-  // Queue job.
+  // Queue job. Pass `mode` in payload so the worker can record it for
+  // audit (the device operation itself is identical for both modes
+  // because every supported vendor's "apply" call is a merge under the
+  // hood — Junos `load set`, IOS-XE `conf t`, EOS `session.config`).
   const outcome = await prisma.$transaction((tx) =>
     tryCreateDeviceJob(tx, device.id, JobType.APPLY_CONFIG, ctx.userId, {
       config: content,
       role,
       previous: runningConfig,
+      mode,
     }),
   );
   if (outcome.kind === 'busy') {
@@ -1232,11 +1296,18 @@ async function queueApplyConfigHandler(
     };
   }
 
+  const message = mode === 'merge'
+    ? `Apply MERGE queued (delta +${diff.added} lines, không xoá dòng nào). ` +
+      'Worker sẽ commit trong vài giây.'
+    : `Apply config queued (added=${diff.added} removed=${diff.removed}). ` +
+      'Worker sẽ commit trong vài giây.';
+
   return {
     ok: true,
     preview: {
       device: device.name,
       role,
+      mode,
       added: diff.added,
       removed: diff.removed,
       unchanged: diff.unchanged,
@@ -1247,7 +1318,7 @@ async function queueApplyConfigHandler(
         : null,
       jobId: outcome.job.id,
       jobStatus: outcome.job.status,
-      message: `Apply config queued (added=${diff.added} removed=${diff.removed}). Worker sẽ commit trong vài giây.`,
+      message,
     },
   };
 }
