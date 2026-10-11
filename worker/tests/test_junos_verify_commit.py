@@ -151,6 +151,56 @@ class VerifyCommitLandedTests(unittest.TestCase):
         # Retry path lands successfully → overall ok=True
         self.assertTrue(result["ok"], f"expected ok=True via retry, got {result}")
 
+    def test_partial_token_match_does_not_qualify_as_verified(self) -> None:
+        """The OLD 'any token matches' logic was a false-positive when
+        the loaded commands include a no-op: e.g. user sends
+          set protocols ospf area 0.0.0.10 interface ge-0/0/4
+          set protocols ospf area 0.0.0.100
+        and 'ge-0/0/4' is ALREADY in the running config (no-op), but
+        '0.0.0.100' is the new area that the commit failed to add.
+        With the any-matches logic, the readback would match
+        'ge-0/0/4' and falsely report success. The all-tokens-must-
+        match logic catches this and triggers the retry path.
+
+        Verified 2026-10-11 against LAB-F6-CORE-02 (job 3c902ad7...).
+        """
+        from netconsole_worker import junos_rest
+
+        pool = _make_pool()
+        with patch.object(junos_rest, "get_rest_pool", return_value=pool), \
+             patch.object(junos_rest, "post_junos_rpc",
+                          side_effect=[
+                              # 1. load
+                              {"ok": True, "raw": "<load-configuration-results><load-success/></load-configuration-results>"},
+                              # 2. commit — empty
+                              {"ok": True, "raw": ""},
+                              # 3. verification readback — contains 'ge-0/0/4' (pre-existing)
+                              #    but NOT '0.0.0.100' (the new area that didn't land)
+                              {"ok": True, "raw": "<configuration><protocols><ospf><area><name>0.0.0.10</name><interface><name>ge-0/0/4</name></interface></area></ospf></protocols></configuration>"},
+                              # 4. discard
+                              {"ok": True, "raw": "<ok/>"},
+                              # 5. retry load
+                              {"ok": True, "raw": "<load-configuration-results><load-success/></load-configuration-results>"},
+                              # 6. retry commit — proper success this time
+                              {"ok": True, "raw": "<commit-results><commit-success/></commit-results>"},
+                          ]):
+            result = apply_set_configuration(
+                host="10.10.20.101",
+                # Both commands in ONE apply — the new area 0.0.0.100 is the
+                # one the user actually wants added; the ge-0/0/4 line is
+                # already present.
+                commands=[
+                    "set protocols ospf area 0.0.0.10 interface ge-0/0/4",
+                    "set protocols ospf area 0.0.0.100",
+                ],
+                username="netconsole",
+                password="x",
+            )
+        # Retry succeeded → overall ok=True (the new commit landed on the
+        # retry socket).
+        self.assertTrue(result["ok"], f"expected ok=True via retry, got {result}")
+        self.assertIn("recovered after empty-commit", result["raw"])
+
 
 if __name__ == "__main__":
     unittest.main()

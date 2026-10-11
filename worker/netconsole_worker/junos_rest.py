@@ -724,16 +724,26 @@ def apply_set_configuration(
             logger.warning("junos %s: commit verification readback returned empty body", host)
             return False
 
+        # Require EVERY high-signal token to be present in the readback.
+        # The previous "any token matches" logic was a false-positive: if
+        # ANY of the loaded commands is a no-op (e.g. an idempotent
+        # `set` that already exists on the device), the token would be
+        # in the readback even when the commit itself failed and the
+        # new commands didn't land. Verified 2026-10-11 against
+        # LAB-F6-CORE-02: token 'ge-0/0/4' was already in the running
+        # config (pre-existing), so the readback matched, but the new
+        # 'set protocols ospf area 0.0.0.100' never landed.
         for tok in tokens:
-            if tok in raw:
-                logger.debug("junos %s: verification token %r found in readback", host, tok)
-                return True
+            if tok not in raw:
+                logger.debug(
+                    "junos %s: verification token %r NOT found in readback (len=%d); "
+                    "commit likely did not land",
+                    host, tok, len(raw),
+                )
+                return False
 
-        logger.debug(
-            "junos %s: verification tokens %r NOT found in readback (len=%d)",
-            host, tokens, len(raw),
-        )
-        return False
+        logger.debug("junos %s: all %d verification tokens found in readback", host, len(tokens))
+        return True
 
     # First attempt
     load_ok, load_raw, load_ms = _load(client)
