@@ -652,7 +652,7 @@ async function queueManagedCheckHandler(
  * stay in sync.
  */
 const DEVICE_OUTPUT_FIELDS = [
-  'id', 'name', 'ip', 'status', 'vendor', 'model', 'version',
+  'id', 'name', 'ip', 'status', 'vendor', 'model', 'version', 'serial',
   'site', 'floor', 'rack', 'unit',
   'description', 'lastPingAt', 'lastPingMs',
 ] as const;

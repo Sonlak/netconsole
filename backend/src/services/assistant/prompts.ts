@@ -834,7 +834,7 @@ const listDevices: CatalogEntry = {
       'Dùng khi user hỏi "có bao nhiêu switch ở site NKKN", "thiết bị tầng 6", "thiết bị ở rack V4", ' +
       '"switch nào OFFLINE", "juniper nào cùng vendor". ' +
       'Lưu ý: floor là số tầng (1-99), KHÔNG phải site. "tầng 6" = floor=6. ' +
-      'Mỗi device trả về các field: name, ip, status, vendor, model, version, site, floor, rack, unit, description, lastPingAt, lastPingMs. ' +
+      'Mỗi device trả về các field: name, ip, status, vendor, model, version, serial, site, floor, rack, unit, description, lastPingAt, lastPingMs. ' +
       'Examples: list_devices({site:"LAB"}) → tất cả thiết bị LAB. list_devices({floor:6}) → tầng 6. ' +
       'list_devices({status:"OFFLINE"}) → thiết bị down. list_devices({site:"LAB",status:"ONLINE"}) → LAB + online. ' +
       'Default limit 50, tối đa 500.',
