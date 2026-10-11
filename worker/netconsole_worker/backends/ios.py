@@ -743,6 +743,160 @@ class IOSBackend(DeviceBackend):
 
         return cleaned
 
+    def run_cli_command(
+        self,
+        device: DeviceInfo,
+        command: str,
+        *,
+        write: bool = False,
+    ) -> dict[str, Any]:
+        """Run an arbitrary IOS CLI command for the assistant's `run_cli_command`.
+
+        The base class default falls back to paramiko SSH, which fails
+        against IOSv 15.x (only offers legacy KEX
+        diffie-hellman-group1-sha1, which paramiko 5.x disables). IOS
+        has TWO working paths instead, both used here:
+
+          - read (`write=False`): the IOSexec HTTPS API on port 443
+            (already used by `get_interfaces` / `get_arp` / etc.). Fast,
+            no SSH kex dance, no banner/timeout friction.
+
+          - write (`write=True`): OpenSSH CLI via sshpass with explicit
+            legacy-KEX override (same trick as `_ssh_exec_stdin`). We
+            send the command as plain CLI (NOT in `conf t` mode — the
+            caller is asking for a single operational command like
+            `clear counters`, not a config apply).
+
+        Verified 2026-10-11 against LAB-F3-AS-01 (Cisco IOSv 15.2)
+        where the paramiko default failed with
+        "Incompatible ssh peer (no acceptable kex algorithm)".
+        """
+        if not self._config.ios_http.enabled:
+            return {
+                "implemented": False,
+                "source": None,
+                "command": command,
+                "output": "",
+                "exitCode": None,
+                "error": "IOS_HTTP enabled=false",
+                "message": "IOS HTTP API not enabled; cannot run CLI command on IOS device",
+            }
+
+        try:
+            if write:
+                # Non-config write (e.g. `clear counters`, `request ...`).
+                # Use sshpass + OpenSSH with legacy KEX (paramiko can't
+                # talk to IOSv 15.x). No `conf t` wrapper — caller wants
+                # a single operational command, not config mode.
+                output = self._ssh_exec_one_command(device, command, timeout=30)
+                source = "ios-ssh"
+            else:
+                # Read path: HTTP is fast and avoids the SSH kex dance.
+                output = self._exec(device, command, timeout=30)
+                source = "ios-http"
+        except Exception as exc:
+            return {
+                "implemented": False,
+                "source": source if 'source' in locals() else "ios-http",
+                "command": command,
+                "output": "",
+                "exitCode": None,
+                "error": str(exc),
+                "message": f"IOS CLI '{command}' failed: {exc}",
+            }
+
+        # Cap output to 8 KB to keep LLM context healthy. Full text is
+        # already in Job.result for the /api/jobs UI.
+        original_bytes = len(output.encode("utf-8"))
+        truncated = False
+        if original_bytes > 8192:
+            output = output[:8192] + "\n... [truncated]"
+            truncated = True
+
+        return {
+            "implemented": True,
+            "source": source,
+            "command": command,
+            "output": output,
+            "truncated": truncated,
+            "originalBytes": original_bytes,
+            "exitCode": 0,
+            "error": None,
+        }
+
+    def _ssh_exec_one_command(
+        self,
+        device: DeviceInfo,
+        command: str,
+        timeout: int = 30,
+    ) -> str:
+        """Run a single non-config IOS CLI command over SSH.
+
+        Mirrors the legacy-KEX trick from `_ssh_exec_stdin` but skips
+        the `conf t` / `end` wrappers — `run_cli_command(write=True)`
+        is for operational commands (`clear counters`,
+        `request system ...`, etc.), not config edits.
+
+        paramiko can't talk to IOSv 15.x (only offers
+        diffie-hellman-group1-sha1 which paramiko 5.x disables), so
+        we shell out to the system `ssh` CLI with explicit
+        `KexAlgorithms=+...` and similar `-o` overrides. The
+        `ssh_client.py` kex fallback (`borrow()` retry) handles other
+        vendors; IOS gets its own bypass because the underlying
+        sshpass+OpenSSH is faster and more reliable than paramiko for
+        this specific device generation.
+        """
+        import subprocess
+        import re as _re
+
+        username = self._config.ios_http.user or self._config.ssh_user
+        password = self._config.ios_http.password or self._config.ssh_password
+
+        # Send the command, then `exit` to close the session cleanly.
+        # IOS CLI echoes the prompt + the command itself; the strip
+        # below drops the noise.
+        stdin_payload = f"{command}\nexit\n"
+
+        ssh_args = [
+            "sshpass", "-p", password, "ssh", "-tt",
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1,diffie-hellman-group1-sha1",
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "Ciphers=+aes128-cbc,3des-cbc,aes128-ctr",
+            "-o", "MACs=+hmac-sha1,hmac-md5",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=8",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+            "-l", username, device.ip,
+        ]
+
+        try:
+            result = subprocess.run(
+                ssh_args,
+                input=stdin_payload.encode("utf-8"),
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"[IOS] SSH write timed out after {timeout}s") from exc
+        except Exception as exc:
+            raise RuntimeError(f"[IOS] SSH write failed: {exc}") from exc
+
+        # Strip ANSI escape codes and the echoed command line.
+        ansi_re = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+        out = ansi_re.sub("", result.stdout.decode("utf-8", errors="replace"))
+        # The CLI echoes the command back; drop the first non-blank
+        # line (the echo) and the final "exit" / prompt.
+        lines = []
+        for i, line in enumerate(out.splitlines()):
+            stripped = line.strip()
+            if i == 0 and stripped == command.strip():
+                continue  # echo line
+            if stripped.endswith("#") and not stripped.startswith("%"):
+                continue  # trailing prompt
+            lines.append(stripped)
+        return "\n".join(lines).strip()
+
     def apply_config(
         self,
         device: DeviceInfo,
