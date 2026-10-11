@@ -68,6 +68,13 @@ const URGENT_PRIORITY_TYPES = new Set<JobType>([
   JobType.CONNECT_TEST,
   JobType.DISCOVERY_PROBE,
   JobType.GET_CONFIG,
+  // CLI_COMMAND — added 2026-10-11 to back the assistant's
+  // `run_cli_command` tool. Operator-driven ("show route", "clear
+  // counters") so it must jump background collections. Urgent vs
+  // High: we want to jump even a stale GET_CONFIG from the same
+  // device so the operator's `show` doesn't wait behind a snapshot
+  // refresh.
+  JobType.CLI_COMMAND,
 ]);
 
 export function jobPriority(type: JobType): number {

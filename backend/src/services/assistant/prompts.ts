@@ -34,6 +34,7 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 ### READ (chạy được ngay, không cần xác nhận)
 - Tra cứu thiết bị (filter theo site / floor / vendor / status), interfaces, MAC, ARP, DHCP lease, fabric topology
 - Xem version NetConsole đang chạy (dùng get_netconsole_info)
+- **Chạy CLI bất kỳ trên thiết bị** — dùng \`run_cli_command\` cho: \`show route\`, \`show ospf neighbor\`, \`show ip bgp summary\`, \`show cdp neighbors\`, \`show interface terse\`, \`show version\`, \`show arp\`, \`show mac-address-table\`, v.v. (READ), và lệnh operational như \`clear counters\`, \`clear arp-cache\` (WRITE flag = true)
 - Xem config history + diff giữa 2 phiên bản config (ai commit, lúc nào, thay đổi gì)
 - Tìm job gần đây, xem chi tiết job (payload, result, error)
 - Xem log/syslog, alert chưa acknowledge, danh sách alert rules
@@ -59,6 +60,7 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - \`acknowledge_alert\` — đánh dấu alert đã xử lý
 - \`sync_to_netbox\` / \`sync_all_to_netbox\` — đồng bộ sang NetBox
 - \`create_user\` / \`update_user_role\` / \`set_user_active\` / \`reset_user_password\` / \`delete_user\` — admin user
+- \`run_cli_command\` với \`write: true\` — lệnh operational mutate state: \`clear counters\`, \`clear arp-cache\`, \`clear mac-address-table\`, v.v. (không gate qua confirmation card vì đã có audit job; tuy nhiên KHÔNG BAO GIỜ chạy \`request system reboot\` hoặc lệnh reboot/factory-reset qua tool này)
 
 ## 2. VÍ DỤ TỐT — Multi-step reasoning patterns
 
@@ -157,6 +159,48 @@ Khi nào gợi ý:
 2. \`get_statistics({names: ["..."]})\` → tính
 3. Nếu \`missing\` không rỗng → retry với tên đúng (auto-suggest)
 4. Trả bảng + 1-2 insight ("site LAB có 8 thiết bị, F2 chiếm 3")
+
+### W7: "Show route / show ospf neighbor / show cdp / v.v."
+1. \`run_cli_command({device_name: "X", command: "show ..."})\`
+2. Tool trả raw text output (max 8 KB) → tổng hợp thành bảng/câu
+3. Nếu output > 8 KB → cảnh báo user, dùng \`get_job_detail\` để xem đầy đủ
+4. KHÔNG cần get_device trước nếu user đã cho tên rõ ràng
+5. Ví dụ:
+   - "show ospf neighbor trên F2-AS-01" → 1 call
+   - "show route 10.0.0.0/8 trên core" → \`get_device\` core → lấy tên → 1 call
+   - "clear counters trên F2-AS-01" → \`run_cli_command({..., command:"clear counters", write:true})\`
+
+### W8: "Cấu hình OSPF / VLAN / route cho cổng / v.v."
+1. **Luôn dùng \`get_device\` trước** để biết vendor (juniper/arista/cisco)
+2. Generate config snippet theo cú pháp VENDOR của thiết bị (xem \`docs/agents/14-vendor-cli-commands.md\`):
+   - **Juniper Junos set-style** (config hierarchy):
+     \`\`\`
+     set protocols ospf area 0 interface ge-0/0/0
+     set interfaces ge-0/0/0 unit 0 family ethernet-switching vlan members 100
+     \`\`\`
+   - **Arista EOS configure** (hierarchical):
+     \`\`\`
+     interface Ethernet1
+        ip address 10.0.0.1/24
+     router ospf 1
+        network 10.0.0.0/24 area 0
+     \`\`\`
+   - **Cisco IOS-XE configure** (hierarchical):
+     \`\`\`
+     interface GigabitEthernet0/0/5
+        ip address 10.0.0.1 255.255.255.0
+     router ospf 1
+        network 10.0.0.0 0.0.0.255 area 0
+     \`\`\`
+3. \`apply_config_dry_run({device_name: X, content: <full-config-snippet>})\`
+   → nếu user chỉ muốn THÊM dòng, họ phải cung cấp \`content\` = full config mới (replace) hoặc dùng Config Studio
+4. Tóm tắt diff cho user
+5. \`queue_apply_config({device_name: X, content: <full-config-snippet>})\` → confirmation card
+6. Sau confirm: ghi nhớ jobId, gợi ý track ở /jobs
+
+⚠️ QUAN TRỌNG: khi user hỏi "thêm OSPF cho cổng mới", LLM phải generate FULL config (replace) — đây là behavior của \`queue_apply_config\`. Nếu user muốn merge chứ không replace, hướng dẫn dùng Config Studio.
+
+⚠️ KHÔNG dùng \`run_cli_command\` cho thay đổi CONFIG — chỉ dùng cho lệnh operational/show.
 
 ## 5. Bản đồ dữ liệu (DATA MAP)
 
@@ -1669,6 +1713,119 @@ const getNetconsoleInfo: CatalogEntry = {
   confirmSummary: () => '',
 };
 
+/**
+ * Generic vendor CLI command runner — backs the assistant's
+ * "show route", "show ospf neighbor", "show cdp", "clear counters",
+ * "request system reboot", and similar ad-hoc operator requests.
+ *
+ * Why ONE generic tool and not 20 specialised ones:
+ *  - The LLM picks the right vendor-specific syntax from the
+ *    reference doc (`docs/agents/14-vendor-cli-commands.md`).
+ *  - Adding a new command = a new line in the LLM's mental
+ *    vocabulary, NOT a new tool entry + handler + schema + test.
+ *  - The vendor backend (`DeviceBackend.run_cli_command`) already
+ *    handles SSH exec; this tool is a thin wrapper around the
+ *    CLI_COMMAND job type.
+ *
+ * READ vs WRITE behaviour:
+ *  - `write: false` (default) — pure read: `show`, `display`, `get`.
+ *    No confirmation card. Examples: `show route`, `show ospf neighbor`,
+ *    `show ip interface brief`, `show version`.
+ *  - `write: true` — operational commands that mutate state but
+ *    are NOT config: `clear counters`, `clear arp`, `clear mac-address-table`,
+ *    `request system reboot` (DANGEROUS), `request chassis fpc restart`.
+ *    Still NO confirmation card from this tool — the LLM is
+ *    responsible for picking the right `write` flag and avoiding
+ *    destructive commands on production boxes.
+ *  - For CONFIG changes (set OSPF, add VLAN, change routing)
+ *    use `queue_apply_config` with the full config text — that
+ *    tool DOES gate through confirmation. This tool is for
+ *    operational (non-config) commands only.
+ *
+ * Output format:
+ *  - Returns the raw stdout text. Output is capped at 8 KB by the
+ *    worker to keep the LLM context window healthy; the full text
+ *    is in Job.result for /api/jobs UI.
+ *  - If the command is in the small "structured parse" allowlist
+ *    (see `worker/netconsole_worker/parsers/textfsm_parse.py`),
+ *    the response also includes `parsed.rows` with normalised
+ *    column names (neighborId, state, etc.) so the LLM can pick
+ *    fields without re-parsing the text. Currently allowlisted:
+ *    Cisco/Arista `show ip ospf neighbor`, `show ip route`,
+ *    `show cdp neighbors` (Cisco only), `show ip bgp summary`,
+ *    and Juniper `show ospf neighbor`, `show route summary`.
+ */
+const runCliCommand: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'run_cli_command',
+    description:
+      'Chạy 1 lệnh CLI bất kỳ trên thiết bị (Junos / EOS / IOS-XE / IOS / NX-OS). ' +
+      'Dùng cho các lệnh ad-hoc KHÔNG nằm trong tool chuyên dụng: ' +
+      '`show route`, `show ospf neighbor`, `show ip bgp summary`, `show cdp neighbors`, ' +
+      '`show version`, `show interface terse`, `show arp`, `show mac-address-table`, ' +
+      '`clear counters`, `clear arp-cache`, `request system reboot` (DANGEROUS), v.v. ' +
+      '\n\n' +
+      '## QUY TẮC CÚ PHÁP (BẮT BUỘC)\n' +
+      '\n' +
+      'Phải dùng đúng cú pháp của VENDOR của thiết bị (xem `get_device` để biết vendor):\n' +
+      '- **Juniper Junos**: `show ospf neighbor`, `show route 10.0.0.0/8`, `show interfaces terse`, ' +
+      '`show configuration`, `clear interfaces statistics`, `request system reboot`\n' +
+      '- **Arista EOS**: `show ip ospf neighbor`, `show ip route`, `show ip bgp summary`, ' +
+      '`show interfaces`, `clear counters`, `reload system` (DANGEROUS)\n' +
+      '- **Cisco IOS-XE**: `show ip ospf neighbor`, `show ip route`, `show ip bgp summary`, ' +
+      '`show cdp neighbors`, `show interfaces status`, `clear counters`, `reload` (DANGEROUS)\n' +
+      '\n' +
+      '## READ vs WRITE\n' +
+      '- `write: false` (mặc định) cho lệnh read-only (`show ...`, `display ...`, `get ...`)\n' +
+      '- `write: true` cho lệnh operational mutate state (`clear ...`, `request ...`, `reload ...`)\n' +
+      '- KHÔNG dùng tool này để THAY ĐỔI CONFIG — dùng `queue_apply_config` với full config text\n' +
+      '\n' +
+      '## VÍ DỤ\n' +
+      '  run_cli_command({device_name:"LAB-F6-AS-01", command:"show ospf neighbor"})\n' +
+      '  run_cli_command({device_name:"LAB-F2-AS-01", command:"show route 10.0.0.0/8"})\n' +
+      '  run_cli_command({device_name:"LAB-F6-AS-01", command:"show ip interface brief"})\n' +
+      '  run_cli_command({device_name:"LAB-F2-AS-01", command:"clear interfaces statistics all", write:true})\n' +
+      '\n' +
+      '## OUTPUT\n' +
+      '  { device, vendor, command, source, output, parsed?, rowCount?, exitCode, error? }\n' +
+      '  - `output`: raw text (max 8 KB, có thể bị truncate trên output lớn)\n' +
+      '  - `parsed`: nếu command nằm trong allowlist textfsm, có thêm `parsed.rows[]` với field normalized',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['device_name', 'command'],
+      properties: {
+        device_name: {
+          type: 'string',
+          description: 'Tên thiết bị (case-insensitive). Dùng `get_device` trước nếu không chắc.',
+        },
+        command: {
+          type: 'string',
+          description:
+            'Câu lệnh CLI theo đúng cú pháp của vendor thiết bị. ' +
+            'KHÔNG bao gồm prompt (">", "#", "$"). ' +
+            'KHÔNG thêm "show" cho IOS-XE nếu đã có sẵn.',
+        },
+        write: {
+          type: 'boolean',
+          description:
+            'true cho lệnh operational mutate state (clear, request, reload). ' +
+            'false (mặc định) cho lệnh read-only (show, display).',
+        },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: (args) => {
+    const d = String(args.device_name ?? '?');
+    const c = String(args.command ?? '?');
+    const w = args.write === true ? '⚙️ ' : '';
+    return `${w}${c} trên ${d}`;
+  },
+};
+
 const getStatistics: CatalogEntry = {
   type: 'function',
   function: {
@@ -1833,6 +1990,12 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   resetUserPassword,
   deleteUser,
   getNetconsoleInfo,
+  // Generic vendor CLI exec (added 2026-10-11). Place near the
+  // other ad-hoc read tools so the LLM sees it next to
+  // get_netconsole_info when scanning the catalog. Read at the
+  // catalog level — the LLM has to use queue_apply_config for
+  // true config changes (which DOES gate through confirmation).
+  runCliCommand,
   getStatistics,
   describeCapabilities,
   // UI affordance — emits clickable follow-up chips

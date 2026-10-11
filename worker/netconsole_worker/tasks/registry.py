@@ -11,6 +11,7 @@ live in `netconsole_worker.backends.{juniper,eos,iosxe,nxos}`.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from netconsole_worker.models import DeviceInfo, JobInfo
@@ -18,6 +19,8 @@ from netconsole_worker.tasks.base import BaseTask
 from netconsole_worker.tasks.managed_check import ManagedCheckTask
 from netconsole_worker.tasks.netbox_sync import NetboxSyncAllTask, NetboxSyncDeviceTask
 from netconsole_worker.vendor import select_backend
+
+logger = logging.getLogger(__name__)
 
 
 def _backend(device: DeviceInfo) -> Any:
@@ -474,6 +477,73 @@ class GetLogsTask(BaseTask):
         return _backend(device).get_logs(device, filename=filename)
 
 
+class CliCommandTask(BaseTask):
+    """Run an arbitrary vendor CLI command on a device.
+
+    Added 2026-10-11 to back the AI assistant's `run_cli_command` tool.
+    The assistant surface area (show route, show ospf neighbor, show
+    cdp, clear counters, request system reboot, ...) maps cleanly to
+    ONE generic job type rather than 20+ specialised ones — the LLM
+    is responsible for picking the right vendor syntax.
+
+    Payload shape:
+
+        {
+            "command":  "show ospf neighbor",
+            "write":    false,                // optional, default false
+        }
+
+    For `write=True` the backend tool gates enqueue behind a
+    confirmation card; the worker just runs whatever the LLM asked
+    for, so the gate is at the assistant layer, not here.
+
+    Returns the full backend result (output text, source, exitCode,
+    error, truncated). The raw `output` is capped at 8 KB by
+    `DeviceBackend.run_cli_command` to keep the assistant preview
+    LLM-friendly; Job.result keeps the full string for the
+    /api/jobs UI.
+
+    If the (vendor, command) pair is in the small structured-parse
+    allowlist (see `netconsole_worker.parsers.textfsm_parse`), the
+    result also carries `parsed.rows` (list of dicts with normalised
+    field names) so the LLM can pick fields without re-parsing the
+    text. Allowlist is intentionally small — see
+    `docs/agents/14-vendor-cli-commands.md` §6.
+    """
+
+    job_type = "CLI_COMMAND"
+
+    def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
+        payload = job.payload or {}
+        command = str(payload.get("command") or "").strip()
+        if not command:
+            raise RuntimeError("CLI_COMMAND payload.command is empty")
+        write = bool(payload.get("write") or False)
+        result = _backend(device).run_cli_command(device, command, write=write)
+
+        # Optional structured parse via ntc-templates (textfsm).
+        # Best-effort — if the parser isn't installed, the command
+        # isn't in the allowlist, or the template drifts between
+        # ntc-templates versions, we silently fall back to the raw
+        # text and let the LLM parse it.
+        if result.get("implemented") and not result.get("error"):
+            try:
+                from netconsole_worker.parsers.textfsm_parse import try_parse
+                parsed = try_parse(
+                    device.vendor or "",
+                    command,
+                    result.get("output", "") or "",
+                )
+                if parsed is not None:
+                    result["parsed"] = parsed
+            except Exception:  # noqa: BLE001 — parser failures must not break the job
+                logger.debug(
+                    "textfsm parse failed for %s %s; falling back to raw text",
+                    device.name, command, exc_info=True,
+                )
+        return result
+
+
 TASK_REGISTRY = {
     task.job_type: task
     for task in [
@@ -487,6 +557,12 @@ TASK_REGISTRY = {
         GetLogsTask(),
         InterfaceActionTask(),
         ManagedCheckTask(),
+        # Generic vendor CLI exec — backs the assistant's
+        # `run_cli_command` tool. Keep this AFTER the specialised
+        # collectors so a future per-command override (e.g. a
+        # RESTCONF fast-path for `show route`) wins on name match
+        # if we ever split it out.
+        CliCommandTask(),
         # NetBox sync — periodic + on-demand (see services/scheduler in
         # backend). Not interactive (no SSH/RPC), but tagged for a
         # dedicated queue group so we can add a special "netbox-only"

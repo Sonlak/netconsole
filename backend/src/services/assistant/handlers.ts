@@ -1816,6 +1816,202 @@ async function getNetconsoleInfoHandler(
   };
 }
 
+// ── Generic vendor CLI command (added 2026-10-11) ────────────────────────────
+
+/**
+ * Run a CLI command on a device via the worker job queue.
+ *
+ * Flow:
+ *   1. Resolve device by name.
+ *   2. Queue a high-priority `CLI_COMMAND` job (priority 200 = URGENT,
+ *      same as MANAGED_CHECK). The `command` and `write` flag go
+ *      into the payload.
+ *   3. Block-poll the job status every ~500ms until SUCCESS / FAILED
+ *      or `CLI_COMMAND_TIMEOUT_MS` elapses. CLI commands are normally
+ *      1-5s, so 60s is plenty of headroom for slow / hung sessions.
+ *   4. Return the worker result (with `output`, `source`, `exitCode`,
+ *      `error`) to the LLM.
+ *
+ * Why a job and not a direct backend call: the worker has the
+ * vendor-specific code paths (Junos RESTCONF vs EOS eAPI vs IOS-XE
+ * SSH) and the Job table is the audit trail. `createdById` is the
+ * assistant user (or `null` for system). The /api/jobs UI also
+ * picks up these jobs so operators can re-run them.
+ *
+ * Why blocking poll instead of "queue + return jobId" like
+ * `queueManagedCheck` does: a show command is fast (1-5s) and
+ * round-tripping the LLM through another `get_job_detail` call
+ * costs ~2-3s of extra latency + a tool-call hop. For commands
+ * that take >60s the assistant user can re-query `get_job_detail`
+ * by jobId (we still return it in the preview).
+ */
+const CLI_COMMAND_TIMEOUT_MS = 60_000;
+const CLI_COMMAND_POLL_MS = 500;
+
+async function runCliCommandHandler(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const name = String(args.device_name ?? '').trim();
+  const command = String(args.command ?? '').trim();
+  if (!name) return { ok: false, error: 'device_name is required' };
+  if (!command) return { ok: false, error: 'command is required' };
+
+  // Defensive: reject obviously dangerous patterns outright. The
+  // vendor backend and the LLM should never produce these in a
+  // tool call, but a hallucinated argument could. Better to fail
+  // at the boundary than to ship a packet to the device.
+  const lower = command.toLowerCase();
+  const blocked = [
+    /\brequest\s+system\s+zeroize\b/i,
+    /\btest\s+software\s+reboot\b/i,
+    /\brequest\s+chassis\s+cluster\s+failover\b/i,
+    /\bwrite\s+erase\b/i,
+    /\bdelete\s+startup-config\b/i,
+    /\berase\s+startup-config\b/i,
+  ];
+  for (const re of blocked) {
+    if (re.test(command)) {
+      return {
+        ok: false,
+        error:
+          'Command blocked: this tool is for non-config operational commands only. ' +
+          'Use `queue_apply_config` to apply full config (which gates through confirmation) ' +
+          'or use the device console directly for destructive operations like ' +
+          '`request system zeroize` or `write erase`.',
+      };
+    }
+  }
+
+  const device = await prisma.device.findFirst({
+    where: { name: { equals: name, mode: 'insensitive' } },
+    select: { id: true, name: true, ip: true, vendor: true, status: true },
+  });
+  if (!device) return { ok: false, error: `Device not found: ${name}` };
+  if (device.status === 'OFFLINE') {
+    return {
+      ok: false,
+      error: `Device ${device.name} is OFFLINE. Wait for managed check to mark it online again, or check connectivity manually.`,
+    };
+  }
+
+  const write = args.write === true;
+  // Priority is set by `tryCreateDeviceJob` via `jobPriority(type)` —
+  // see deviceOperations.ts. CLI_COMMAND is in URGENT_PRIORITY_TYPES
+  // so it jumps the queue (200) regardless of the `write` flag.
+
+  const outcome = await prisma.$transaction((tx) =>
+    tryCreateDeviceJob(tx, device.id, JobType.CLI_COMMAND, ctx.userId, {
+      command,
+      write,
+    }),
+  );
+  if (outcome.kind === 'busy') {
+    return {
+      ok: false,
+      error: `Device busy — ${outcome.error.blockingJob.type} ${outcome.error.blockingJob.status}. Try again in a moment.`,
+    };
+  }
+
+  const jobId = outcome.job.id;
+  const startedAt = Date.now();
+  let lastStatus: string = 'PENDING';
+
+  // Block-poll for the job to leave PENDING/RUNNING. Worker jobs
+  // typically take 1-5s; we cap at 60s and return what we have so
+  // the LLM can decide to keep waiting via `get_job_detail` if it
+  // really wants.
+  while (Date.now() - startedAt < CLI_COMMAND_TIMEOUT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, CLI_COMMAND_POLL_MS));
+    const row = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { status: true, result: true, error: true, updatedAt: true },
+    });
+    if (!row) break;
+    lastStatus = row.status;
+    if (row.status === JobStatus.SUCCESS || row.status === JobStatus.FAILED) {
+      const result = (row.result ?? {}) as Record<string, unknown>;
+      const resultError = typeof result.error === 'string' ? result.error : null;
+      const jobError = row.error ?? null;
+      const errMsg = resultError || jobError;
+      if (row.status === JobStatus.FAILED) {
+        return {
+          ok: false,
+          preview: {
+            device: device.name,
+            vendor: device.vendor,
+            command,
+            write,
+            jobId,
+            jobStatus: row.status,
+            error: errMsg,
+          },
+          error: errMsg ?? 'CLI command failed',
+        };
+      }
+      // SUCCESS
+      const output = typeof result.output === 'string' ? result.output : '';
+      const source = typeof result.source === 'string' ? result.source : null;
+      const truncated = result.truncated === true;
+      const originalBytes = typeof result.originalBytes === 'number' ? result.originalBytes : null;
+      const exitCode = typeof result.exitCode === 'number' ? result.exitCode : null;
+      // Optional structured-parse envelope from the worker's
+      // textfsm allowlist (see docs/agents/14-vendor-cli-commands.md
+      // §6). When present, expose it to the LLM as `parsed` so it
+      // can pick fields without re-parsing the text.
+      const parsed = result.parsed && typeof result.parsed === 'object'
+        ? result.parsed
+        : null;
+
+      // Cap the preview output for the LLM. The full text is in
+      // Job.result and can be fetched via get_job_detail if needed.
+      const PREVIEW_OUTPUT_MAX = 4_000;
+      const previewOutput = output.length > PREVIEW_OUTPUT_MAX
+        ? output.slice(0, PREVIEW_OUTPUT_MAX)
+        : output;
+
+      return {
+        ok: true,
+        preview: {
+          device: device.name,
+          vendor: device.vendor,
+          command,
+          write,
+          source,
+          output: previewOutput,
+          outputBytes: output.length,
+          truncated: truncated || output.length > PREVIEW_OUTPUT_MAX,
+          originalBytes,
+          exitCode,
+          // If the worker parsed the output via ntc-templates, surface
+          // the rows so the LLM doesn't have to re-parse the text.
+          ...(parsed ? { parsed } : {}),
+          jobId,
+          jobStatus: row.status,
+          message: truncated
+            ? `Output bị cắt (${output.length} bytes). Dùng get_job_detail với jobId để xem đầy đủ.`
+            : `OK · ${output.length} bytes · jobId=${jobId}`,
+        },
+      };
+    }
+  }
+
+  // Timed out waiting for the worker. Return the jobId so the
+  // assistant can keep polling via get_job_detail.
+  return {
+    ok: true,
+    preview: {
+      device: device.name,
+      vendor: device.vendor,
+      command,
+      write,
+      jobId,
+      jobStatus: lastStatus,
+      message: `Job chưa xong sau ${Math.round((Date.now() - startedAt) / 1000)}s. Dùng get_job_detail với jobId để kiểm tra lại.`,
+    },
+  };
+}
+
 // ── Statistics + capabilities (meta) ─────────────────────────────────────────
 
 /**
@@ -1914,7 +2110,8 @@ async function describeCapabilitiesHandler(
           'get_recent_logs', 'get_unacknowledged_alerts', 'list_alert_rules',
           'list_users', 'get_config_history', 'get_config_diff',
           'list_discovery_scans', 'get_discovery_scan',
-          'get_netconsole_info', 'get_statistics', 'describe_capabilities',
+          'get_netconsole_info', 'run_cli_command',
+          'get_statistics', 'describe_capabilities',
         ],
         WRITE: [
           'queue_interface_action', 'queue_log_collect', 'queue_managed_check',
@@ -2034,6 +2231,7 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   reset_user_password: resetUserPasswordHandler,
   delete_user: deleteUserHandler,
   get_netconsole_info: getNetconsoleInfoHandler,
+  run_cli_command: runCliCommandHandler,
   get_statistics: getStatisticsHandler,
   describe_capabilities: describeCapabilitiesHandler,
   suggest_followup: suggestFollowupHandler,

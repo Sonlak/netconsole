@@ -47,6 +47,16 @@ enum JobType {
   // for low-volume test deploys). The job exists so operators can run
   // a single sync-everything from the UI / API.
   NETBOX_SYNC_ALL
+  // CLI_COMMAND — run an arbitrary vendor CLI command (read or write).
+  // Created by the assistant's `run_cli_command` tool when the LLM asks
+  // for `show route`, `show ospf neighbor`, `clear counters`, etc.
+  // The worker dispatches to the matching vendor backend's
+  // `run_cli_command()` method (SSH primary; RESTCONF/eAPI where the
+  // vendor has a structured equivalent). For write commands (e.g.
+  // `clear`, `request system reboot`) the assistant surfaces a
+  // confirmation card before the job is enqueued — same gate as
+  // INTERFACE_ACTION.
+  CLI_COMMAND
 }
 
 enum JobStatus {

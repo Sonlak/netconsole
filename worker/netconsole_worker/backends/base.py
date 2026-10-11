@@ -163,6 +163,82 @@ class DeviceBackend(ABC):
         """Liveness probe; default falls back to a `show version` SSH call."""
         return {"connected": False, "protocol": "ssh", "message": "not implemented"}
 
+    # -- Arbitrary CLI command (added 2026-10-11 for AI assistant) -----------
+
+    def run_cli_command(
+        self,
+        device: DeviceInfo,
+        command: str,
+        *,
+        write: bool = False,
+    ) -> dict[str, Any]:
+        """Run an arbitrary vendor CLI command via SSH.
+
+        Used by the assistant's `run_cli_command` tool. The default
+        implementation is a plain SSH exec — fast, vendor-agnostic,
+        no extra API call. Vendors with a structured equivalent
+        (Junos RESTCONF `cli -c`, EOS eAPI) override this for the
+        read path to get faster + more reliable results.
+
+        Args:
+            device: target device.
+            command: the CLI command to run, e.g. `show ospf neighbor`
+                or `show route 10.0.0.0/8`. Caller is responsible for
+                picking the vendor-correct syntax.
+            write: True for state-mutating commands (`clear`,
+                `request system reboot`, etc.). Default False.
+
+        Returns:
+            {implemented, source, command, output, exitCode, error}.
+            `output` is the raw stdout text. For long output the
+            backend trims to 8 KB to keep the LLM context window
+            healthy.
+        """
+        from netconsole_worker.ssh_client import run_ssh_command
+
+        cfg = self.config
+        if not cfg.ssh_enabled:
+            return {
+                "implemented": False,
+                "source": self.source,
+                "command": command,
+                "error": "SSH is disabled (LAB_SSH_ENABLED=false)",
+            }
+        result = run_ssh_command(
+            device.ip,
+            cfg.ssh_user,
+            cfg.ssh_password,
+            command,
+            port=cfg.ssh_port,
+            timeout=30,
+        )
+        if not result.get("sshOk"):
+            return {
+                "implemented": True,
+                "source": self.source,
+                "command": command,
+                "write": write,
+                "output": result.get("output", "") or "",
+                "error": result.get("error") or "SSH command failed",
+            }
+        raw = result.get("output", "") or ""
+        # Cap to 8 KB so we don't blow the LLM context window on
+        # verbose `show` commands (e.g. `show ip route` on a big
+        # BGP table). The full raw text is in Job.result, the LLM
+        # preview gets the head.
+        max_bytes = 8 * 1024
+        truncated = len(raw) > max_bytes
+        return {
+            "implemented": True,
+            "source": self.source,
+            "command": command,
+            "write": write,
+            "output": raw[:max_bytes],
+            "truncated": truncated,
+            "originalBytes": len(raw),
+            "exitCode": 0,
+        }
+
     # -- LLDP -------------------------------------------------------------
 
     def get_lldp(self, device: DeviceInfo) -> dict[str, Any]:

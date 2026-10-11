@@ -43,6 +43,10 @@ export type AssistantToolName =
   | 'list_discovery_scans'
   | 'get_discovery_scan'
   | 'get_netconsole_info'
+  // Generic vendor CLI exec — added 2026-10-11. READ when `write=false`
+  // (default; show route, show ospf neighbor, etc.), WRITE when
+  // `write=true` (clear counters, request system reboot, etc.).
+  | 'run_cli_command'
   // WRITE — emit confirmation_required
   | 'queue_interface_action'
   | 'queue_log_collect'
