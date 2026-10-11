@@ -110,6 +110,70 @@ class SSHConnectionPool:
             return False
         return True
 
+    def _is_kex_or_algo_error(self, exc: BaseException) -> bool:
+        """Return True if `exc` looks like the device only offers legacy
+        SSH algorithms that paramiko 5.x disables by default.
+
+        Symptom (verified 2026-10-11 against LAB-F3-AS-01 / Cisco IOSv
+        15.2 / 10.10.20.211): the device's SSH server only advertises
+        `diffie-hellman-group1-sha1` (and possibly group14-sha1) for
+        key exchange — both flagged weak and rejected by paramiko's
+        default `disabled_algorithms` dict. The error message is one
+        of:
+          - "Incompatible ssh peer (no acceptable kex algorithm)"
+          - "No suitable kex algorithm"
+          - "no matching cipher found"
+        All three mean "the device and client can't agree on a primitive" —
+        the right fix is to retry the connect with permissive algorithms
+        so legacy lab gear (Cisco IOSv 15.x, IOS 12.x, old Junos, etc.)
+        stays reachable.
+        """
+        msg = str(exc).lower()
+        return (
+            "kex" in msg
+            or "incompatible ssh peer" in msg
+            or "no suitable" in msg
+            or "no matching cipher" in msg
+            or "no matching key" in msg
+        )
+
+    def _connect(
+        self,
+        client: paramiko.SSHClient,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        timeout: int,
+        permissive: bool,
+    ) -> None:
+        """Single-shot connect with the requested algo policy.
+
+        `permissive=True` allows legacy kex (group1-sha1, group14-sha1),
+        legacy ciphers (3des-cbc, aes*-cbc), legacy keys (ssh-rsa,
+        ssh-dss) and legacy MACs (hmac-md5, hmac-sha1). Use only for
+        fallback against old devices that don't offer modern primitives.
+        """
+        kwargs: dict[str, Any] = dict(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        if permissive:
+            # Empty set = don't disable anything. Paramiko treats a key
+            # present in the dict with an empty set as "no restrictions".
+            kwargs["disabled_algorithms"] = {
+                "kex": set(),
+                "ciphers": set(),
+                "keys": set(),
+                "digests": set(),
+            }
+        client.connect(**kwargs)
+
     def borrow(
         self,
         host: str,
@@ -141,21 +205,35 @@ class SSHConnectionPool:
                 self.stats["closes"] += 1
                 del self._pool[key]
 
+            # First try: secure defaults (paramiko 5.x disables weak kex,
+            # ciphers, keys, MACs). Works against anything modern.
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             try:
-                client.connect(
-                    hostname=host,
-                    port=port,
-                    username=username,
-                    password=password,
-                    timeout=timeout,
-                    look_for_keys=False,
-                    allow_agent=False,
+                self._connect(client, host, port, username, password, timeout, permissive=False)
+            except paramiko.ssh_exception.SSHException as exc:
+                # Fall back to permissive algorithms only when the failure
+                # is clearly an algorithm mismatch (kex / cipher / key).
+                # All other SSH failures (auth, host key, etc.) propagate
+                # unchanged so the caller still gets a clean error.
+                if not self._is_kex_or_algo_error(exc):
+                    raise
+                log.warning(
+                    "SSH algo negotiation failed for %s (%s); retrying with "
+                    "permissive algorithms (allows legacy kex/ciphers/keys — "
+                    "needed for Cisco IOSv 15.x, old IOS, legacy Junos)",
+                    host, exc,
                 )
-            except Exception:
-                # Don't cache a connection we never opened.
-                raise
+                # Fresh client for the retry; the first one is half-open.
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                try:
+                    self._connect(client, host, port, username, password, timeout, permissive=True)
+                except Exception:
+                    # Re-raise the ORIGINAL kex error so the operator
+                    # sees the secure-defaults message first (clearer
+                    # root cause). The retry's exception is hidden.
+                    raise exc from None
             # Send keepalive every 60s so lab firewalls / idle-timers
             # don't drop the connection mid-job.
             transport = client.get_transport()
