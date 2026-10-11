@@ -183,30 +183,42 @@ class InterfaceActionTask(BaseTask):
 
     def run(self, job: JobInfo, device: DeviceInfo) -> dict[str, Any]:
         """
-        Supports two payload shapes:
+        Supports three payload shapes:
 
-        1. Legacy single-action: { action, interface, vlan?, description? }
+        1. Legacy single-action:
+           { action, interface, vlan?, description? }
            → backend parses InterfaceActionPayload.action and dispatches.
 
-        2. Multi-action: { interface, actions: [{action, ...}, ...] }
-           → build commands for every subaction in order, then commit
-           ALL of them in ONE device commit. This is atomic on the device:
-           either every change lands together or none do.
+        2. Same-interface multi-action (atomic on the device):
+           { interface, actions: [{action, ...}, ...] }
+           → one backend.interface_action_multi() call, ONE device commit.
 
-        Reject contradictory batches (e.g. shut + no-shut) with a clear
-        error so the operator gets a useful message instead of "commit
-        failed with X syntax error".
+        3. Cross-interface multi-action (new):
+           { actions: [{interface, action, ...}, ...] }
+           → worker groups subactions by interface (in declaration order),
+           calls backend.interface_action_multi() once per interface group.
+           Each group lands atomically on its own interface; groups commit
+           sequentially. No top-level `interface` field required.
+
+        All shapes go through the same single `interface_action` (legacy)
+        or `interface_action_multi` (multi) backend methods — the cross-
+        interface shape is just "same-interface multi-action" applied once
+        per distinct interface.
+
+        Reject contradictory batches per interface (e.g. shut + no-shut)
+        with a clear error so the operator gets a useful message instead
+        of "commit failed with X syntax error".
         """
         payload = job.payload or {}
-        iface = str(payload.get("interface") or "").strip()
-        if not iface:
-            raise RuntimeError("Missing 'interface' in job payload")
+        top_iface = str(payload.get("interface") or "").strip()
 
         subactions_raw = payload.get("actions")
         if isinstance(subactions_raw, list) and len(subactions_raw) > 0:
-            return self._run_multi_action(device, iface, subactions_raw)
+            return self._run_multi_action(device, top_iface, subactions_raw)
 
         # Legacy single-action path
+        if not top_iface:
+            raise RuntimeError("Missing 'interface' in job payload (single-action requires top-level interface)")
         action = str(payload.get("action") or "").strip()
         vlan = payload.get("vlan")
         description = payload.get("description")
@@ -234,7 +246,7 @@ class InterfaceActionTask(BaseTask):
         return _backend(device).interface_action(
             device,
             action=effective_action,
-            iface=iface,
+            iface=top_iface,
             vlan=str(vlan) if vlan is not None else None,
             description=effective_description,
         )
@@ -242,81 +254,190 @@ class InterfaceActionTask(BaseTask):
     def _run_multi_action(
         self,
         device: DeviceInfo,
-        iface: str,
+        top_iface: str,
         subactions_raw: list[object],
     ) -> dict[str, Any]:
         """
-        Build one combined command list from the subactions and dispatch
-        via a NEW single backend call (`interface_action_multi`) that
-        commits all of them in one load+commit on the device.
+        Multi-action dispatcher. Three sub-modes:
 
-        For Junos this means ONE `<load-configuration>` RPC and ONE
-        `<commit-configuration>` RPC, even if 3 subactions were requested.
+        - All subactions target the same interface (top-level `interface`
+          covers them, or all have the same `interface` field):
+          ONE backend.interface_action_multi() call → ONE device commit.
+
+        - Subactions target multiple interfaces (cross-interface batch):
+          group by interface (declaration order), call
+          interface_action_multi() once per group, return a per-group
+          result envelope. Each group is atomic on its own interface;
+          groups commit sequentially.
+
+        For Junos, each group is one `<load-configuration>` + one
+        `<commit-configuration>` pair (~17s RESTCONF). The whole job is
+        still ONE confirmation in the UI.
         """
-        # Parse + validate the batch.
-        subactions: list[dict[str, object]] = []
+        # 1) Parse + validate the batch. Each subaction resolves to
+        #    (interface, action, fields) and gets a normalised dict.
+        resolved: list[tuple[str, dict[str, object]]] = []
         for i, raw in enumerate(subactions_raw):
             if not isinstance(raw, dict):
                 raise RuntimeError(f"actions[{i}] is not an object")
+            sub_iface = raw.get("interface")
+            if isinstance(sub_iface, str) and sub_iface.strip():
+                iface = sub_iface.strip()
+            elif top_iface:
+                iface = top_iface
+            else:
+                raise RuntimeError(
+                    f"actions[{i}] has no 'interface' (provide top-level "
+                    f"'interface' or per-subaction 'interface' for cross-interface batches)"
+                )
             sa = self._normalize_subaction(iface, raw)
-            subactions.append(sa)
+            resolved.append((iface, sa))
 
-        if not subactions:
+        if not resolved:
             raise RuntimeError("Empty actions list")
 
-        # Reject contradictory pairs.
-        actions = {s["action"] for s in subactions}
-        if "shut" in actions and "no-shut" in actions:
-            raise RuntimeError("Contradictory batch: 'shut' and 'no-shut' on the same interface in one commit")
-        if "delete-interface" in actions and len(actions) > 1:
+        # 2) Sanity cap. Backend allows up to 16 subactions total; we
+        #    further cap to 8 distinct interfaces per job so the UI
+        #    summary stays readable.
+        distinct_ifaces = []
+        for iface, _ in resolved:
+            if iface not in distinct_ifaces:
+                distinct_ifaces.append(iface)
+        if len(distinct_ifaces) > 8:
             raise RuntimeError(
-                "'delete-interface' must be the only subaction in the batch "
-                "(combining it with set-vlan/description is contradictory — "
-                "delete clears everything anyway)"
+                f"Too many distinct interfaces in one batch ({len(distinct_ifaces)} > 8). "
+                f"Split into multiple calls."
             )
 
-        backend = _backend(device)
-        multi = getattr(backend, "interface_action_multi", None)
-        if multi is None:
-            # Older backend without the new method — fall back to running
-            # each subaction sequentially through the legacy single-action
-            # path. NOT atomic (each subaction is its own commit), but at
-            # least the operator's change isn't rejected outright.
-            results = []
-            for sa in subactions:
-                results.append(
-                    backend.interface_action(
-                        device,
-                        action=str(sa["action"]),
-                        iface=iface,
-                        vlan=str(sa.get("vlan", "")) if sa.get("vlan") is not None else None,
-                        description=str(sa.get("description", "")) if sa.get("description") is not None else None,
-                    )
+        # 3) Group by interface (preserving declaration order).
+        groups: list[tuple[str, list[dict[str, object]]]] = []
+        seen: dict[str, int] = {}
+        for iface, sa in resolved:
+            if iface in seen:
+                groups[seen[iface]][1].append(sa)
+            else:
+                seen[iface] = len(groups)
+                groups.append((iface, [sa]))
+
+        # 4) Per-group contradictory validation. Only shut+no-shut is
+        #    contradictory (they negate each other).
+        #    `delete-interface` mixed with `set-access-vlan` / `set-description`
+        #    is FINE: in Junos the commands sequence in declaration order
+        #    within one `<load-configuration>` load, so
+        #    `delete interfaces X` followed by
+        #    `set interfaces X unit 0 family ethernet-switching vlan members 201`
+        #    produces a clean interface with just vlan 201. (The
+        #    `delete ... vlan members` line that the smart-delete logic
+        #    prepends for set-access-vlan becomes a no-op after the
+        #    earlier delete, which Junos handles as a warning, not error.)
+        for iface, subs in groups:
+            actions = {s["action"] for s in subs}
+            if "shut" in actions and "no-shut" in actions:
+                raise RuntimeError(
+                    f"Contradictory batch on {iface}: 'shut' and 'no-shut' in one commit"
                 )
-            return {
-                "implemented": True,
-                "source": "sequential",
-                "interface": iface,
-                "subActionCount": len(subactions),
-                "subActions": subactions,
-                "results": results,
-                "message": f"Multi-action fallback (sequential commits) on {iface} — backend lacks atomic multi method.",
-            }
-        return backend.interface_action_multi(device, iface=iface, subactions=subactions)
+
+        backend = _backend(device)
+
+        # 5) Single-interface fast path: one call, one commit.
+        if len(groups) == 1:
+            iface, subs = groups[0]
+            multi = getattr(backend, "interface_action_multi", None)
+            if multi is None:
+                # Older backend without the new method — fall back to
+                # running each subaction sequentially. NOT atomic.
+                results = self._sequential_fallback(backend, device, iface, subs)
+                return {
+                    "implemented": True,
+                    "source": "sequential",
+                    "interface": iface,
+                    "subActionCount": len(subs),
+                    "subActions": subs,
+                    "results": results,
+                    "message": f"Multi-action fallback (sequential commits) on {iface} — backend lacks atomic multi method.",
+                }
+            return multi(device, iface=iface, subactions=subs)
+
+        # 6) Cross-interface: one commit-group per interface, sequentially.
+        per_group: list[dict[str, Any]] = []
+        for iface, subs in groups:
+            multi = getattr(backend, "interface_action_multi", None)
+            if multi is None:
+                results = self._sequential_fallback(backend, device, iface, subs)
+                per_group.append({
+                    "interface": iface,
+                    "subActionCount": len(subs),
+                    "subActions": subs,
+                    "results": results,
+                    "source": "sequential",
+                })
+            else:
+                res = multi(device, iface=iface, subactions=subs)
+                per_group.append({
+                    "interface": iface,
+                    "subActionCount": len(subs),
+                    "subActions": subs,
+                    "source": res.get("source"),
+                    "message": res.get("message"),
+                    "commands": res.get("commands"),
+                    "loadMs": res.get("loadMs"),
+                    "commitMs": res.get("commitMs"),
+                    "raw": res.get("raw"),
+                })
+        return {
+            "implemented": True,
+            "source": "cross-interface",
+            "interfaceCount": len(groups),
+            "interfaces": [g[0] for g in groups],
+            "subActionCount": len(resolved),
+            "groups": per_group,
+            "message": (
+                f"Cross-interface multi-action OK on {len(groups)} interface(s), "
+                f"{len(resolved)} subaction(s) total. Each interface's subactions "
+                f"landed in 1 commit on that interface; groups committed sequentially."
+            ),
+        }
+
+    def _sequential_fallback(
+        self,
+        backend: Any,
+        device: DeviceInfo,
+        iface: str,
+        subs: list[dict[str, object]],
+    ) -> list[dict[str, Any]]:
+        """Sequential single-action fallback (NOT atomic)."""
+        results: list[dict[str, Any]] = []
+        for sa in subs:
+            results.append(
+                backend.interface_action(
+                    device,
+                    action=str(sa["action"]),
+                    iface=iface,
+                    vlan=str(sa.get("vlan", "")) if sa.get("vlan") is not None else None,
+                    description=str(sa.get("description", "")) if sa.get("description") is not None else None,
+                )
+            )
+        return results
 
     def _normalize_subaction(
         self,
         iface: str,
         raw: dict[str, object],
     ) -> dict[str, object]:
-        """Mirror parseInterfaceActionPayload's parseSubAction in TS."""
+        """Mirror parseInterfaceActionPayload's parseSubAction in TS.
+
+        The `interface` arg here is the RESOLVED interface for this
+        subaction (either from the per-subaction field or hoisted from
+        the top level). We don't store it back into the normalised dict
+        because the worker groups by it before calling the backend.
+        """
         action = raw.get("action")
         if not isinstance(action, str) or action not in {
             "shut", "no-shut", "set-access-vlan", "set-description",
             "remove-description", "delete-interface",
         }:
             raise RuntimeError(f"Invalid subaction action: {action!r}")
-        out: dict[str, object] = {"action": action}
+        out: dict[str, object] = {"action": action, "_iface": iface}
         if action == "set-access-vlan":
             vlan = raw.get("vlan")
             if not isinstance(vlan, str) or not vlan.strip():

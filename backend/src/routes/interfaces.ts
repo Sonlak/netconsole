@@ -80,7 +80,7 @@ interfacesRouter.post('/:deviceId/actions', authMiddleware, (req, res) => {
     if (!payload) {
       res.status(400).json({
         error:
-          'Invalid body. Expected either { action: shut|no-shut|show-run|set-access-vlan|set-description|remove-description|delete-interface, interface, vlan?, description? } OR { interface, actions: SubAction[] } (multi-action, atomic commit)',
+          'Invalid body. Accepted: (a) { action, interface, vlan?, description? } single-action, (b) { interface, actions: [{action, vlan?|description?}, ...] } same-interface multi-action (atomic), or (c) { actions: [{interface, action, ...}, ...] } cross-interface multi-action.',
       });
       return;
     }

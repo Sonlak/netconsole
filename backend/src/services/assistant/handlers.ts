@@ -452,10 +452,15 @@ async function queueInterfaceActionHandler(
   ctx: ToolContext,
 ): Promise<ToolResult> {
   const name = String(args.device_name ?? '').trim();
-  const iface = String(args.interface ?? '').trim();
-  if (!name || !iface) {
-    return { ok: false, error: 'device_name and interface are required' };
+  if (!name) {
+    return { ok: false, error: 'device_name is required' };
   }
+  // `interface` is OPTIONAL on the top-level: it's only required for the
+  // legacy single-action shape. Same-interface multi-action uses the
+  // top-level interface; cross-interface multi-action lets each subaction
+  // carry its own (no top-level needed). We accept both forms here; the
+  // parser will reject the request if no subaction resolves to an
+  // interface.
 
   // Resolve the friendly name → deviceId.
   const device = await prisma.device.findFirst({
@@ -469,12 +474,17 @@ async function queueInterfaceActionHandler(
     return { ok: false, error: `Device ${device.name} is OFFLINE — cannot queue interface action. Wait for managed check to mark it online again.` };
   }
 
-  // Build the payload. Support two shapes:
-  //   1. Multi-action: { actions: [{action, vlan?|description?}, ...] }
-  //      → ONE job, ONE device commit (atomic on the device). LLM should
-  //      prefer this when applying multiple changes to the same interface
+  // Build the payload. Three shapes:
+  //   1. Multi-action cross-interface: { actions: [{interface, action, ...}, ...] }
+  //      → ONE job, the worker groups by interface and commits each group
+  //      atomically. Use when the user wants to change multiple interfaces
+  //      in one confirmation (e.g. "delete config of xe-0/0/8 AND xe-0/0/9
+  //      AND set VLAN/description on both").
+  //   2. Multi-action same-interface: { interface, actions: [{action, ...}, ...] }
+  //      → ONE job, ONE device commit (atomic on the device). Use when
+  //      applying multiple changes to the same interface
   //      (e.g. "set VLAN 203 AND description 'sonnx_test'").
-  //   2. Legacy single-action: { action, vlan?, description? }
+  //   3. Legacy single-action: { action, interface, vlan?, description? }
   //      → kept for backward compat with one-off calls.
   let payload;
   if (Array.isArray(args.actions) && args.actions.length > 0) {
@@ -491,7 +501,7 @@ async function queueInterfaceActionHandler(
     });
   }
   if (!payload) {
-    return { ok: false, error: 'Invalid action payload. Either pass a single `action` (+vlan/description), or an `actions: [...]` array of subactions targeting the same interface.' };
+    return { ok: false, error: 'Invalid action payload. Either pass a single `action` (+vlan/description), or an `actions: [...]` array of subactions. Each subaction may carry its own `interface` for cross-interface batches; otherwise the top-level `interface` applies.' };
   }
 
   const result = await queueInterfaceAction(device.id, payload, ctx.userId);
@@ -507,24 +517,39 @@ async function queueInterfaceActionHandler(
 
   // Build a human-friendly summary for the preview.
   const subCount = Array.isArray(payload.actions) ? payload.actions.length : 1;
-  const subSummary = Array.isArray(payload.actions)
-    ? payload.actions.map((s) => {
+  const interfacesTouched = new Set<string>();
+  const subSummaries: string[] = [];
+  if (Array.isArray(payload.actions)) {
+    for (const s of payload.actions) {
+      const iface = (s as { interface?: string }).interface ?? payload.interface;
+      if (iface) interfacesTouched.add(iface);
+      const summary = (() => {
         if (s.action === 'set-access-vlan') return `set-access-vlan ${s.vlan}`;
         if (s.action === 'set-description') return `set-description "${s.description}"`;
         return s.action;
-      }).join(' + ')
-    : (() => {
-        if (payload.action === 'set-access-vlan') return `set-access-vlan ${payload.vlan ?? '?'}`;
-        if (payload.action === 'set-description') return `set-description "${payload.description ?? ''}"`;
-        return String(payload.action ?? '?');
       })();
+      subSummaries.push(iface ? `${iface}: ${summary}` : summary);
+    }
+  } else {
+    const summary = (() => {
+      if (payload.action === 'set-access-vlan') return `set-access-vlan ${payload.vlan ?? '?'}`;
+      if (payload.action === 'set-description') return `set-description "${payload.description ?? ''}"`;
+      return String(payload.action ?? '?');
+    })();
+    if (payload.interface) interfacesTouched.add(payload.interface);
+    subSummaries.push(`${payload.interface ?? '?'}: ${summary}`);
+  }
+  const subSummary = subSummaries.join('; ');
+  const interfaceList = Array.from(interfacesTouched).join(', ');
 
   return {
     ok: true,
     preview: {
       action: payload.action ?? 'multi',
       device: device.name,
-      interface: payload.interface,
+      interface: payload.interface ?? null,
+      interfaces: Array.from(interfacesTouched),
+      interfaceCount: interfacesTouched.size,
       vlan: payload.vlan ?? null,
       description: payload.description ?? null,
       subActionCount: subCount,
@@ -532,7 +557,7 @@ async function queueInterfaceActionHandler(
       jobId: result.job.id,
       jobStatus: result.job.status,
       message: subCount > 1
-        ? `Đã queue INTERFACE_ACTION multi-job (${subCount} subactions trên ${payload.interface}). Worker sẽ commit 1 lần trên thiết bị. Track ở /jobs.`
+        ? `Đã queue INTERFACE_ACTION multi-job (${subCount} subactions trên ${interfacesTouched.size} interface(s): ${interfaceList}). Worker sẽ group theo interface và commit mỗi group 1 lần. Track ở /jobs.`
         : 'Đã queue INTERFACE_ACTION job. Worker sẽ chạy trong vài giây. Track ở /jobs.',
     },
   };

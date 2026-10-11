@@ -43,7 +43,9 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 
 ### WRITE (backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
 - \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description / remove-description / **delete-interface (reset toàn bộ config)**
-  - Hỗ trợ **multi-action**: truyền \`actions: [{action, vlan?|description?}, ...]\` để apply nhiều thay đổi trên CÙNG interface trong 1 commit (atomic). Đây là cách đúng khi user yêu cầu >1 thay đổi cùng lúc (ví dụ "set VLAN 203 VÀ description sonnx_test"). Ưu tiên multi-action hơn queue nhiều job riêng.
+  - Hỗ trợ **multi-action cross-interface**: truyền \`actions: [{interface, action, vlan?|description?}, ...]\` — mỗi subaction có \`interface\` riêng, worker group theo interface, commit mỗi group 1 lần. Đây là cách đúng khi user muốn làm NHIỀU THAY ĐỔI TRÊN NHIỀU CỔNG cùng lúc (ví dụ "xoá + set VLAN + set desc trên cả cổng 8 và 9"). Ưu tiên multi-action cross-interface hơn queue nhiều job riêng.
+  - Cũng hỗ trợ **multi-action same-interface**: truyền \`interface\` ở top-level + \`actions: [{action, ...}, ...]\` — atomic 1 commit trên 1 cổng.
+  - Pattern KHẢ THI: \`delete-interface\` + \`set-access-vlan\` + \`set-description\` trên cùng 1 interface trong 1 batch (worker xử lý theo thứ tự, Junos commit 1 lần → interface sạch + chỉ giữ VLAN/desc mới).
 - \`queue_apply_config\` — apply config (commit) lên thiết bị (Junos/EOS/IOS-XE)
 - \`queue_rollback_config\` — rollback về config trước khi commit
 - \`apply_config_dry_run\` — tính diff (thêm/xoá/sửa dòng) mà KHÔNG commit
@@ -640,53 +642,62 @@ const queueInterfaceAction: CatalogEntry = {
       'Queue 1 INTERFACE_ACTION job. Write op — backend sẽ tạo ' +
       'confirmation card. CHỈ gọi sau khi đã lookup device qua get_device. ' +
       '\n\n' +
-      '## Hai cách gọi (ưu tiên multi-action khi apply >1 thay đổi)\n' +
+      '## Ba cách gọi (ưu tiên multi-action khi >1 thay đổi)\n' +
       '\n' +
-      '### Cách 1: Multi-action (PREFERRED cho >1 thay đổi)\n' +
-      'Truyền `actions: [...]` array. Tất cả subactions target CÙNG 1 interface, ' +
-      'commit 1 LẦN trên thiết bị (atomic, không có trạng thái "đã set VLAN nhưng chưa set description"). ' +
-      'Đây là cách đúng khi user yêu cầu "set VLAN 203 VÀ description sonnx_test" cùng lúc. ' +
-      'Examples: \n' +
-      '  queue_interface_action({device_name:"LAB-F6-DS-01", interface:"xe-0/0/7", ' +
+      '### Cách 1: Cross-interface multi-action (PREFERRED cho nhiều interface cùng lúc)\n' +
+      'Mỗi subaction có field `interface` riêng. Worker group theo interface, ' +
+      'commit mỗi group 1 LẦN. Tất cả trong 1 job, 1 confirmation card.\n' +
+      'Đây là cách đúng khi user yêu cầu "xoá cổng 8, 9 + cấu hình VLAN/desc cho cả 8 và 9" cùng lúc. \n' +
+      'Example (xoá + cấu hình 2 cổng trong 1 commit-set):\n' +
+      '  queue_interface_action({device_name:"LAB-F6-DS-01", \n' +
       '    actions: [\n' +
-      '      {action:"set-access-vlan", vlan:"203"},\n' +
-      '      {action:"set-description", description:"sonnx_test"}\n' +
-      '    ]}) — set VLAN + description trong 1 commit\n' +
-      '  queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", ' +
-      '    actions: [{action:"shut"}]}) — shut, tương đương single-action\n' +
+      '      {interface:"xe-0/0/8", action:"delete-interface"},\n' +
+      '      {interface:"xe-0/0/9", action:"delete-interface"},\n' +
+      '      {interface:"xe-0/0/8", action:"set-access-vlan", vlan:"201"},\n' +
+      '      {interface:"xe-0/0/8", action:"set-description", description:"client-tang1"},\n' +
+      '      {interface:"xe-0/0/9", action:"set-access-vlan", vlan:"202"},\n' +
+      '      {interface:"xe-0/0/9", action:"set-description", description:"client-tang2"},\n' +
+      '    ]}) — tất cả 6 thay đổi trên 2 cổng trong 1 job\n' +
       '\n' +
-      '### Cách 2: Single-action (legacy, chỉ dùng cho 1 thay đổi đơn lẻ)\n' +
-      'Truyền `action` (+ `vlan` hoặc `description` nếu cần). ' +
-      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/5", action:"shut"}). ' +
-      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-access-vlan", vlan:"100"}). ' +
-      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-description", description:"uplink-to-core"}). \n' +
+      '### Cách 2: Same-interface multi-action (atomic 1 commit)\n' +
+      'Top-level `interface` + `actions: [...]`. Tất cả subactions target CÙNG 1 interface, ' +
+      'commit 1 LẦN trên thiết bị. Dùng khi >1 thay đổi trên CÙNG interface. \n' +
+      'Example: queue_interface_action({device_name:"LAB-F6-DS-01", interface:"xe-0/0/7", \n' +
+      '  actions: [{action:"set-access-vlan", vlan:"203"},{action:"set-description", description:"sonnx_test"}]})\n' +
+      '\n' +
+      '### Cách 3: Single-action (legacy, chỉ dùng cho 1 thay đổi đơn lẻ)\n' +
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/5", action:"shut"}). \n' +
+      'queue_interface_action({device_name:"F2-AS-01", interface:"ge-0/0/3", action:"set-access-vlan", vlan:"100"}). \n' +
       '\n' +
       '## Quy tắc\n' +
-      '- KHÔNG queue 2 jobs riêng cho cùng interface khi có thể gộp (dùng multi-action).\n' +
+      '- KHÔNG queue 2 jobs riêng khi có thể gộp vào 1 (dùng multi-action).\n' +
       '- KHÔNG queue nếu device OFFLINE (tool sẽ trả lỗi).\n' +
       '- action=`delete-interface`: XÓA TOÀN BỘ cấu hình của interface (reset về default). ' +
-      'Dùng multi-action kèm với shut/no-shut nếu cần, không dùng kèm set-access-vlan (mâu thuẫn).',
+      'Có thể kết hợp với `set-access-vlan` / `set-description` trong CÙNG batch trên CÙNG interface: ' +
+      'worker sẽ load theo thứ tự khai báo (delete trước, set sau), Junos xử lý tuần tự trong 1 commit ' +
+      '→ kết quả: interface sạch + chỉ có VLAN/description mới. ' +
+      'VÍ DỤ: delete cổng 8 + set VLAN 201 + set desc "client-tang1" trên cùng xe-0/0/8 trong 1 call.\n' +
+      '- KHÔNG mix `shut` + `no-shut` trên cùng interface trong cùng batch (mâu thuẫn, 2 lệnh triệt tiêu nhau).',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['device_name', 'interface'],
+      required: ['device_name'],
       properties: {
         device_name: { type: 'string', description: 'Tên thiết bị (case-insensitive)' },
-        interface: { type: 'string', description: 'Tên interface (vendor-specific, ví dụ xe-0/0/7, ge-0/0/5, Ethernet1/1)' },
-        // Multi-action path
+        interface: { type: 'string', description: 'Interface mặc định (vendor-specific, ví dụ xe-0/0/7). Bắt buộc cho single-action và same-interface multi-action. Bỏ qua khi mỗi subaction có interface riêng (cross-interface).' },
+        // Multi-action path (covers both same- and cross-interface)
         actions: {
           type: 'array',
-          description: 'Danh sách subactions áp dụng lên CÙNG interface, commit 1 lần. ' +
-            'Ưu tiên dùng khi >1 thay đổi. Mỗi subaction có `action` (+ `vlan` hoặc `description` nếu cần). ' +
-            'Tối đa 16 subactions / call.',
+          description: 'Danh sách subactions. Mỗi subaction có `action` (+ `vlan` hoặc `description` nếu cần). Mỗi subaction CÓ THỂ có field `interface` riêng (cross-interface) hoặc dùng top-level `interface` (same-interface). Tối đa 16 subactions / call, tối đa 8 interface khác nhau / call.',
           items: {
             type: 'object',
             additionalProperties: false,
             required: ['action'],
             properties: {
               action: strEnum(['shut', 'no-shut', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface']),
-              vlan: { type: 'string', description: 'VLAN ID (1-4094). Bắt buộc khi sub-action action="set-access-vlan".' },
-              description: { type: 'string', description: 'Mô tả mới (non-empty). Bắt buộc khi sub-action action="set-description".' },
+              interface: { type: 'string', description: 'Interface riêng cho subaction này. Khi có, override top-level `interface`. Khi không có, dùng top-level `interface`.' },
+              vlan: { type: 'string', description: 'VLAN ID (1-4094). Bắt buộc khi action="set-access-vlan".' },
+              description: { type: 'string', description: 'Mô tả mới (non-empty). Bắt buộc khi action="set-description".' },
             },
           },
         },
@@ -710,21 +721,34 @@ const queueInterfaceAction: CatalogEntry = {
   readonly: false,
   requiresRole: 'OPERATOR',
   confirmSummary: (args) => {
-    const i = String(args.interface ?? '?');
     const d = String(args.device_name ?? '?');
-    // Multi-action path: list all subactions joined
+    const topIface = String(args.interface ?? '').trim();
+    // Multi-action path: list all subactions joined, grouped by interface
     if (Array.isArray(args.actions) && args.actions.length > 0) {
-      const parts = (args.actions as Array<Record<string, unknown>>).map((s) => {
+      const subs = args.actions as Array<Record<string, unknown>>;
+      // Group by interface
+      const groups = new Map<string, string[]>();
+      for (const s of subs) {
         const a = String(s.action ?? '?');
-        if (a === 'set-access-vlan') return `set VLAN ${s.vlan ?? '?'}`;
-        if (a === 'set-description') return `set desc "${s.description ?? ''}"`;
-        if (a === 'remove-description') return 'xóa desc';
-        if (a === 'delete-interface') return 'XÓA TOÀN BỘ cấu hình';
-        return a;
-      });
-      return `${parts.join(' + ')} trên ${i} (${d})`;
+        const iface = String(s.interface ?? topIface ?? '?');
+        let part: string;
+        if (a === 'set-access-vlan') part = `set VLAN ${s.vlan ?? '?'}`;
+        else if (a === 'set-description') part = `set desc "${s.description ?? ''}"`;
+        else if (a === 'remove-description') part = 'xóa desc';
+        else if (a === 'delete-interface') part = 'XÓA TOÀN BỘ cấu hình';
+        else part = a;
+        if (!groups.has(iface)) groups.set(iface, []);
+        groups.get(iface)!.push(part);
+      }
+      const lines: string[] = [];
+      for (const [iface, parts] of groups) {
+        lines.push(`${parts.join(' + ')} trên ${iface}`);
+      }
+      const suffix = groups.size > 1 ? ` (${groups.size} cổng)` : '';
+      return `${lines.join('; ')} — ${d}${suffix}`;
     }
     // Legacy single-action
+    const i = String(args.interface ?? '?');
     const a = String(args.action ?? '?');
     if (a === 'set-access-vlan') {
       return `Set VLAN ${args.vlan ?? '?'} trên ${i} (${d})`;

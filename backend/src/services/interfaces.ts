@@ -22,45 +22,69 @@ export type InterfaceAction =
 /**
  * One logical change applied to an interface.
  *
- * Used by the new multi-action payload: queueInterfaceAction now accepts a
- * batch of `actions: SubAction[]` so the LLM can do
- * "set-access-vlan 203 + set-description 'sonnx_test'" in ONE job and ONE
- * device commit instead of two separate round-trips.
+ * Used by the multi-action payload. `interface` is OPTIONAL on a
+ * subaction — when present, that subaction targets its own interface
+ * (enabling cross-interface batches). When absent, the subaction
+ * targets the interface hoisted on the top-level payload (legacy
+ * same-interface multi-action).
  *
- * Each subaction carries the same fields as the legacy single-action payload
- * but drops `interface` (it's hoisted to the top-level payload).
+ * Cross-interface example (one call, one job, one device commit-set):
+ *   actions: [
+ *     {interface:"xe-0/0/8", action:"delete-interface"},
+ *     {interface:"xe-0/0/9", action:"delete-interface"},
+ *     {interface:"xe-0/0/8", action:"set-access-vlan", vlan:"201"},
+ *     {interface:"xe-0/0/8", action:"set-description", description:"client-tang1"},
+ *     {interface:"xe-0/0/9", action:"set-access-vlan", vlan:"202"},
+ *     {interface:"xe-0/0/9", action:"set-description", description:"client-tang2"},
+ *   ]
+ *
+ * Same-interface (legacy) example:
+ *   interface: "xe-0/0/7"
+ *   actions: [
+ *     {action:"set-access-vlan", vlan:"203"},
+ *     {action:"set-description", description:"sonnx_test"},
+ *   ]
  */
 export type InterfaceSubAction =
-  | { action: 'shut' }
-  | { action: 'no-shut' }
-  | { action: 'set-access-vlan'; vlan: string }
-  | { action: 'set-description'; description: string }
-  | { action: 'remove-description' }
-  | { action: 'delete-interface' };
+  | { action: 'shut'; interface?: string }
+  | { action: 'no-shut'; interface?: string }
+  | { action: 'set-access-vlan'; vlan: string; interface?: string }
+  | { action: 'set-description'; description: string; interface?: string }
+  | { action: 'remove-description'; interface?: string }
+  | { action: 'delete-interface'; interface?: string };
 
 /**
- * Stored in the Job.payload column. Two shapes are accepted:
+ * Stored in the Job.payload column. Three shapes are accepted:
  *
- *   1. Legacy single-action: { action, interface, vlan?, description? }
- *      (kept for backward compat with existing jobs and the public REST route
- *      /api/devices/:id/actions)
+ *   1. Legacy single-action:
+ *        { action, interface, vlan?, description? }
+ *      (kept for backward compat with existing jobs and the public REST
+ *      route /api/devices/:id/actions)
  *
- *   2. Multi-action (new): { interface, actions: SubAction[] }
- *      - all subactions target the SAME interface
- *      - all commands land in ONE device commit (atomic on the device)
- *      - `description` on `set-description` is a non-empty string;
- *        `remove-description` clears the description
- *      - `delete-interface` and `shut` in the same batch is rejected
- *        (contradictory — see validateSubActions in the worker)
+ *   2. Multi-action on the SAME interface (hoisted):
+ *        { interface, actions: SubAction[] }   // all subactions on `interface`
+ *      → all commands land in ONE device commit (atomic on the device)
+ *
+ *   3. Multi-action ACROSS interfaces (new):
+ *        { actions: SubAction[] }              // each subaction has its own `interface`
+ *      → worker groups subactions by interface, commits each group
+ *        atomically on its own interface, all in the same job.
+ *        No top-level `interface` field.
+ *
+ * Rules:
+ * - Reject contradictory subactions on the same interface
+ *   (shut+no-shut, delete-interface + anything else).
+ * - Cap batch size to 16 subactions and 8 distinct interfaces per job
+ *   (operator can always send another job if they need more).
  */
 export type InterfaceActionPayload = {
   // Legacy single-action form
   action?: InterfaceAction;
   vlan?: string;
   description?: string;
-  // New multi-action form
+  // Multi-action form (same or cross interface)
   actions?: InterfaceSubAction[];
-} & { interface: string };
+} & { interface?: string };
 
 const ACTION_VALUES: InterfaceAction[] = ['shut', 'no-shut', 'show-run', 'set-access-vlan', 'set-description', 'remove-description', 'delete-interface'];
 
@@ -83,12 +107,20 @@ function parseSubAction(raw: unknown): InterfaceSubAction | null {
   const action = v.action;
   if (typeof action !== 'string' || !SUBACTION_VALUES.has(action)) return null;
 
+  // Per-subaction `interface` is OPTIONAL. When present, it overrides
+  // the top-level hoisted `interface` and enables cross-interface
+  // multi-action batches. The worker validates uniqueness / conflicts.
+  let perIface: string | undefined;
+  if (typeof v.interface === 'string' && v.interface.trim()) {
+    perIface = v.interface.trim();
+  }
+
   if (action === 'set-access-vlan') {
     const vlan = v.vlan;
     if (typeof vlan !== 'string' || !/^\d{1,4}$/.test(vlan.trim())) return null;
     const n = parseInt(vlan, 10);
     if (n < 1 || n > 4094) return null;
-    return { action: 'set-access-vlan', vlan: vlan.trim() };
+    return { action: 'set-access-vlan', vlan: vlan.trim(), ...(perIface ? { interface: perIface } : {}) };
   }
   if (action === 'set-description') {
     if (typeof v.description !== 'string') return null;
@@ -98,10 +130,10 @@ function parseSubAction(raw: unknown): InterfaceSubAction | null {
     // send `description ""` which means something weird per-vendor.
     const d = v.description.trim();
     if (!d) return null;
-    return { action: 'set-description', description: d };
+    return { action: 'set-description', description: d, ...(perIface ? { interface: perIface } : {}) };
   }
   if (action === 'shut' || action === 'no-shut' || action === 'remove-description' || action === 'delete-interface') {
-    return { action } as InterfaceSubAction;
+    return { action, ...(perIface ? { interface: perIface } : {}) } as InterfaceSubAction;
   }
   return null;
 }
@@ -112,15 +144,24 @@ export function parseInterfaceActionPayload(body: unknown): InterfaceActionPaylo
   }
 
   const value = body as Record<string, unknown>;
-  const iface = value.interface;
+  const topIface = typeof value.interface === 'string' && value.interface.trim()
+    ? value.interface.trim()
+    : undefined;
 
-  if (typeof iface !== 'string' || !iface.trim()) {
-    return null;
-  }
-
-  // Multi-action form: { interface, actions: [...] }
-  // Preferred for new code; the LLM tool should call this way so the worker
-  // can commit all changes atomically.
+  // Multi-action form: { interface?, actions: [...] }
+  //
+  // Two sub-shapes:
+  //   A) Cross-interface: NO top-level interface, each subaction has its
+  //      own `interface` field. Worker groups by interface.
+  //   B) Same-interface: top-level `interface` is set, subactions may or
+  //      may not have their own. If a subaction has its own, it OVERRIDES
+  //      the top-level for that subaction (so the LLM can mix interfaces
+  //      in the same batch even if a top-level interface is provided as
+  //      a "default").
+  //
+  // We don't enforce shape-A-vs-B strictly — we just accept either as
+  // long as every subaction has a resolved interface (top-level or
+  // per-subaction) by the time the worker sees it.
   if (Array.isArray(value.actions)) {
     if (value.actions.length === 0) return null;
     if (value.actions.length > 16) return null; // sanity cap
@@ -130,10 +171,17 @@ export function parseInterfaceActionPayload(body: unknown): InterfaceActionPaylo
       if (!parsed) return null;
       sub.push(parsed);
     }
-    return { interface: iface.trim(), actions: sub };
+    return {
+      ...(topIface ? { interface: topIface } : {}),
+      actions: sub,
+    };
   }
 
   // Legacy single-action form: { action, interface, vlan?, description? }
+  // Requires a top-level interface.
+  if (!topIface) return null;
+  const iface = topIface;
+
   const action = value.action;
   if (typeof action !== 'string' || !ACTION_VALUES.includes(action as InterfaceAction)) {
     return null;
@@ -164,7 +212,7 @@ export function parseInterfaceActionPayload(body: unknown): InterfaceActionPaylo
 
   return {
     action: action as InterfaceAction,
-    interface: iface.trim(),
+    interface: iface,
     ...(vlan ? { vlan } : {}),
     ...(action === 'set-description' || action === 'remove-description'
       ? { description: description ?? '' }

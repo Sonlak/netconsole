@@ -453,6 +453,75 @@ describe('queue_interface_action (WRITE)', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/Invalid action payload/);
   });
+
+  // ── Multi-action CROSS-INTERFACE: 2 ports in 1 call ────────────────────
+
+  it('queues a cross-interface batch (2 ports, 6 subactions) and reports interfaceCount=2', async () => {
+    deviceFindFirst.mockResolvedValueOnce({ id: 'dev-1', name: 'LAB-F6-DS-01', ip: '10.10.20.6', status: 'ONLINE' });
+    parseInterfaceActionPayload.mockReturnValueOnce({
+      actions: [
+        { interface: 'xe-0/0/8', action: 'delete-interface' },
+        { interface: 'xe-0/0/9', action: 'delete-interface' },
+        { interface: 'xe-0/0/8', action: 'set-access-vlan', vlan: '201' },
+        { interface: 'xe-0/0/8', action: 'set-description', description: 'client-tang1' },
+        { interface: 'xe-0/0/9', action: 'set-access-vlan', vlan: '202' },
+        { interface: 'xe-0/0/9', action: 'set-description', description: 'client-tang2' },
+      ],
+    });
+    queueInterfaceAction.mockResolvedValueOnce({
+      kind: 'created',
+      job: {
+        id: 'job-cross-1',
+        type: 'INTERFACE_ACTION',
+        status: 'PENDING',
+        createdAt: new Date(),
+        deviceId: 'dev-1',
+        payload: {
+          actions: [
+            { interface: 'xe-0/0/8', action: 'delete-interface' },
+            { interface: 'xe-0/0/9', action: 'delete-interface' },
+            { interface: 'xe-0/0/8', action: 'set-access-vlan', vlan: '201' },
+            { interface: 'xe-0/0/8', action: 'set-description', description: 'client-tang1' },
+            { interface: 'xe-0/0/9', action: 'set-access-vlan', vlan: '202' },
+            { interface: 'xe-0/0/9', action: 'set-description', description: 'client-tang2' },
+          ],
+        },
+      },
+    });
+    const result = await HANDLERS.queue_interface_action(
+      {
+        device_name: 'LAB-F6-DS-01',
+        actions: [
+          { interface: 'xe-0/0/8', action: 'delete-interface' },
+          { interface: 'xe-0/0/9', action: 'delete-interface' },
+          { interface: 'xe-0/0/8', action: 'set-access-vlan', vlan: '201' },
+          { interface: 'xe-0/0/8', action: 'set-description', description: 'client-tang1' },
+          { interface: 'xe-0/0/9', action: 'set-access-vlan', vlan: '202' },
+          { interface: 'xe-0/0/9', action: 'set-description', description: 'client-tang2' },
+        ],
+      },
+      ctx,
+    );
+    if (!result.ok) {
+      throw new Error(`handler returned ok=false, error=${(result as { error: string }).error}`);
+    }
+    expect(result.ok).toBe(true);
+    const preview = result.preview as {
+      subActionCount: number;
+      interfaceCount: number;
+      interfaces: string[];
+      subActionSummary: string;
+      jobId: string;
+    };
+    expect(preview.subActionCount).toBe(6);
+    expect(preview.interfaceCount).toBe(2);
+    expect(preview.interfaces).toEqual(expect.arrayContaining(['xe-0/0/8', 'xe-0/0/9']));
+    expect(preview.subActionSummary).toContain('client-tang1');
+    expect(preview.subActionSummary).toContain('client-tang2');
+    expect(preview.subActionSummary).toContain('201');
+    expect(preview.subActionSummary).toContain('202');
+    expect(preview.jobId).toBe('job-cross-1');
+  });
 });
 
 describe('suggest_followup (UI affordance)', () => {
