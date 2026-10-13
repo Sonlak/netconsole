@@ -136,6 +136,19 @@ export function AssistantDrawer({ open, onClose }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
+  /**
+   * Set to true when the user sends a message that contains an export
+   * keyword ("xuất", "tải file", "excel", "export", "csv", "download",
+   * ...). The flag is consumed once — it marks only the immediately
+   * following assistant bubble so the export button appears without the
+   * user having to ask twice.
+   */
+  const expectExportRef = useRef(false);
+
+  /** Case-insensitive keyword test for export requests. */
+  const hasExportKeyword = (text: string) =>
+    /\b(xuất|tải\s*(về|file|xlsx|excel|csv)|export|excel|xlsx|csv|download)\b/i.test(text);
+
   const isAdmin = user?.role === 'ADMIN';
 
   // ── persistence ─────────────────────────────────────────────────────
@@ -224,11 +237,17 @@ export function AssistantDrawer({ open, onClose }: Props) {
           { id: `u-${Date.now()}`, role: 'user', content: userMessage },
         ]);
       }
+      // Detect export keyword before consuming the ref.
+      if (userMessage && hasExportKeyword(userMessage)) {
+        expectExportRef.current = true;
+      }
       // Add a placeholder assistant bubble that we'll stream into.
       const assistantId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const showExport = expectExportRef.current;
+      expectExportRef.current = false; // consume — only next response gets the flag
       setMessages((prev) => [
         ...prev,
-        { id: assistantId, role: 'assistant', content: '', isStreaming: true },
+        { id: assistantId, role: 'assistant', content: '', isStreaming: true, showExport },
       ]);
 
       setInput('');

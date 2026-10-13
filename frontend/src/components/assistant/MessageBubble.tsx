@@ -77,6 +77,15 @@ export type AssistantMessageView = {
    * chip sends the suggestion text as a new user message.
    */
   suggestions?: string[];
+  /**
+   * When true, the bubble renders a "Tải Excel" button under any
+   * tool call that returned a list-shaped preview. Set by the
+   * drawer when the user message contains an export keyword
+   * ("xuất", "tải file", "excel", "export", "csv", "download",
+   * ...). Default off so the chat doesn't push a download CTA on
+   * every list response.
+   */
+  showExport?: boolean;
   isStreaming?: boolean;
 };
 
@@ -415,10 +424,13 @@ export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, 
           </div>
         ) : null}
 
-        {/* Export-to-Excel action. One button per tool call that
-            returned an exportable preview. Hidden while streaming so
-            the user doesn't see a half-baked action. */}
+        {/* Export-to-Excel action. Hidden by default — only shown when
+            the user explicitly asked for export (xuất/tải file/excel/
+            csv/download). One button per qualifying tool call. The
+            button is also hidden during streaming so the user doesn't
+            see a half-baked action. */}
         {!message.isStreaming &&
+          message.showExport === true &&
           message.toolCalls &&
           message.toolCalls.length > 0 && (
             <div
