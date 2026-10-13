@@ -333,12 +333,21 @@ export async function listNetboxVlans(
 export type NetBoxPrefix = {
   id: number;
   prefix: string;
-  site: { id: number; name: string } | null;
-  vrf: { id: number; name: string } | null;
+  site: { id: number; name: string; slug?: string } | null;
+  vrf: { id: number; name: string; rd?: string | null } | null;
+  // NetBox returns tenant/vlan/role as nested objects. The assistant
+  // needs all of them when the user asks "cho thông tin đầy đủ" — the
+  // old shape only exposed site/vrf/status, so the LLM kept saying
+  // "không có" for tenant/vlan/role even though NetBox had the data.
+  tenant: { id: number; name: string; slug?: string } | null;
+  vlan: { id: number; vid: number; name: string; display?: string } | null;
+  role: { id: number; name: string; slug?: string } | null;
   status: { value: string; label: string };
-  role: { id: number; name: string } | null;
   description: string;
   utilization: number; // % (NetBox v4 computes this)
+  is_pool: boolean;
+  mark_utilized: boolean;
+  prefix_length: number; // e.g. 24
 };
 
 export async function listNetboxPrefixes(
@@ -350,6 +359,12 @@ export async function listNetboxPrefixes(
     contains?: string;
     /** NetBox prefix filter: exact prefix match (e.g. "10.10.20.0/24"). */
     prefix?: string;
+    /** Filter by tenant slug or name. */
+    tenant?: string;
+    /** Filter by VLAN id (1-4094) or name. */
+    vlan?: string | number;
+    /** Filter by role slug or name. */
+    role?: string;
     limit?: number;
   } = {},
 ): Promise<NetBoxPrefix[]> {
@@ -361,6 +376,10 @@ export async function listNetboxPrefixes(
       status: options.status,
       contains: options.contains,
       prefix: options.prefix,
+      tenant: options.tenant,
+      vlan_id: typeof options.vlan === 'number' ? options.vlan : undefined,
+      vlan: typeof options.vlan === 'string' ? options.vlan : undefined,
+      role: options.role,
       limit,
     },
   });

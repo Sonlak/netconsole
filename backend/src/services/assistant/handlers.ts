@@ -2713,18 +2713,39 @@ async function listNetboxPrefixesHandler(
       contains: typeof args.contains === 'string' ? args.contains : undefined,
       // `prefix` is an exact CIDR match (e.g. "10.10.20.0/24").
       prefix: typeof args.prefix === 'string' ? args.prefix : undefined,
+      tenant: typeof args.tenant === 'string' ? args.tenant : undefined,
+      vlan: typeof args.vlan === 'string' && args.vlan !== '' ? args.vlan : undefined,
+      role: typeof args.role === 'string' ? args.role : undefined,
       limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
     });
     return {
       ok: true,
       preview: {
         total: prefixes.length,
+        // Surface every field the LLM (and the Excel export) needs.
+        // The OLD shape exposed only site/vrf/status/utilization/description,
+        // so any user asking "cho thông tin đầy đủ" got a partial answer
+        // — NetBox also stores tenant / vlan / role / mark_utilized
+        // / is_pool / prefix_length, and the LLM couldn't quote them.
         prefixes: prefixes.map((p) => ({
           id: p.id,
           prefix: p.prefix,
+          prefixLength: p.prefix_length,
           site: p.site?.name ?? null,
+          siteSlug: p.site?.slug ?? null,
           vrf: p.vrf?.name ?? null,
+          vrfRd: p.vrf?.rd ?? null,
+          tenant: p.tenant?.name ?? null,
+          tenantSlug: p.tenant?.slug ?? null,
+          vlanId: p.vlan?.id ?? null,
+          vlanVid: p.vlan?.vid ?? null,
+          vlanName: p.vlan?.name ?? null,
+          role: p.role?.name ?? null,
+          roleSlug: p.role?.slug ?? null,
           status: p.status?.value ?? null,
+          statusLabel: p.status?.label ?? null,
+          isPool: p.is_pool,
+          markUtilized: p.mark_utilized,
           utilization: p.utilization,
           description: p.description,
         })),

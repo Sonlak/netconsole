@@ -1123,6 +1123,68 @@ describe('list_netbox_prefixes', () => {
       expect.objectContaining({ prefix: '10.10.20.0/24' }),
     );
   });
+
+  it('forwards tenant/vlan/role filter args to client', async () => {
+    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    await HANDLERS.list_netbox_prefixes(
+      { tenant: 'ttdl-binh-duong', vlan: '190', role: 'internal' },
+      ctx,
+    );
+    expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        tenant: 'ttdl-binh-duong',
+        vlan: '190',
+        role: 'internal',
+      }),
+    );
+  });
+
+  it('exposes tenant / vlan / role / utilization in preview (full-info request)', async () => {
+    // User pasted the raw NetBox UI output showing these fields; the
+    // assistant must surface them when the LLM calls
+    // list_netbox_prefixes with prefix="192.168.190.0/24" and the user
+    // asks "cho thông tin đầy đủ". Before this fix the response only
+    // had site/vrf/status/utilization/description → LLM kept saying
+    // "không có" for tenant/vlan/role even though NetBox had the data.
+    listNetboxPrefixesMock.mockResolvedValueOnce([
+      {
+        id: 973,
+        prefix: '192.168.190.0/24',
+        prefix_length: 24,
+        site: { id: 1, name: 'DC-A10', slug: 'dc-a10' },
+        vrf: { id: 2, name: 'mgmt', rd: '65000:2' },
+        tenant: { id: 5, name: 'TTDL Bình Dương', slug: 'ttdl-binh-duong' },
+        vlan: { id: 17, vid: 190, name: 'VLAN 190' },
+        role: { id: 3, name: 'Internal', slug: 'internal' },
+        status: { value: 'active', label: 'Active' },
+        description: 'TERMINAL GATEWAY1',
+        utilization: 42.0,
+        is_pool: false,
+        mark_utilized: false,
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_prefixes(
+      { prefix: '192.168.190.0/24' },
+      ctx,
+    );
+    expect(result.ok).toBe(true);
+    const preview = result.preview as {
+      prefixes: Array<Record<string, unknown>>;
+    };
+    const p = preview.prefixes[0];
+    expect(p.tenant).toBe('TTDL Bình Dương');
+    expect(p.tenantSlug).toBe('ttdl-binh-duong');
+    expect(p.vlanVid).toBe(190);
+    expect(p.vlanName).toBe('VLAN 190');
+    expect(p.vlanId).toBe(17);
+    expect(p.role).toBe('Internal');
+    expect(p.roleSlug).toBe('internal');
+    expect(p.vrfRd).toBe('65000:2');
+    expect(p.siteSlug).toBe('dc-a10');
+    expect(p.statusLabel).toBe('Active');
+    expect(p.prefixLength).toBe(24);
+    expect(p.utilization).toBe(42.0);
+  });
 });
 
 describe('list_netbox_ip_addresses', () => {

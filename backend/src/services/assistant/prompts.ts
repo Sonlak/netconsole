@@ -309,7 +309,8 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 - \`list_netbox_devices\` / \`get_netbox_device\`: mỗi device có \`id, name, status, site, role, manufacturer, model, platform, serial, primaryIp4, rack, position, description, netconsoleId, tags, url, lastUpdated\`
 - \`list_netbox_interfaces\` (theo NetBox device id): \`name, type, enabled, description, mtu, speedMbps, macAddress, mode, untaggedVlan, taggedVlans[]\`
 - \`list_netbox_vlans\` (filter site): \`vid, name, status, site, group, description\`
-- \`list_netbox_prefixes\` (IPAM CIDR): \`prefix, site, vrf, status, utilization (%), description\`
+- \`list_netbox_prefixes\` (IPAM CIDR): \`prefix, prefixLength, site, siteSlug, vrf, vrfRd, tenant, tenantSlug, vlan {id, vid, name}, role, roleSlug, status, statusLabel, isPool, markUtilized, utilization (%), description\`
+  - Khi user hỏi "thông tin đầy đủ" về 1 prefix → dùng filter \`prefix="CIDR"\`, đọc row đầu tiên, liệt kê TẤT CẢ field ở trên. KHÔNG bịa field không có, nhưng CŨNG KHÔNG nói "không có thông tin" nếu field đó nằm trong JSON.
 - \`list_netbox_ip_addresses\` (IPAM): \`address, status, dnsName, description, assignedTo: {interfaceId, interfaceName, device}, tags\`
 - \`get_netbox_sync_status\` (đọc NetConsole DB): \`{summary: {total, synced, pending, failed}, devices: [{synced, netboxDeviceId, netboxSyncedAt, netboxSyncError}]}\`
 - KHÔNG có: log, alert, job history (dùng tool NetConsole tương ứng)
@@ -2271,10 +2272,16 @@ const listNetboxPrefixes: CatalogEntry = {
   function: {
     name: 'list_netbox_prefixes',
     description:
-      'Liệt kê prefix (CIDR) trong IPAM của NetBox. Mỗi prefix: prefix, site, vrf, ' +
-      'status, utilization (%), description. Dùng khi user hỏi "subnet nào đã khai báo ' +
-      'trong NetBox", "IPAM có bao nhiêu /24 ở site NKKN", "subnet nào chứa IP 10.10.20.131", ' +
-      '"có tồn tại prefix 10.10.20.0/24 trong NetBox không". ' +
+      'Liệt kê prefix (CIDR) trong IPAM của NetBox. Mỗi prefix: prefix, prefixLength, ' +
+      'site (name + slug), vrf (name + rd), tenant (name + slug), vlan (id + vid + name), ' +
+      'role (name + slug), status (value + label), isPool, markUtilized, utilization (%), ' +
+      'description. Dùng khi user hỏi "subnet nào đã khai báo trong NetBox", "IPAM có bao nhiêu /24 ở site NKKN", ' +
+      '"subnet nào chứa IP 10.10.20.131", "có tồn tại prefix 10.10.20.0/24 trong NetBox không", ' +
+      '"prefix 192.168.190.0/24 thuộc tenant nào / VLAN nào / role gì". ' +
+      'Khi user hỏi "thông tin đầy đủ" về MỘT prefix, dùng filter `prefix="CIDR"` để exact-match ' +
+      'rồi liệt kê TẤT CẢ field trong row đầu tiên (id, prefix, prefixLength, site, vrf, tenant, ' +
+      'vlan, role, status, isPool, markUtilized, utilization, description). KHÔNG nói "không có ' +
+      'thông tin" nếu field đó nằm trong JSON. ' +
       'Returns: mảng prefixes.',
     parameters: {
       type: 'object',
@@ -2291,6 +2298,14 @@ const listNetboxPrefixes: CatalogEntry = {
         //   list_netbox_prefixes(prefix="10.10.20.0/24")
         //   → trả về prefix đó nếu tồn tại, hoặc rỗng nếu không có
         prefix: { type: 'string', description: 'CIDR đầy đủ để exact-match. Ví dụ: "10.10.20.0/24".' },
+        // Tenant/VLAN/Role filters — bổ sung 2026-10-13 sau khi user kêu
+        // "thông tin đầy đủ prefix 192.168.190.0/24" mà LLM báo "không
+        // có" vì response cũ không expose tenant/vlan/role. Khi user hỏi
+        // "các prefix của tenant X" / "subnet ở VLAN 190" / "prefix role
+        // Internal" thì truyền filter tương ứng để giảm noise.
+        tenant: { type: 'string', description: 'Filter theo tenant slug hoặc name. Ví dụ: "ttdl-binh-duong".' },
+        vlan: { type: 'string', description: 'Filter theo VLAN. Truyền số VID (1-4094, dạng string) hoặc name. Ví dụ: "190" hoặc "VLAN 190".' },
+        role: { type: 'string', description: 'Filter theo role slug hoặc name. Ví dụ: "internal".' },
         // ⚠️ QUAN TRỌNG: để lấy TOÀN BỘ prefix (ví dụ "liệt kê đầy đủ" /
         // "toàn bộ subnet"), LUÔN truyền limit=1000. Không dùng limit mặc
         // định (200) vì sẽ thiếu dữ liệu. NetBox có thể chứa >200 prefix.
