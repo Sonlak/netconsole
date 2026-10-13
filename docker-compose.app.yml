@@ -198,13 +198,17 @@ services:
       # deploy.yml environment block (or in /opt/netconsole/backend/.env
       # on the VPS) before this will return anything other than 503.
       # Get a key at https://platform.openai.com/api-keys.
-      # gpt-4.1 (full) is the production default since 2026-10-13.
+      # gpt-4o-mini is the production default since 2026-10-13
+      # (revert from gpt-4.1 per user request — "như ban đầu").
+      # gpt-4.1 (full) was tried 2026-10-13 to fix tool routing but
+      # reverted the same day at user request.
       # gpt-4.1-mini was unreliable for tool routing with 55+ tools
       # (would call list_dhcp_leases for ARP queries, queue_collect
-      # for "tổng hợp MAC"). 6x cost but better tool selection.
+      # for "tổng hợp MAC"); gpt-4o-mini handles this slightly better
+      # than gpt-4.1-mini and costs less.
       # For local dev, override OPENAI_MODEL=gpt-4.1-mini in .env.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4.1}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
     networks:
       netconsole:
         ipv4_address: 172.31.0.3
