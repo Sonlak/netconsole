@@ -102,6 +102,18 @@ type Props = {
   onCancel: (toolCallId: string) => void;
   onPickSuggestion?: (suggestion: string) => void;
   showUsage: boolean;
+  /**
+   * If the user asked for export on this turn but the AI didn't
+   * re-call a data tool, this prop carries the most recent
+   * assistant message that DID produce an exportable tool result.
+   * We surface a "Tải lại Excel" button on the current bubble
+   * pointing at that previous data so the user always has a
+   * working download path even when the LLM forgets to refetch.
+   */
+  lastExportableToolCall?: {
+    name: string;
+    preview: unknown;
+  };
 };
 
 const TOOL_LABELS: Record<string, { label: string; color: string }> = {
@@ -300,7 +312,7 @@ function TypingDots() {
   );
 }
 
-export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, showUsage: _showUsage }: Props) {
+export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, showUsage: _showUsage, lastExportableToolCall }: Props) {
   const { token } = theme.useToken();
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
@@ -499,7 +511,10 @@ export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, 
 
         {/* Fallback tip: user asked for export but AI didn't re-call
             a data tool, so no button could appear. Show a small yellow
-            card telling the user how to ask again so the button shows. */}
+            card telling the user how to ask again so the button shows.
+            When we have a previous exportable tool result, ALSO render
+            a "Tải lại Excel" button so the user can still get a file
+            from the most recent fetch — better than no download at all. */}
         {!message.isStreaming && message.exportTip && (
           <div
             role="status"
@@ -520,6 +535,59 @@ export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, 
             {message.exportTip}
           </div>
         )}
+
+        {/* "Tải lại Excel" rescue button — shown when the current
+            message has no exportable tool call BUT the previous
+            assistant message did. Lets the user always get a
+            download even if the LLM forgets to re-fetch. */}
+        {!message.isStreaming &&
+          message.showExport === true &&
+          (!message.toolCalls || message.toolCalls.length === 0) &&
+          lastExportableToolCall &&
+          detectPreviewArray(lastExportableToolCall.preview) !== null && (
+            <div style={{ marginTop: 6 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  const res = downloadPreviewAsXlsx(lastExportableToolCall.preview, {
+                    toolName: lastExportableToolCall.name,
+                  });
+                  if (res.ok) {
+                    antdMessage.success(
+                      `Đã tải xuống ${res.filename} (${res.rowCount} dòng) — dùng data gần nhất`,
+                    );
+                  } else {
+                    antdMessage.warning(res.reason);
+                  }
+                }}
+                style={{
+                  cursor: 'pointer',
+                  padding: '5px 12px',
+                  borderRadius: 14,
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: token.colorPrimary,
+                  background: token.colorPrimaryBg,
+                  border: `1px solid ${token.colorPrimaryBorder}`,
+                  transition: 'all 160ms ease',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = token.colorPrimary;
+                  e.currentTarget.style.color = '#fff';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = token.colorPrimaryBg;
+                  e.currentTarget.style.color = token.colorPrimary;
+                }}
+                title="AI không gọi lại data tool, button này dùng data từ lần gọi trước đó"
+              >
+                <DownloadOutlined style={{ fontSize: 12, marginRight: 4 }} />
+                Tải lại Excel (
+                {detectPreviewArray(lastExportableToolCall.preview)!.rows.length} dòng — từ
+                lần gọi trước)
+              </button>
+            </div>
+          )}
 
         {/* Clickable follow-up chips. Rendered AFTER the text card so
             they read as "what to do next". Hide while streaming so

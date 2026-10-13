@@ -34,6 +34,12 @@ export type AssistantToolName =
   | 'get_fabric_topology'
   | 'search_recent_jobs'
   | 'get_job_detail'
+  // Raw ARP / MAC table READ tools (added 2026-10-13) — give the
+  // LLM an obvious answer for "xem ARP toàn hệ thống" / "liệt kê
+  // MAC" instead of falling back to get_job_detail (1 row each) or
+  // the wrong DHCP tool.
+  | 'list_arp_entries'
+  | 'list_mac_entries'
   | 'get_recent_logs'
   | 'get_unacknowledged_alerts'
   | 'list_alert_rules'

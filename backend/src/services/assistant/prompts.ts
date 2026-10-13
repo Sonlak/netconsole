@@ -242,6 +242,24 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 ### DHCP lease — list_dhcp_leases
 - \`ip\`, \`mac\`, \`hostname\`, \`subnetId\`, \`state\`, \`expiresAt\`
 - State: 'default' (=active), 'expired-reclaimed' (=expired), 'released', 'declined', 'static'
+- ⚠️ Đây là bảng DHCP do Kea cấp phát, KHÔNG phải bảng ARP. Nếu user hỏi
+  "xem ARP" / "MAC đã học" thì dùng list_arp_entries / list_mac_entries, KHÔNG
+  dùng tool này (dễ nhầm vì cùng là network table).
+
+### ARP table — list_arp_entries (mới 2026-10-13)
+- \`ip\`, \`mac\`, \`hostname\`, \`interface\`, \`flags\`, \`deviceName\`,
+  \`deviceIp\`, \`site\`, \`floor\`, \`collectedAt\`, \`clientDevice\`, \`clientPort\`
+- Filter: \`device\`, \`vlan\`, \`ip_contains\`, \`mac_contains\`, \`limit\`
+- Dùng cho "xem ARP toàn hệ thống", "ARP chi tiết thiết bị X",
+  "xuất file ARP", "ARP subnet Y". Đây là READ — KHÔNG dùng queue_collect
+  (đó là WRITE — trigger collect job mới).
+
+### MAC address table — list_mac_entries (mới 2026-10-13)
+- \`mac\`, \`ip\`, \`vlan\`, \`tag\`, \`interface\`, \`type\`, \`deviceName\`,
+  \`deviceIp\`, \`site\`, \`floor\`, \`collectedAt\`
+- Filter: \`device\`, \`vlan\`, \`mac_contains\`, \`interface_contains\`, \`limit\`
+- Dùng cho "liệt kê MAC", "MAC VLAN 201", "tổng hợp MAC rồi xuất excel",
+  "MAC chi tiết thiết bị X". Đây là READ — KHÔNG dùng queue_collect.
 
 ### DHCP pool/subnet — list_dhcp_subnets / get_dhcp_subnet / get_dhcp_pool_status
 - \`subnetId\`, \`name\`, \`site\`, \`vlan\`, \`subnet\`, \`pool\`, \`gateway\`, \`dns\`, \`utilization\`, \`leased\`
@@ -1007,6 +1025,110 @@ const getDhcpSubnet: CatalogEntry = {
       required: ['subnet_id'],
       properties: {
         subnet_id: { type: 'number', description: 'Subnet ID (xem list_dhcp_subnets)' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+/**
+ * Raw ARP table across all managed devices.
+ *
+ * Added 2026-10-13 to fix gpt-4.1-mini falling back to
+ * `list_dhcp_leases` for "xem ARP toàn hệ thống" / "xuất 34 bản
+ * ghi ARP" — DHCP lease ≠ ARP. This tool reads the latest GET_ARP
+ * job per device and merges the entries into one flat list, with
+ * optional filter by device / vlan / subnet.
+ *
+ * Returns a list-shaped preview (rows[]) so the export-to-Excel
+ * button on the frontend can pick it up automatically.
+ */
+const listArpEntries: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_arp_entries',
+    description:
+      'Liệt kê bảng ARP (IP ↔ MAC) đã được collect gần nhất trên các thiết bị managed. ' +
+      'Đây là tool ĐÚNG cho các câu hỏi kiểu "xem ARP toàn hệ thống", "xuất file ARP", ' +
+      '"ARP chi tiết thiết bị X", "có bao nhiêu MAC đã học", v.v. — KHÔNG dùng ' +
+      'list_dhcp_leases (DHCP lease là bảng khác, do Kea cấp phát). ' +
+      'Returns: { total, returned, truncated, deviceCount, devicesWithData, ' +
+      'lastUpdatedAt, rows[] } — mỗi row có { ip, mac, hostname, interface, flags, ' +
+      'deviceName, deviceIp, site, floor, collectedAt, clientDevice, clientPort }. ' +
+      'Nếu user hỏi "đếm bao nhiêu" thì dùng get_statistics(arp_total) nhanh hơn; ' +
+      'tool này trả RAW ROWS để xem chi tiết / xuất Excel.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        device: { type: 'string', description: 'Tên thiết bị (vd "LAB-F1-AS-01"). Tùy chọn.' },
+        vlan: {
+          type: 'number',
+          description: 'Filter theo VLAN ID (lấy từ subnet của IP). Tùy chọn.',
+        },
+        ip_contains: {
+          type: 'string',
+          description: 'Filter IP subnet hoặc prefix (vd "10.1.201"). Tùy chọn.',
+        },
+        mac_contains: {
+          type: 'string',
+          description: 'Filter theo MAC substring. Tùy chọn.',
+        },
+        limit: { type: 'number', description: 'Số row tối đa (mặc định 100, tối đa 2000).' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+/**
+ * Raw MAC address table across all managed devices.
+ *
+ * Added 2026-10-13 to give the LLM an obvious tool for "liệt kê
+ * MAC toàn hệ thống", "MAC VLAN 201", "tổng hợp MAC rồi xuất
+ * Excel". Previously the LLM defaulted to `queue_collect` (which
+ * would TRIGGER a fresh collect instead of reading existing data)
+ * because no read tool existed for the MAC table.
+ *
+ * Returns a list-shaped preview so the Excel export button picks
+ * it up automatically.
+ */
+const listMacEntries: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_mac_entries',
+    description:
+      'Liệt kê bảng MAC address (MAC ↔ VLAN ↔ interface) đã được collect gần nhất ' +
+      'trên các thiết bị managed. Đây là tool ĐÚNG cho "liệt kê MAC", "MAC VLAN X", ' +
+      '"tổng hợp MAC rồi xuất excel", "MAC chi tiết thiết bị Y", v.v. — KHÔNG dùng ' +
+      'queue_collect (đó là WRITE — trigger collect job mới). ' +
+      'Returns: { total, returned, truncated, deviceCount, devicesWithData, ' +
+      'lastUpdatedAt, rows[] } — mỗi row có { mac, ip, vlan, tag, interface, type, ' +
+      'deviceName, deviceIp, site, floor, collectedAt }. ' +
+      'Nếu user chỉ hỏi "đếm bao nhiêu" thì dùng get_statistics(mac_total) nhanh hơn; ' +
+      'tool này trả RAW ROWS để xem chi tiết / xuất Excel.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        device: { type: 'string', description: 'Tên thiết bị (vd "LAB-F1-AS-01"). Tùy chọn.' },
+        vlan: {
+          type: 'number',
+          description: 'Filter theo VLAN ID (vd 201). Tùy chọn.',
+        },
+        mac_contains: {
+          type: 'string',
+          description: 'Filter theo MAC substring. Tùy chọn.',
+        },
+        interface_contains: {
+          type: 'string',
+          description: 'Filter theo interface name substring (vd "Ethernet1"). Tùy chọn.',
+        },
+        limit: { type: 'number', description: 'Số row tối đa (mặc định 100, tối đa 2000).' },
       },
     },
   },
@@ -2328,6 +2450,11 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   lookupMac,
   getDeviceInterfaces,
   listDhcpLeases,
+  // Raw ARP / MAC tables (added 2026-10-13) — placed right after
+  // list_dhcp_leases so the LLM sees the network-table trio together
+  // and stops routing ARP/MAC queries to DHCP.
+  listArpEntries,
+  listMacEntries,
   getDhcpPoolStatus,
   listDhcpSubnets,
   getDhcpSubnet,

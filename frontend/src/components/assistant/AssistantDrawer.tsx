@@ -598,16 +598,42 @@ export function AssistantDrawer({ open, onClose }: Props) {
         {messages.length === 0 ? (
           <EmptyState onPick={(p) => void sendMessage(p)} token={token} />
         ) : (
-          messages.map((m) => (
-            <MessageBubble
-              key={m.id}
-              message={m}
-              onConfirm={handleConfirm}
-              onCancel={handleCancel}
-              onPickSuggestion={(s) => void sendMessage(s)}
-              showUsage={isAdmin}
-            />
-          ))
+          // Walk the message list left-to-right and remember the most
+          // recent assistant message that produced an exportable tool
+          // result. We pass that to the next bubble as `lastExportableToolCall`
+          // so the rescue button can recover when the LLM forgets to
+          // re-call a data tool on an export request. The carry-over
+          // resets naturally when a NEW exportable tool call appears.
+          (() => {
+            let lastExp: { name: string; preview: unknown } | undefined;
+            return messages.map((m) => {
+              const ownExp =
+                m.toolCalls
+                  ?.filter((tc) => tc.result?.ok && detectPreviewArray(tc.result.preview) !== null)
+                  .slice(-1)[0] ?? null;
+              if (ownExp) {
+                lastExp = { name: ownExp.name, preview: ownExp.result!.preview };
+              }
+              // For the current message, only show the rescue button
+              // when it didn't produce its own exportable tool call.
+              const showRescue =
+                m.role === 'assistant' &&
+                m.showExport === true &&
+                (!m.toolCalls || m.toolCalls.length === 0) &&
+                lastExp !== undefined;
+              return (
+                <MessageBubble
+                  key={m.id}
+                  message={m}
+                  onConfirm={handleConfirm}
+                  onCancel={handleCancel}
+                  onPickSuggestion={(s) => void sendMessage(s)}
+                  showUsage={isAdmin}
+                  lastExportableToolCall={showRescue ? lastExp : undefined}
+                />
+              );
+            });
+          })()
         )}
 
         {error && (

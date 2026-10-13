@@ -251,7 +251,14 @@ jobs:
           # docker-compose.app.yml — the backend already checks for the env
           # var at first request, not at process start.
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
-          echo "OPENAI_MODEL=gpt-4.1-mini" >> "$DEPLOY_DIR/.env"
+          # gpt-4.1 (full, not mini) — bumped 2026-10-13 to fix tool
+          # routing reliability. gpt-4.1-mini was returning
+          # list_dhcp_leases for ARP queries and queue_collect for
+          # "tổng hợp MAC". Cost ~6x but tool selection is much
+          # cleaner. If we need to downgrade for cost: gpt-4.1-mini
+          # is the previous default; the new list_arp_entries /
+          # list_mac_entries tools also help.
+          echo "OPENAI_MODEL=gpt-4.1" >> "$DEPLOY_DIR/.env"
           echo "==> Starting fresh containers..."
           # NOTE: NO --build flag. Images are built in CI (push-images job)
           # and pulled here. This is Phase 3 of the deploy-pipeline perf plan:

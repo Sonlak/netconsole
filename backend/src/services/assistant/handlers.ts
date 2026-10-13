@@ -34,6 +34,7 @@ import { getTool } from './prompts.js';
 
 import { prisma } from '../../lib/prisma.js';
 import { getMacAddressInventory } from '../macAddress.js';
+import { getArpInventory } from '../arpAddress.js';
 import { getFabricTopology } from '../fabricTopology.js';
 import {
   addDhcpReservation,
@@ -292,6 +293,158 @@ async function listDhcpLeasesHandler(
         site: l.site,
         state: l.stateLabel,
         expiresAt: l.expiresAt,
+      })),
+    },
+  };
+}
+
+/**
+ * Raw ARP table READ — added 2026-10-13.
+ *
+ * Wraps `getArpInventory()` (which reads the latest GET_ARP job
+ * per device) and applies optional filters before returning a
+ * list-shaped preview. The preview shape (`rows[]` + `total` +
+ * `truncated`) is the contract the frontend's Excel export button
+ * looks for via `detectPreviewArray`.
+ *
+ * Why this exists: gpt-4.1-mini was falling back to
+ * `list_dhcp_leases` for ARP questions because no other "table
+ * shaped" tool existed. With this in the catalog + the routing
+ * note in prompts.ts section 5, the LLM now has an obvious
+ * "ARP query → this tool" path.
+ */
+async function listArpEntriesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const inv = await getArpInventory();
+  let rows = inv.rows;
+
+  if (typeof args.device === 'string' && args.device) {
+    const needle = args.device.toLowerCase();
+    rows = rows.filter((r) => r.deviceName.toLowerCase().includes(needle));
+  }
+  if (typeof args.vlan === 'number' && Number.isFinite(args.vlan)) {
+    rows = rows.filter((r) => {
+      // ARP rows don't carry vlan directly, but the entry's interface
+      // (if it encodes a sub-if like "ge-0/0/0.201") or the device's
+      // site/vlan can imply it. Easiest reliable filter: if the IP
+      // matches a /24 in vlan vlan_id, keep. Use a relaxed prefix
+      // match — most L2/VLAN deployments use /24 per VLAN, so the
+      // 3rd octet of the IP is a good proxy. We DO NOT have a
+      // direct vlan column on ArpAddressRow, so this is best-effort
+      // (the user can re-filter on IP after).
+      // For now: if the user provides vlan, also accept entries
+      // whose hostname or interface tag matches ".vlan" or "vlanN".
+      // Simpler: just match if the interface string contains the
+      // vlan digit, OR skip silently.
+      const intf = r.interface ?? '';
+      return intf.includes(`.${args.vlan}`) || intf.includes(`vlan${args.vlan}`);
+    });
+  }
+  if (typeof args.ip_contains === 'string' && args.ip_contains) {
+    const needle = args.ip_contains.trim();
+    rows = rows.filter((r) => r.ip.includes(needle));
+  }
+  if (typeof args.mac_contains === 'string' && args.mac_contains) {
+    const needle = args.mac_contains.toLowerCase();
+    rows = rows.filter((r) => r.mac.toLowerCase().includes(needle));
+  }
+
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 100, 2000);
+  const truncated = rows.length > limit;
+  const out = rows.slice(0, limit);
+
+  return {
+    ok: true,
+    preview: {
+      total: rows.length,
+      returned: out.length,
+      truncated,
+      deviceCount: inv.managedDevices,
+      devicesWithData: inv.devicesWithData,
+      lastUpdatedAt: inv.lastUpdatedAt,
+      rows: out.map((r) => ({
+        ip: r.ip,
+        mac: r.mac,
+        hostname: r.hostname,
+        interface: r.interface,
+        flags: r.flags,
+        deviceName: r.deviceName,
+        deviceIp: r.deviceIp,
+        site: r.site,
+        floor: r.floor,
+        collectedAt: r.collectedAt,
+        clientDevice: r.clientDevice,
+        clientPort: r.clientPort,
+      })),
+    },
+  };
+}
+
+/**
+ * Raw MAC table READ — added 2026-10-13.
+ *
+ * Wraps `getMacAddressInventory()` and applies optional filters.
+ * Same preview contract as list_arp_entries so the Excel button
+ * works automatically.
+ *
+ * Why: gpt-4.1-mini was calling `queue_collect` (WRITE — trigger
+ * a fresh collect job) for "tổng hợp MAC rồi xuất excel" because
+ * no READ tool for the MAC table existed. The LLM interpreted
+ * "tổng hợp MAC" as "go collect". With this tool + the routing
+ * note in prompts.ts section 5, the LLM now reads existing data
+ * instead of triggering writes.
+ */
+async function listMacEntriesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const inv = await getMacAddressInventory();
+  let rows = inv.rows;
+
+  if (typeof args.device === 'string' && args.device) {
+    const needle = args.device.toLowerCase();
+    rows = rows.filter((r) => r.deviceName.toLowerCase().includes(needle));
+  }
+  if (typeof args.vlan === 'number' && Number.isFinite(args.vlan)) {
+    const want = String(args.vlan);
+    rows = rows.filter((r) => r.vlan === want);
+  }
+  if (typeof args.mac_contains === 'string' && args.mac_contains) {
+    const needle = args.mac_contains.toLowerCase();
+    rows = rows.filter((r) => r.mac.toLowerCase().includes(needle));
+  }
+  if (typeof args.interface_contains === 'string' && args.interface_contains) {
+    const needle = args.interface_contains.toLowerCase();
+    rows = rows.filter((r) => (r.interface ?? '').toLowerCase().includes(needle));
+  }
+
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 100, 2000);
+  const truncated = rows.length > limit;
+  const out = rows.slice(0, limit);
+
+  return {
+    ok: true,
+    preview: {
+      total: rows.length,
+      returned: out.length,
+      truncated,
+      deviceCount: inv.managedDevices,
+      devicesWithData: inv.devicesWithData,
+      lastUpdatedAt: inv.lastUpdatedAt,
+      rows: out.map((r) => ({
+        mac: r.mac,
+        ip: r.ip,
+        vlan: r.vlan,
+        tag: r.tag,
+        interface: r.interface,
+        type: r.type,
+        deviceName: r.deviceName,
+        deviceIp: r.deviceIp,
+        site: r.site,
+        floor: r.floor,
+        collectedAt: r.collectedAt,
       })),
     },
   };
@@ -2199,6 +2352,11 @@ async function describeCapabilitiesHandler(
         READ: [
           'lookup_mac', 'get_device', 'list_devices', 'get_device_interfaces',
           'get_dhcp_pool_status', 'list_dhcp_subnets', 'get_dhcp_subnet', 'list_dhcp_leases',
+          // Raw ARP / MAC tables (added 2026-10-13) — the LLM used to
+          // fall back to list_dhcp_leases for ARP/MAC queries because
+          // those names were the closest in the catalog. Now they have
+          // dedicated tools and appear right after list_dhcp_leases.
+          'list_arp_entries', 'list_mac_entries',
           'get_fabric_topology', 'search_recent_jobs', 'get_job_detail',
           'get_recent_logs', 'get_unacknowledged_alerts', 'list_alert_rules',
           'list_users', 'get_config_history', 'get_config_diff',
@@ -2695,6 +2853,10 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   get_device: getDeviceHandler,
   get_device_interfaces: getDeviceInterfacesHandler,
   list_dhcp_leases: listDhcpLeasesHandler,
+  // Raw ARP / MAC tables (added 2026-10-13) — see listArpEntriesHandler
+  // / listMacEntriesHandler for the "why this exists" notes.
+  list_arp_entries: listArpEntriesHandler,
+  list_mac_entries: listMacEntriesHandler,
   get_dhcp_pool_status: getDhcpPoolStatusHandler,
   get_fabric_topology: getFabricTopologyHandler,
   search_recent_jobs: searchRecentJobsHandler,
