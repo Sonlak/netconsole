@@ -369,6 +369,14 @@ export function AssistantDrawer({ open, onClose }: Props) {
               setTotalCostMicrodollars((p) => p + cost);
             },
             onError: (msg) => {
+              // On auth failure, wipe the stale session so the user can
+              // re-login without stale messages blocking the next turn.
+              if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+                sessionStorage.removeItem(MESSAGES_STORAGE_KEY);
+                sessionStorage.removeItem(SESSION_STORAGE_KEY);
+                setMessages([]);
+                setSessionId(null);
+              }
               setError(msg);
             },
             onDone: () => {
