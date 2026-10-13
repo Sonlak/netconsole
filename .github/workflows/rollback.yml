@@ -62,13 +62,23 @@ concurrency:
 env:
   DEPLOY_DIR: /opt/netconsole
   COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
+  # Production overlay — forces `image:` instead of `build:` so the rollback
+  # pulls a pre-baked GHCR image (built by the push-images job) instead of
+  # compiling locally. Without this, the local build re-uses cached layers
+  # from an older image (with stale schema.prisma) and the rolled-back
+  # container keeps crashing on prisma db push because the cached schema
+  # no longer matches the DB.
+  PROD_COMPOSE_FILE: /opt/netconsole/docker-compose.app.prod.yml
   COMPOSE_PROJECT: netconsole
   DEPLOY_SERVICES: "backend worker frontend"
   # Last-resort fallback when ALL marker logic fails.
   # Update this when a new "known-good" is confirmed in production.
-  # Currently: 2026-09-16 08:20 "fix(rollback): use local file ops + FALLBACK_SHA"
-  # Verified working: Rollback #19 (commit 563f8a9 failed, rollback to 2341643 succeeded in 1m53s).
-  FALLBACK_SHA: 2341643b4e07b2f5d71282d07c421faf91b305a8
+  # Current: 2026-10-13 12:00 — `8dab6659` (assistant tool fix + gpt-4.1
+  # upgrade) verified after rollback #245 from failed `adb1c95` deploy.
+  # Rollback workflow now uses the prod overlay (see "Rebuild and restart
+  # app services" step) to pull the GHCR image instead of rebuilding
+  # locally with a cached schema.
+  FALLBACK_SHA: 8dab6659c3f4b6c0ce06bd4920b6706b6b20c2fa
   FALLBACK_REF: main
 
 jobs:
@@ -263,33 +273,37 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -uo pipefail
-          # Safe rebuild: try with --build first (the normal path). If the build
-          # itself fails (e.g. the previous SHA's code no longer builds), fall
-          # back to recreating containers from cached images without rebuilding.
-          # The cached image still has the OLD compiled binary — that's exactly
-          # what we want: code from the previous successful deploy, not the
-          # failing commit's code.
-          #
-          # The backend startup script (scripts/docker-start.sh) is resilient:
-          # it never blocks container start even if prisma db push fails due
-          # to schema drift between the rolled-back schema.prisma and the DB.
-          echo "==> Building + recreating containers (attempt 1: with --build)..."
+          # Use the production overlay so `image:` is used instead of `build:`.
+          # Without the overlay, `docker compose up -d --build` re-uses cached
+          # build layers from an older image (with stale schema.prisma) and
+          # the rolled-back container keeps crashing on `prisma db push`
+          # because the cached schema no longer matches the DB. The deploy
+          # job already uses this overlay (see deploy.yml "Build & restart");
+          # rollback must do the same.
+          echo "==> Pulling fresh images from GHCR (tag: $PREV_SHA)..."
+          export GITHUB_SHA="${{ steps.marker.outputs.PREV_SHA }}"
+          docker compose -p "$COMPOSE_PROJECT" \
+            -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" \
+            --env-file "$DEPLOY_DIR/.env" \
+            pull $DEPLOY_SERVICES 2>&1 || echo "::warning::pull failed; falling back to recreate"
+
+          echo "==> Recreating containers from pulled images..."
+          if docker compose -p "$COMPOSE_PROJECT" \
+               -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" \
+               --env-file "$DEPLOY_DIR/.env" \
+               up -d --no-deps --force-recreate $DEPLOY_SERVICES 2>&1; then
+            echo "✅ Recreate from GHCR images succeeded"
+            exit 0
+          fi
+
+          echo "::warning::Recreate from pulled images failed; trying local build fallback"
           if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
                up -d --build --no-deps $DEPLOY_SERVICES; then
-            echo "✅ Build + recreate succeeded"
+            echo "✅ Local build + recreate succeeded"
             exit 0
           fi
 
-          echo "::warning::Build failed — falling back to recreate from cached images"
-          echo "==> Attempt 2: recreate without --build (use cached image for the rolled-back SHA)"
-          if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
-               up -d --no-deps $DEPLOY_SERVICES; then
-            echo "✅ Recreate from cached images succeeded"
-            exit 0
-          fi
-
-          echo "::warning::Recreate failed — trying compose restart as last resort"
-          echo "==> Attempt 3: restart existing containers (if any survived)"
+          echo "::warning::Local build failed; trying compose restart as last resort"
           if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
                restart $DEPLOY_SERVICES 2>&1; then
             echo "✅ Restart succeeded"
@@ -297,7 +311,7 @@ jobs:
           fi
 
           echo "::error::All recovery attempts failed. Containers are down."
-          echo "::error::Manual fix: ssh to VPS and run 'cd /opt/netconsole && docker compose -p netconsole -f docker-compose.app.yml up -d --build'"
+          echo "::error::Manual fix: ssh to VPS and run 'cd /opt/netconsole && GITHUB_SHA=8dab6659c3f4b6c0ce06bd4920b6706b6b20c2fa docker compose -p netconsole -f docker-compose.app.yml -f docker-compose.app.prod.yml --env-file .env up -d --force-recreate'"
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps || true
           exit 1
 
