@@ -58,6 +58,28 @@ import { pingAndUpdateDevice } from '../devicePing.js';
 import bcrypt from 'bcryptjs';
 import { computeStatistics, listStatDescriptors, type StatContext } from './statistics.js';
 
+// NetBox read-only client (backend counterpart to the worker's sync client).
+// All handlers below call directly — no HTTP roundtrip (same process).
+import {
+  findNetboxDeviceByNetconsoleId,
+  getNetboxDeviceById,
+  listNetboxDeviceRoles,
+  listNetboxDevices,
+  listNetboxIpAddresses,
+  listNetboxManufacturers,
+  listNetboxInterfaces,
+  listNetboxPrefixes,
+  listNetboxSites,
+  listNetboxVlans,
+  netboxHealthCheck,
+  type NetBoxDevice,
+  type NetBoxInterface,
+  type NetBoxIpAddress,
+  type NetBoxPrefix,
+  type NetBoxVlan,
+} from '../netboxClient.js';
+import { NetBoxError } from '../netboxClient.js';
+
 const BCRYPT_ROUNDS = 12;
 
 const PREVIEW_BYTES = 4_000;
@@ -2183,6 +2205,11 @@ async function describeCapabilitiesHandler(
           'list_discovery_scans', 'get_discovery_scan',
           'get_netconsole_info', 'run_cli_command',
           'get_statistics', 'describe_capabilities',
+          // NetBox read — query the live NetBox API
+          'get_netbox_health', 'list_netbox_sites', 'list_netbox_device_roles',
+          'list_netbox_manufacturers', 'list_netbox_devices', 'get_netbox_device',
+          'list_netbox_interfaces', 'list_netbox_vlans', 'list_netbox_prefixes',
+          'list_netbox_ip_addresses', 'get_netbox_sync_status',
         ],
         WRITE: [
           'queue_interface_action', 'queue_log_collect', 'queue_managed_check',
@@ -2234,6 +2261,411 @@ async function suggestFollowupHandler(
     ok: true,
     preview: { suggestions },
   };
+}
+
+// ── NetBox READ handlers ────────────────────────────────────────────────────
+//
+// All NetBox read tools share a few common helpers (the /api/netbox/* route
+// is the same client functions — the assistant just calls them in-process
+// instead of HTTP). Errors are normalised to `{ok: false, error: '...'}` so
+// the LLM can recover ("NetBox is unreachable, try again in a moment").
+
+/** Map a NetBox device to the LLM-friendly preview shape. */
+function netboxDeviceToPreview(d: NetBoxDevice): Record<string, unknown> {
+  return {
+    id: d.id,
+    name: d.name,
+    status: d.status?.value ?? null,
+    statusLabel: d.status?.label ?? null,
+    site: d.site?.name ?? null,
+    siteSlug: d.site?.slug ?? null,
+    role: d.role?.name ?? null,
+    roleSlug: d.role?.slug ?? null,
+    manufacturer: d.device_type?.manufacturer?.name ?? null,
+    model: d.device_type?.model ?? null,
+    platform: d.platform?.name ?? null,
+    serial: d.serial,
+    primaryIp4: d.primary_ip4?.address ?? null,
+    rack: d.rack?.name ?? null,
+    position: d.position,
+    description: d.description,
+    netconsoleId: d.custom_fields?.netconsole_id ?? null,
+    tags: d.tags.map((t) => t.name),
+    url: d.url,
+    lastUpdated: d.last_updated,
+  };
+}
+
+/** Map a NetBox interface to the LLM-friendly preview shape. */
+function netboxInterfaceToPreview(i: NetBoxInterface): Record<string, unknown> {
+  return {
+    id: i.id,
+    name: i.name,
+    type: i.type?.value ?? null,
+    enabled: i.enabled,
+    description: i.description,
+    mtu: i.mtu,
+    speedMbps: i.speed != null ? Math.round(i.speed / 1_000_000) : null,
+    macAddress: i.mac_address,
+    mode: i.mode?.value ?? null,
+    untaggedVlan: i.untagged_vlan?.vid ?? null,
+    taggedVlans: i.tagged_vlans.map((v) => v.vid),
+  };
+}
+
+async function getNetboxHealthHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const ok = await netboxHealthCheck();
+  return {
+    ok: true,
+    preview: {
+      ok,
+      url: process.env.NETBOX_URL ?? null,
+      message: ok
+        ? 'NetBox API đang hoạt động.'
+        : 'NetBox API KHÔNG phản hồi. Kiểm tra NETBOX_URL / NETBOX_TOKEN.',
+    },
+  };
+}
+
+async function listNetboxSitesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 100, 1000);
+  try {
+    const sites = await listNetboxSites({ limit });
+    return {
+      ok: true,
+      preview: {
+        total: sites.length,
+        sites: sites.map((s) => ({
+          id: s.id,
+          name: s.name,
+          slug: s.slug,
+          status: s.status?.value ?? null,
+          description: s.description,
+          tags: s.tags.map((t) => t.name),
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxDeviceRolesHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  try {
+    const roles = await listNetboxDeviceRoles({ limit: 100 });
+    return {
+      ok: true,
+      preview: {
+        total: roles.length,
+        roles: roles.map((r) => ({
+          id: r.id,
+          name: r.name,
+          slug: r.slug,
+          color: r.color,
+          vmRole: r.vm_role,
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxManufacturersHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  try {
+    const manufacturers = await listNetboxManufacturers({ limit: 200 });
+    return {
+      ok: true,
+      preview: {
+        total: manufacturers.length,
+        manufacturers: manufacturers.map((m) => ({
+          id: m.id,
+          name: m.name,
+          slug: m.slug,
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxDevicesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 500);
+  const offset = typeof args.offset === 'number' ? args.offset : 0;
+  try {
+    const result = await listNetboxDevices({
+      limit,
+      offset,
+      site: typeof args.site === 'string' ? args.site : undefined,
+      role: typeof args.role === 'string' ? args.role : undefined,
+      manufacturer_id: typeof args.manufacturer_id === 'number' ? args.manufacturer_id : undefined,
+      status: typeof args.status === 'string' ? (args.status as 'active' | 'offline' | 'planned' | 'staged' | 'failed' | 'inventory' | 'decommissioning') : undefined,
+      search: typeof args.search === 'string' ? args.search : undefined,
+      netconsole_id: typeof args.netconsole_id === 'string' ? args.netconsole_id : undefined,
+      tag: typeof args.tag === 'string' ? args.tag : undefined,
+    });
+    return {
+      ok: true,
+      preview: {
+        total: result.total,
+        returned: result.devices.length,
+        offset,
+        devices: result.devices.map(netboxDeviceToPreview),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function getNetboxDeviceHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  // Three lookup modes: by id, by netconsole_id, or by name (search).
+  // Mode 1: id
+  if (typeof args.id === 'number' && Number.isFinite(args.id)) {
+    const device = await getNetboxDeviceById(args.id);
+    if (!device) return { ok: true, preview: { id: args.id, found: false } };
+    return { ok: true, preview: { found: true, device: netboxDeviceToPreview(device) } };
+  }
+  // Mode 2: netconsole_id (custom field exact match — preferred for "device X in NetConsole")
+  if (typeof args.netconsole_id === 'string' && args.netconsole_id.trim()) {
+    const device = await findNetboxDeviceByNetconsoleId(args.netconsole_id.trim());
+    if (!device) return { ok: true, preview: { netconsoleId: args.netconsole_id, found: false } };
+    return { ok: true, preview: { found: true, device: netboxDeviceToPreview(device) } };
+  }
+  // Mode 3: name (full-text search)
+  if (typeof args.name === 'string' && args.name.trim()) {
+    const { devices } = await listNetboxDevices({ search: args.name.trim(), limit: 5 });
+    if (devices.length === 0) {
+      return { ok: true, preview: { name: args.name, found: false } };
+    }
+    return {
+      ok: true,
+      preview: {
+        found: devices.length,
+        devices: devices.map(netboxDeviceToPreview),
+      },
+    };
+  }
+  return { ok: false, error: 'Cần truyền một trong: id, netconsole_id, name.' };
+}
+
+async function listNetboxInterfacesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const id = typeof args.netbox_device_id === 'number' ? args.netbox_device_id : Number(args.netbox_device_id);
+  if (!Number.isFinite(id)) {
+    return { ok: false, error: 'netbox_device_id là bắt buộc (số nguyên).' };
+  }
+  try {
+    const interfaces = await listNetboxInterfaces(id, { limit: 500 });
+    const onlyUp = args.only_up === true;
+    const onlyDown = args.only_down === true;
+    let filtered = interfaces;
+    if (onlyUp) filtered = filtered.filter((i) => i.enabled);
+    else if (onlyDown) filtered = filtered.filter((i) => !i.enabled);
+    return {
+      ok: true,
+      preview: {
+        netboxDeviceId: id,
+        total: interfaces.length,
+        returned: filtered.length,
+        interfaces: filtered.map(netboxInterfaceToPreview),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxVlansHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  try {
+    const vlans: NetBoxVlan[] = await listNetboxVlans({
+      site: typeof args.site === 'string' ? args.site : undefined,
+      limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
+    });
+    return {
+      ok: true,
+      preview: {
+        total: vlans.length,
+        vlans: vlans.map((v) => ({
+          id: v.id,
+          vid: v.vid,
+          name: v.name,
+          site: v.site?.name ?? null,
+          group: v.group?.name ?? null,
+          status: v.status?.value ?? null,
+          description: v.description,
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxPrefixesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  try {
+    const prefixes: NetBoxPrefix[] = await listNetboxPrefixes({
+      site: typeof args.site === 'string' ? args.site : undefined,
+      status: typeof args.status === 'string' ? args.status : undefined,
+      limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
+    });
+    return {
+      ok: true,
+      preview: {
+        total: prefixes.length,
+        prefixes: prefixes.map((p) => ({
+          id: p.id,
+          prefix: p.prefix,
+          site: p.site?.name ?? null,
+          vrf: p.vrf?.name ?? null,
+          status: p.status?.value ?? null,
+          utilization: p.utilization,
+          description: p.description,
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function listNetboxIpAddressesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const deviceId = typeof args.netbox_device_id === 'number' ? args.netbox_device_id : Number(args.netbox_device_id);
+  try {
+    const addresses: NetBoxIpAddress[] = await listNetboxIpAddresses({
+      device_id: Number.isFinite(deviceId) ? deviceId : undefined,
+      status: typeof args.status === 'string' ? args.status : undefined,
+      search: typeof args.search === 'string' ? args.search : undefined,
+      limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
+    });
+    return {
+      ok: true,
+      preview: {
+        total: addresses.length,
+        addresses: addresses.map((a) => ({
+          id: a.id,
+          address: a.address,
+          status: a.status?.value ?? null,
+          dnsName: a.dns_name,
+          description: a.description,
+          assignedTo: a.assigned_object
+            ? {
+                interfaceId: a.assigned_object.id,
+                interfaceName: a.assigned_object.name,
+                device: a.assigned_object.device?.name ?? null,
+              }
+            : null,
+          tags: a.tags.map((t) => t.name),
+        })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function getNetboxSyncStatusHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  // Reads from the NetConsole Device table — no NetBox API call needed.
+  // Answers: "Which NetConsole devices are synced to NetBox? Which failed?"
+  const where: Record<string, unknown> = {};
+  if (typeof args.device_name === 'string' && args.device_name.trim()) {
+    where.name = { contains: args.device_name.trim(), mode: 'insensitive' };
+  } else if (typeof args.device_id === 'string' && args.device_id.trim()) {
+    where.id = args.device_id.trim();
+  }
+  if (typeof args.site === 'string' && args.site.trim()) {
+    where.site = args.site.trim();
+  }
+  if (args.only_unsynced === true) {
+    where.netboxDeviceId = null;
+    where.netboxSyncError = null;
+  } else if (args.only_failed === true) {
+    where.netboxSyncError = { not: null };
+  }
+
+  const limit = Math.min(typeof args.limit === 'number' ? args.limit : 100, 500);
+  const rows = await prisma.device.findMany({
+    where,
+    take: limit,
+    orderBy: [{ site: 'asc' }, { name: 'asc' }],
+    select: {
+      id: true,
+      name: true,
+      ip: true,
+      site: true,
+      vendor: true,
+      model: true,
+      netboxDeviceId: true,
+      netboxSyncedAt: true,
+      netboxSyncError: true,
+    },
+  });
+
+  const summary = {
+    total: rows.length,
+    synced: rows.filter((r) => r.netboxDeviceId !== null && r.netboxSyncError === null).length,
+    pending: rows.filter((r) => r.netboxDeviceId === null && r.netboxSyncError === null).length,
+    failed: rows.filter((r) => r.netboxSyncError !== null).length,
+  };
+
+  return {
+    ok: true,
+    preview: {
+      summary,
+      devices: rows.map((r) => ({
+        deviceId: r.id,
+        name: r.name,
+        ip: r.ip,
+        site: r.site,
+        vendor: r.vendor,
+        model: r.model,
+        synced: r.netboxDeviceId !== null && r.netboxSyncError === null,
+        netboxDeviceId: r.netboxDeviceId,
+        netboxSyncedAt: r.netboxSyncedAt,
+        netboxSyncError: r.netboxSyncError,
+      })),
+    },
+  };
+}
+
+/** Normalise any error from the NetBox client into a short string. */
+function netboxErrorMessage(error: unknown): string {
+  if (error instanceof NetBoxError) return error.message;
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -2296,6 +2728,18 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   acknowledge_alert: acknowledgeAlertHandler,
   sync_to_netbox: syncToNetboxHandler,
   sync_all_to_netbox: syncAllToNetboxHandler,
+  // NetBox read — query live NetBox API
+  get_netbox_health: getNetboxHealthHandler,
+  list_netbox_sites: listNetboxSitesHandler,
+  list_netbox_device_roles: listNetboxDeviceRolesHandler,
+  list_netbox_manufacturers: listNetboxManufacturersHandler,
+  list_netbox_devices: listNetboxDevicesHandler,
+  get_netbox_device: getNetboxDeviceHandler,
+  list_netbox_interfaces: listNetboxInterfacesHandler,
+  list_netbox_vlans: listNetboxVlansHandler,
+  list_netbox_prefixes: listNetboxPrefixesHandler,
+  list_netbox_ip_addresses: listNetboxIpAddressesHandler,
+  get_netbox_sync_status: getNetboxSyncStatusHandler,
   create_user: createUserHandler,
   update_user_role: updateUserRoleHandler,
   set_user_active: setUserActiveHandler,

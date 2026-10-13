@@ -89,6 +89,33 @@ vi.mock('../../../src/services/interfaces.js', () => ({
   parseInterfaceActionPayload: (...args: unknown[]) => parseInterfaceActionPayload(...args),
 }));
 
+// NetBox read-only client — 8 new assistant tools call this directly.
+const listNetboxSitesMock = vi.fn();
+const listNetboxDeviceRolesMock = vi.fn();
+const listNetboxManufacturersMock = vi.fn();
+const listNetboxDevicesMock = vi.fn();
+const getNetboxDeviceByIdMock = vi.fn();
+const findNetboxDeviceByNetconsoleIdMock = vi.fn();
+const listNetboxInterfacesMock = vi.fn();
+const listNetboxVlansMock = vi.fn();
+const listNetboxPrefixesMock = vi.fn();
+const listNetboxIpAddressesMock = vi.fn();
+const netboxHealthCheckMock = vi.fn();
+vi.mock('../../../src/services/netboxClient.js', () => ({
+  listNetboxSites: (...args: unknown[]) => listNetboxSitesMock(...args),
+  listNetboxDeviceRoles: (...args: unknown[]) => listNetboxDeviceRolesMock(...args),
+  listNetboxManufacturers: (...args: unknown[]) => listNetboxManufacturersMock(...args),
+  listNetboxDevices: (...args: unknown[]) => listNetboxDevicesMock(...args),
+  getNetboxDeviceById: (...args: unknown[]) => getNetboxDeviceByIdMock(...args),
+  findNetboxDeviceByNetconsoleId: (...args: unknown[]) => findNetboxDeviceByNetconsoleIdMock(...args),
+  listNetboxInterfaces: (...args: unknown[]) => listNetboxInterfacesMock(...args),
+  listNetboxVlans: (...args: unknown[]) => listNetboxVlansMock(...args),
+  listNetboxPrefixes: (...args: unknown[]) => listNetboxPrefixesMock(...args),
+  listNetboxIpAddresses: (...args: unknown[]) => listNetboxIpAddressesMock(...args),
+  netboxHealthCheck: (...args: unknown[]) => netboxHealthCheckMock(...args),
+  NetBoxError: class NetBoxError extends Error {},
+}));
+
 const { HANDLERS, mapRole } = await import('../../../src/services/assistant/handlers.js');
 
 const ctx = {
@@ -806,6 +833,365 @@ describe('queue_apply_config — merge mode', () => {
       'APPLY_CONFIG',
       'user-1',
       expect.objectContaining({ mode: 'replace' }),
+    );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// NetBox READ handlers (added 2026-10-13)
+//
+// All 8 tools call the netboxClient directly (in-process; no HTTP). The
+// get_netbox_sync_status handler is the only one that reads from the
+// NetConsole DB — it answers "do we have a NetBox record for this
+// device?" without making a NetBox API call.
+// ───────────────────────────────────────────────────────────────────────────
+
+describe('get_netbox_health', () => {
+  it('returns ok=true when NetBox is reachable', async () => {
+    netboxHealthCheckMock.mockResolvedValueOnce(true);
+    const result = await HANDLERS.get_netbox_health({}, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { ok: boolean; message: string };
+    expect(preview.ok).toBe(true);
+    expect(preview.message).toMatch(/hoạt động/);
+  });
+
+  it('returns ok=true with "không phản hồi" when NetBox is unreachable', async () => {
+    netboxHealthCheckMock.mockResolvedValueOnce(false);
+    const result = await HANDLERS.get_netbox_health({}, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { ok: boolean; message: string };
+    expect(preview.ok).toBe(false);
+    expect(preview.message).toMatch(/KHÔNG phản hồi/);
+  });
+});
+
+describe('list_netbox_sites', () => {
+  it('returns compact site list with id/name/slug', async () => {
+    listNetboxSitesMock.mockResolvedValueOnce([
+      { id: 1, name: 'LAB', slug: 'lab', status: { value: 'active', label: 'Active' }, description: '', tags: [{ id: 99, name: 'source-netconsole', slug: 'source-netconsole' }] },
+      { id: 2, name: 'NKKN', slug: 'nkkn', status: { value: 'active', label: 'Active' }, description: 'Nội khu khuôn viên', tags: [] },
+    ]);
+    const result = await HANDLERS.list_netbox_sites({ limit: 50 }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { total: number; sites: Array<{ name: string; tags: string[] }> };
+    expect(preview.total).toBe(2);
+    expect(preview.sites[0].name).toBe('LAB');
+    expect(preview.sites[0].tags).toEqual(['source-netconsole']);
+  });
+
+  it('returns ok=false on NetBox error', async () => {
+    const { NetBoxError } = await import('../../../src/services/netboxClient.js');
+    listNetboxSitesMock.mockRejectedValueOnce(new NetBoxError('NetBox HTTP 502: Bad Gateway'));
+    const result = await HANDLERS.list_netbox_sites({}, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/502/);
+  });
+});
+
+describe('list_netbox_devices', () => {
+  it('passes filters through to the client and returns compact device list', async () => {
+    listNetboxDevicesMock.mockResolvedValueOnce({
+      total: 3,
+      devices: [
+        {
+          id: 7,
+          name: 'LAB-F2-AS-01',
+          device_type: { id: 1, manufacturer: { id: 1, name: 'Juniper' }, model: 'EX3400', slug: 'juniper-ex3400' },
+          role: { id: 1, name: 'Access', slug: 'access', color: '9e9e9e' },
+          site: { id: 1, name: 'LAB', slug: 'lab' },
+          status: { value: 'active', label: 'Active' },
+          serial: 'ABC123',
+          platform: { id: 5, name: '23.4R2', slug: 'juniper-23-4r2' },
+          rack: { id: 1, name: 'V1' },
+          position: 11,
+          face: { value: 'front', label: 'Front' },
+          primary_ip4: { id: 1, address: '10.10.20.1/24' },
+          primary_ip6: null,
+          description: '',
+          comments: '',
+          tags: [{ id: 99, name: 'source-netconsole', slug: 'source-netconsole' }],
+          custom_fields: { netconsole_id: 'dev-abc' },
+          url: 'http://netbox/api/dcim/devices/7/',
+          created: '2026-10-01T00:00:00Z',
+          last_updated: '2026-10-12T00:00:00Z',
+        },
+      ],
+    });
+    const result = await HANDLERS.list_netbox_devices({ site: 'lab', status: 'active' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(listNetboxDevicesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ site: 'lab', status: 'active', limit: 50, offset: 0 }),
+    );
+    const preview = result.preview as {
+      total: number;
+      returned: number;
+      devices: Array<{ name: string; netconsoleId: string; primaryIp4: string }>;
+    };
+    expect(preview.total).toBe(3);
+    expect(preview.returned).toBe(1);
+    expect(preview.devices[0].name).toBe('LAB-F2-AS-01');
+    expect(preview.devices[0].netconsoleId).toBe('dev-abc');
+    expect(preview.devices[0].primaryIp4).toBe('10.10.20.1/24');
+  });
+});
+
+describe('get_netbox_device', () => {
+  it('looks up by id', async () => {
+    getNetboxDeviceByIdMock.mockResolvedValueOnce({
+      id: 7,
+      name: 'LAB-F2-AS-01',
+      device_type: { id: 1, manufacturer: { id: 1, name: 'Juniper' }, model: 'EX3400', slug: 'j' },
+      role: { id: 1, name: 'Access', slug: 'access', color: '9e9e9e' },
+      site: { id: 1, name: 'LAB', slug: 'lab' },
+      status: { value: 'active', label: 'Active' },
+      serial: 'ABC123',
+      platform: null,
+      rack: null,
+      position: null,
+      face: null,
+      primary_ip4: null,
+      primary_ip6: null,
+      description: '',
+      comments: '',
+      tags: [],
+      custom_fields: {},
+      url: '',
+      created: '',
+      last_updated: '',
+    });
+    const result = await HANDLERS.get_netbox_device({ id: 7 }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { found: boolean; device: { id: number; name: string } };
+    expect(preview.found).toBe(true);
+    expect(preview.device.id).toBe(7);
+  });
+
+  it('returns found=false when id has no match', async () => {
+    getNetboxDeviceByIdMock.mockResolvedValueOnce(null);
+    const result = await HANDLERS.get_netbox_device({ id: 9999 }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { found: boolean };
+    expect(preview.found).toBe(false);
+  });
+
+  it('looks up by netconsole_id (preferred path)', async () => {
+    findNetboxDeviceByNetconsoleIdMock.mockResolvedValueOnce({
+      id: 7,
+      name: 'LAB-F2-AS-01',
+      device_type: { id: 1, manufacturer: { id: 1, name: 'Juniper' }, model: 'EX3400', slug: 'j' },
+      role: { id: 1, name: 'Access', slug: 'access', color: '9e9e9e' },
+      site: { id: 1, name: 'LAB', slug: 'lab' },
+      status: { value: 'active', label: 'Active' },
+      serial: 'ABC123',
+      platform: null,
+      rack: null,
+      position: null,
+      face: null,
+      primary_ip4: null,
+      primary_ip6: null,
+      description: '',
+      comments: '',
+      tags: [],
+      custom_fields: { netconsole_id: 'dev-abc' },
+      url: '',
+      created: '',
+      last_updated: '',
+    });
+    const result = await HANDLERS.get_netbox_device({ netconsole_id: 'dev-abc' }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { found: boolean; device: { netconsoleId: string } };
+    expect(preview.found).toBe(true);
+    expect(preview.device.netconsoleId).toBe('dev-abc');
+  });
+
+  it('looks up by name via full-text search', async () => {
+    listNetboxDevicesMock.mockResolvedValueOnce({
+      total: 1,
+      devices: [{
+        id: 7, name: 'LAB-F2-AS-01',
+        device_type: { id: 1, manufacturer: { id: 1, name: 'Juniper' }, model: 'EX3400', slug: 'j' },
+        role: { id: 1, name: 'Access', slug: 'access', color: '9e9e9e' },
+        site: { id: 1, name: 'LAB', slug: 'lab' },
+        status: { value: 'active', label: 'Active' },
+        serial: '', platform: null, rack: null, position: null, face: null,
+        primary_ip4: null, primary_ip6: null, description: '', comments: '',
+        tags: [], custom_fields: {}, url: '', created: '', last_updated: '',
+      }],
+    });
+    const result = await HANDLERS.get_netbox_device({ name: 'F2-AS' }, ctx);
+    expect(listNetboxDevicesMock).toHaveBeenCalledWith(expect.objectContaining({ search: 'F2-AS', limit: 5 }));
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects when no lookup key is given', async () => {
+    const result = await HANDLERS.get_netbox_device({}, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/id, netconsole_id, name/);
+  });
+});
+
+describe('list_netbox_interfaces', () => {
+  it('requires netbox_device_id', async () => {
+    const result = await HANDLERS.list_netbox_interfaces({}, ctx);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/netbox_device_id/);
+  });
+
+  it('returns compact interface list with speed converted to Mbps', async () => {
+    listNetboxInterfacesMock.mockResolvedValueOnce([
+      {
+        id: 1, device: { id: 7, name: 'LAB-F2-AS-01' },
+        name: 'ge-0/0/0', type: { value: '1000base-t', label: '1000BASE-T (1GE)' },
+        enabled: true, description: 'uplink', mtu: 1514,
+        speed: 1_000_000_000, mac_address: 'aa:bb:cc:00:00:01',
+        mode: { value: 'tagged', label: 'Tagged' },
+        untagged_vlan: null,
+        tagged_vlans: [{ id: 1, vid: 201, name: 'VLAN201' }, { id: 2, vid: 202, name: 'VLAN202' }],
+        tag: null,
+      },
+      {
+        id: 2, device: { id: 7, name: 'LAB-F2-AS-01' },
+        name: 'ge-0/0/1', type: { value: '1000base-t', label: '1000BASE-T (1GE)' },
+        enabled: false, description: '', mtu: null,
+        speed: null, mac_address: null, mode: null, untagged_vlan: null, tagged_vlans: [],
+        tag: null,
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_interfaces({ netbox_device_id: 7, only_up: true }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as {
+      total: number;
+      returned: number;
+      interfaces: Array<{ name: string; speedMbps: number | null; taggedVlans: number[] }>;
+    };
+    expect(preview.total).toBe(2);
+    // only_up filter should drop the disabled interface
+    expect(preview.returned).toBe(1);
+    expect(preview.interfaces[0].name).toBe('ge-0/0/0');
+    expect(preview.interfaces[0].speedMbps).toBe(1000);
+    expect(preview.interfaces[0].taggedVlans).toEqual([201, 202]);
+  });
+});
+
+describe('list_netbox_vlans', () => {
+  it('maps vlan list to compact shape', async () => {
+    listNetboxVlansMock.mockResolvedValueOnce([
+      {
+        id: 1, vid: 201, name: 'VLAN201',
+        status: { value: 'active', label: 'Active' },
+        site: { id: 1, name: 'LAB' }, group: { id: 1, name: 'default' },
+        description: '', role: null,
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_vlans({ site: 'lab' }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { vlans: Array<{ vid: number; site: string | null }> };
+    expect(preview.vlans[0].vid).toBe(201);
+    expect(preview.vlans[0].site).toBe('LAB');
+  });
+});
+
+describe('list_netbox_prefixes', () => {
+  it('passes filters through and returns utilization', async () => {
+    listNetboxPrefixesMock.mockResolvedValueOnce([
+      {
+        id: 1, prefix: '10.10.20.0/24',
+        site: { id: 1, name: 'LAB' }, vrf: null,
+        status: { value: 'active', label: 'Active' },
+        role: null, description: 'synced from NetConsole', utilization: 87.5,
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_prefixes({ site: 'lab' }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { prefixes: Array<{ utilization: number }> };
+    expect(preview.prefixes[0].utilization).toBe(87.5);
+  });
+});
+
+describe('list_netbox_ip_addresses', () => {
+  it('returns compact IP list with assignedTo', async () => {
+    listNetboxIpAddressesMock.mockResolvedValueOnce([
+      {
+        id: 1, address: '10.10.20.1/24',
+        status: { value: 'active', label: 'Active' },
+        role: null, dns_name: 'f2-as-01.lab.local', description: 'mgmt',
+        assigned_object: {
+          id: 5, name: 'fxp0', device: { id: 7, name: 'LAB-F2-AS-01' },
+        },
+        interface: { id: 5, name: 'fxp0' },
+        nat_inside: null,
+        tags: [{ id: 99, name: 'source-netconsole', slug: 'source-netconsole' }],
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_ip_addresses({ netbox_device_id: 7 }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as {
+      addresses: Array<{ address: string; assignedTo: { device: string | null; interfaceName: string } | null; tags: string[] }>;
+    };
+    expect(preview.addresses[0].address).toBe('10.10.20.1/24');
+    expect(preview.addresses[0].assignedTo?.device).toBe('LAB-F2-AS-01');
+    expect(preview.addresses[0].assignedTo?.interfaceName).toBe('fxp0');
+    expect(preview.addresses[0].tags).toEqual(['source-netconsole']);
+  });
+
+  it('handles unassigned IP (assignedTo=null)', async () => {
+    listNetboxIpAddressesMock.mockResolvedValueOnce([
+      {
+        id: 2, address: '10.10.20.50/24',
+        status: { value: 'active', label: 'Active' },
+        role: null, dns_name: '', description: '',
+        assigned_object: null, interface: null, nat_inside: null, tags: [],
+      },
+    ]);
+    const result = await HANDLERS.list_netbox_ip_addresses({ search: '10.10.20.50' }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as { addresses: Array<{ assignedTo: unknown }> };
+    expect(preview.addresses[0].assignedTo).toBeNull();
+  });
+});
+
+describe('get_netbox_sync_status', () => {
+  it('returns summary + device list, including synced/pending/failed counts', async () => {
+    deviceFindMany.mockResolvedValueOnce([
+      {
+        id: 'dev-1', name: 'LAB-F2-AS-01', ip: '10.10.20.1', site: 'LAB', vendor: 'juniper', model: 'EX3400',
+        netboxDeviceId: 7, netboxSyncedAt: new Date('2026-10-12T00:00:00Z'), netboxSyncError: null,
+      },
+      {
+        id: 'dev-2', name: 'LAB-F2-DS-01', ip: '10.10.20.2', site: 'LAB', vendor: 'juniper', model: 'QFX5120',
+        netboxDeviceId: null, netboxSyncedAt: null, netboxSyncError: null,
+      },
+      {
+        id: 'dev-3', name: 'LAB-F2-AS-02', ip: '10.10.20.3', site: 'LAB', vendor: 'arista', model: '7050',
+        netboxDeviceId: 99, netboxSyncedAt: new Date('2026-10-10T00:00:00Z'),
+        netboxSyncError: 'NetBox upsert failed: HTTP 502',
+      },
+    ]);
+    const result = await HANDLERS.get_netbox_sync_status({ site: 'LAB' }, ctx);
+    expect(result.ok).toBe(true);
+    const preview = result.preview as {
+      summary: { total: number; synced: number; pending: number; failed: number };
+      devices: Array<{ name: string; synced: boolean; netboxDeviceId: number | null; netboxSyncError: string | null }>;
+    };
+    expect(preview.summary).toEqual({ total: 3, synced: 1, pending: 1, failed: 1 });
+    expect(preview.devices[0].name).toBe('LAB-F2-AS-01');
+    expect(preview.devices[0].synced).toBe(true);
+    expect(preview.devices[1].synced).toBe(false);
+    expect(preview.devices[2].synced).toBe(false);
+    expect(preview.devices[2].netboxSyncError).toMatch(/502/);
+  });
+
+  it('filters to only_failed when requested', async () => {
+    deviceFindMany.mockResolvedValueOnce([
+      {
+        id: 'dev-3', name: 'LAB-F2-AS-02', ip: '10.10.20.3', site: 'LAB', vendor: 'arista', model: '7050',
+        netboxDeviceId: 99, netboxSyncedAt: new Date(), netboxSyncError: 'broken',
+      },
+    ]);
+    await HANDLERS.get_netbox_sync_status({ only_failed: true }, ctx);
+    expect(deviceFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ netboxSyncError: { not: null } }) }),
     );
   });
 });

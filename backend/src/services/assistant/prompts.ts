@@ -41,6 +41,14 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
 - Liệt kê DHCP subnet (subnet, pool, gateway, DNS, vlan, site, utilization)
 - Liệt kê user (chỉ ADMIN)
 - Liệt kê discovery scan
+- **Query NetBox API (DCIM + IPAM)**:
+  - \`get_netbox_health\` — kiểm tra NetBox có chạy không
+  - \`list_netbox_sites\` / \`list_netbox_device_roles\` / \`list_netbox_manufacturers\` — metadata
+  - \`list_netbox_devices\` / \`get_netbox_device\` — thiết bị trong NetBox (filter site, role, status, search, netconsole_id)
+  - \`list_netbox_interfaces\` — interface theo NetBox device id (cần lookup id trước nếu user chỉ cho tên NetConsole)
+  - \`list_netbox_vlans\` / \`list_netbox_prefixes\` / \`list_netbox_ip_addresses\` — IPAM
+  - \`get_netbox_sync_status\` — trạng thái sync NetConsole → NetBox (đọc NetConsole DB, không gọi NetBox API)
+  - **Phân biệt rõ** với tool NetConsole: \`list_devices\` (NetConsole DB) vs \`list_netbox_devices\` (NetBox API) — chọn đúng nguồn theo yêu cầu user
 
 ### WRITE (backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
 - \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description / remove-description / **delete-interface (reset toàn bộ config)**
@@ -119,6 +127,8 @@ Khi nào gợi ý:
 | Có alert chưa ack | ["Acknowledge alert #X", "Xem chi tiết rule"] |
 | DHCP lease hết hạn | ["Xoá lease expired", "Ghim static IP"] |
 | Topology thiếu link | ["Chạy discovery scan subnet"] |
+| NetBox sync failed | ["Xem chiết lỗi", "Sync NetBox lại"] |
+| NetBox down | ["Check NetBox health"] |
 | Job FAILED | ["Xem chi tiết job", "Retry job"] |
 
 **QUY TẮC suggest_followup:**
@@ -260,6 +270,20 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 ### Config history/diff — get_config_history / get_config_diff
 - History: \`entries[]\` mỗi entry có \`id\`, \`entryType\` (snapshot/apply), \`createdAt\`, \`username\`
 - Diff: \`from\`, \`to\`, \`added\`, \`removed\`, \`changed\`, \`patch\`
+
+### NetBox read — list_netbox_* / get_netbox_* / get_netbox_sync_status
+- **Quan trọng**: 2 nguồn dữ liệu KHÁC NHAU:
+  - \`list_devices\` / \`get_device\` → NetConsole DB (single source of truth cho inventory)
+  - \`list_netbox_devices\` / \`get_netbox_device\` → NetBox API (DCIM, IPAM, role inference theo NetBox)
+  - Khi user nói "thiết bị X" không rõ nguồn → mặc định dùng NetConsole. Khi user nói "trong NetBox" → dùng NetBox.
+- \`list_netbox_devices\` / \`get_netbox_device\`: mỗi device có \`id, name, status, site, role, manufacturer, model, platform, serial, primaryIp4, rack, position, description, netconsoleId, tags, url, lastUpdated\`
+- \`list_netbox_interfaces\` (theo NetBox device id): \`name, type, enabled, description, mtu, speedMbps, macAddress, mode, untaggedVlan, taggedVlans[]\`
+- \`list_netbox_vlans\` (filter site): \`vid, name, status, site, group, description\`
+- \`list_netbox_prefixes\` (IPAM CIDR): \`prefix, site, vrf, status, utilization (%), description\`
+- \`list_netbox_ip_addresses\` (IPAM): \`address, status, dnsName, description, assignedTo: {interfaceId, interfaceName, device}, tags\`
+- \`get_netbox_sync_status\` (đọc NetConsole DB): \`{summary: {total, synced, pending, failed}, devices: [{synced, netboxDeviceId, netboxSyncedAt, netboxSyncError}]}\`
+- KHÔNG có: log, alert, job history (dùng tool NetConsole tương ứng)
+- \`get_netbox_health\`: chỉ trả {ok, url, message} — dùng trước khi gọi tool NetBox khác nếu nghi NetBox down
 
 ## 6. Quy tắc chống bịa dữ liệu (BẮT BUỘC)
 
@@ -1867,6 +1891,281 @@ const runCliCommand: CatalogEntry = {
   },
 };
 
+// ─── NetBox READ tools (added 2026-10-13) ───────────────────────────────────
+//
+// All NetBox reads — read-only, no confirmation card. The backend hits the
+// NetBox REST API directly (in-process; no HTTP roundtrip to the worker).
+// Errors from the NetBox client surface as {ok:false, error:"..."} so the
+// LLM can report "NetBox is unreachable" instead of hallucinating data.
+
+const getNetboxHealth: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'get_netbox_health',
+    description:
+      'Check if NetBox API is reachable. Dùng khi user hỏi "NetBox có chạy không", "NetBox lỗi gì", ' +
+      'hoặc trước khi gọi các tool NetBox khác để fail-fast. Trả về {ok, url, message}. ' +
+      'Không cần args.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxSites: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_sites',
+    description:
+      'Liệt kê site trong NetBox (đơn vị vật lý, vd "LAB", "NKKN", "NTMK"). ' +
+      'Dùng khi user hỏi "NetBox có site nào" hoặc cần filter thiết bị theo site. ' +
+      'Returns: mảng sites, mỗi site có {id, name, slug, status, description, tags}.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        limit: { type: 'number', description: 'Mặc định 100, tối đa 1000.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxDeviceRoles: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_device_roles',
+    description:
+      'Liệt kê device-role trong NetBox (core / distribution / access / custom). ' +
+      'Dùng để biết role-slug chính xác khi filter list_netbox_devices. ' +
+      'Returns: mảng roles, mỗi role có {id, name, slug, color}.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxManufacturers: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_manufacturers',
+    description:
+      'Liệt kê manufacturer (Cisco / Juniper / Arista / ...) trong NetBox. ' +
+      'Dùng khi user hỏi "NetBox có vendor nào" hoặc cần filter thiết bị theo manufacturer. ' +
+      'Returns: mảng manufacturers, mỗi manufacturer có {id, name, slug}.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxDevices: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_devices',
+    description:
+      'Liệt kê thiết bị trong NetBox (đã được sync từ NetConsole). Có filter: ' +
+      'site, role, status (active/offline/...), manufacturer_id, search, tag, netconsole_id. ' +
+      'Dùng khi user hỏi "trong NetBox có bao nhiêu switch site NKKN", "thiết bị nào offline trên NetBox". ' +
+      'Returns: {total, returned, offset, devices[]} — mỗi device có ' +
+      '{id, name, status, site, role, manufacturer, model, platform, serial, primaryIp4, ' +
+      'rack, position, description, netconsoleId, tags, url, lastUpdated}. ' +
+      'KHÔNG có: interface list (dùng list_netbox_interfaces riêng), MAC, ARP, log, alert. ' +
+      'LƯU Ý: tool này query NetBox API, KHÔNG query NetConsole DB. Nếu user hỏi về ' +
+      'NetConsole inventory thì dùng list_devices. Tool này dùng khi user cụ thể nói "NetBox" ' +
+      'hoặc cần data từ NetBox (vd primary IP theo NetBox, role theo NetBox, tags).',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        site: { type: 'string', description: 'Filter theo site slug (vd "lab", "nkkn").' },
+        role: { type: 'string', description: 'Filter theo role slug (vd "core", "distribution", "access").' },
+        status: {
+          type: 'string',
+          enum: ['active', 'offline', 'planned', 'staged', 'failed', 'inventory', 'decommissioning'],
+          description: 'Filter theo NetBox status.',
+        },
+        manufacturer_id: { type: 'number', description: 'Filter theo manufacturer id (xem list_netbox_manufacturers).' },
+        search: { type: 'string', description: 'Full-text search theo name/serial/asset_tag.' },
+        tag: { type: 'string', description: 'Filter theo tag slug (vd "source-netconsole").' },
+        netconsole_id: { type: 'string', description: 'Filter theo NetConsole device UUID (exact match custom field).' },
+        limit: { type: 'number', description: 'Mặc định 50, tối đa 500.' },
+        offset: { type: 'number', description: 'Mặc định 0.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const getNetboxDevice: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'get_netbox_device',
+    description:
+      'Lookup 1 thiết bị trong NetBox theo id HOẶC netconsole_id HOẶC name. ' +
+      'Cần truyền 1 trong 3. NetBox trả full record bao gồm: ' +
+      'name, site, role, status, device_type, platform, serial, primary_ip4, ' +
+      'rack/position, custom_fields (gồm netconsole_id), tags, description, url, last_updated. ' +
+      'Examples: get_netbox_device({id: 42}) → device. ' +
+      'get_netbox_device({netconsole_id:"abc-123-def"}) → device synced từ NetConsole ID đó. ' +
+      'get_netbox_device({name:"LAB-F2-AS-01"}) → full-text search top 5. ' +
+      'Dùng khi user hỏi "thiết bị F2-AS-01 trong NetBox" hoặc "NetBox có device nào ' +
+      'khớp với serial X".',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'number', description: 'NetBox device id (xem list_netbox_devices).' },
+        netconsole_id: { type: 'string', description: 'NetConsole device UUID (exact match).' },
+        name: { type: 'string', description: 'Tên thiết bị (full-text search, trả top 5).' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxInterfaces: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_interfaces',
+    description:
+      'Liệt kê interface của 1 NetBox device (theo NetBox id, KHÔNG phải NetConsole id). ' +
+      'Mỗi interface: name, type, enabled, description, mtu, speed (Mbps), mac_address, ' +
+      'mode, untagged_vlan, tagged_vlans. ' +
+      'Cần NetBox device id — nếu user chỉ biết tên NetConsole, lookup trước qua ' +
+      'get_netbox_device({netconsole_id: "..."}) hoặc get_netbox_device({name: "..."}). ' +
+      'Dùng khi user hỏi "thiết bị X trong NetBox có bao nhiêu port, port nào trunk".',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['netbox_device_id'],
+      properties: {
+        netbox_device_id: { type: 'number', description: 'NetBox device id (BẮT BUỘC).' },
+        only_up: { type: 'boolean', description: 'Chỉ lấy interface enabled. Mặc định false.' },
+        only_down: { type: 'boolean', description: 'Chỉ lấy interface disabled. Mặc định false.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxVlans: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_vlans',
+    description:
+      'Liệt kê VLAN trong NetBox (filter theo site). Mỗi VLAN: vid, name, status, ' +
+      'site, group, description. Dùng khi user hỏi "NetBox có VLAN nào ở site NKKN", ' +
+      '"VLAN 201 ở đâu". Cross-reference với get_dhcp_subnet (subnet có vlan nào). ' +
+      'Returns: mảng vlans.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        site: { type: 'string', description: 'Filter theo site slug (vd "lab", "nkkn").' },
+        limit: { type: 'number', description: 'Mặc định 200, tối đa 1000.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxPrefixes: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_prefixes',
+    description:
+      'Liệt kê prefix (CIDR) trong IPAM của NetBox. Mỗi prefix: prefix, site, vrf, ' +
+      'status, utilization (%), description. Dùng khi user hỏi "subnet nào đã khai báo ' +
+      'trong NetBox", "IPAM có bao nhiêu /24 ở site NKKN". ' +
+      'Returns: mảng prefixes.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        site: { type: 'string', description: 'Filter theo site slug.' },
+        status: { type: 'string', enum: ['active', 'reserved', 'deprecated', 'container'], description: 'Filter theo status.' },
+        limit: { type: 'number', description: 'Mặc định 200, tối đa 1000.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const listNetboxIpAddresses: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_ip_addresses',
+    description:
+      'Liệt kê IP address trong IPAM của NetBox. Mỗi IP: address (CIDR), status, dns_name, ' +
+      'description, assignedTo (interface + device), tags. ' +
+      'Dùng khi user hỏi "IP 10.10.20.50 nằm ở thiết bị nào trong NetBox" (dùng search), ' +
+      '"thiết bị X có IP nào trong NetBox" (dùng netbox_device_id). ' +
+      'LƯU Ý: tool này query IPAM của NetBox, KHÔNG phải DHCP lease. Để xem DHCP lease ' +
+      '(Kea), dùng list_dhcp_leases. ' +
+      'Returns: mảng addresses.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        netbox_device_id: { type: 'number', description: 'Filter theo NetBox device id.' },
+        status: { type: 'string', enum: ['active', 'reserved', 'deprecated', 'dhcp', 'slaac'], description: 'Filter theo status.' },
+        search: { type: 'string', description: 'Search theo address hoặc dns_name.' },
+        limit: { type: 'number', description: 'Mặc định 200, tối đa 1000.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
+const getNetboxSyncStatus: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'get_netbox_sync_status',
+    description:
+      'Trạng thái sync NetConsole → NetBox cho 1 hoặc nhiều thiết bị. ' +
+      'Đọc trực tiếp từ NetConsole DB (KHÔNG gọi NetBox API). Mỗi device trả: ' +
+      '{synced, netboxDeviceId, netboxSyncedAt, netboxSyncError}. ' +
+      'Summary: {total, synced, pending, failed}. ' +
+      'Dùng khi user hỏi "thiết bị nào chưa sync NetBox", "sync lỗi chỗ nào", ' +
+      '"F2-AS-01 sync NetBox lần cuối khi nào". ' +
+      'Filters: device_name (substring), device_id (UUID), site, only_unsynced, only_failed. ' +
+      'Sau khi xem failed list, gợi ý dùng sync_to_netbox để retry từng cái.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        device_name: { type: 'string', description: 'Filter theo tên thiết bị (substring, case-insensitive).' },
+        device_id: { type: 'string', description: 'Filter theo NetConsole device UUID (exact match).' },
+        site: { type: 'string', description: 'Filter theo site code.' },
+        only_unsynced: { type: 'boolean', description: 'Chỉ lấy thiết bị CHƯA sync (chưa có netboxDeviceId).' },
+        only_failed: { type: 'boolean', description: 'Chỉ lấy thiết bị sync FAILED (có netboxSyncError).' },
+        limit: { type: 'number', description: 'Mặc định 100, tối đa 500.' },
+      },
+    },
+  },
+  readonly: true,
+  requiresRole: 'VIEWER',
+  confirmSummary: () => '',
+};
+
 const getStatistics: CatalogEntry = {
   type: 'function',
   function: {
@@ -2037,6 +2336,18 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   // catalog level — the LLM has to use queue_apply_config for
   // true config changes (which DOES gate through confirmation).
   runCliCommand,
+  // NetBox read — query live NetBox API (added 2026-10-13)
+  getNetboxHealth,
+  listNetboxSites,
+  listNetboxDeviceRoles,
+  listNetboxManufacturers,
+  listNetboxDevices,
+  getNetboxDevice,
+  listNetboxInterfaces,
+  listNetboxVlans,
+  listNetboxPrefixes,
+  listNetboxIpAddresses,
+  getNetboxSyncStatus,
   getStatistics,
   describeCapabilities,
   // UI affordance — emits clickable follow-up chips

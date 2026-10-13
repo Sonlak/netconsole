@@ -28,6 +28,7 @@ import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
 import { fabricRouter } from './routes/fabric.js';
 import { logsRouter } from './routes/logs.js';
+import { netboxRouter } from './routes/netbox.js';
 import { authRouter } from './routes/auth.js';
 import { auditLogRouter } from './routes/auditLog.js';
 import { searchRouter } from './routes/search.js';
@@ -186,6 +187,7 @@ app.get('/api/health', (_req, res) => {
       'audit-log',
       'terminal',
       'assistant',
+      'netbox',
     ],
     pingIntervalSeconds,
     macCollectIntervalSeconds,
@@ -230,6 +232,7 @@ app.use('/api/search', authMiddleware, strictRateLimit, searchRouter);
 app.use('/api/terminal', authMiddleware, strictRateLimit, terminalRouter);
 app.use('/api/devices', authMiddleware, moderateRateLimit, interfaceCountersRouter);
 app.use('/api/assistant', assistantRouter);
+app.use('/api/netbox', authMiddleware, moderateRateLimit, netboxRouter);
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {
