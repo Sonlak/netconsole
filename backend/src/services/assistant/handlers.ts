@@ -51,6 +51,7 @@ import { acknowledgeAlert, listAlertRules, listAlerts } from '../logAlerts.js';
 import { getLatestInterfacesJob, queueInterfaceAction, parseInterfaceActionPayload } from '../interfaces.js';
 import { tryCreateDeviceJob } from '../deviceOperations.js';
 import { collectArpForDevice } from '../arpAddress.js';
+import { checkProtocolKeywordInDescription } from './protocolGuard.js';
 import { collectMacForDevice } from '../macAddress.js';
 import { collectDeviceConfig } from '../collectConfig.js';
 import { diffConfigs, getDeviceSnapshots, getSnapshotConfig } from '../configCompare.js';
@@ -618,77 +619,6 @@ async function getUnacknowledgedAlertsHandler(
       })),
     },
   };
-}
-
-/**
- * Reject `set-description` payloads whose `description` text looks like a
- * networking protocol/routing keyword (e.g. "passive", "ospf area 20",
- * "bgp neighbor 1.1.1.1").
- *
- * Background: gpt-4o-mini kept routing "cấu hình OSPF passive cổng ge-0/0/4"
- * to `queue_interface_action` with `action: "set-description",
- * description: "passive"` — which only labels the interface and does NOT
- * enable OSPF passive mode. Same pattern for "ospf area 0", "bgp", "vrf
- * RED", etc. The description field is a free-form text label; it does not
- * activate any protocol.
- *
- * The fix has two parts:
- *   1. This guard in the handler (rejects the bad call with a clear error
- *      so the LLM self-corrects in the next turn — verified 2026-10-13).
- *   2. Updated tool description in prompts.ts (queue_interface_action
- *      explicitly lists what it does NOT do, pointing to queue_apply_config).
- *
- * Returns an error string if the call should be rejected; null if OK.
- */
-const PROTOCOL_KEYWORDS = [
-  // routing protocols
-  'ospf', 'bgp', 'isis', 'rip', 'eigrp',
-  // protocol features
-  'passive', 'area ', 'neighbor', 'peer', 'vrf', 'rd ', 'route-target',
-  // routing objects
-  'route-map', 'prefix-list', 'access-list', 'acl', 'policy',
-  // L3 features
-  'mtu', 'ip address', 'ip ospf', 'ipv6', 'vlan ', 'vlanid',
-  // junos-specific set-stanza fragments that look like "configuration"
-  'protocols ', 'interfaces ge-', 'interfaces xe-', 'interfaces et-',
-  'unit 0', 'family inet',
-];
-
-function checkProtocolKeywordInDescription(payload: {
-  action?: string;
-  description?: string;
-  actions?: Array<{ action?: string; description?: string }>;
-}): string | null {
-  const descsToCheck: Array<{ ctx: string; desc: string }> = [];
-  if (payload.action === 'set-description' && typeof payload.description === 'string') {
-    descsToCheck.push({ ctx: 'top-level', desc: payload.description });
-  }
-  if (Array.isArray(payload.actions)) {
-    for (const s of payload.actions) {
-      if (s.action === 'set-description' && typeof s.description === 'string') {
-        descsToCheck.push({ ctx: 'sub-action', desc: s.description });
-      }
-    }
-  }
-  if (descsToCheck.length === 0) return null;
-  const lower = descsToCheck.map((d) => ({ ...d, desc: d.desc.toLowerCase() }));
-  for (const { ctx, desc } of lower) {
-    for (const kw of PROTOCOL_KEYWORDS) {
-      if (desc.includes(kw)) {
-        return (
-          `Refused: description "${descsToCheck.find((d) => d.desc === desc)?.desc}" ` +
-          `(${ctx}) looks like a protocol/routing keyword ("${kw.trim()}"). ` +
-          `The interface description field is a free-form text label — it does NOT ` +
-          `enable OSPF/BGP/passive/VLAN/etc. To actually configure routing on a port, ` +
-          `use queue_apply_config with the vendor CLI set-stanza, e.g. for Junos: ` +
-          `apply_config_dry_run({device_name:"${payload.action === 'set-description' ? 'X' : 'X'}", ` +
-          `mode:"merge", content:"set protocols ospf area 0.0.0.20 interface ge-0/0/4.0 passive"}) ` +
-          `then queue_apply_config with the same content.`
-        );
-      }
-    }
-  }
-  return null;
 }
 
 // ── WRITE handlers (require confirmation upstream) ───────────────────────────
