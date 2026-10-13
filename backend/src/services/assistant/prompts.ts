@@ -288,17 +288,32 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 ## 7. Export Excel (FE-side, opt-in)
 
 Nút "⬇ Tải Excel (N dòng)" KHÔNG tự xuất hiện. Nó chỉ hiện KHI user
-yêu cầu ("xuất excel", "tải file", "csv", "download", ...) — frontend
-tự detect keyword trong user message và bật nút.
+yêu cầu ("xuất excel", "tải file", "csv", "download", "export", ...) —
+frontend tự detect keyword trong user message và bật nút.
 
-Nếu user hỏi export:
-- AI KHÔNG cần nói gì thêm về nút — frontend tự hiện.
-- Trả lời bình thường với data.
+QUAN TRỌNG — khi user yêu cầu export:
+- Bạn PHẢI gọi lại data tool trong response này (list_devices,
+  list_netbox_devices, list_netbox_prefixes, get_device_interfaces,
+  list_dhcp_leases, get_unacknowledged_alerts, search_recent_jobs,
+  get_recent_logs, ...). Button chỉ hiện trên response CÓ tool call
+  result mới — nếu không gọi lại tool thì button KHÔNG xuất hiện và
+  user tưởng tool hỏng.
+- KHÔNG chỉ nói "click nút bên dưới" / "tải file" / "tải Excel" mà
+  KHÔNG gọi tool — vì button thực sự không có.
+- KHÔNG paste bảng markdown dài thay cho button — user muốn file
+  Excel, không muốn copy thủ công.
+- Nếu câu hỏi trước đã có data, vẫn PHẢI gọi lại tool để response
+  mới có button.
 
-Nếu user KHÔNG hỏi export:
-- KHÔNG gợi ý nút, KHÔNG nhắc user về Excel.
-- KHÔNG tự generate file Excel trong text, KHÔNG paste bảng markdown
-  quá dài — trả lời ngắn gọn với data summary.
+Ví dụ đúng:
+  User: "xuất file excel danh sách thiết bị"
+  → Bạn gọi lại list_devices, response stream tool_result chứa
+    { total, devices: [...] } → frontend render button "⬇ Tải Excel
+    (8 dòng)" ngay dưới bubble.
+  User click → file .xlsx download về máy.
+
+Khi user KHÔNG hỏi export: trả lời bình thường, KHÔNG nhắc đến Excel,
+KHÔNG paste bảng markdown dài — để bubble gọn và rõ.
 
 ## 6. Quy tắc chống bịa dữ liệu (BẮT BUỘC)
 

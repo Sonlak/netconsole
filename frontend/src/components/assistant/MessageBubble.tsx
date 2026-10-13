@@ -86,6 +86,13 @@ export type AssistantMessageView = {
    * every list response.
    */
   showExport?: boolean;
+  /**
+   * Set when the user asked for export BUT the AI didn't re-call a
+   * data tool, so no button could appear. Renders a yellow tip
+   * bubble telling the user to ask again with the data fetch
+   * (e.g. "list X và xuất excel"). Cleared on the next turn.
+   */
+  exportTip?: string;
   isStreaming?: boolean;
 };
 
@@ -489,6 +496,30 @@ export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, 
                 })}
             </div>
           )}
+
+        {/* Fallback tip: user asked for export but AI didn't re-call
+            a data tool, so no button could appear. Show a small yellow
+            card telling the user how to ask again so the button shows. */}
+        {!message.isStreaming && message.exportTip && (
+          <div
+            role="status"
+            style={{
+              marginTop: 6,
+              padding: '8px 12px',
+              borderRadius: 10,
+              background: token.colorWarningBg,
+              border: `1px solid ${token.colorWarningBorder}`,
+              color: token.colorText,
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            <span style={{ color: token.colorWarning, fontWeight: 600, marginRight: 6 }}>
+              ⚠️
+            </span>
+            {message.exportTip}
+          </div>
+        )}
 
         {/* Clickable follow-up chips. Rendered AFTER the text card so
             they read as "what to do next". Hide while streaming so

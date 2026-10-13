@@ -56,6 +56,7 @@ import { useAuth } from '@/hooks/useAuth';
 import { streamAssistant, type AssistantMessage, type AssistantStreamEvent } from '@/api/assistant';
 import { MessageBubble, type AssistantMessageView } from './MessageBubble';
 import { startJobFollowUp } from '@/lib/jobFollowUp';
+import { detectPreviewArray } from '../../utils/excelExport';
 
 type Props = {
   open: boolean;
@@ -390,7 +391,19 @@ export function AssistantDrawer({ open, onClose }: Props) {
               setError(msg);
             },
             onDone: () => {
-              updateAssistant((m) => ({ ...m, isStreaming: false }));
+              updateAssistant((m) => {
+                // If the user asked for export but the AI didn't re-call
+                // a data tool, no button will appear — surface a tip so
+                // the user knows to ask again with the data fetch.
+                const hasExportableTool = (m.toolCalls ?? []).some(
+                  (tc) => tc.result?.ok && detectPreviewArray(tc.result.preview) !== null,
+                );
+                const exportTip =
+                  showExport && !hasExportableTool
+                    ? 'AI chưa gọi lại data tool nên chưa có nút tải. Hãy hỏi lại kiểu "liệt kê X rồi xuất Excel" để có nút nhé.'
+                    : undefined;
+                return { ...m, isStreaming: false, ...(exportTip ? { exportTip } : {}) };
+              });
             },
           }),
           ac.signal,
