@@ -371,7 +371,17 @@ export function AssistantDrawer({ open, onClose }: Props) {
             onError: (msg) => {
               // On auth failure, wipe the stale session so the user can
               // re-login without stale messages blocking the next turn.
-              if (msg.includes('401') || msg.toLowerCase().includes('unauthorized')) {
+              // The coordinator returns "Session expired — please log in
+              // again." on 401, and the backend may return the same on
+              // server-side session errors. Any 401 text in the error
+              // is also covered.
+              const lower = msg.toLowerCase();
+              const isAuthError =
+                lower.includes('401') ||
+                lower.includes('unauthorized') ||
+                lower.includes('session expired') ||
+                lower.includes('token expired');
+              if (isAuthError) {
                 sessionStorage.removeItem(MESSAGES_STORAGE_KEY);
                 sessionStorage.removeItem(SESSION_STORAGE_KEY);
                 setMessages([]);
