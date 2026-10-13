@@ -23,17 +23,19 @@
  * Heavy lifting (markdown rendering) lives in `MarkdownText`.
  */
 
-import { Tooltip, Typography, theme } from 'antd';
+import { Tooltip, Typography, message as antdMessage, theme } from 'antd';
 import {
   ApiOutlined,
   CheckCircleTwoTone,
   CloseCircleTwoTone,
+  DownloadOutlined,
   InfoCircleOutlined,
   LoadingOutlined,
   RobotFilled,
 } from '@ant-design/icons';
 import { MarkdownText } from './MarkdownText';
 import { ConfirmationCard } from './ConfirmationCard';
+import { downloadPreviewAsXlsx, detectPreviewArray } from '../../utils/excelExport';
 
 export type AssistantMessageRole = 'user' | 'assistant' | 'system';
 
@@ -412,6 +414,69 @@ export function MessageBubble({ message, onConfirm, onCancel, onPickSuggestion, 
             <TypingDots />
           </div>
         ) : null}
+
+        {/* Export-to-Excel action. One button per tool call that
+            returned an exportable preview. Hidden while streaming so
+            the user doesn't see a half-baked action. */}
+        {!message.isStreaming &&
+          message.toolCalls &&
+          message.toolCalls.length > 0 && (
+            <div
+              style={{
+                marginTop: 6,
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 6,
+              }}
+            >
+              {message.toolCalls
+                .filter((tc) => tc.result?.ok && detectPreviewArray(tc.result.preview) !== null)
+                .map((tc) => {
+                  const handleExport = () => {
+                    const res = downloadPreviewAsXlsx(tc.result!.preview, {
+                      toolName: tc.name,
+                    });
+                    if (res.ok) {
+                      antdMessage.success(
+                        `Đã tải xuống ${res.filename} (${res.rowCount} dòng)`,
+                      );
+                    } else {
+                      antdMessage.warning(res.reason);
+                    }
+                  };
+                  const detected = detectPreviewArray(tc.result!.preview)!;
+                  return (
+                    <button
+                      key={`export-${tc.id}`}
+                      type="button"
+                      onClick={handleExport}
+                      style={{
+                        cursor: 'pointer',
+                        padding: '5px 12px',
+                        borderRadius: 14,
+                        fontSize: 12,
+                        fontWeight: 500,
+                        color: token.colorSuccess,
+                        background: token.colorSuccessBg,
+                        border: `1px solid ${token.colorSuccessBorder}`,
+                        transition: 'all 160ms ease',
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = token.colorSuccess;
+                        e.currentTarget.style.color = '#fff';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = token.colorSuccessBg;
+                        e.currentTarget.style.color = token.colorSuccess;
+                      }}
+                    >
+                      <DownloadOutlined style={{ fontSize: 12, marginRight: 4 }} />
+                      Tải Excel ({detected.rows.length} dòng)
+                    </button>
+                  );
+                })}
+            </div>
+          )}
 
         {/* Clickable follow-up chips. Rendered AFTER the text card so
             they read as "what to do next". Hide while streaming so
