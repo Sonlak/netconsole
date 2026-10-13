@@ -316,6 +316,11 @@ QUAN TRỌNG — khi user yêu cầu export:
   get_recent_logs, ...). Button chỉ hiện trên response CÓ tool call
   result mới — nếu không gọi lại tool thì button KHÔNG xuất hiện và
   user tưởng tool hỏng.
+- **⚠️ list_netbox_prefixes**: luôn truyền limit=1000 khi user hỏi
+  "đầy đủ", "toàn bộ", "tất cả" prefix. Mặc định chỉ trả 200 dòng —
+  nếu không tăng limit, file Excel sẽ thiếu dữ liệu (NetBox có thể
+  chứa >200 prefix). Ví dụ đúng:
+    list_netbox_prefixes({limit: 1000})
 - KHÔNG chỉ nói "click nút bên dưới" / "tải file" / "tải Excel" mà
   KHÔNG gọi tool — vì button thực sự không có.
 - KHÔNG paste bảng markdown dài thay cho button — user muốn file
@@ -2260,7 +2265,10 @@ const listNetboxPrefixes: CatalogEntry = {
         //   list_netbox_prefixes(prefix="10.10.20.0/24")
         //   → trả về prefix đó nếu tồn tại, hoặc rỗng nếu không có
         prefix: { type: 'string', description: 'CIDR đầy đủ để exact-match. Ví dụ: "10.10.20.0/24".' },
-        limit: { type: 'number', description: 'Mặc định 200, tối đa 1000.' },
+        // ⚠️ QUAN TRỌNG: để lấy TOÀN BỘ prefix (ví dụ "liệt kê đầy đủ" /
+        // "toàn bộ subnet"), LUÔN truyền limit=1000. Không dùng limit mặc
+        // định (200) vì sẽ thiếu dữ liệu. NetBox có thể chứa >200 prefix.
+        limit: { type: 'number', description: 'Số prefix trả về. Mặc định 200. ⚠️ Luôn dùng limit=1000 khi user hỏi "đầy đủ", "toàn bộ", "tất cả" prefix — nếu không sẽ bị thiếu dòng trong file Excel. Tối đa 1000.' },
       },
     },
   },
