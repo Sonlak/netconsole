@@ -2534,6 +2534,12 @@ async function listNetboxPrefixesHandler(
     const prefixes: NetBoxPrefix[] = await listNetboxPrefixes({
       site: typeof args.site === 'string' ? args.site : undefined,
       status: typeof args.status === 'string' ? args.status : undefined,
+      // `contains` is a NetBox IPAM filter: pass a single IP (e.g. "192.168.1.1")
+      // to find which prefix contains it. Useful when the user asks
+      // "what subnet does 10.10.20.131 belong to?".
+      contains: typeof args.contains === 'string' ? args.contains : undefined,
+      // `prefix` is an exact CIDR match (e.g. "10.10.20.0/24").
+      prefix: typeof args.prefix === 'string' ? args.prefix : undefined,
       limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
     });
     return {

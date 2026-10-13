@@ -1107,6 +1107,22 @@ describe('list_netbox_prefixes', () => {
     const preview = result.preview as { prefixes: Array<{ utilization: number }> };
     expect(preview.prefixes[0].utilization).toBe(87.5);
   });
+
+  it('forwards contains= arg to client (NetBox IPAM "find prefix containing IP X")', async () => {
+    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    await HANDLERS.list_netbox_prefixes({ contains: '10.10.20.131' }, ctx);
+    expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ contains: '10.10.20.131' }),
+    );
+  });
+
+  it('forwards prefix= arg to client (exact CIDR match)', async () => {
+    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    await HANDLERS.list_netbox_prefixes({ prefix: '10.10.20.0/24' }, ctx);
+    expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ prefix: '10.10.20.0/24' }),
+    );
+  });
 });
 
 describe('list_netbox_ip_addresses', () => {

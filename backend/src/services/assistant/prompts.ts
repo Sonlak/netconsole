@@ -2090,7 +2090,8 @@ const listNetboxPrefixes: CatalogEntry = {
     description:
       'Liệt kê prefix (CIDR) trong IPAM của NetBox. Mỗi prefix: prefix, site, vrf, ' +
       'status, utilization (%), description. Dùng khi user hỏi "subnet nào đã khai báo ' +
-      'trong NetBox", "IPAM có bao nhiêu /24 ở site NKKN". ' +
+      'trong NetBox", "IPAM có bao nhiêu /24 ở site NKKN", "subnet nào chứa IP 10.10.20.131", ' +
+      '"có tồn tại prefix 10.10.20.0/24 trong NetBox không". ' +
       'Returns: mảng prefixes.',
     parameters: {
       type: 'object',
@@ -2098,6 +2099,15 @@ const listNetboxPrefixes: CatalogEntry = {
       properties: {
         site: { type: 'string', description: 'Filter theo site slug.' },
         status: { type: 'string', enum: ['active', 'reserved', 'deprecated', 'container'], description: 'Filter theo status.' },
+        // `contains`: truyền MỘT địa chỉ IP (không có CIDR) để tìm prefix chứa IP đó.
+        // Dùng khi user hỏi "subnet nào chứa IP X.X.X.X" — ví dụ:
+        //   list_netbox_prefixes(contains="10.10.20.131")
+        //   → trả về mọi prefix có chứa IP đó (vd 10.10.20.0/24)
+        contains: { type: 'string', description: 'Một địa chỉ IP (không CIDR) — tìm prefix chứa IP này. Ví dụ: "10.10.20.131".' },
+        // `prefix`: truyền CIDR đầy đủ để exact-match — ví dụ:
+        //   list_netbox_prefixes(prefix="10.10.20.0/24")
+        //   → trả về prefix đó nếu tồn tại, hoặc rỗng nếu không có
+        prefix: { type: 'string', description: 'CIDR đầy đủ để exact-match. Ví dụ: "10.10.20.0/24".' },
         limit: { type: 'number', description: 'Mặc định 200, tối đa 1000.' },
       },
     },

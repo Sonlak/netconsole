@@ -145,4 +145,43 @@ describe('netboxClient URL construction', () => {
 
     expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/dcim\/interfaces\/\?device_id=42&limit=100/);
   });
+
+  it('list_netbox_prefixes passes contains= param to NetBox IPAM', async () => {
+    setNetboxEnv('http://host:8080/api/', 'tok-abc');
+    let capturedUrl = '';
+    const fakeFetch = vi.fn(async (input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return new Response(JSON.stringify({ count: 0, next: null, previous: null, results: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fakeFetch);
+
+    const { listNetboxPrefixes } = await import('../../../src/services/netboxClient.js');
+    await listNetboxPrefixes({ contains: '10.10.20.131' });
+
+    // The `contains` query param tells NetBox IPAM "find the prefix that
+    // contains this IP". Caught 2026-10-13: without this param, the assistant
+    // couldn't answer "which subnet is 10.10.20.131 in?".
+    expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/ipam\/prefixes\/\?contains=10\.10\.20\.131/);
+  });
+
+  it('list_netbox_prefixes passes exact prefix= param for exact-match lookup', async () => {
+    setNetboxEnv('http://host:8080/api/', 'tok-abc');
+    let capturedUrl = '';
+    const fakeFetch = vi.fn(async (input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return new Response(JSON.stringify({ count: 0, next: null, previous: null, results: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fakeFetch);
+
+    const { listNetboxPrefixes } = await import('../../../src/services/netboxClient.js');
+    await listNetboxPrefixes({ prefix: '10.10.20.0/24' });
+
+    expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/ipam\/prefixes\/\?prefix=10\.10\.20\.0%2F24/);
+  });
 });

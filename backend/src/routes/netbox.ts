@@ -179,6 +179,12 @@ netboxRouter.get('/prefixes', async (req, res) => {
     const prefixes = await listNetboxPrefixes({
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
+      // `contains` accepts a single IP and returns the prefix(es) that contain it.
+      // Example: /api/netbox/prefixes?contains=192.168.95.1
+      contains: typeof req.query.contains === 'string' ? req.query.contains : undefined,
+      // `prefix` is an exact CIDR match.
+      // Example: /api/netbox/prefixes?prefix=10.10.20.0/24
+      prefix: typeof req.query.prefix === 'string' ? req.query.prefix : undefined,
       limit: clampInt(req.query.limit, 200, 1, 1000),
     });
     res.json({ total: prefixes.length, prefixes });

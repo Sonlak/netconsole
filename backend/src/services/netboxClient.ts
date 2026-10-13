@@ -342,7 +342,16 @@ export type NetBoxPrefix = {
 };
 
 export async function listNetboxPrefixes(
-  options: { site_id?: number; site?: string; status?: string; limit?: number } = {},
+  options: {
+    site_id?: number;
+    site?: string;
+    status?: string;
+    /** NetBox contains filter: find prefixes that contain this IP (e.g. "192.168.1.1"). */
+    contains?: string;
+    /** NetBox prefix filter: exact prefix match (e.g. "10.10.20.0/24"). */
+    prefix?: string;
+    limit?: number;
+  } = {},
 ): Promise<NetBoxPrefix[]> {
   const limit = Math.min(options.limit ?? 200, 1000);
   const data = await netboxGet<NetBoxListResponse<NetBoxPrefix>>('/ipam/prefixes/', {
@@ -350,6 +359,8 @@ export async function listNetboxPrefixes(
       site_id: options.site_id,
       site: options.site,
       status: options.status,
+      contains: options.contains,
+      prefix: options.prefix,
       limit,
     },
   });
