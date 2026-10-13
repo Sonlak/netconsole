@@ -23,7 +23,7 @@
  * open (e.g. copy a device name from Devices page into the chat).
  */
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import {
   Alert,
   App as AntApp,
@@ -41,6 +41,7 @@ import {
 import {
   ApartmentOutlined,
   ApiOutlined,
+  ArrowDownOutlined,
   ArrowUpOutlined,
   ClearOutlined,
   CloseOutlined,
@@ -63,8 +64,22 @@ type Props = {
   onClose: () => void;
 };
 
-const SESSION_STORAGE_KEY = 'netconsole:assistant:session';
-const MESSAGES_STORAGE_KEY = 'netconsole:assistant:messages';
+// Storage keys are namespaced per user so a shared browser (kiosk,
+// team machine) doesn't leak one user's chat history to another.
+// `null` userId (logged out) means we still want a stable key so
+// the drawer doesn't show someone else's session — we wipe state
+// instead in that case.
+function messagesKey(userId: string | null) {
+  return `netconsole:assistant:messages:${userId ?? 'guest'}`;
+}
+function sessionKey(userId: string | null) {
+  return `netconsole:assistant:session:${userId ?? 'guest'}`;
+}
+
+// Legacy keys from the pre-per-user version. We migrate on first
+// read and then drop them so old browsers don't carry stale state.
+const LEGACY_MESSAGES_KEY = 'netconsole:assistant:messages';
+const LEGACY_SESSION_KEY = 'netconsole:assistant:session';
 
 // Card-grid suggested prompts for the welcome state. Each card has
 // an icon, title, and the actual prompt. Clicking the card fires
@@ -117,10 +132,16 @@ export function AssistantDrawer({ open, onClose }: Props) {
   // beats var() cascade. Inline-style values are guaranteed to apply.
   const { token } = theme.useToken();
 
+  // Per-user storage keys (memoized — the helpers above would be
+  // called on every render otherwise).
+  const storageUserId = user?.id ?? null;
+  const messagesStorageKey = useMemo(() => messagesKey(storageUserId), [storageUserId]);
+  const sessionStorageKey = useMemo(() => sessionKey(storageUserId), [storageUserId]);
+
   // ── state ────────────────────────────────────────────────────────────
-  const [messages, setMessages] = useState<AssistantMessageView[]>(() => loadMessages());
+  const [messages, setMessages] = useState<AssistantMessageView[]>(() => loadMessages(storageUserId));
   const [input, setInput] = useState('');
-  const [sessionId, setSessionId] = useState<string | null>(() => loadSessionId());
+  const [sessionId, setSessionId] = useState<string | null>(() => loadSessionId(storageUserId));
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{
@@ -132,10 +153,32 @@ export function AssistantDrawer({ open, onClose }: Props) {
   const [totalInputTokens, setTotalInputTokens] = useState(0);
   const [totalCachedTokens, setTotalCachedTokens] = useState(0);
   const [totalOutputTokens, setTotalOutputTokens] = useState(0);
+  // True when the messages scroll viewport is at (or within ~80px of)
+  // the bottom. Drives the floating "↓ xuống cuối" button so the user
+  // can jump back without manual scroll, and gates auto-scroll on new
+  // messages (don't yank a reading user away from the top).
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  // Counter for new messages that arrived while the user was scrolled
+  // up. Displayed as a Badge dot on the jump-to-bottom button so the
+  // user knows there's something new without committing to a scroll.
+  const [unreadCount, setUnreadCount] = useState(0);
 
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Last userId we loaded messages for. Used to detect user switches
+  // mid-session so we don't show user A's history to user B on the
+  // same shared browser/kiosk.
+  const loadedForUserRef = useRef<string | null>(storageUserId);
+  // Tracks the previous value of `messages` so we can count "new"
+  // bubbles that arrived while the user was scrolled up. Kept in a
+  // ref (not state) so updating it doesn't trigger a render — only
+  // the unreadCount state update does.
+  const prevMessagesLengthRef = useRef(messages.length);
+  // True when the next messages change should auto-scroll (e.g. user
+  // sent a message, drawer just opened, or user clicked the jump
+  // button). Resets to false after the next scroll-to-bottom.
+  const forceScrollRef = useRef(false);
 
   /**
    * Set to true when the user sends a message that contains an export
@@ -152,29 +195,108 @@ export function AssistantDrawer({ open, onClose }: Props) {
 
   const isAdmin = user?.role === 'ADMIN';
 
-  // ── persistence ─────────────────────────────────────────────────────
+  // ── persistence (per-user keys) ─────────────────────────────────────
   useEffect(() => {
-    sessionStorage.setItem(MESSAGES_STORAGE_KEY, JSON.stringify(messages));
-  }, [messages]);
+    sessionStorage.setItem(messagesStorageKey, JSON.stringify(messages));
+  }, [messages, messagesStorageKey]);
   useEffect(() => {
-    if (sessionId) sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-    else sessionStorage.removeItem(SESSION_STORAGE_KEY);
-  }, [sessionId]);
+    if (sessionId) sessionStorage.setItem(sessionStorageKey, sessionId);
+    else sessionStorage.removeItem(sessionStorageKey);
+  }, [sessionId, sessionStorageKey]);
+
+  // ── user-switch detection ───────────────────────────────────────────
+  // If the logged-in user changes (e.g. logout/login on a shared
+  // browser), reload the chat for the new user. Without this, user B
+  // would see user A's history and possibly send follow-up messages
+  // to a sessionId that belongs to user A's server session.
+  useEffect(() => {
+    if (loadedForUserRef.current === storageUserId) return;
+    loadedForUserRef.current = storageUserId;
+    setMessages(loadMessages(storageUserId));
+    setSessionId(loadSessionId(storageUserId));
+    setError(null);
+    setTotalCostMicrodollars(0);
+    setTotalInputTokens(0);
+    setTotalCachedTokens(0);
+    setTotalOutputTokens(0);
+    setUnreadCount(0);
+    // After swapping state, force a scroll to the (new) bottom.
+    forceScrollRef.current = true;
+  }, [storageUserId]);
+
+  // ── scroll position tracking ───────────────────────────────────────
+  // `isAtBottom` is true when the user can see the last message. We
+  // use an 80px tolerance so the button doesn't flicker on small
+  // bounces (typing, single new tool pill, etc.).
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceFromBottom < 80;
+    setIsAtBottom(atBottom);
+    if (atBottom) setUnreadCount(0);
+  }, []);
 
   // ── auto-scroll ─────────────────────────────────────────────────────
+  // Three triggers force a scroll-to-bottom:
+  //   1. The drawer just opened (useEffect on `open` below, with a
+  //      delay that beats the drawer slide-in animation).
+  //   2. The user clicked the jump button (sets forceScrollRef = true
+  //      then dispatches a no-op state change).
+  //   3. The user sent a message — we mark forceScrollRef and let
+  //      sendMessage flip the new bubble into the list.
+  // For streaming chunks we only auto-scroll if the user was ALREADY
+  // at the bottom (otherwise we'd yank them off a message they're
+  // re-reading just because a token came in).
   useEffect(() => {
-    if (!scrollRef.current) return;
-    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [messages]);
+    const el = scrollRef.current;
+    if (!el) return;
+    const lengthDelta = messages.length - prevMessagesLengthRef.current;
+    prevMessagesLengthRef.current = messages.length;
+    // If a new bubble appeared and we were NOT at the bottom, count
+    // it as "unread" so the jump button badge can show.
+    if (lengthDelta > 0 && !isAtBottom && !forceScrollRef.current) {
+      setUnreadCount((c) => c + lengthDelta);
+      return;
+    }
+    if (forceScrollRef.current || isAtBottom) {
+      el.scrollTop = el.scrollHeight;
+      forceScrollRef.current = false;
+    }
+  }, [messages, isAtBottom]);
 
-  // ── focus input on open ─────────────────────────────────────────────
+  // ── focus input on open + scroll to bottom ─────────────────────────
   useEffect(() => {
     if (open) {
-      // Slight delay to let the drawer animation finish.
-      const t = setTimeout(() => inputRef.current?.focus(), 200);
+      // Slight delay to let the drawer animation finish (AntD's
+      // slide-in takes ~300ms). Without the delay, scrollHeight is 0
+      // because the panel hasn't laid out yet, and the user lands at
+      // the top of an empty container — the bug that prompted the
+      // "↓ xuống cuối" request.
+      const t = setTimeout(() => {
+        inputRef.current?.focus();
+        const el = scrollRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight;
+          setIsAtBottom(true);
+          setUnreadCount(0);
+        }
+      }, 200);
       return () => clearTimeout(t);
     }
   }, [open]);
+
+  // ── jump-to-bottom button handler ──────────────────────────────────
+  const scrollToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    forceScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    setIsAtBottom(true);
+    setUnreadCount(0);
+    // Restore focus to the composer so the user can type right away.
+    inputRef.current?.focus();
+  }, []);
 
   // ── send a message ──────────────────────────────────────────────────
   const sendMessage = useCallback(
@@ -237,6 +359,9 @@ export function AssistantDrawer({ open, onClose }: Props) {
           ...prev,
           { id: `u-${Date.now()}`, role: 'user', content: userMessage },
         ]);
+        // User-initiated message — always jump to bottom so they see
+        // the streaming reply land.
+        forceScrollRef.current = true;
       }
       // Detect export keyword before consuming the ref.
       if (userMessage && hasExportKeyword(userMessage)) {
@@ -383,8 +508,8 @@ export function AssistantDrawer({ open, onClose }: Props) {
                 lower.includes('session expired') ||
                 lower.includes('token expired');
               if (isAuthError) {
-                sessionStorage.removeItem(MESSAGES_STORAGE_KEY);
-                sessionStorage.removeItem(SESSION_STORAGE_KEY);
+                sessionStorage.removeItem(messagesStorageKey);
+                sessionStorage.removeItem(sessionStorageKey);
                 setMessages([]);
                 setSessionId(null);
               }
@@ -462,8 +587,11 @@ export function AssistantDrawer({ open, onClose }: Props) {
     setTotalInputTokens(0);
     setTotalCachedTokens(0);
     setTotalOutputTokens(0);
+    setUnreadCount(0);
+    sessionStorage.removeItem(messagesStorageKey);
+    sessionStorage.removeItem(sessionStorageKey);
     toast.info('Đã xoá cuộc trò chuyện.');
-  }, [toast]);
+  }, [toast, messagesStorageKey, sessionStorageKey]);
 
   // ── input handlers ──────────────────────────────────────────────────
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -585,16 +713,28 @@ export function AssistantDrawer({ open, onClose }: Props) {
         `}
       </style>
 
-      {/* Messages scroll area */}
+      {/* Messages scroll area. Wrapped in a positioned container so
+          we can float a "↓ xuống cuối" button on top without it
+          being part of the scroll content (which would shift the
+          scrollHeight and the auto-scroll math). */}
       <div
-        ref={scrollRef}
         style={{
           flex: 1,
-          overflowY: 'auto',
-          padding: '16px 14px',
-          background: token.colorBgLayout,
+          position: 'relative',
+          minHeight: 0,
         }}
       >
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            overflowY: 'auto',
+            padding: '16px 14px 16px 14px',
+            background: token.colorBgLayout,
+          }}
+        >
         {messages.length === 0 ? (
           <EmptyState onPick={(p) => void sendMessage(p)} token={token} />
         ) : (
@@ -645,6 +785,70 @@ export function AssistantDrawer({ open, onClose }: Props) {
             closable
             onClose={() => setError(null)}
           />
+        )}
+        </div>
+
+        {/* Floating "↓ xuống cuối" button. Hidden when the user is
+            already at the bottom (no need for a button that scrolls
+            to where they already are). The unread badge is a soft
+            hint — it doesn't force the user to scroll away from a
+            message they're re-reading. Pattern borrowed from
+            Messenger / Telegram / Slack: button is only visible when
+            the viewport is NOT pinned to the bottom. */}
+        {!isAtBottom && messages.length > 0 && (
+          <Tooltip
+            title={
+              unreadCount > 0
+                ? `${unreadCount} tin nhắn mới — bấm để xuống cuối`
+                : 'Xuống cuối cuộc trò chuyện'
+            }
+            placement="left"
+          >
+            <Button
+              type="primary"
+              shape="circle"
+              size="middle"
+              icon={<ArrowDownOutlined />}
+              onClick={scrollToBottom}
+              style={{
+                position: 'absolute',
+                right: 16,
+                bottom: 16,
+                zIndex: 5,
+                boxShadow: `0 4px 14px ${token.colorPrimary}44, 0 1px 3px rgba(0,0,0,0.18)`,
+              }}
+              aria-label={
+                unreadCount > 0
+                  ? `Xuống cuối (${unreadCount} tin nhắn mới)`
+                  : 'Xuống cuối cuộc trò chuyện'
+              }
+            >
+              {unreadCount > 0 && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    top: -4,
+                    right: -4,
+                    minWidth: 18,
+                    height: 18,
+                    borderRadius: 9,
+                    background: token.colorError,
+                    color: '#fff',
+                    fontSize: 10,
+                    fontWeight: 600,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '0 5px',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </span>
+              )}
+            </Button>
+          </Tooltip>
         )}
       </div>
 
@@ -767,22 +971,50 @@ export function AssistantDrawer({ open, onClose }: Props) {
 
 // ─── persistence helpers ──────────────────────────────────────────────────
 
-function loadSessionId(): string | null {
+function loadSessionId(userId: string | null): string | null {
   try {
-    return sessionStorage.getItem(SESSION_STORAGE_KEY);
+    const v = sessionStorage.getItem(sessionKey(userId));
+    if (v) return v;
+    // One-time migration: if the user has a legacy key, adopt it for
+    // the first logged-in user and drop the legacy entry so it never
+    // leaks again.
+    if (userId && sessionStorage.getItem(LEGACY_SESSION_KEY)) {
+      const legacy = sessionStorage.getItem(LEGACY_SESSION_KEY);
+      sessionStorage.removeItem(LEGACY_SESSION_KEY);
+      if (legacy) {
+        sessionStorage.setItem(sessionKey(userId), legacy);
+        return legacy;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-function loadMessages(): AssistantMessageView[] {
+function loadMessages(userId: string | null): AssistantMessageView[] {
   try {
-    const raw = sessionStorage.getItem(MESSAGES_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as AssistantMessageView[];
-    if (!Array.isArray(parsed)) return [];
-    // Strip the streaming flag on rehydrate — the previous stream is dead.
-    return parsed.map((m) => ({ ...m, isStreaming: false }));
+    const v = sessionStorage.getItem(messagesKey(userId));
+    if (v) {
+      const parsed = JSON.parse(v) as AssistantMessageView[];
+      if (Array.isArray(parsed)) {
+        // Strip the streaming flag on rehydrate — the previous stream is dead.
+        return parsed.map((m) => ({ ...m, isStreaming: false }));
+      }
+    }
+    // One-time migration from the legacy (shared) key.
+    if (userId && sessionStorage.getItem(LEGACY_MESSAGES_KEY)) {
+      const legacy = sessionStorage.getItem(LEGACY_MESSAGES_KEY);
+      sessionStorage.removeItem(LEGACY_MESSAGES_KEY);
+      if (legacy) {
+        sessionStorage.setItem(messagesKey(userId), legacy);
+        const parsed = JSON.parse(legacy) as AssistantMessageView[];
+        if (Array.isArray(parsed)) {
+          return parsed.map((m) => ({ ...m, isStreaming: false }));
+        }
+      }
+    }
+    return [];
   } catch {
     return [];
   }
