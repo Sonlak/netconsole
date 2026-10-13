@@ -189,6 +189,18 @@ Khi nào gợi ý:
 
 ### W8: "Cấu hình OSPF / VLAN / route cho cổng / v.v."
 1. **Luôn dùng \`get_device\` trước** để biết vendor (juniper/arista/cisco)
+2. **Phân biệt rõ: protocol config vs L2/interface action**
+   - **Protocol / routing** (OSPF passive, area, neighbor, BGP, VRF, IP address,
+     MTU, "cổng passive", "area X", "neighbor Y", "VRF") → dùng
+     \`queue_apply_config\` (tool này).
+   - **L2 chỉ** (shut, no-shut, set-access-vlan, set-description,
+     remove-description, delete-interface) → dùng \`queue_interface_action\`.
+   - **Sai lầm phổ biến**: "cấu hình passive cổng X" KHÔNG phải
+     \`set-description "passive"\`. Description chỉ là text label trên
+     interface; phải dùng \`queue_apply_config\` với
+     \`set protocols ospf area ... interface X passive\`. Backend có guard
+     chặn \`set-description\` với keyword giao thức — sẽ bị reject và
+     phải gọi lại bằng \`queue_apply_config\`.
 2. Generate config snippet theo cú pháp VENDOR của thiết bị (xem \`docs/agents/14-vendor-cli-commands.md\`):
    - **Juniper Junos set-style** (config hierarchy):
      \`\`\`
@@ -771,8 +783,22 @@ const queueInterfaceAction: CatalogEntry = {
     name: 'queue_interface_action',
     description:
       'Queue 1 INTERFACE_ACTION job. Write op — backend sẽ tạo ' +
-      'confirmation card. CHỈ gọi sau khi đã lookup device qua get_device. ' +
+      'confirmation card. CHỉ gọi sau khi đã lookup device qua get_device. ' +
       '\n\n' +
+      '## SCOPE — chỉ dành cho L2 / interface-level actions\n' +
+      'Tool này chỉ handle 6 thao tác L2/interface sau: ' +
+      '`shut`, `no-shut`, `set-access-vlan`, `set-description`, ' +
+      '`remove-description`, `delete-interface`.\n' +
+      '**KHÔNG dùng tool này cho protocol config** (OSPF/BGP/ISIS/RIP passive, ' +
+      'area, neighbor, VRF, route-map, IP address, MTU, v.v.). ' +
+      'Mô tả ("description") chỉ là text label trên interface — KHÔNG activate ' +
+      'protocol nào. Ví dụ: "cấu hình OSPF passive cổng ge-0/0/4" KHÔNG phải ' +
+      '`set-description "passive"` — phải dùng `queue_apply_config` với ' +
+      '`set protocols ospf area 0.0.0.20 interface ge-0/0/4.0 passive`.\n' +
+      'Backend có guard chặn `set-description` với keyword giao thức ' +
+      '("passive", "ospf", "area ", "vrf", ...) — nếu gọi sai sẽ bị reject ' +
+      'và phải gọi lại bằng `queue_apply_config`.\n' +
+      '\n' +
       '## Ba cách gọi (ưu tiên multi-action khi >1 thay đổi)\n' +
       '\n' +
       '### Cách 1: Cross-interface multi-action (PREFERRED cho nhiều interface cùng lúc)\n' +
