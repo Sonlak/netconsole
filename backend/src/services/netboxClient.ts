@@ -62,7 +62,13 @@ async function netboxGet<T>(path: string, options: NetBoxRequestOptions = {}): P
   if (!token) {
     throw new NetBoxError('NETBOX_TOKEN is not set on the backend');
   }
-  const url = new URL(path, base);
+  // Normalize: callers may pass either "dcim/sites/" or "/dcim/sites/".
+  // Strip any leading slash so `new URL(path, base)` treats it as relative
+  // to the base (which ends in "/"). If we kept the leading slash, the
+  // WHATWG URL spec would replace the base path and drop the "/api/"
+  // prefix (caught 2026-10-13 on VPS — landed on the NetBox 404 page).
+  const relative = path.replace(/^\/+/, '');
+  const url = new URL(relative, base);
   if (options.params) {
     for (const [key, value] of Object.entries(options.params)) {
       if (value === undefined || value === null || value === '') continue;
