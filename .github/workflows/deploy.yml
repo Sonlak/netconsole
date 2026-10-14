@@ -53,7 +53,18 @@ env:
   # that adds the file is responsible for `up -d` of the netbox stack. After
   # that, deploys keep netbox untouched (the running container's data
   # volume is what holds the inventory).
-  DEPLOY_SERVICES: "backend worker frontend"
+  DEPLOY_SERVICES: "backend worker frontend redis"
+  # CHANGED 2026-10-14 22:50 (deploy hardening).
+  # Added 'redis' to the stop/rm/pull/up list. The previous list
+  # (backend worker frontend) left a broken redis container in
+  # 'Created' state if its first network setup failed (e.g. IP
+  # collision with netbox-redis at .21). That broken container
+  # blocked the next 'up -d --no-deps' from creating a healthy
+  # redis, which made backend unhealthy (depends_on: redis), which
+  # made workers never start (depends_on: backend), which made
+  # 'up -d' return non-zero, which failed the whole 'Build & restart'
+  # step. Including redis in all four operations ensures a clean
+  # recreate on every deploy.
 
 jobs:
   deploy:
