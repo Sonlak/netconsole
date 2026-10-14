@@ -712,7 +712,12 @@ def apply_set_configuration(
         try:
             resp = post_junos_rpc(
                 host,
-                "<get-configuration><configuration><protocols/></configuration></get-configuration>",
+                # Read both interfaces and protocols stanzas so interface-action
+                # commands (which modify interfaces/) are verified correctly.
+                # Previously only protocols/ was read, causing _verify_commit_landed
+                # to return False for set/delete interfaces commands → worker
+                # called discard-changes even after a successful commit.
+                "<get-configuration><configuration><interfaces/><protocols/></configuration></get-configuration>",
                 client=client, scheme=scheme, port=port,
             )
         except Exception as exc:
