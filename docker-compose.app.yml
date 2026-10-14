@@ -135,6 +135,12 @@ services:
   # restart. If we later want cache to survive Redis restarts, switch
   # to AOF via `--appendonly yes`.
   redis:
+    # IP CHANGED 2026-10-14 22:30 (fix IP conflict with netbox-redis)
+    # Original .21 collided with docker-compose.netbox.yml's netbox-redis
+    # service at the same IP — caused "failed to set up container networking:
+    # Address already in use" on every deploy since commit 3adfd01.
+    # .23 was free (allocted: .2 postgres, .3 backend, .5 frontend,
+    # .10/.11 kea, .20 netbox-postgres, .21 netbox-redis, .22 netbox).
     image: redis:7-alpine
     container_name: netconsole-redis
     restart: unless-stopped
@@ -148,7 +154,7 @@ services:
       - ""
     networks:
       netconsole:
-        ipv4_address: 172.31.0.21
+        ipv4_address: 172.31.0.23
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -181,9 +187,10 @@ services:
       DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
       # REDIS_URL — used by backend/src/lib/redis.ts. Hit it via the
       # fixed IP rather than `redis:6379` to avoid a Docker DNS lookup
-      # on every cache call. 172.31.0.21 is the redis service's
-      # static IP assigned above.
-      REDIS_URL: redis://172.31.0.21:6379/0
+      # on every cache call. 172.31.0.23 is the redis service's
+      # static IP assigned in the redis: block above.
+      # CHANGED 2026-10-14 22:30 (was .21, conflict with netbox-redis).
+      REDIS_URL: redis://172.31.0.23:6379/0
       PORT: 3000
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
       PING_INTERVAL_SECONDS: 60
