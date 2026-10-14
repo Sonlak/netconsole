@@ -14,9 +14,26 @@ const { JWT_SECRET } = vi.hoisted(() => {
 // Mock prisma BEFORE importing the router
 const jobFindMany = vi.fn();
 const jobUpdate = vi.fn();
+// Phase 2 (2026-10-14): /jobs/queue now atomically claims inside a
+// SELECT FOR UPDATE SKIP LOCKED transaction. The test mocks the
+// transaction surface ($queryRaw, $executeRaw, transaction-scoped
+// findMany) so we don't need a real PG connection for this suite.
+const txQueryRaw = vi.fn();
+const txExecuteRaw = vi.fn();
+const txJobFindMany = vi.fn();
 
 vi.mock('../../src/lib/prisma.js', () => ({
   prisma: {
+    $transaction: (fn: (tx: {
+      $queryRaw: (...args: unknown[]) => unknown;
+      $executeRaw: (...args: unknown[]) => unknown;
+      job: { findMany: (...args: unknown[]) => unknown };
+    }) => Promise<unknown>) =>
+      fn({
+        $queryRaw: (...args: unknown[]) => txQueryRaw(...args),
+        $executeRaw: (...args: unknown[]) => txExecuteRaw(...args),
+        job: { findMany: (...args: unknown[]) => txJobFindMany(...args) },
+      }),
     job: {
       findMany: (...args: unknown[]) => jobFindMany(...args),
       findUnique: (...args: unknown[]) => jobFindMany(...args),
@@ -58,6 +75,13 @@ describe('worker auth on /jobs endpoints', () => {
   beforeEach(async () => {
     jobFindMany.mockReset();
     jobUpdate.mockReset();
+    txQueryRaw.mockReset();
+    txExecuteRaw.mockReset();
+    // Default: empty queue (no PENDING jobs). Tests that exercise
+    // the SKIP LOCKED claim path override these to return rows.
+    txQueryRaw.mockResolvedValue([]);
+    txExecuteRaw.mockResolvedValue(0);
+    txJobFindMany.mockResolvedValue([]);
     const s = await startServer();
     server = s.server;
     baseUrl = s.url;
