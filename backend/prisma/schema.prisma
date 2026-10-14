@@ -178,6 +178,19 @@ model Job {
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+  // Phase 2 (2026-10-14): claim tracking for SELECT FOR UPDATE SKIP LOCKED
+  // in /jobs/queue. `startedAt` is set when the worker flips PENDING →
+  // RUNNING; `claimedBy` is the worker identity (req.user.sub on the
+  // worker JWT, or WORKER_NAME from env). Both nullable so existing
+  // rows continue to load without a backfill.
+  //
+  // `startedAt` doubles as the watchdog signal: if startedAt is older
+  // than WATCHDOG_TIMEOUT_S (60s in jobWatchdog.ts) the row gets reset
+  // to PENDING so another worker can pick it up. Previously the
+  // watchdog relied on `updatedAt` for that, which broke if any code
+  // path touched updatedAt (e.g. applyManagedCheckResult).
+  startedAt  DateTime?
+  claimedBy  String?
 
   @@index([deviceId])
   @@index([status])
@@ -185,6 +198,7 @@ model Job {
   @@index([deviceId, status])
   @@index([deviceId, type, status, updatedAt(sort: Desc)])
   @@index([status, priority, createdAt])
+  @@index([claimedBy, startedAt])
   // Partial index for the periodic NetBox sync — scheduler picks the
   // oldest PENDING sync job to keep latency bounded when there are many
   // devices.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any
@@ -15,12 +17,27 @@ from netconsole_worker.tasks.registry import TASK_REGISTRY
 
 logger = logging.getLogger(__name__)
 
+# Graceful-shutdown knobs. The container's `stop_grace_period` in
+# docker-compose.app.yml caps how long Docker waits before SIGKILL after
+# `docker stop`. We drain in-flight jobs up to DRAIN_TIMEOUT_SECS, then exit
+# even if work is mid-flight. Stale RUNNING rows are reclaimed by the
+# backend's jobWatchdog every 30s, so the worst-case loss is at most ~1
+# re-pickup latency for an unlucky Juniper INTERFACE_ACTION. Juniper RESTCONF
+# writes can run 60-120s (gotcha #15a); we pick 180s as the drain budget.
+# DRAIN_TIMEOUT_SECS MUST be ≤ container stop_grace_period (300s) to avoid
+# Docker force-killing us mid-shutdown.
+DRAIN_TIMEOUT_SECS = 180
+
 
 class WorkerClient:
     def __init__(self) -> None:
         self.base_url = settings.api_base_url.rstrip("/")
         self.client = httpx.Client(timeout=30.0)
         self._headers = self._build_headers()
+        # Phase 2 (2026-10-14): cache the worker name so fetch_pending_jobs
+        # can pass it to /jobs/queue?workName=. The backend stamps the
+        # value into Job.claimedBy for debugging stuck-RUNNING jobs.
+        self.settings = settings
 
     def _build_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -33,22 +50,20 @@ class WorkerClient:
         self.client.close()
 
     def fetch_pending_jobs(self, limit: int = 1) -> list[dict[str, Any]]:
+        # Phase 2 (2026-10-14): /jobs/queue now atomically claims inside
+        # a SELECT FOR UPDATE SKIP LOCKED transaction (see
+        # backend/src/routes/jobs.ts). The response array contains jobs
+        # whose status was just flipped PENDING → RUNNING. We pass the
+        # worker identity as ?workName= so the backend stamps the
+        # claimedBy audit column for debugging stuck-RUNNING jobs.
         response = self.client.get(
             f"{self.base_url}/jobs/queue",
-            params={"limit": max(1, limit)},
+            params={"limit": max(1, limit), "workName": self.settings.worker_name},
             headers=self._headers,
         )
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, list) else []
-
-    def claim_job(self, job_id: str) -> dict[str, Any]:
-        response = self.client.patch(
-            f"{self.base_url}/jobs/{job_id}/claim",
-            headers=self._headers,
-        )
-        response.raise_for_status()
-        return response.json()
 
     def complete_job(
         self,
@@ -100,19 +115,16 @@ def run_job(payload: dict[str, Any]) -> None:
     job_id = payload["id"]
     job_type = payload.get("type")
     try:
-        claimed = client.claim_job(job_id)
-        result = process_job(claimed)
+        # Phase 2 (2026-10-14): no more separate claim call. /jobs/queue
+        # atomically flips status PENDING → RUNNING via SELECT FOR UPDATE
+        # SKIP LOCKED inside the backend transaction. The job returned in
+        # `payload` is already claimed. If we still called PATCH /jobs/{id}
+        # /claim here, the backend would return 409 (already RUNNING) and
+        # the existing handler would log "already claimed" and skip
+        # processing — silently dropping the job.
+        result = process_job(payload)
         client.complete_job(job_id, result=result)
         logger.info("Completed job %s (%s)", job_id, job_type)
-    except httpx.HTTPStatusError as exc:
-        if exc.response is not None and exc.response.status_code == 409:
-            logger.info("Job %s already claimed", job_id)
-            return
-        logger.exception("Job %s failed", job_id)
-        try:
-            client.complete_job(job_id, error=str(exc))
-        except Exception:
-            logger.exception("Could not report failure for job %s", job_id)
     except Exception as exc:
         logger.exception("Job %s failed", job_id)
         try:
@@ -146,16 +158,43 @@ def main() -> None:
         concurrency,
     )
 
+    # ── Graceful shutdown wiring ──────────────────────────────────────────
+    # SIGTERM is what Docker sends on `docker stop` (after stop_grace_period).
+    # SIGINT is what Ctrl-C sends (dev). Both flip `_shutdown_event`; the
+    # main loop checks it on each iteration and stops fetching new jobs
+    # once the in-flight set drains. Hard kill (SIGKILL) skips this — the
+    # backend's jobWatchdog reclaims stale RUNNING rows every 30s.
+    _shutdown_event = threading.Event()
+
+    def _handle_signal(signum: int, _frame: Any) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        logger.warning("%s received — initiating graceful shutdown", name)
+        _shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     inflight: dict[Future[None], str] = {}
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="nc-job") as pool:
         last_pool_stats_at = 0.0
         while True:
+            # Reap completed futures first so inflight shrinks even during drain.
             for fut in [item for item in list(inflight) if item.done()]:
                 job_id = inflight.pop(fut)
                 try:
                     fut.result()
                 except Exception:
                     logger.exception("Job %s worker crash", job_id)
+
+            # Shutdown gate: if SIGTERM was received AND there is no work in
+            # flight, exit the main loop. In-flight jobs keep running in the
+            # thread pool and are awaited in the drain phase below.
+            if _shutdown_event.is_set() and not inflight:
+                logger.info("Shutdown gate: no in-flight jobs, exiting main loop")
+                break
 
             now = time.monotonic()
             if now - last_pool_stats_at >= 300:
@@ -187,7 +226,7 @@ def main() -> None:
 
             free = concurrency - len(inflight)
             submitted = 0
-            if free > 0:
+            if free > 0 and not _shutdown_event.is_set():
                 try:
                     jobs = poller.fetch_pending_jobs(limit=free)
                 except Exception:
@@ -207,10 +246,56 @@ def main() -> None:
                         break
 
             if not inflight:
+                if _shutdown_event.is_set():
+                    # No work, already logged "exiting main loop" above.
+                    break
                 time.sleep(settings.poll_interval_seconds)
                 continue
             if submitted == 0:
-                wait(list(inflight), timeout=0.25, return_when=FIRST_COMPLETED)
+                # While shutting down we wait longer per iteration so the
+                # in-flight set has time to drain. Otherwise we wake up
+                # every 0.25s and re-check, which just adds log noise.
+                wait_timeout = 5.0 if _shutdown_event.is_set() else 0.25
+                wait(list(inflight), timeout=wait_timeout, return_when=FIRST_COMPLETED)
+
+        # ── Drain phase ───────────────────────────────────────────────────
+        # Main loop exited (either via shutdown + empty inflight, or we
+        # broke through the shutdown gate above). If anything is still
+        # running we wait up to DRAIN_TIMEOUT_SECS for it to finish. The
+        # container's stop_grace_period (300s) gives us 180s of grace
+        # before Docker SIGKILLs the process — any jobs that exceed the
+        # drain budget are reclaimed by the backend jobWatchdog after 30s.
+        if inflight:
+            logger.warning(
+                "Draining %d in-flight job(s) before exit (timeout=%ds)...",
+                len(inflight),
+                DRAIN_TIMEOUT_SECS,
+            )
+            deadline = time.monotonic() + DRAIN_TIMEOUT_SECS
+            while inflight and time.monotonic() < deadline:
+                wait(list(inflight.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in [f for f in inflight if f.done()]:
+                    job_id = inflight.pop(fut)
+                    try:
+                        fut.result()
+                    except Exception:
+                        logger.exception("Job %s drain crash", job_id)
+            if inflight:
+                logger.error(
+                    "Drain timeout — %d job(s) still running, exiting. "
+                    "Backend jobWatchdog will reclaim them within 30s.",
+                    len(inflight),
+                )
+            else:
+                logger.info("Drain complete — all in-flight jobs finished cleanly")
+
+        # Tell the pool to stop accepting new work; existing threads keep
+        # running because we set wait=False. They are bounded by the
+        # drain loop above.
+        pool.shutdown(wait=False)
+
+    poller.close()
+    logger.info("Worker exited cleanly")
 
 
 if __name__ == "__main__":

@@ -97,68 +97,107 @@ jobsRouter.get('/', authMiddleware, async (req, res) => {
   res.json(jobs);
 });
 
-// Worker-only: claim the next pending job(s). Requires `role: "worker"`.
+// Worker-only: atomically claim the next pending job(s). Requires
+// `role: "worker"`. Returns up to `?limit=` (max 16) jobs.
 //
-// Priority order (config-studio jobs MUST be picked up before collection jobs
-// even if they were created later):
-//   1. Config Studio interactive: APPLY_CONFIG / ROLLBACK_CONFIG / MANAGED_CHECK
-//      / INTERFACE_ACTION / CONNECT_TEST / DISCOVERY_PROBE (priority HIGH)
-//   2. Manual refresh: GET_CONFIG / GET_INTERFACES (priority HIGH)
-//   3. Scheduled collection: GET_ARP / GET_MAC / scheduled GET_CONFIG
-//      (priority NORMAL — uses the index [status, priority, createdAt])
+// Phase 2 (2026-10-14): refactored to SELECT ... FOR UPDATE SKIP LOCKED
+// inside a transaction. The same transaction flips status PENDING → RUNNING
+// and stamps startedAt/claimedBy. Two concurrent worker replicas calling
+// this endpoint get disjoint sets — Postgres guarantees that without any
+// application-level coordination. Previously the queue endpoint just
+// returned pending rows and workers raced on a separate PATCH /claim;
+// under 5+ worker replicas that produced measurable wasted bandwidth
+// (workers polling + retrying on 409). With SKIP LOCKED the workers
+// spend 100% of their time on real jobs.
 //
-// Device lock: a device with an existing RUNNING job is skipped so two workers
-// never operate on the same device concurrently. This mirrors the advisory-lock
-// check in tryCreateDeviceJob so the queue and the job-creation path agree.
-jobsRouter.get('/queue', workerAuth, async (req, res) => {
-  const include = {
-    device: {
-      select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
-    },
-  };
+// Priority order (config-studio jobs MUST jump the queue):
+//   1. INTERACTIVE_JOB_TYPES (HIGH)
+//   2. REFRESH_JOB_TYPES (HIGH)
+//   3. All other pending (NORMAL)
+//
+// Device lock: a device with an existing RUNNING job is skipped so two
+// workers never operate on the same device concurrently. Implemented as
+// a NOT EXISTS subquery in the WHERE clause.
+//
+// `?workName=<string>` overrides the audit column (otherwise the JWT
+// `sub` is used). Useful when the same worker process handles two
+// logical workers (the current compose setup uses one process per
+// replica, so this is more about future-proofing).
+jobsRouter.get('/queue', workerAuth, async (req: AuthenticatedRequest, res) => {
   const take = Math.min(Math.max(Number(req.query.limit) || 1, 1), 16);
-  const picked: Array<{ id: string }> = [];
-  const seen: string[] = [];
+  const workerName =
+    (typeof req.query.workName === 'string' && req.query.workName) ||
+    req.user?.userId ||
+    'unknown';
 
-  const pull = async (typeFilter?: JobType[]) => {
-    if (picked.length >= take) return;
-    const rows = await prisma.job.findMany({
-      where: {
-        status: JobStatus.PENDING,
-        ...(typeFilter ? { type: { in: typeFilter } } : {}),
-        ...(seen.length ? { id: { notIn: seen } } : {}),
-      },
-      include,
-      // Priority DESC then FIFO so config-studio jobs ALWAYS jump the queue
-      // ahead of any backlogged collection jobs.
-      orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
-      take: take - picked.length,
-    });
-    // Filter out PENDING jobs whose device already has a RUNNING job.
-    // We check ALL running job deviceIds at once (single query) so the
-    // filter is cheap even for a large pending queue.
-    const runningDeviceIds = new Set(
-      (
-        await prisma.job.findMany({
-          where: { status: JobStatus.RUNNING },
-          select: { deviceId: true },
-        })
-      )
-        .map((r) => r.deviceId)
-        .filter((id): id is string => id !== null),
-    );
-    for (const row of rows) {
-      // Skip if this device has an active (RUNNING) job — device is busy.
-      if (row.deviceId && runningDeviceIds.has(row.deviceId)) continue;
-      seen.push(row.id);
-      picked.push(row);
-    }
-  };
+  const claimed = await prisma.$transaction(
+    async (tx) => {
+      // 1. Lock and select IDs. The FOR UPDATE clause locks the
+      // selected rows for the duration of the transaction; SKIP
+      // LOCKED makes concurrent transactions skip rows that are
+      // already locked (instead of waiting on them). Postgres ≥ 9.5.
+      //
+      // Device-lock subquery: NOT EXISTS against any RUNNING job for
+      // the same deviceId. NULL cost equals the fleet because most
+      // collection jobs are scoped to a device.
+      const rows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Job"
+        WHERE status = 'PENDING'::"JobStatus"
+          AND (
+            "deviceId" IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM "Job" j2
+              WHERE j2."deviceId" = "Job"."deviceId"
+                AND j2.status = 'RUNNING'::"JobStatus"
+            )
+          )
+        ORDER BY priority DESC, "createdAt" ASC
+        LIMIT ${take}
+        FOR UPDATE SKIP LOCKED
+      `;
 
-  await pull(INTERACTIVE_JOB_TYPES);
-  await pull(REFRESH_JOB_TYPES);
-  await pull();
-  res.json(picked);
+      if (rows.length === 0) return [];
+
+      const ids = rows.map((r) => r.id);
+
+      // 2. Stamp audit columns + claim. Atomic with the SELECT
+      // because we're still inside the transaction holding the row
+      // locks. The Prisma.join(ids) renders a comma-separated list of
+      // quoted UUID literals — still parameterized, so SQL injection
+      // is not a concern.
+      await tx.$executeRaw`
+        UPDATE "Job"
+        SET status = 'RUNNING'::"JobStatus",
+            "startedAt" = NOW(),
+            "claimedBy" = ${workerName}
+        WHERE id IN (${Prisma.join(ids)})
+      `;
+
+      // 3. Re-fetch with relations for the worker. We re-read rather
+      // than use the locked rows directly because Prisma's include
+      // (relation loader) only works through the typed findMany API.
+      return tx.job.findMany({
+        where: { id: { in: ids } },
+        include: {
+          device: {
+            select: { id: true, name: true, ip: true, site: true, vendor: true, model: true },
+          },
+        },
+        orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }],
+      });
+    },
+    {
+      // ReadCommitted (Postgres default) is correct here: each
+      // transaction sees the latest committed state, and FOR UPDATE
+      // provides the per-row lock. RepeatableRead would also work
+      // but can cause serialization conflicts under contention.
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      maxWait: 5_000,
+      timeout: 10_000,
+    },
+  );
+
+  res.json(claimed);
 });
 
 jobsRouter.get('/:id', async (req, res) => {

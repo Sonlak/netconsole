@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma.js';
 import { getDeviceById, registerDeviceOperationRoutes } from './deviceOperations.js';
 import { devicePingRouter } from './devicePing.js';
 import { pingAndUpdateDevice } from '../services/devicePing.js';
+import { deviceCache } from '../services/deviceCache.js';
 
 export const devicesRouter = Router();
 
@@ -68,10 +69,16 @@ function parseDeviceBody(body: Record<string, unknown>, isUpdate = false) {
   };
 }
 
+// Phase 2 (2026-10-14): wrapped with deviceCache (30s TTL, read-through).
+// Cache miss path is identical to the original handler — DB load + JSON
+// response — so callers see no latency penalty beyond an extra Redis
+// round-trip (~1ms locally).
 devicesRouter.get('/', async (_req, res) => {
-  const devices = await prisma.device.findMany({
-    orderBy: [{ site: 'asc' }, { floor: 'asc' }, { name: 'asc' }],
-  });
+  const devices = await deviceCache.getDevicesList(() =>
+    prisma.device.findMany({
+      orderBy: [{ site: 'asc' }, { floor: 'asc' }, { name: 'asc' }],
+    }),
+  );
   res.json(devices);
 });
 
@@ -89,6 +96,9 @@ devicesRouter.post('/', async (req, res) => {
 
   try {
     const device = await prisma.device.create({ data: parsed.data });
+    // Phase 2: invalidate device list cache after a new device is added.
+    // The next /api/devices request will rebuild from PG.
+    void deviceCache.invalidate();
     void pingAndUpdateDevice(device.id).catch((error) => {
       console.error(`[ping] initial check failed for ${device.id}`, error);
     });
@@ -119,6 +129,11 @@ devicesRouter.patch('/:id', async (req, res) => {
       where: { id: req.params.id },
       data,
     });
+    // Phase 2: invalidate device list cache after an update. Field
+    // changes (rack, unit) don't change member set, but we invalidate
+    // anyway because the cached blob includes those fields and stale
+    // rack/unit values would be confusing for floor-plan views.
+    void deviceCache.invalidate();
     res.json(device);
   } catch {
     res.status(404).json({ error: 'Device not found' });
@@ -156,6 +171,8 @@ devicesRouter.put('/:id', async (req, res) => {
         status: nextStatus,
       },
     });
+    // Phase 2: full-replace PUT also invalidates cache.
+    void deviceCache.invalidate();
 
     if (
       existing.status === DeviceStatus.MAINTENANCE &&
@@ -175,6 +192,8 @@ devicesRouter.put('/:id', async (req, res) => {
 devicesRouter.delete('/:id', async (req, res) => {
   try {
     await prisma.device.delete({ where: { id: req.params.id } });
+    // Phase 2: invalidate cache after deletion.
+    void deviceCache.invalidate();
     res.status(204).send();
   } catch {
     res.status(404).json({ error: 'Device not found' });

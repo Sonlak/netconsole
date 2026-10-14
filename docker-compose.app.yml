@@ -1,6 +1,28 @@
 # NetConsole app stack for production server.
 # Kea DHCPv4 HA with hot-standby on Docker custom bridge.
 # DHCP relay from EVE-NG should send to private NIC 10.10.20.20:67 (not public IP).
+#
+# Phase 1 + 2 changes (2026-10-14):
+#   * Backend now has healthcheck + stop_grace_period — docker compose
+#     rolling update waits for /api/health before declaring deploy done.
+#   * Worker scaled to `replicas: 2` for horizontal throughput. Two
+#     workers polling /jobs/queue in parallel ~doubles the device
+#     processing rate. Container name + fixed IP removed so compose can
+#     create multiple replicas (auto-named `netconsole-worker-1/-2`,
+#     auto-IP'd on the netconsole bridge). Worker still reaches backend
+#     via backend's fixed IP 172.31.0.3.
+#   * Worker drains in-flight jobs on SIGTERM (worker/netconsole_worker/
+#     main.py — see DRAIN_TIMEOUT_SECS). stop_grace_period: 300s on the
+#     compose service gives the worker up to 240s to finish the longest
+#     Juniper RESTCONF write before docker SIGKILLs. Backend's
+#     jobWatchdog reclaims stale RUNNING rows after 30s as a safety
+#     net for any jobs that exceed the drain budget.
+#   * Redis added for hot-read caching (/api/devices) and any future
+#     pub/sub. No persistence (cache rebuilds on next request).
+#   * PgBouncer deferred to Phase 2.5/3 — at the current 1 backend +
+#     2 worker setup, Prisma connection count is well under PG's
+#     max_connections=100. Add pgbouncer when total app clients > 50
+#     (track via `SELECT count(*) FROM pg_stat_activity`).
 
 networks:
   netconsole:
@@ -105,6 +127,34 @@ services:
       timeout: 5s
       retries: 25
 
+  # Redis cache layer (Phase 2 — 2026-10-14).
+  # Used for:
+  #   * hot-read cache on /api/devices (read-through, 30s TTL)
+  #   * future pub/sub or rate-limit buckets
+  # No persistence — cache rebuilds from PG on next request after
+  # restart. If we later want cache to survive Redis restarts, switch
+  # to AOF via `--appendonly yes`.
+  redis:
+    image: redis:7-alpine
+    container_name: netconsole-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+    networks:
+      netconsole:
+        ipv4_address: 172.31.0.21
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   backend:
     build:
       context: ./backend
@@ -113,13 +163,27 @@ services:
         NETCONSOLE_GIT_COMMIT: "${NETCONSOLE_GIT_COMMIT:-unknown}"
     container_name: netconsole-backend
     restart: unless-stopped
+    # Phase 1: graceful shutdown window. SIGTERM handler in
+    # backend/src/index.ts sets isShuttingDown=true (returns 503 from
+    # /api/health so any future LB drains), closes HTTP server, stops
+    # syslog receiver, then disconnects Prisma. 30s is the worst-case
+    # bound for active HTTP requests + Prisma disconnect. Docker
+    # SIGKILLs after this grace period.
+    stop_grace_period: 30s
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       kea-dhcp1:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
+      # REDIS_URL — used by backend/src/lib/redis.ts. Hit it via the
+      # fixed IP rather than `redis:6379` to avoid a Docker DNS lookup
+      # on every cache call. 172.31.0.21 is the redis service's
+      # static IP assigned above.
+      REDIS_URL: redis://172.31.0.21:6379/0
       PORT: 3000
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
       PING_INTERVAL_SECONDS: 60
@@ -231,15 +295,51 @@ services:
     mem_limit: 1g
     mem_reservation: 512m
     cpus: '1.5'
+    # Phase 1: backend healthcheck. Used by docker compose rolling
+    # update (`update_config.order: start-first`) and by the deploy
+    # workflow's "Wait for backend healthy" probe. Returns 503 while
+    # shutting down (see gracefulShutdown → /api/health branch in
+    # backend/src/index.ts), so any future load balancer in front
+    # would drain this instance during a deploy.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -o /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      # First-boot can include `prisma db push` (~30s on cold start
+      # with --accept-data-loss), then Node startup, then API bind.
+      # 30s start_period tolerates that without flapping.
+      start_period: 30s
 
   worker:
     build:
       context: ./worker
-    container_name: netconsole-worker
+    # Phase 2: container_name + ipv4_address REMOVED so `replicas: 2`
+    # works (compose auto-names to netconsole-worker-1 / -2 and
+    # auto-IPs each on the netconsole bridge). The previous single
+    # `netconsole-worker` container is removed by deploy.yml's
+    # `rm -sf worker` step on the next deploy. Worker still reaches
+    # backend via backend's fixed IP 172.31.0.3 — that hasn't changed.
     restart: unless-stopped
+    # Phase 1: drain window for in-flight jobs. SIGTERM handler in
+    # worker/netconsole_worker/main.py drains up to DRAIN_TIMEOUT_SECS
+    # (180s, matches Juniper RESTCONF write worst case from gotcha
+    # #15a). 300s grace period gives Docker enough time to wait for
+    # the longest legitimate write to finish before SIGKILL.
+    stop_grace_period: 300s
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
+    # Phase 2: horizontal worker scaling. `replicas: 2` (instead of 1)
+    # gives us 2× the device-processing throughput without any code
+    # changes — both replicas poll /jobs/queue and the queue's
+    # SELECT ... FOR UPDATE SKIP LOCKED (Phase 2 in jobs.ts) prevents
+    # duplicate claim. Scale up by editing this number and re-running
+    # deploy. Note: Prisma's device-lock check (busy device skip)
+    # also works across replicas — only one worker can hold a
+    # RUNNING job for a given device at a time.
+    deploy:
+      replicas: 2
     environment:
       API_BASE_URL: http://172.31.0.3:3000/api
       POLL_INTERVAL_SECONDS: 1
@@ -299,9 +399,12 @@ services:
       # and populates primary_ip4 on each device. Change to match your lab subnet.
       # Leave empty to skip IPAM (management IPs stored in device description only).
       NETBOX_MANAGEMENT_PREFIX: "10.10.20.0/24"
+    # Phase 2: removed `ipv4_address` to support `replicas: 2`.
+    # Compose auto-assigns IPs from the 172.31.0.0/24 subnet for
+    # each replica. Worker → backend traffic still uses the fixed
+    # IP 172.31.0.3 (backend service has its own ipv4_address).
     networks:
-      netconsole:
-        ipv4_address: 172.31.0.4
+      - netconsole
 
   frontend:
     build:

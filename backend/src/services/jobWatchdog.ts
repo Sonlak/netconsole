@@ -49,10 +49,22 @@ const VENDOR_EXTRA_MS: Partial<Record<JobType, number>> = {
 const DEFAULT_STALE_MS = 120_000;
 
 export async function reclaimStaleJobs() {
-  const running = await prisma.job.findMany({
-    where: { status: JobStatus.RUNNING },
-    select: { id: true, type: true, updatedAt: true, deviceId: true },
-  });
+  // Pull the staleness anchor per row:
+  //   - startedAt: when the worker claimed the job (set by /jobs/queue's
+  //     SELECT FOR UPDATE SKIP LOCKED transaction). This is the canonical
+  //     "worker is processing this" timestamp.
+  //   - updatedAt: fallback for legacy RUNNING rows that pre-date the
+  //     startedAt column (added 2026-10-14, Phase 2). They'll get
+  //     startedAt stamped on the next claim cycle.
+  // We coalesce in SQL so the staleness math is consistent across both
+  // new and old rows without an application-level fallback.
+  const running = await prisma.$queryRaw<
+    Array<{ id: string; type: JobType; anchor: Date; deviceId: string | null }>
+  >`
+    SELECT id, type, COALESCE("startedAt", "updatedAt") AS anchor, "deviceId"
+    FROM "Job"
+    WHERE status = 'RUNNING'::"JobStatus"
+  `;
   if (running.length === 0) {
     return 0;
   }
@@ -78,7 +90,7 @@ export async function reclaimStaleJobs() {
     const extra = vendorById.get(job.deviceId ?? '') === 'juniper'
       ? VENDOR_EXTRA_MS[job.type] ?? 0
       : 0;
-    if (now - job.updatedAt.getTime() >= base + extra) {
+    if (now - job.anchor.getTime() >= base + extra) {
       staleIds.push(job.id);
     }
   }
