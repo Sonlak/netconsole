@@ -308,8 +308,21 @@ services:
     # shutting down (see gracefulShutdown → /api/health branch in
     # backend/src/index.ts), so any future load balancer in front
     # would drain this instance during a deploy.
+    #
+    # CHANGED 2026-10-14 22:50 (deploy hardening).
+    # The previous `curl -sf http://...` probe failed with
+    # '/bin/sh: 1: curl: not found' because the backend image
+    # (node:22-bookworm-slim) only installs iputils-ping, openssl,
+    # ca-certificates, postgresql-client — no curl. FailedStreak went
+    # to 23, backend was marked 'unhealthy' by Docker, and the worker
+    # depends_on: backend: service_healthy never resolved — workers
+    # stayed in 'Created' state forever. Replaced curl with a
+    # Node one-liner so the probe uses the same runtime that's
+    # already in the image (no Dockerfile change needed).
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf -o /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      test:
+        - "CMD-SHELL"
+        - "node -e \"require('http').get('http://127.0.0.1:3000/api/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""
       interval: 5s
       timeout: 3s
       retries: 10
