@@ -85,7 +85,7 @@ services:
       # NetBox v5 uses API_TOKEN_PEPPER_1 (single string, not JSON array).
       # The configuration.py reads: _read_secret('api_token_pepper_1', environ.get('API_TOKEN_PEPPER_1', ''))
       # Pepper must be at least 50 characters.
-      API_TOKEN_PEPPER_1: "nb2-pepper-1-CHANGE-ME-in-production-do-not-share"
+      API_TOKEN_PEPPER_1: "nb2-pepper-1-CHANGE-ME-in-production-do-not-share-x"
       SUPERUSER_NAME: admin
       SUPERUSER_PASSWORD: Admin@123
       SUPERUSER_EMAIL: admin@netconsole.local
