@@ -82,6 +82,11 @@ services:
       ALLOWED_HOSTS: "*"
       # Pad to 50+ chars per NetBox Django requirement.
       SECRET_KEY: "netbox2-dev-secret-CHANGE-ME-in-prod-padding-xyz1234abcd"
+      # NetBox v5+ requires API_TOKEN_PEPPERS. Without it, even
+      # Token.objects.create(key=...) fails with "API_TOKEN_PEPPERS is
+      # not defined" because the v2 token digest path requires a pepper.
+      # The value is a single-element JSON list of arbitrary strings.
+      API_TOKEN_PEPPERS: '["nb2-pepper-1"]'
       SUPERUSER_NAME: admin
       SUPERUSER_PASSWORD: Admin@123
       SUPERUSER_EMAIL: admin@netconsole.local
