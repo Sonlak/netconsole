@@ -2377,6 +2377,142 @@ const getNetboxSyncStatus: CatalogEntry = {
   confirmSummary: () => '',
 };
 
+// ── NetBox multi-instance + WRITE tools (added 2026-10-15) ─────────────────────────────
+
+const listNetboxInstances: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'list_netbox_instances',
+    description:
+      'Liệt kê các NetBox instance đã config trong backend. ' +
+      'Mỗi instance có name + url + token. ' +
+      'Dùng khi user muốn biết có bao nhiêu NetBox, hoặc muốn chuyển data giữa 2 instance. ' +
+      'Returns: { instances: string[], default: string }.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  readonly: true,
+  requiresRole: 'OPERATOR',
+  confirmSummary: () => '',
+};
+
+const createNetboxPrefix: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'create_netbox_prefix',
+    description:
+      'Tạo MỘT prefix mới trong NetBox (hoặc PATCH nếu overwrite=true). ' +
+      'Tự động get-or-create các related object: tenant, vrf, vlan, role, tags. ' +
+      'Dùng khi user muốn tạo thủ công 1 prefix trên NetBox. ' +
+      '⚠️ Xác nhận với user TRƯỚC KHI gọi — confirmation card sẽ hiện summary.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        instance: { type: 'string', description: 'Tên NetBox instance (mặc định = production). Ví dụ: "production", "netbox2".' },
+        prefix: { type: 'string', description: 'CIDR prefix, bắt buộc. Ví dụ: "10.10.20.0/24".' },
+        status: { type: 'string', enum: ['active', 'reserved', 'deprecated', 'planned'], description: 'Status. Mặc định "active".' },
+        description: { type: 'string', description: 'Mô tả prefix.' },
+        site: { type: 'string', description: 'Tên site (slug). Tự động get-or-create.' },
+        vrf: { type: 'string', description: 'Tên VRF. Tự động get-or-create nếu chưa có.' },
+        tenant: { type: 'string', description: 'Tên tenant. Tự động get-or-create nếu chưa có.' },
+        vlan: { type: 'number', description: 'VLAN ID (1-4094). Tự động get-or-create.' },
+        role: { type: 'string', description: 'Tên prefix role (slug). Tự động get-or-create.' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Tag slugs. Tự động get-or-create tag.' },
+        is_pool: { type: 'boolean', description: 'Là IP pool? Mặc định false.' },
+        mark_utilized: { type: 'boolean', description: 'Đánh dấu utilized? Mặc định false.' },
+        overwrite: { type: 'boolean', description: 'Nếu prefix đã tồn tại: true = PATCH với data mới, false = skip (mặc định).' },
+      },
+      required: ['prefix'],
+    },
+  },
+  readonly: false,
+  requiresRole: 'ADMIN',
+  confirmSummary: (args: Record<string, unknown>) =>
+    `Tạo prefix "${args.prefix}"${(args as Record<string, string | number | boolean>).instance ? ` trên instance "${args.instance}"` : ''} vào NetBox.${args.overwrite === true ? ' Ghi đè nếu đã tồn tại.' : ''}`,
+};
+
+const bulkCreateNetboxPrefixes: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'bulk_create_netbox_prefixes',
+    description:
+      'Tạo hoặc cập nhật NHIỀU prefixes trong NetBox từ JSON array. ' +
+      'Mỗi row hỗ trợ: prefix, status, description, site, vrf, tenant, vlan (VID), role, tags, is_pool, mark_utilized. ' +
+      'Related objects (tenant/vrf/vlan/role/tags) được tự động get-or-create bằng tên. ' +
+      'Dùng khi user muốn import CSV từ Excel vào NetBox. ' +
+      '⚠️ Xác nhận với user TRƯỚC KHI gọi — confirmation card hiện tổng số prefix.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        instance: { type: 'string', description: 'Tên NetBox instance (mặc định = production).' },
+        rows: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              prefix: { type: 'string', description: 'CIDR, bắt buộc.' },
+              status: { type: 'string', description: 'active/reserved/deprecated/planned. Mặc định active.' },
+              description: { type: 'string', description: 'Mô tả.' },
+              site: { type: 'string', description: 'Tên site.' },
+              vrf: { type: 'string', description: 'Tên VRF.' },
+              tenant: { type: 'string', description: 'Tên tenant.' },
+              vlan: { type: 'number', description: 'VLAN ID.' },
+              role: { type: 'string', description: 'Tên prefix role.' },
+              tags: { type: 'array', items: { type: 'string' }, description: 'Tag slugs, phân cách bằng ; hoặc array.' },
+              is_pool: { type: 'boolean', description: 'Là pool?' },
+              mark_utilized: { type: 'boolean', description: 'Mark utilized?' },
+            },
+            required: ['prefix'],
+          },
+          description: 'Mảng prefix objects. Tối đa 5000 dòng.',
+        },
+        overwrite: { type: 'boolean', description: 'true = PATCH existing prefixes. false = skip (mặc định, an toàn).' },
+      },
+      required: ['rows'],
+    },
+  },
+  readonly: false,
+  requiresRole: 'ADMIN',
+  confirmSummary: (args: Record<string, unknown>) => {
+    const rows = Array.isArray(args.rows) ? args.rows : [];
+    return `Import ${rows.length} prefixes vào NetBox${typeof args.instance === 'string' ? ` instance "${args.instance}"` : ''}.${args.overwrite ? ' Ghi đè prefix đã tồn tại.' : ' Skip prefix đã tồn tại.'}`;
+  },
+};
+
+const copyNetboxPrefixes: CatalogEntry = {
+  type: 'function',
+  function: {
+    name: 'copy_netbox_prefixes',
+    description:
+      'Copy TẤT CẢ prefixes từ một NetBox instance sang instance khác qua API. ' +
+      'Source và target được chỉ định bằng tên instance (xem list_netbox_instances). ' +
+      'Tự động get-or-create tenant/vrf/vlan/role/tags ở target. ' +
+      'Dùng khi user muốn replicate prefix data từ production sang netbox2. ' +
+      '⚠️ Xác nhận với user TRƯỚC KHI gọi vì operation này tạo object mới ở target.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        source: { type: 'string', description: 'Tên source instance. Ví dụ: "production".' },
+        target: { type: 'string', description: 'Tên target instance. Ví dụ: "netbox2".' },
+        tenant_filter: { type: 'string', description: 'Chỉ copy prefixes thuộc tenant này. Tùy chọn.' },
+        site_filter: { type: 'string', description: 'Chỉ copy prefixes thuộc site này. Tùy chọn.' },
+        overwrite: { type: 'boolean', description: 'true = PATCH existing prefixes ở target. false = skip (mặc định).' },
+      },
+      required: ['source', 'target'],
+    },
+  },
+  readonly: false,
+  requiresRole: 'ADMIN',
+  confirmSummary: (args: Record<string, unknown>) =>
+    `Copy TẤT CẢ prefixes từ "${args.source}" → "${args.target}".${args.overwrite ? ' Ghi đè prefix đã tồn tại.' : ' Skip prefix đã tồn tại.'}${args.tenant_filter ? ` Chỉ tenant "${args.tenant_filter}".` : ''}`,
+};
+
 const getStatistics: CatalogEntry = {
   type: 'function',
   function: {
@@ -2564,6 +2700,11 @@ export const TOOL_CATALOG: CatalogEntry[] = [
   listNetboxPrefixes,
   listNetboxIpAddresses,
   getNetboxSyncStatus,
+  // NetBox multi-instance + WRITE (added 2026-10-15)
+  listNetboxInstances,
+  createNetboxPrefix,
+  bulkCreateNetboxPrefixes,
+  copyNetboxPrefixes,
   getStatistics,
   describeCapabilities,
   // UI affordance — emits clickable follow-up chips

@@ -921,6 +921,7 @@ describe('list_netbox_devices', () => {
     const result = await HANDLERS.list_netbox_devices({ site: 'lab', status: 'active' }, ctx);
     expect(result.ok).toBe(true);
     expect(listNetboxDevicesMock).toHaveBeenCalledWith(
+      undefined,
       expect.objectContaining({ site: 'lab', status: 'active', limit: 50, offset: 0 }),
     );
     const preview = result.preview as {
@@ -1020,7 +1021,7 @@ describe('get_netbox_device', () => {
       }],
     });
     const result = await HANDLERS.get_netbox_device({ name: 'F2-AS' }, ctx);
-    expect(listNetboxDevicesMock).toHaveBeenCalledWith(expect.objectContaining({ search: 'F2-AS', limit: 5 }));
+    expect(listNetboxDevicesMock).toHaveBeenCalledWith(undefined, expect.objectContaining({ search: 'F2-AS', limit: 5 }));
     expect(result.ok).toBe(true);
   });
 
@@ -1112,6 +1113,7 @@ describe('list_netbox_prefixes', () => {
     listNetboxPrefixesMock.mockResolvedValueOnce([]);
     await HANDLERS.list_netbox_prefixes({ contains: '10.10.20.131' }, ctx);
     expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      undefined,
       expect.objectContaining({ contains: '10.10.20.131' }),
     );
   });
@@ -1120,6 +1122,7 @@ describe('list_netbox_prefixes', () => {
     listNetboxPrefixesMock.mockResolvedValueOnce([]);
     await HANDLERS.list_netbox_prefixes({ prefix: '10.10.20.0/24' }, ctx);
     expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      undefined,
       expect.objectContaining({ prefix: '10.10.20.0/24' }),
     );
   });
@@ -1131,6 +1134,7 @@ describe('list_netbox_prefixes', () => {
       ctx,
     );
     expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
+      undefined,
       expect.objectContaining({
         tenant: 'ttdl-binh-duong',
         vlan: '190',

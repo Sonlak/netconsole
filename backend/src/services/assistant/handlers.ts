@@ -64,9 +64,11 @@ import { computeStatistics, listStatDescriptors, type StatContext } from './stat
 // All handlers below call directly — no HTTP roundtrip (same process).
 import {
   findNetboxDeviceByNetconsoleId,
+  getDefaultInstance,
   getNetboxDeviceById,
   listNetboxDeviceRoles,
   listNetboxDevices,
+  listNetboxInstanceNames,
   listNetboxIpAddresses,
   listNetboxManufacturers,
   listNetboxInterfaces,
@@ -74,11 +76,15 @@ import {
   listNetboxSites,
   listNetboxVlans,
   netboxHealthCheck,
+  createNetboxPrefix,
+  bulkCreateNetboxPrefixes,
+  copyNetboxPrefixesToInstance,
   type NetBoxDevice,
   type NetBoxInterface,
   type NetBoxIpAddress,
   type NetBoxPrefix,
   type NetBoxVlan,
+  type CreateNetboxPrefixOptions,
 } from '../netboxClient.js';
 import { NetBoxError } from '../netboxClient.js';
 
@@ -2509,7 +2515,7 @@ async function listNetboxSitesHandler(
 ): Promise<ToolResult> {
   const limit = Math.min(typeof args.limit === 'number' ? args.limit : 100, 1000);
   try {
-    const sites = await listNetboxSites({ limit });
+    const sites = await listNetboxSites(undefined, { limit });
     return {
       ok: true,
       preview: {
@@ -2534,7 +2540,7 @@ async function listNetboxDeviceRolesHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const roles = await listNetboxDeviceRoles({ limit: 100 });
+    const roles = await listNetboxDeviceRoles(undefined, { limit: 100 });
     return {
       ok: true,
       preview: {
@@ -2558,7 +2564,7 @@ async function listNetboxManufacturersHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const manufacturers = await listNetboxManufacturers({ limit: 200 });
+    const manufacturers = await listNetboxManufacturers(undefined, { limit: 200 });
     return {
       ok: true,
       preview: {
@@ -2582,7 +2588,7 @@ async function listNetboxDevicesHandler(
   const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 500);
   const offset = typeof args.offset === 'number' ? args.offset : 0;
   try {
-    const result = await listNetboxDevices({
+    const result = await listNetboxDevices(undefined, {
       limit,
       offset,
       site: typeof args.site === 'string' ? args.site : undefined,
@@ -2614,19 +2620,19 @@ async function getNetboxDeviceHandler(
   // Three lookup modes: by id, by netconsole_id, or by name (search).
   // Mode 1: id
   if (typeof args.id === 'number' && Number.isFinite(args.id)) {
-    const device = await getNetboxDeviceById(args.id);
+    const device = await getNetboxDeviceById(undefined, args.id as number);
     if (!device) return { ok: true, preview: { id: args.id, found: false } };
     return { ok: true, preview: { found: true, device: netboxDeviceToPreview(device) } };
   }
   // Mode 2: netconsole_id (custom field exact match — preferred for "device X in NetConsole")
   if (typeof args.netconsole_id === 'string' && args.netconsole_id.trim()) {
-    const device = await findNetboxDeviceByNetconsoleId(args.netconsole_id.trim());
+    const device = await findNetboxDeviceByNetconsoleId(undefined, args.netconsole_id.trim());
     if (!device) return { ok: true, preview: { netconsoleId: args.netconsole_id, found: false } };
     return { ok: true, preview: { found: true, device: netboxDeviceToPreview(device) } };
   }
   // Mode 3: name (full-text search)
   if (typeof args.name === 'string' && args.name.trim()) {
-    const { devices } = await listNetboxDevices({ search: args.name.trim(), limit: 5 });
+    const { devices } = await listNetboxDevices(undefined, { search: args.name.trim(), limit: 5 });
     if (devices.length === 0) {
       return { ok: true, preview: { name: args.name, found: false } };
     }
@@ -2650,7 +2656,7 @@ async function listNetboxInterfacesHandler(
     return { ok: false, error: 'netbox_device_id là bắt buộc (số nguyên).' };
   }
   try {
-    const interfaces = await listNetboxInterfaces(id, { limit: 500 });
+    const interfaces = await listNetboxInterfaces(undefined, id, { limit: 500 });
     const onlyUp = args.only_up === true;
     const onlyDown = args.only_down === true;
     let filtered = interfaces;
@@ -2675,7 +2681,7 @@ async function listNetboxVlansHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const vlans: NetBoxVlan[] = await listNetboxVlans({
+    const vlans: NetBoxVlan[] = await listNetboxVlans(undefined, {
       site: typeof args.site === 'string' ? args.site : undefined,
       limit: Math.min(typeof args.limit === 'number' ? args.limit : 200, 1000),
     });
@@ -2704,7 +2710,7 @@ async function listNetboxPrefixesHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const prefixes: NetBoxPrefix[] = await listNetboxPrefixes({
+    const prefixes: NetBoxPrefix[] = await listNetboxPrefixes(undefined, {
       site: typeof args.site === 'string' ? args.site : undefined,
       status: typeof args.status === 'string' ? args.status : undefined,
       // `contains` is a NetBox IPAM filter: pass a single IP (e.g. "192.168.1.1")
@@ -2762,7 +2768,7 @@ async function listNetboxIpAddressesHandler(
 ): Promise<ToolResult> {
   const deviceId = typeof args.netbox_device_id === 'number' ? args.netbox_device_id : Number(args.netbox_device_id);
   try {
-    const addresses: NetBoxIpAddress[] = await listNetboxIpAddresses({
+    const addresses: NetBoxIpAddress[] = await listNetboxIpAddresses(undefined, {
       device_id: Number.isFinite(deviceId) ? deviceId : undefined,
       status: typeof args.status === 'string' ? args.status : undefined,
       search: typeof args.search === 'string' ? args.search : undefined,
@@ -2787,6 +2793,121 @@ async function listNetboxIpAddressesHandler(
             : null,
           tags: a.tags.map((t) => t.name),
         })),
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+// ── NetBox multi-instance + WRITE handlers ──────────────────────────────────────
+
+async function listNetboxInstancesHandler(
+  _args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  return {
+    ok: true,
+    preview: { instances: listNetboxInstanceNames(), default: getDefaultInstance() },
+  };
+}
+
+async function createNetboxPrefixHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const prefix = String(args.prefix ?? '').trim();
+  if (!prefix) return { ok: false, error: 'prefix is required (CIDR, e.g. "10.10.20.0/24")' };
+  const instance = typeof args.instance === 'string' ? args.instance.trim() : undefined;
+  const tags = Array.isArray(args.tags) ? (args.tags as unknown[]).filter((t): t is string => typeof t === 'string') : undefined;
+
+  try {
+    const result = await createNetboxPrefix(instance, {
+      prefix,
+      status: typeof args.status === 'string' ? args.status : undefined,
+      description: typeof args.description === 'string' ? args.description : undefined,
+      site: typeof args.site === 'string' ? args.site : undefined,
+      vrf: typeof args.vrf === 'string' ? args.vrf : undefined,
+      tenant: typeof args.tenant === 'string' ? args.tenant : undefined,
+      vlan: typeof args.vlan === 'number' ? args.vlan : undefined,
+      role: typeof args.role === 'string' ? args.role : undefined,
+      tags,
+      is_pool: args.is_pool === true,
+      mark_utilized: args.mark_utilized === true,
+      comments: typeof args.comments === 'string' ? args.comments : undefined,
+      overwrite: args.overwrite === true,
+    });
+    return {
+      ok: result.action !== 'error',
+      preview: { action: result.action, id: result.id, prefix, error: result.error },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function bulkCreateNetboxPrefixesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const rows = Array.isArray(args.rows) ? args.rows : [];
+  if (rows.length === 0) return { ok: false, error: 'rows is required and must be a non-empty array of prefix objects' };
+  const instance = typeof args.instance === 'string' ? args.instance.trim() : undefined;
+  const overwrite = args.overwrite === true;
+  try {
+    const result = await bulkCreateNetboxPrefixes(
+      instance,
+      (rows as CreateNetboxPrefixOptions[]).map((r) => ({ ...r, overwrite })),
+    );
+    const target = instance || getDefaultInstance();
+    return {
+      ok: result.errors === 0,
+      preview: {
+        targetInstance: target,
+        total: result.total,
+        created: result.created,
+        skipped: result.skipped,
+        updated: result.updated,
+        errors: result.errors,
+        summary: `Created ${result.created} prefixes, skipped ${result.skipped}, updated ${result.updated}, errors ${result.errors} on "${target}".`,
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: netboxErrorMessage(error) };
+  }
+}
+
+async function copyNetboxPrefixesHandler(
+  args: Record<string, unknown>,
+  _ctx: ToolContext,
+): Promise<ToolResult> {
+  const sourceInstance = typeof args.source === 'string' ? args.source.trim() : undefined;
+  const targetInstance = typeof args.target === 'string' ? args.target.trim() : undefined;
+  if (!sourceInstance || !targetInstance) {
+    return { ok: false, error: 'source and target instance names are required' };
+  }
+  if (sourceInstance === targetInstance) {
+    return { ok: false, error: 'source and target must be different' };
+  }
+  try {
+    const result = await copyNetboxPrefixesToInstance({
+      sourceInstance,
+      targetInstance,
+      tenantFilter: typeof args.tenant_filter === 'string' ? args.tenant_filter : undefined,
+      siteFilter: typeof args.site_filter === 'string' ? args.site_filter : undefined,
+      overwrite: args.overwrite === true,
+    });
+    return {
+      ok: result.errors === 0,
+      preview: {
+        sourceInstance,
+        targetInstance,
+        total: result.total,
+        created: result.created,
+        skipped: result.skipped,
+        updated: result.updated,
+        errors: result.errors,
+        summary: `Copied ${result.total} prefixes: created ${result.created}, skipped ${result.skipped}, updated ${result.updated}, errors ${result.errors}.`,
       },
     };
   } catch (error) {
@@ -2944,6 +3065,10 @@ export const HANDLERS: Record<AssistantToolName, ToolHandler> = {
   list_netbox_prefixes: listNetboxPrefixesHandler,
   list_netbox_ip_addresses: listNetboxIpAddressesHandler,
   get_netbox_sync_status: getNetboxSyncStatusHandler,
+  list_netbox_instances: listNetboxInstancesHandler,
+  create_netbox_prefix: createNetboxPrefixHandler,
+  bulk_create_netbox_prefixes: bulkCreateNetboxPrefixesHandler,
+  copy_netbox_prefixes: copyNetboxPrefixesHandler,
   create_user: createUserHandler,
   update_user_role: updateUserRoleHandler,
   set_user_active: setUserActiveHandler,

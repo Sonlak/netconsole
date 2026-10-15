@@ -6,6 +6,7 @@ import {
   CloudServerOutlined,
   ClusterOutlined,
   DashboardOutlined,
+  DatabaseOutlined,
   FileTextOutlined,
   FileSearchOutlined,
   LogoutOutlined,
@@ -48,6 +49,7 @@ const NAV: NavDef[] = [
   { key: '/generate-config', label: 'Config Studio', hint: 'Draft · commit · rollback', icon: <FileTextOutlined /> },
   { key: '/dhcp', label: 'DHCP', hint: 'Kea DC · relay', icon: <WifiOutlined /> },
   { key: '/jobs', label: 'Jobs', hint: 'Recent activity · last 1000', icon: <UnorderedListOutlined /> },
+  { key: '/netbox-import', label: 'NetBox Import', hint: 'CSV · copy between instances', icon: <DatabaseOutlined /> },
   { key: '/settings', label: 'Settings', hint: 'Architecture & theme', icon: <SettingOutlined /> },
 ];
 
@@ -63,6 +65,7 @@ const PAGE_META: Record<string, { title: string; subtitle: string }> = {
   '/interfaces': { title: 'Ports', subtitle: 'Device ports · shut / VLAN' },
   '/generate-config': { title: 'Config Studio', subtitle: 'Running · draft · commit' },
   '/dhcp': { title: 'DHCP', subtitle: 'Kea datacenter' },
+  '/netbox-import': { title: 'NetBox Import', subtitle: 'CSV · copy between instances' },
   '/settings': { title: 'Settings', subtitle: 'Architecture and theme' },
 };
 

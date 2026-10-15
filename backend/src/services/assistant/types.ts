@@ -88,6 +88,11 @@ export type AssistantToolName =
   | 'list_netbox_prefixes'
   | 'list_netbox_ip_addresses'
   | 'get_netbox_sync_status'
+  // NetBox multi-instance + WRITE tools (added 2026-10-15)
+  | 'list_netbox_instances'
+  | 'create_netbox_prefix'
+  | 'bulk_create_netbox_prefixes'
+  | 'copy_netbox_prefixes'
   | 'create_user'
   | 'update_user_role'
   | 'set_user_active'

@@ -50,7 +50,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxDevices } = await import('../../../src/services/netboxClient.js');
-    await listNetboxDevices({ limit: 5 });
+    await listNetboxDevices(undefined, { limit: 5 });
 
     expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/dcim\/devices\/\?limit=5/);
     expect(capturedUrl).not.toContain('/api//'); // double slash
@@ -70,7 +70,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxSites } = await import('../../../src/services/netboxClient.js');
-    await listNetboxSites({ limit: 3 });
+    await listNetboxSites(undefined, { limit: 3 });
 
     expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/dcim\/sites\/\?limit=3/);
   });
@@ -88,7 +88,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxVlans } = await import('../../../src/services/netboxClient.js');
-    await listNetboxVlans({ limit: 10 });
+    await listNetboxVlans(undefined, { limit: 10 });
 
     // /api + /ipam/vlans/ (after stripping leading /) → base ends with /, path "ipam/vlans/"
     // NetBoxClient normalizes: strips leading / and ensures base ends with /
@@ -106,8 +106,8 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxDevices, NetBoxError } = await import('../../../src/services/netboxClient.js');
-    await expect(listNetboxDevices({ limit: 5 })).rejects.toBeInstanceOf(NetBoxError);
-    await expect(listNetboxDevices({ limit: 5 })).rejects.toThrow(/NetBox HTTP 404/);
+    await expect(listNetboxDevices(undefined, { limit: 5 })).rejects.toBeInstanceOf(NetBoxError);
+    await expect(listNetboxDevices(undefined, { limit: 5 })).rejects.toThrow(/NetBox HTTP 404/);
   });
 
   it('health check path /status/ resolves correctly', async () => {
@@ -141,7 +141,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxInterfaces } = await import('../../../src/services/netboxClient.js');
-    await listNetboxInterfaces(42, { limit: 100 });
+    await listNetboxInterfaces(undefined, 42, { limit: 100 });
 
     expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/dcim\/interfaces\/\?device_id=42&limit=100/);
   });
@@ -159,7 +159,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxPrefixes } = await import('../../../src/services/netboxClient.js');
-    await listNetboxPrefixes({ contains: '10.10.20.131' });
+    await listNetboxPrefixes(undefined, { contains: '10.10.20.131' });
 
     // The `contains` query param tells NetBox IPAM "find the prefix that
     // contains this IP". Caught 2026-10-13: without this param, the assistant
@@ -180,7 +180,7 @@ describe('netboxClient URL construction', () => {
     vi.stubGlobal('fetch', fakeFetch);
 
     const { listNetboxPrefixes } = await import('../../../src/services/netboxClient.js');
-    await listNetboxPrefixes({ prefix: '10.10.20.0/24' });
+    await listNetboxPrefixes(undefined, { prefix: '10.10.20.0/24' });
 
     expect(capturedUrl).toMatch(/^http:\/\/host:8080\/api\/ipam\/prefixes\/\?prefix=10\.10\.20\.0%2F24/);
   });

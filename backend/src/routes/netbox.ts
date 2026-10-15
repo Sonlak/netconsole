@@ -1,21 +1,26 @@
 /**
- * NetBox HTTP routes (read-only).
+ * NetBox HTTP routes (read + write).
  *
- * Mirrors the Kea DHCP route pattern: thin handlers that call into
- * `netboxClient.ts` and convert errors to 502. Mounted at `/api/netbox`
- * by `index.ts`. The assistant handlers also use these client functions
- * directly (no HTTP roundtrip — same process, same DB).
+ * Thin handlers that call into `netboxClient.ts` and convert errors to 502.
+ * Mounted at `/api/netbox` by `index.ts`.
  *
- * Why a separate route group: we want the frontend to be able to fetch
- * NetBox data for its own UI (not just via assistant). This also lets
- * us paginate, filter, and shape responses with a stable contract
- * independent of the chat-style tool preview.
+ * Multi-instance: all routes accept `?instance=<name>` to target a specific
+ * NetBox instance. Default is the `NETBOX_DEFAULT_INSTANCE` env var (or
+ * "production"). Available instances are configured via `NETBOX_INSTANCES` env
+ * var as JSON:
+ *   '{"production":{"url":"...","token":"..."},"netbox2":{"url":"...","token":"..."}}'
+ *
+ * WRITE routes require ADMIN role (netbox import/copy is a privileged operation).
  */
 
 import { Router } from 'express';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
+import type { AuthenticatedRequest } from '../middleware/auth.js';
 import {
   NetBoxError,
+  listNetboxInstanceNames,
+  getDefaultInstance,
+  netboxHealthCheck,
   getNetboxDeviceById,
   listNetboxDeviceRoles,
   listNetboxDevices,
@@ -25,16 +30,24 @@ import {
   listNetboxPrefixes,
   listNetboxSites,
   listNetboxVlans,
-  netboxHealthCheck,
+  bulkCreateNetboxPrefixes,
+  copyNetboxPrefixesToInstance,
+  type CreateNetboxPrefixOptions,
 } from '../services/netboxClient.js';
 import { prisma } from '../lib/prisma.js';
 
 export const netboxRouter = Router();
 
-/**
- * Convert any thrown error into a JSON 502 response. The frontend
- * surfaces the message as a toast.
- */
+// ─── Instance helper ─────────────────────────────────────────────────────────
+
+/** Extract the instance name from the request query params. */
+function instanceFromReq(req: import('express').Request): string | undefined {
+  const raw = typeof req.query.instance === 'string' ? req.query.instance.trim() : undefined;
+  return raw || undefined; // undefined → use default
+}
+
+// ─── Error handler ────────────────────────────────────────────────────────────
+
 function handleNetboxError(error: unknown, res: import('express').Response): void {
   if (error instanceof NetBoxError) {
     res.status(502).json({ error: error.message });
@@ -45,67 +58,72 @@ function handleNetboxError(error: unknown, res: import('express').Response): voi
   res.status(500).json({ error: message });
 }
 
-// ── Health ──────────────────────────────────────────────────────────────────
+// ─── Instance management ──────────────────────────────────────────────────────
 
-/** Lightweight reachability check for the frontend banner. */
-netboxRouter.get('/health', async (_req, res) => {
-  const ok = await netboxHealthCheck();
-  res.json({ ok, url: process.env.NETBOX_URL ?? null });
+/** List available NetBox instances and which is the default. */
+netboxRouter.get('/instances', async (req, res) => {
+  const instances = listNetboxInstanceNames();
+  const def = getDefaultInstance();
+  res.json({ instances, default: def });
 });
 
-// ── Sites ───────────────────────────────────────────────────────────────────
+// ─── Health ─────────────────────────────────────────────────────────────────
+
+/** Lightweight reachability check. Checks the instance named in `?instance=`, or the default. */
+netboxRouter.get('/health', async (req, res) => {
+  const instance = instanceFromReq(req);
+  const ok = await netboxHealthCheck(instance);
+  res.json({ ok, instance: instance || getDefaultInstance() });
+});
+
+// ─── Sites ───────────────────────────────────────────────────────────────────
 
 netboxRouter.get('/sites', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const limit = clampInt(req.query.limit, 200, 1, 1000);
-    const sites = await listNetboxSites({ limit });
+    const sites = await listNetboxSites(instance, { limit });
     res.json({ total: sites.length, sites });
   } catch (error) {
     handleNetboxError(error, res);
   }
 });
 
-// ── Device roles ────────────────────────────────────────────────────────────
+// ─── Device roles ────────────────────────────────────────────────────────────
 
 netboxRouter.get('/device-roles', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const limit = clampInt(req.query.limit, 100, 1, 500);
-    const roles = await listNetboxDeviceRoles({ limit });
+    const roles = await listNetboxDeviceRoles(instance, { limit });
     res.json({ total: roles.length, roles });
   } catch (error) {
     handleNetboxError(error, res);
   }
 });
 
-// ── Manufacturers ───────────────────────────────────────────────────────────
+// ─── Manufacturers ───────────────────────────────────────────────────────────
 
 netboxRouter.get('/manufacturers', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const limit = clampInt(req.query.limit, 200, 1, 1000);
-    const manufacturers = await listNetboxManufacturers({ limit });
+    const manufacturers = await listNetboxManufacturers(instance, { limit });
     res.json({ total: manufacturers.length, manufacturers });
   } catch (error) {
     handleNetboxError(error, res);
   }
 });
 
-// ── Devices ─────────────────────────────────────────────────────────────────
+// ─── Devices ─────────────────────────────────────────────────────────────────
 
-/**
- * List NetBox devices. Optional filters:
- *   - site (string, matches site slug)
- *   - role (string, matches role slug)
- *   - status (active/offline/planned/staged/failed/inventory/decommissioning)
- *   - search (full-text on name/serial)
- *   - netconsole_id (exact match on custom field; preferred lookup)
- *   - limit, offset
- */
 netboxRouter.get('/devices', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const status = (typeof req.query.status === 'string' ? req.query.status : undefined) as
       | 'active' | 'offline' | 'planned' | 'staged' | 'failed' | 'inventory' | 'decommissioning'
       | undefined;
-    const result = await listNetboxDevices({
+    const result = await listNetboxDevices(instance, {
       limit: clampInt(req.query.limit, 50, 1, 500),
       offset: clampInt(req.query.offset, 0, 0, 100_000),
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
@@ -120,15 +138,15 @@ netboxRouter.get('/devices', async (req, res) => {
   }
 });
 
-/** Get one NetBox device by id. */
 netboxRouter.get('/devices/:nbid', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const id = Number(req.params.nbid);
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: 'id must be a positive integer' });
       return;
     }
-    const device = await getNetboxDeviceById(id);
+    const device = await getNetboxDeviceById(instance, id);
     if (!device) {
       res.status(404).json({ error: 'NetBox device not found' });
       return;
@@ -139,17 +157,17 @@ netboxRouter.get('/devices/:nbid', async (req, res) => {
   }
 });
 
-// ── Interfaces (per NetBox device) ──────────────────────────────────────────
+// ─── Interfaces ─────────────────────────────────────────────────────────────
 
-/** List interfaces for a NetBox device by id. */
 netboxRouter.get('/devices/:nbid/interfaces', async (req, res) => {
   try {
+    const instance = instanceFromReq(req);
     const id = Number(req.params.nbid);
     if (!Number.isFinite(id)) {
       res.status(400).json({ error: 'id must be a positive integer' });
       return;
     }
-    const interfaces = await listNetboxInterfaces(id, {
+    const interfaces = await listNetboxInterfaces(instance, id, {
       limit: clampInt(req.query.limit, 500, 1, 1000),
     });
     res.json({ total: interfaces.length, interfaces });
@@ -158,11 +176,12 @@ netboxRouter.get('/devices/:nbid/interfaces', async (req, res) => {
   }
 });
 
-// ── VLANs ───────────────────────────────────────────────────────────────────
+// ─── VLANs ─────────────────────────────────────────────────────────────────
 
 netboxRouter.get('/vlans', async (req, res) => {
   try {
-    const vlans = await listNetboxVlans({
+    const instance = instanceFromReq(req);
+    const vlans = await listNetboxVlans(instance, {
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
       limit: clampInt(req.query.limit, 200, 1, 1000),
     });
@@ -172,18 +191,15 @@ netboxRouter.get('/vlans', async (req, res) => {
   }
 });
 
-// ── Prefixes (IPAM) ─────────────────────────────────────────────────────────
+// ─── Prefixes ───────────────────────────────────────────────────────────────
 
 netboxRouter.get('/prefixes', async (req, res) => {
   try {
-    const prefixes = await listNetboxPrefixes({
+    const instance = instanceFromReq(req);
+    const prefixes = await listNetboxPrefixes(instance, {
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
-      // `contains` accepts a single IP and returns the prefix(es) that contain it.
-      // Example: /api/netbox/prefixes?contains=192.168.95.1
       contains: typeof req.query.contains === 'string' ? req.query.contains : undefined,
-      // `prefix` is an exact CIDR match.
-      // Example: /api/netbox/prefixes?prefix=10.10.20.0/24
       prefix: typeof req.query.prefix === 'string' ? req.query.prefix : undefined,
       limit: clampInt(req.query.limit, 200, 1, 1000),
     });
@@ -193,11 +209,12 @@ netboxRouter.get('/prefixes', async (req, res) => {
   }
 });
 
-// ── IP addresses (IPAM) ─────────────────────────────────────────────────────
+// ─── IP addresses ────────────────────────────────────────────────────────────
 
 netboxRouter.get('/ip-addresses', async (req, res) => {
   try {
-    const addresses = await listNetboxIpAddresses({
+    const instance = instanceFromReq(req);
+    const addresses = await listNetboxIpAddresses(instance, {
       device_id: typeof req.query.device_id === 'string' ? Number(req.query.device_id) : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
       search: typeof req.query.search === 'string' ? req.query.search : undefined,
@@ -209,18 +226,8 @@ netboxRouter.get('/ip-addresses', async (req, res) => {
   }
 });
 
-// ── Sync status (NetConsole-side) ──────────────────────────────────────────
+// ─── Sync status ─────────────────────────────────────────────────────────────
 
-/**
- * Return the NetBox sync state for one device (or all). Reads from the
- * NetConsole Device table — this is the "do we have a NetBox record
- * for this device?" question that the assistant often needs.
- *
- *   - netboxDeviceId: NetBox dcim.devices.id (null = not yet synced)
- *   - netboxSyncedAt: when did the last successful sync complete
- *   - netboxSyncError: last failure message (cleared on next success)
- *   - site: same as the device site (used for filtering)
- */
 netboxRouter.get('/sync-status', async (req, res) => {
   try {
     const deviceId = typeof req.query.device_id === 'string' ? req.query.device_id : null;
@@ -233,15 +240,8 @@ netboxRouter.get('/sync-status', async (req, res) => {
     const rows = await prisma.device.findMany({
       where,
       select: {
-        id: true,
-        name: true,
-        ip: true,
-        site: true,
-        vendor: true,
-        model: true,
-        netboxDeviceId: true,
-        netboxSyncedAt: true,
-        netboxSyncError: true,
+        id: true, name: true, ip: true, site: true, vendor: true, model: true,
+        netboxDeviceId: true, netboxSyncedAt: true, netboxSyncError: true,
       },
       orderBy: [{ site: 'asc' }, { name: 'asc' }],
     });
@@ -256,12 +256,8 @@ netboxRouter.get('/sync-status', async (req, res) => {
     res.json({
       summary,
       devices: rows.map((r) => ({
-        deviceId: r.id,
-        name: r.name,
-        ip: r.ip,
-        site: r.site,
-        vendor: r.vendor,
-        model: r.model,
+        deviceId: r.id, name: r.name, ip: r.ip, site: r.site,
+        vendor: r.vendor, model: r.model,
         synced: r.netboxDeviceId !== null && r.netboxSyncError === null,
         netboxDeviceId: r.netboxDeviceId,
         netboxSyncedAt: r.netboxSyncedAt,
@@ -273,10 +269,193 @@ netboxRouter.get('/sync-status', async (req, res) => {
   }
 });
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+// ─── WRITE: Bulk import prefixes ────────────────────────────────────────────
+
+/**
+ * POST /api/netbox/import-prefixes
+ *
+ * Bulk-import prefixes from an in-request CSV or from pre-built JSON rows.
+ * Admin-only.
+ *
+ * Body shape (JSON):
+ *   {
+ *     "instance": "netbox2",          // target instance name (optional, default = default instance)
+ *     "rows": [
+ *       { "prefix": "10.10.20.0/24", "status": "active", "description": "LAN", ... }
+ *     ],
+ *     "overwrite": false              // skip existing (default) | overwrite = PATCH existing
+ *   }
+ *
+ * OR multipart/form-data with field `file` = CSV file upload.
+ * CSV columns: prefix, status, description, site, vrf, tenant, vlan, role, tags
+ * (name-based — tags = semicolon-separated slugs)
+ */
+netboxRouter.post(
+  '/import-prefixes',
+  authMiddleware,
+  requireRole('ADMIN'),
+  async (req: AuthenticatedRequest, res: import('express').Response) => {
+    try {
+      const instance = typeof req.body.instance === 'string' ? req.body.instance.trim() : undefined;
+      const overwrite = req.body.overwrite === true || req.body.overwrite === 'true';
+
+      // Support both JSON rows and file upload
+      let rows: CreateNetboxPrefixOptions[];
+      if (Array.isArray(req.body.rows)) {
+        rows = req.body.rows as CreateNetboxPrefixOptions[];
+      } else if (typeof req.body.csvText === 'string') {
+        // CSV text sent as base64 or plain string
+        let text: string;
+        try {
+          text = Buffer.from(req.body.csvText, 'base64').toString('utf-8');
+        } catch {
+          text = req.body.csvText; // plain text
+        }
+        rows = parseCsvRows(text);
+      } else {
+        res.status(400).json({ error: 'Provide either `rows` (JSON array) or `csvText` (CSV string or base64).' });
+        return;
+      }
+
+      if (!Array.isArray(rows) || rows.length === 0) {
+        res.status(400).json({ error: 'rows must be a non-empty array.' });
+        return;
+      }
+
+      // Inject overwrite into each row
+      const rowsWithOverwrite = rows.map((r) => ({ ...r, overwrite }));
+
+      const result = await bulkCreateNetboxPrefixes(instance, rowsWithOverwrite);
+      res.json({
+        ...result,
+        instance: instance || getDefaultInstance(),
+        overwrite,
+      });
+    } catch (error) {
+      handleNetboxError(error, res);
+    }
+  },
+);
+
+// ─── WRITE: Copy prefixes from one instance to another ────────────────────────
+
+/**
+ * POST /api/netbox/copy-prefixes
+ *
+ * Copy all prefixes from one NetBox instance to another.
+ * Admin-only.
+ *
+ * Body:
+ *   {
+ *     "sourceInstance": "production",
+ *     "targetInstance": "netbox2",
+ *     "tenantFilter": "TTDL Binh Duong",   // optional
+ *     "siteFilter": "LAB",                  // optional
+ *     "overwrite": false                     // default = skip existing
+ *   }
+ */
+netboxRouter.post(
+  '/copy-prefixes',
+  authMiddleware,
+  requireRole('ADMIN'),
+  async (req: AuthenticatedRequest, res: import('express').Response) => {
+    try {
+      const {
+        sourceInstance,
+        targetInstance,
+        tenantFilter,
+        siteFilter,
+        overwrite = false,
+      } = req.body as {
+        sourceInstance?: string;
+        targetInstance?: string;
+        tenantFilter?: string;
+        siteFilter?: string;
+        overwrite?: boolean;
+      };
+
+      if (!sourceInstance || !targetInstance) {
+        res.status(400).json({ error: 'sourceInstance and targetInstance are required.' });
+        return;
+      }
+      if (sourceInstance === targetInstance) {
+        res.status(400).json({ error: 'source and target must be different instances.' });
+        return;
+      }
+
+      const result = await copyNetboxPrefixesToInstance({
+        sourceInstance,
+        targetInstance,
+        tenantFilter,
+        siteFilter,
+        overwrite,
+      });
+
+      res.json({ ...result, sourceInstance, targetInstance, overwrite });
+    } catch (error) {
+      handleNetboxError(error, res);
+    }
+  },
+);
+
+// ─── helpers ────────────────────────────────────────────────────────────────
 
 function clampInt(raw: unknown, fallback: number, min: number, max: number): number {
   const n = typeof raw === 'string' ? Number(raw) : NaN;
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
+/** Parse CSV text into CreateNetboxPrefixOptions[]. Handles name-based format. */
+function parseCsvRows(text: string): CreateNetboxPrefixOptions[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) return [];
+  const headers = parseCSVLine(lines[0]).map((h) => h.trim().toLowerCase());
+  const rows: CreateNetboxPrefixOptions[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseCSVLine(lines[i]);
+    if (cols.length === 0) continue;
+    const row: Record<string, string> = {};
+    for (let j = 0; j < headers.length && j < cols.length; j++) {
+      row[headers[j]] = cols[j].trim();
+    }
+    if (!row.prefix) continue;
+    rows.push({
+      prefix: row.prefix,
+      status: row.status || 'active',
+      description: row.description || '',
+      site: row.site || undefined,
+      vrf: row.vrf || undefined,
+      tenant: row.tenant || undefined,
+      vlan: row.vlan ? Number(row.vlan) : undefined,
+      role: row.role || undefined,
+      tags: row.tags ? row.tags.split(';').map((t: string) => t.trim()).filter(Boolean) : undefined,
+    });
+  }
+  return rows;
+}
+
+/** Minimal CSV line parser (handles quoted fields). */
+function parseCSVLine(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current);
+  return result;
 }

@@ -21,6 +21,7 @@ const AlertsPage = lazy(() => import('./features/logs/AlertsPage').then((m) => (
 const GenerateConfigPage = lazy(() => import('./pages/GenerateConfigPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const FabricPage = lazy(() => import('./pages/FabricPage'));
+const NetBoxImportPage = lazy(() => import('./pages/NetBoxImportPage'));
 
 export default function App() {
   return (
@@ -49,6 +50,14 @@ export default function App() {
               <Route path="interfaces" element={<InterfacesPage />} />
               <Route path="generate-config" element={<GenerateConfigPage />} />
               <Route path="dhcp" element={<DhcpPage />} />
+              <Route
+                path="netbox-import"
+                element={
+                  <ProtectedRoute requiredRoles={['ADMIN']}>
+                    <NetBoxImportPage />
+                  </ProtectedRoute>
+                }
+              />
               <Route
                 path="settings"
                 element={

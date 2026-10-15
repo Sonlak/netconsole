@@ -262,6 +262,12 @@ services:
       # is occupied by netconsole-kea-primary's control channel.
       NETBOX_URL: "http://42.119.165.109:8080/api/"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+      # Multi-instance NetBox — enables AI assistant tools and the
+      # frontend /netbox-import page to target any registered instance.
+      # Production + netbox2 (the second NetBox stack on port 8081).
+      # netbox2 token is auto-set by lab/netbox/init/02-init2.py.
+      NETBOX_INSTANCES: '{"production":{"url":"http://42.119.165.109:8080/api/","token":"0123456789abcdef0123456789abcdef01234567"},"netbox2":{"url":"http://42.119.165.109:8081/api/","token":"fedcba9876543210fedcba9876543210fedcba98"}}'
+      NETBOX_DEFAULT_INSTANCE: "production"
       SEED_DISABLED: "false"
       CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
       JWT_SECRET: "d97aklKZ_BKmRrHtXH6fLSZs48AlwJpAU8_RdcuCKqBm_0Jufe8Rx-FkpGhQT-cu"
@@ -415,6 +421,12 @@ services:
       # Port 8080 chosen because 8001 is occupied by kea-primary.
       NETBOX_URL: "http://42.119.165.109:8080/api/"
       NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
+      # Multi-instance NetBox (added 2026-10-15) — enables AI assistant
+      # tools and frontend /netbox-import page to target any registered
+      # instance. Production + netbox2 (the second NetBox stack on
+      # port 8081). netbox2 token is auto-set by lab/netbox/init/02-init2.py.
+      NETBOX_INSTANCES: '{"production":{"url":"http://42.119.165.109:8080/api/","token":"0123456789abcdef0123456789abcdef01234567"},"netbox2":{"url":"http://42.119.165.109:8081/api/","token":"fedcba9876543210fedcba9876543210fedcba98"}}'
+      NETBOX_DEFAULT_INSTANCE: "production"
       # Management prefix for IPAM sync. Creates /24 prefix in NetBox IPAM
       # and populates primary_ip4 on each device. Change to match your lab subnet.
       # Leave empty to skip IPAM (management IPs stored in device description only).
