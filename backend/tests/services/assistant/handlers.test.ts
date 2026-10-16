@@ -101,6 +101,12 @@ const listNetboxVlansMock = vi.fn();
 const listNetboxPrefixesMock = vi.fn();
 const listNetboxIpAddressesMock = vi.fn();
 const netboxHealthCheckMock = vi.fn();
+// resolveNetboxInstance is a pure helper (resolves name to default if
+// undefined). Tests don't need to assert on it — just pass-through to
+// the real implementation. Without this, the handler throws on import
+// and all 5 list_netbox_prefixes tests fail with "ok: false".
+const resolveNetboxInstanceMock = (...args: unknown[]) =>
+  (args[0] && String(args[0]).trim()) || 'production';
 vi.mock('../../../src/services/netboxClient.js', () => ({
   listNetboxSites: (...args: unknown[]) => listNetboxSitesMock(...args),
   listNetboxDeviceRoles: (...args: unknown[]) => listNetboxDeviceRolesMock(...args),
@@ -113,6 +119,7 @@ vi.mock('../../../src/services/netboxClient.js', () => ({
   listNetboxPrefixes: (...args: unknown[]) => listNetboxPrefixesMock(...args),
   listNetboxIpAddresses: (...args: unknown[]) => listNetboxIpAddressesMock(...args),
   netboxHealthCheck: (...args: unknown[]) => netboxHealthCheckMock(...args),
+  resolveNetboxInstance: (...args: unknown[]) => resolveNetboxInstanceMock(...args),
   NetBoxError: class NetBoxError extends Error {},
 }));
 
@@ -1095,22 +1102,27 @@ describe('list_netbox_vlans', () => {
 
 describe('list_netbox_prefixes', () => {
   it('passes filters through and returns utilization', async () => {
-    listNetboxPrefixesMock.mockResolvedValueOnce([
-      {
-        id: 1, prefix: '10.10.20.0/24',
-        site: { id: 1, name: 'LAB' }, vrf: null,
-        status: { value: 'active', label: 'Active' },
-        role: null, description: 'synced from NetConsole', utilization: 87.5,
-      },
-    ]);
+    listNetboxPrefixesMock.mockResolvedValueOnce({
+      results: [
+        {
+          id: 1, prefix: '10.10.20.0/24',
+          site: { id: 1, name: 'LAB' }, vrf: null,
+          status: { value: 'active', label: 'Active' },
+          role: null, description: 'synced from NetConsole', utilization: 87.5,
+        },
+      ],
+      count: 1,
+    });
     const result = await HANDLERS.list_netbox_prefixes({ site: 'lab' }, ctx);
     expect(result.ok).toBe(true);
-    const preview = result.preview as { prefixes: Array<{ utilization: number }> };
+    const preview = result.preview as { count: number; returned: number; prefixes: Array<{ utilization: number }> };
+    expect(preview.count).toBe(1);
+    expect(preview.returned).toBe(1);
     expect(preview.prefixes[0].utilization).toBe(87.5);
   });
 
   it('forwards contains= arg to client (NetBox IPAM "find prefix containing IP X")', async () => {
-    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    listNetboxPrefixesMock.mockResolvedValueOnce({ results: [], count: 0 });
     await HANDLERS.list_netbox_prefixes({ contains: '10.10.20.131' }, ctx);
     expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
       undefined,
@@ -1119,7 +1131,7 @@ describe('list_netbox_prefixes', () => {
   });
 
   it('forwards prefix= arg to client (exact CIDR match)', async () => {
-    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    listNetboxPrefixesMock.mockResolvedValueOnce({ results: [], count: 0 });
     await HANDLERS.list_netbox_prefixes({ prefix: '10.10.20.0/24' }, ctx);
     expect(listNetboxPrefixesMock).toHaveBeenLastCalledWith(
       undefined,
@@ -1128,7 +1140,7 @@ describe('list_netbox_prefixes', () => {
   });
 
   it('forwards tenant/vlan/role filter args to client', async () => {
-    listNetboxPrefixesMock.mockResolvedValueOnce([]);
+    listNetboxPrefixesMock.mockResolvedValueOnce({ results: [], count: 0 });
     await HANDLERS.list_netbox_prefixes(
       { tenant: 'ttdl-binh-duong', vlan: '190', role: 'internal' },
       ctx,
@@ -1150,31 +1162,42 @@ describe('list_netbox_prefixes', () => {
     // asks "cho thông tin đầy đủ". Before this fix the response only
     // had site/vrf/status/utilization/description → LLM kept saying
     // "không có" for tenant/vlan/role even though NetBox had the data.
-    listNetboxPrefixesMock.mockResolvedValueOnce([
-      {
-        id: 973,
-        prefix: '192.168.190.0/24',
-        prefix_length: 24,
-        site: { id: 1, name: 'DC-A10', slug: 'dc-a10' },
-        vrf: { id: 2, name: 'mgmt', rd: '65000:2' },
-        tenant: { id: 5, name: 'TTDL Bình Dương', slug: 'ttdl-binh-duong' },
-        vlan: { id: 17, vid: 190, name: 'VLAN 190' },
-        role: { id: 3, name: 'Internal', slug: 'internal' },
-        status: { value: 'active', label: 'Active' },
-        description: 'TERMINAL GATEWAY1',
-        utilization: 42.0,
-        is_pool: false,
-        mark_utilized: false,
-      },
-    ]);
+    listNetboxPrefixesMock.mockResolvedValueOnce({
+      results: [
+        {
+          id: 973,
+          prefix: '192.168.190.0/24',
+          prefix_length: 24,
+          site: { id: 1, name: 'DC-A10', slug: 'dc-a10' },
+          vrf: { id: 2, name: 'mgmt', rd: '65000:2' },
+          tenant: { id: 5, name: 'TTDL Bình Dương', slug: 'ttdl-binh-duong' },
+          vlan: { id: 17, vid: 190, name: 'VLAN 190' },
+          role: { id: 3, name: 'Internal', slug: 'internal' },
+          status: { value: 'active', label: 'Active' },
+          description: 'TERMINAL GATEWAY1',
+          utilization: 42.0,
+          is_pool: false,
+          mark_utilized: false,
+        },
+      ],
+      count: 1,
+    });
     const result = await HANDLERS.list_netbox_prefixes(
       { prefix: '192.168.190.0/24' },
       ctx,
     );
     expect(result.ok).toBe(true);
     const preview = result.preview as {
+      instance: string;
+      count: number;
+      returned: number;
       prefixes: Array<Record<string, unknown>>;
     };
+    // Stamps resolved instance name so LLM can't mislabel production
+    // data as 'netbox2' when the user asked about netbox2.
+    expect(preview.instance).toBe('production');
+    expect(preview.count).toBe(1);
+    expect(preview.returned).toBe(1);
     const p = preview.prefixes[0];
     expect(p.tenant).toBe('TTDL Bình Dương');
     expect(p.tenantSlug).toBe('ttdl-binh-duong');
