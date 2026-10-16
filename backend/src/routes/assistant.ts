@@ -177,7 +177,20 @@ async function runConfirmation(
   sseSend(res, { type: 'tool_call', id, name, arguments: args });
 
   const handler = HANDLERS[name];
-  const result = await handler(args, ctx);
+  // Heartbeat so nginx doesn't sever the SSE connection on long
+  // tool calls. `copy_netbox_prefixes` over 800 rows takes ~75s
+  // end-to-end; without the 25s ping, the upstream goes idle and
+  // the user sees a misleading "⚠️ network error" in the chat
+  // drawer even though the operation completes server-side.
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) sseHeartbeat(res);
+  }, 25_000);
+  let result;
+  try {
+    result = await handler(args, ctx);
+  } finally {
+    clearInterval(heartbeat);
+  }
   sseSend(res, {
     type: 'tool_result',
     id,
@@ -435,9 +448,18 @@ async function streamTurn(
     }
 
     // READ: execute, persist, queue the tool result for the next
-    // LLM call.
+    // LLM call. Heartbeat so nginx doesn't sever the SSE connection
+    // on long tool calls (see runConfirmation for the full rationale).
     const handler = HANDLERS[name];
-    const handlerResult = await handler(args, ctx);
+    const turnHeartbeat = setInterval(() => {
+      if (!res.writableEnded) sseHeartbeat(res);
+    }, 25_000);
+    let handlerResult;
+    try {
+      handlerResult = await handler(args, ctx);
+    } finally {
+      clearInterval(turnHeartbeat);
+    }
 
     // UI affordance — `suggest_followup` is a read-only tool but its
     // result is intended for the frontend, not the LLM. Emit a
@@ -665,6 +687,20 @@ function sseOpen(res: Response) {
 function sseSend(res: Response, event: AssistantStreamEvent) {
   res.write(`event: message\n`);
   res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+/**
+ * SSE comment line — ignored by EventSource clients, but flushes bytes
+ * through nginx so the upstream connection doesn't go idle and get
+ * closed by `proxy_read_timeout`. Without this, the assistant stream
+ * silently dies after 120s (current nginx config) when a tool call
+ * runs longer than that — e.g. `copy_netbox_prefixes` over 800 rows.
+ * The copy itself keeps running on the backend; only the SSE response
+ * is severed, which the LLM client surfaces as a misleading
+ * "⚠️ network error" even though the operation succeeded.
+ */
+function sseHeartbeat(res: Response): void {
+  res.write(`: keepalive ${Date.now()}\n\n`);
 }
 
 // ─── Tool name fuzzy-match helpers ────────────────────────────────────────────
