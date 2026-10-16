@@ -196,14 +196,17 @@ netboxRouter.get('/vlans', async (req, res) => {
 netboxRouter.get('/prefixes', async (req, res) => {
   try {
     const instance = instanceFromReq(req);
-    const prefixes = await listNetboxPrefixes(instance, {
+    const { results, count } = await listNetboxPrefixes(instance, {
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
       contains: typeof req.query.contains === 'string' ? req.query.contains : undefined,
       prefix: typeof req.query.prefix === 'string' ? req.query.prefix : undefined,
       limit: clampInt(req.query.limit, 200, 1, 1000),
     });
-    res.json({ total: prefixes.length, prefixes });
+    // `count` is the real total in NetBox (e.g. 835); `total` is the page
+    // size we returned (≤ limit). Both exposed so the UI can show
+    // "Showing 200 of 835" instead of pretending there are only 200.
+    res.json({ total: results.length, count, prefixes: results });
   } catch (error) {
     handleNetboxError(error, res);
   }

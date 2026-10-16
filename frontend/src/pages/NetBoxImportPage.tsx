@@ -18,7 +18,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { CloudServerOutlined, CopyOutlined, FileExcelOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
+import { CloudServerOutlined, CopyOutlined, DownloadOutlined, FileExcelOutlined, ImportOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import {
   Alert,
   Button,
@@ -45,6 +45,7 @@ import {
 import type { UploadProps } from 'antd';
 import {
   copyPrefixes,
+  exportPrefixesCsv,
   fetchNetboxHealth,
   fetchNetboxInstances,
   fetchNetboxPrefixes,
@@ -163,6 +164,11 @@ export default function NetBoxImportPage() {
   const [copyOverwrite, setCopyOverwrite] = useState(false);
   const [copyPreviewCount, setCopyPreviewCount] = useState<number | null>(null);
 
+  // Tab 3 — Export to CSV
+  const [exportSource, setExportSource] = useState<string>('');
+  const [exporting, setExporting] = useState(false);
+  const [exportInfo, setExportInfo] = useState<{ rowCount: number; filename: string } | null>(null);
+
   // Result
   const [importResult, setImportResult] = useState<{
     total: number;
@@ -263,6 +269,25 @@ export default function NetBoxImportPage() {
       setImporting(false);
     }
   }, [copySource, copyTenant, copySite, target, copyOverwrite]);
+
+  // Run export to CSV
+  const runExport = useCallback(async () => {
+    if (!exportSource) {
+      message.error('Pick a source instance to export from');
+      return;
+    }
+    setExporting(true);
+    try {
+      const filename = `netbox-prefixes-${exportSource}-${new Date().toISOString().slice(0, 10)}.csv`;
+      const { rowCount } = await exportPrefixesCsv(exportSource, filename);
+      setExportInfo({ rowCount, filename });
+      message.success(`Exported ${rowCount} prefixes to ${filename}`);
+    } catch (cause) {
+      message.error(`Export failed: ${toError(cause).message}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [exportSource]);
 
   // Run CSV import
   const runCsvImport = useCallback(async () => {
@@ -511,6 +536,60 @@ export default function NetBoxImportPage() {
                     />
                   )}
                 </Form>
+              </Card>
+            ),
+          },
+          {
+            key: 'export',
+            label: <span><DownloadOutlined /> Export CSV</span>,
+            children: (
+              <Card>
+                <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="Export → Import round-trip"
+                    description={
+                      <>
+                        Tải TẤT CẢ prefix từ 1 NetBox instance về file CSV (offline), rồi có thể dùng tab
+                        <b> Upload CSV</b> để import vào instance khác.
+                        Hỗ trợ multi-page (limit=1000/page, paginate tới 50k rows).
+                      </>
+                    }
+                  />
+
+                  <Form layout="inline">
+                    <Form.Item label="Source instance" required>
+                      <Select
+                        value={exportSource}
+                        onChange={setExportSource}
+                        style={{ width: 240 }}
+                        options={instances.map((i) => ({ value: i, label: i === defaultInstance ? `${i} (default)` : i }))}
+                        placeholder="Chọn instance để export"
+                      />
+                    </Form.Item>
+                    <Form.Item>
+                      <Button
+                        type="primary"
+                        icon={<DownloadOutlined />}
+                        loading={exporting}
+                        disabled={!exportSource}
+                        onClick={() => void runExport()}
+                      >
+                        Export ra CSV
+                      </Button>
+                    </Form.Item>
+                  </Form>
+
+                  {exportInfo && (
+                    <Alert
+                      type="success"
+                      showIcon
+                      message={`Đã export ${exportInfo.rowCount} prefixes ra file "${exportInfo.filename}"`}
+                      description="Mở tab Upload CSV → chọn file vừa tải về → pick target → Import. Hoặc copy file đó sang máy khác để import sau."
+                    />
+                  )}
+                </Space>
               </Card>
             ),
           },

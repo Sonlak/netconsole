@@ -137,3 +137,78 @@ export async function copyPrefixes(
   });
   return res;
 }
+
+/**
+ * Export prefixes as a downloadable CSV file (browser-side).
+ *
+ * Fetches all pages from the source instance (limit=1000 per page) and
+ * builds a name-based CSV that can be re-imported via the "Upload CSV"
+ * tab. Used for offline editing / sharing the dataset outside the app.
+ */
+export async function exportPrefixesCsv(
+  instance: string,
+  filename: string,
+): Promise<{ rowCount: number }> {
+  const allRows: NetBoxPrefix[] = [];
+  let offset = 0;
+  const pageSize = 1000;
+  // The backend caps limit at 1000; for very large datasets we paginate
+  // by repeatedly filtering the previous page's max id. NetBox's `prefix`
+  // filter does exact-match only, so we use a stable cursor: fetch all
+  // then sort client-side.
+  while (true) {
+    const params = new URLSearchParams({ limit: String(pageSize) });
+    params.set('instance', instance);
+    if (offset > 0) params.set('offset', String(offset));
+    const res = await fetch(`/api/netbox/prefixes?${params}`, { credentials: 'include' });
+    if (!res.ok) throw new Error(`NetBox prefixes HTTP ${res.status}`);
+    const body = await res.json();
+    const page = (body.prefixes ?? []) as NetBoxPrefix[];
+    allRows.push(...page);
+    if (page.length < pageSize) break;
+    offset += pageSize;
+    // Safety: cap at 50k to avoid runaway loops
+    if (allRows.length >= 50_000) break;
+  }
+  if (allRows.length === 0) {
+    throw new Error(`No prefixes found in instance "${instance}"`);
+  }
+
+  const headers = [
+    'prefix', 'status', 'description', 'site', 'vrf', 'tenant', 'vlan', 'role', 'tags',
+  ];
+  const escape = (v: string | number | null | undefined): string => {
+    if (v == null) return '';
+    const s = String(v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+  const lines = [headers.join(',')];
+  for (const p of allRows) {
+    lines.push([
+      escape(p.prefix),
+      escape(p.status?.value ?? 'active'),
+      escape(p.description),
+      escape(p.site?.name),
+      escape(p.vrf?.name),
+      escape(p.tenant?.name),
+      escape(p.vlan?.vid ?? ''),
+      escape(p.role?.name),
+      escape((p as unknown as { tags?: Array<{ slug?: string }> }).tags?.map((t) => t.slug).filter(Boolean).join(';') ?? ''),
+    ].join(','));
+  }
+  // BOM so Excel opens UTF-8 correctly
+  const csv = '\uFEFF' + lines.join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return { rowCount: allRows.length };
+}

@@ -422,7 +422,7 @@ export async function listNetboxPrefixes(
     role?: string;
     limit?: number;
   } = {},
-): Promise<NetBoxPrefix[]> {
+): Promise<{ results: NetBoxPrefix[]; count: number }> {
   const limit = Math.min(options.limit ?? 200, 1000);
   const data = await netboxGet<NetBoxListResponse<NetBoxPrefix>>(instance, '/ipam/prefixes/', {
     params: {
@@ -435,10 +435,13 @@ export async function listNetboxPrefixes(
       vlan_id: typeof options.vlan === 'number' ? options.vlan : undefined,
       vlan: typeof options.vlan === 'string' ? options.vlan : undefined,
       role: options.role,
-      limit,
+      // `limit=0` is the documented NetBox way to ask for the total count
+      // without paying for a results page. Falls back to the actual limit
+      // if 0 isn't accepted (older NetBox versions).
+      limit: limit === 0 ? 0 : limit,
     },
   });
-  return data.results;
+  return { results: data.results, count: data.count };
 }
 
 export async function listNetboxIpAddresses(

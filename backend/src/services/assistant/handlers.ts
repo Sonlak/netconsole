@@ -2710,7 +2710,7 @@ async function listNetboxPrefixesHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const prefixes: NetBoxPrefix[] = await listNetboxPrefixes(undefined, {
+    const { results: prefixes, count } = await listNetboxPrefixes(undefined, {
       site: typeof args.site === 'string' ? args.site : undefined,
       status: typeof args.status === 'string' ? args.status : undefined,
       // `contains` is a NetBox IPAM filter: pass a single IP (e.g. "192.168.1.1")
@@ -2727,7 +2727,12 @@ async function listNetboxPrefixesHandler(
     return {
       ok: true,
       preview: {
-        total: prefixes.length,
+        // `count` = real total in NetBox (e.g. 835). `returned` = what
+        // we actually shipped to the LLM in this page (≤ limit). The
+        // LLM uses count to answer "how many prefixes are there" and
+        // uses the prefixes array for content questions.
+        count,
+        returned: prefixes.length,
         // Surface every field the LLM (and the Excel export) needs.
         // The OLD shape exposed only site/vrf/status/utilization/description,
         // so any user asking "cho thông tin đầy đủ" got a partial answer
