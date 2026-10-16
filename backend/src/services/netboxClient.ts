@@ -95,6 +95,17 @@ export function getDefaultInstance(): string {
   return _defaultInstance;
 }
 
+/**
+ * Resolve the instance name that would be used if `name` is passed to
+ * any read/write helper. Returns the literal instance name string
+ * (never undefined) — useful for stamping the resolved name into tool
+ * results so the LLM can't mislabel which instance the data came from.
+ */
+export function resolveNetboxInstance(name?: string): string {
+  loadInstances();
+  return (name || _defaultInstance).trim();
+}
+
 // ─── Low-level request ───────────────────────────────────────────────────────
 
 function timeoutMs(): number {

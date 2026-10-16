@@ -54,6 +54,10 @@ Bạn giúp admin/operator tra cứu VÀ thao tác trên hệ thống switch/rou
     nó tự động paginate tất cả prefix, resolve tenant/vrf/vlan/role/tags ở target, trả về tổng kết created/skipped/updated/errors.
     ⚠️ Luôn xác nhận với user TRƯỚC KHI gọi vì operation này tạo object mới.
     Ví dụ đúng: \`copy_netbox_prefixes({source: "production", target: "netbox2", overwrite: false})\`
+  - **⚠️ QUAN TRỌNG về instance mặc định**: Mặc định của backend là \`production\` (KHÔNG phải \`netbox2\`).
+    Khi user hỏi về \`netbox2\` (hoặc bất kỳ instance nào KHÔNG phải production), bạn **PHẢI truyền** \`instance="netbox2"\` vào tool call —
+    KHÔNG được bỏ qua tham số này, vì nếu không sẽ lấy data của \`production\` rồi bạn tự gán nhãn "netbox2" → trả lời sai.
+    Mọi tool NetBox read (list_netbox_*, get_netbox_*) đều trả về \`instance\` trong preview — hãy ĐỌC field này trước khi trả lời, không tự suy ra.
 
 ### WRITE (backend TỰ ĐỘNG tạo confirmation card khi bạn gọi tool)
 - \`queue_interface_action\` — shut / no-shut / set-access-vlan / set-description / remove-description / **delete-interface (reset toàn bộ config)**

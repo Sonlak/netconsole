@@ -20,6 +20,7 @@ import {
   NetBoxError,
   listNetboxInstanceNames,
   getDefaultInstance,
+  resolveNetboxInstance,
   netboxHealthCheck,
   getNetboxDeviceById,
   listNetboxDeviceRoles,
@@ -195,8 +196,8 @@ netboxRouter.get('/vlans', async (req, res) => {
 
 netboxRouter.get('/prefixes', async (req, res) => {
   try {
-    const instance = instanceFromReq(req);
-    const { results, count } = await listNetboxPrefixes(instance, {
+    const requested = instanceFromReq(req);
+    const { results, count } = await listNetboxPrefixes(requested, {
       site: typeof req.query.site === 'string' ? req.query.site : undefined,
       status: typeof req.query.status === 'string' ? req.query.status : undefined,
       contains: typeof req.query.contains === 'string' ? req.query.contains : undefined,
@@ -206,7 +207,15 @@ netboxRouter.get('/prefixes', async (req, res) => {
     // `count` is the real total in NetBox (e.g. 835); `total` is the page
     // size we returned (≤ limit). Both exposed so the UI can show
     // "Showing 200 of 835" instead of pretending there are only 200.
-    res.json({ total: results.length, count, prefixes: results });
+    // `instance` echoes the resolved name so the UI/curl user can see
+    // whether they hit `production` (default) or what they asked for.
+    res.json({
+      instance: resolveNetboxInstance(requested),
+      requestedInstance: requested ?? null,
+      total: results.length,
+      count,
+      prefixes: results,
+    });
   } catch (error) {
     handleNetboxError(error, res);
   }

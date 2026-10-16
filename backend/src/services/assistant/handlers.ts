@@ -79,6 +79,7 @@ import {
   createNetboxPrefix,
   bulkCreateNetboxPrefixes,
   copyNetboxPrefixesToInstance,
+  resolveNetboxInstance,
   type NetBoxDevice,
   type NetBoxInterface,
   type NetBoxIpAddress,
@@ -2710,7 +2711,14 @@ async function listNetboxPrefixesHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   try {
-    const { results: prefixes, count } = await listNetboxPrefixes(undefined, {
+    // Stamp the resolved instance name into the result so the LLM
+    // can't mislabel the data (e.g. report production's 835 prefixes
+    // as "NetBox2's prefixes" when the user asked about netbox2 and
+    // we fell back to the default). The instance name echoes whatever
+    // the LLM passed, after default resolution.
+    const requestedInstance = typeof args.instance === 'string' ? args.instance.trim() : undefined;
+    const actualInstance = resolveNetboxInstance(requestedInstance);
+    const { results: prefixes, count } = await listNetboxPrefixes(requestedInstance, {
       site: typeof args.site === 'string' ? args.site : undefined,
       status: typeof args.status === 'string' ? args.status : undefined,
       // `contains` is a NetBox IPAM filter: pass a single IP (e.g. "192.168.1.1")
@@ -2727,6 +2735,12 @@ async function listNetboxPrefixesHandler(
     return {
       ok: true,
       preview: {
+        // ⚠️ Always include the resolved instance name. The LLM was
+        // previously free to label default-instance data with whatever
+        // name the user asked for — that produced the "NetBox2 has 835
+        // prefixes" lie when netbox2 was actually empty.
+        instance: actualInstance,
+        requestedInstance: requestedInstance ?? null,
         // `count` = real total in NetBox (e.g. 835). `returned` = what
         // we actually shipped to the LLM in this page (≤ limit). The
         // LLM uses count to answer "how many prefixes are there" and
