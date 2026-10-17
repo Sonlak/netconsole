@@ -4,30 +4,50 @@ export type KeaCommandResult = {
   arguments?: Record<string, unknown>;
 };
 
-function getPrimaryUrl() {
+/**
+ * Kea peer URL accessors.
+ *
+ * Semantic labels (DC = primary site, DR = disaster recovery):
+ *   getDcUrl()  → DC control agent (normally the primary)
+ *   getDrUrl()  → DR control agent (normally the standby)
+ *
+ * The legacy `getPrimaryUrl` / `getStandbyUrl` names are kept as aliases
+ * for back-compat with the existing KEA_API_URL / KEA_STANDBY_API_URL
+ * env vars. The new alias names are used inside this file where the
+ * DC/DR semantics matter.
+ */
+function getDcUrl() {
   return (process.env.KEA_API_URL || 'http://127.0.0.1:8001/').replace(/\/?$/, '/');
 }
 
-function getStandbyUrl() {
+function getDrUrl() {
   return (process.env.KEA_STANDBY_API_URL || 'http://127.0.0.1:8002/').replace(/\/?$/, '/');
 }
+
+// Back-compat aliases (existing code uses primary/standby)
+const getPrimaryUrl = getDcUrl;
+const getStandbyUrl = getDrUrl;
 
 function timeoutMs() {
   return Number(process.env.KEA_TIMEOUT_MS) || 5000;
 }
 
+export type KeaTarget = 'dc' | 'dr' | 'primary' | 'standby' | 'auto' | 'all';
+
 export async function keaCommand(
   command: string,
   argumentsPayload?: Record<string, unknown>,
-  options?: { target?: 'primary' | 'standby' | 'auto' },
+  options?: { target?: KeaTarget },
 ): Promise<KeaCommandResult> {
   const target = options?.target ?? 'auto';
   const urls =
-    target === 'standby'
-      ? [getStandbyUrl()]
-      : target === 'primary'
-        ? [getPrimaryUrl()]
-        : [getPrimaryUrl(), getStandbyUrl()];
+    target === 'dr' || target === 'standby'
+      ? [getDrUrl()]
+      : target === 'dc' || target === 'primary'
+        ? [getDcUrl()]
+        : target === 'all'
+          ? [getDcUrl(), getDrUrl()]
+          : [getDcUrl(), getDrUrl()];
 
   let lastError: Error | null = null;
 
@@ -65,6 +85,50 @@ export async function keaCommand(
   }
 
   throw lastError ?? new Error('Kea API unavailable');
+}
+
+/**
+ * Run a command against BOTH DC and DR in parallel. Returns one result per
+ * site keyed by `dc` / `dr`. Failures are reported per-site rather than
+ * throwing, so the caller can render a "DC healthy, DR down" picture in
+ * one round-trip (used by the auto-failback scheduler + dashboard).
+ */
+export async function keaCommandBoth(
+  command: string,
+  argumentsPayload?: Record<string, unknown>,
+): Promise<{ dc: KeaCommandResult | null; dr: KeaCommandResult | null; dcError?: string; drError?: string }> {
+  const send = async (url: string) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs());
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          command,
+          service: ['dhcp4'],
+          ...(argumentsPayload ? { arguments: argumentsPayload } : {}),
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!response.ok) {
+        return { ok: false as const, error: `HTTP ${response.status}` };
+      }
+      const payload = (await response.json()) as KeaCommandResult | KeaCommandResult[];
+      return { ok: true as const, result: Array.isArray(payload) ? payload[0] : payload };
+    } catch (error) {
+      return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  const [dcRes, drRes] = await Promise.all([send(getDcUrl()), send(getDrUrl())]);
+  return {
+    dc: dcRes.ok ? dcRes.result : null,
+    dr: drRes.ok ? drRes.result : null,
+    dcError: dcRes.ok ? undefined : dcRes.error,
+    drError: drRes.ok ? undefined : drRes.error,
+  };
 }
 
 import { buildClientLookup } from './arpAddress.js';
@@ -107,10 +171,30 @@ export type DhcpLease = {
 
 export type DhcpHaPeer = {
   name: string;
+  /** DC = primary site, DR = disaster recovery site. */
+  site: 'DC' | 'DR';
+  /** Role this server is in: primary (serving) or standby (passive). */
   role: string;
   url: string;
   reachable: boolean;
+  /**
+   * Kea HA hook state. Possible values:
+   *   - "waiting"               — Kea starting up, not yet synced
+   *   - "syncing"               — initial lease DB sync in progress
+   *   - "hot-standby"           — normal standby, partner is up
+   *   - "load-balancing"        — only in load-balancing mode
+   *   - "partner-down"          — I am primary, partner is unreachable
+   *   - "unavailable"           — partner has been down too long
+   *   - "communication-recovered" — partner just came back
+   *   - "terminated"            — HA disabled
+   */
   state?: string;
+  /** Lease scopes this server is responsible for (from ha-heartbeat). */
+  scopes?: string[];
+  /** ISO timestamp of the last successful heartbeat we received. */
+  lastHeartbeatAt?: string | null;
+  /** How long this server has been in its current role (seconds). */
+  uptimeInRole?: number;
 };
 
 function parsePoolRange(pool: string): { start: string; end: string; size: number } {
@@ -302,22 +386,42 @@ export async function getDhcpDashboard() {
     utilization: site.poolSize > 0 ? Math.round((site.leased / site.poolSize) * 1000) / 10 : 0,
   }));
 
+  const haArgs = (args?: KeaCommandResult | null) =>
+    (args?.arguments ?? {}) as { state?: string; scopes?: string[]; 'date-time'?: string };
+
+  const dcHeartbeat = haArgs(haPrimary);
+  const drHeartbeat = haArgs(haStandby);
+
   const peers: DhcpHaPeer[] = [
     {
-      name: 'kea-primary',
+      name: 'kea-dc1',
+      site: 'DC',
       role: 'primary',
-      url: getPrimaryUrl(),
+      url: getDcUrl(),
       reachable: Boolean(haPrimary && (haPrimary.result ?? 1) === 0),
-      state: String((haPrimary?.arguments as { state?: string } | undefined)?.state || ''),
+      state: dcHeartbeat.state || '',
+      scopes: Array.isArray(dcHeartbeat.scopes) ? dcHeartbeat.scopes : [],
+      lastHeartbeatAt: dcHeartbeat['date-time'] || null,
     },
     {
-      name: 'kea-standby',
+      name: 'kea-dr1',
+      site: 'DR',
       role: 'standby',
-      url: getStandbyUrl(),
+      url: getDrUrl(),
       reachable: Boolean(haStandby && (haStandby.result ?? 1) === 0),
-      state: String((haStandby?.arguments as { state?: string } | undefined)?.state || ''),
+      state: drHeartbeat.state || '',
+      scopes: Array.isArray(drHeartbeat.scopes) ? drHeartbeat.scopes : [],
+      lastHeartbeatAt: drHeartbeat['date-time'] || null,
     },
   ];
+
+  // Active site = the one that is currently serving DHCP. Determined by
+  // combination of role + state:
+  //   - DC's state 'partner-down'        → DC is serving alone (DR down)
+  //   - DR's state 'partner-down'        → DR is serving (DC was down, now DR up)
+  //   - DC 'hot-standby' + DR 'partner-down' → DR is serving (DR promoted)
+  //   - both 'hot-standby'              → DC serving (normal state)
+  const active = resolveActiveSite(peers);
 
   return {
     sites,
@@ -332,10 +436,7 @@ export async function getDhcpDashboard() {
     ha: {
       mode: 'hot-standby',
       peers,
-      active:
-        peers.find((peer) => peer.reachable && peer.role === 'primary')?.name ||
-        peers.find((peer) => peer.reachable)?.name ||
-        null,
+      active,
     },
     totals: {
       sites: sites.length,
@@ -345,6 +446,199 @@ export async function getDhcpDashboard() {
     },
   };
 }
+
+/**
+ * Determine which site is currently serving DHCP, based on the HA state
+ * of both peers. Returns 'DC' | 'DR' | null.
+ *
+ * Logic mirrors Kea HA's hot-standby state machine:
+ *   - If DC says 'partner-down' but DR says 'hot-standby' → DR is primary
+ *     (this is the failover state: DR took over, DC demoted)
+ *   - If DC says 'hot-standby' and DR says 'hot-standby' → DC is primary
+ *     (normal state: DC serves, DR passively syncs)
+ *   - If both say 'partner-down' → split-brain, prefer DC
+ *   - If both unreachable → null
+ */
+function resolveActiveSite(peers: DhcpHaPeer[]): 'DC' | 'DR' | null {
+  const dc = peers.find((p) => p.site === 'DC');
+  const dr = peers.find((p) => p.site === 'DR');
+  if (!dc?.reachable && !dr?.reachable) return null;
+
+  // DR promoting scenario: DC went down, DR took over
+  if (dr?.reachable && (dr.state === 'partner-down' || dr.state === 'unavailable')) {
+    // DC's heartbeat is fresh enough to claim 'hot-standby' but the
+    // state field tells us who's actually serving. If DR is partner-down
+    // (i.e. DR's view: "I cannot reach DC, so I'm serving"), DR is active.
+    return 'DR';
+  }
+
+  // Normal scenario: DC primary, DR standby. If DC is reachable and
+  // DC's state is hot-standby (its OWN role), it's serving. Note: Kea's
+  // hot-standby state name is the role of THIS server, so a primary
+  // reports state='hot-standby' when normal and 'partner-down' when alone.
+  if (dc?.reachable && dc.state === 'hot-standby' && dr?.state === 'hot-standby') {
+    return 'DC';
+  }
+
+  // DC says it's hot-standby and DR is unreachable — DC serving
+  if (dc?.reachable && !dr?.reachable) {
+    return 'DC';
+  }
+
+  // DR says it's hot-standby and DC is unreachable — DR serving
+  if (dr?.reachable && !dc?.reachable) {
+    return 'DR';
+  }
+
+  // Both reachable, both 'hot-standby' — normal, DC serves
+  if (dc?.reachable) return 'DC';
+  return dr?.reachable ? 'DR' : null;
+}
+
+/**
+ * Detailed HA state snapshot for the auto-failback scheduler and
+ * the operator UI. Returns one entry per site, plus the resolved
+ * active site and a recommended action.
+ */
+export type HaStateSnapshot = {
+  activeSite: 'DC' | 'DR' | null;
+  peers: DhcpHaPeer[];
+  recommendedAction: 'none' | 'switchover-to-dc' | 'switchover-to-dr' | 'investigate';
+  reason: string;
+  capturedAt: string;
+};
+
+export async function getHaState(): Promise<HaStateSnapshot> {
+  const both = await keaCommandBoth('ha-heartbeat');
+
+  const parseHeartbeat = (args: KeaCommandResult | null) => {
+    const a = (args?.arguments ?? {}) as { state?: string; scopes?: string[]; 'date-time'?: string };
+    return {
+      state: a.state || '',
+      scopes: Array.isArray(a.scopes) ? a.scopes : [],
+      lastHeartbeatAt: a['date-time'] || null,
+    };
+  };
+
+  const dcHb = parseHeartbeat(both.dc);
+  const drHb = parseHeartbeat(both.dr);
+
+  const peers: DhcpHaPeer[] = [
+    {
+      name: 'kea-dc1',
+      site: 'DC',
+      role: 'primary',
+      url: getDcUrl(),
+      reachable: Boolean(both.dc && (both.dc.result ?? 1) === 0) && !both.dcError,
+      state: dcHb.state,
+      scopes: dcHb.scopes,
+      lastHeartbeatAt: dcHb.lastHeartbeatAt,
+    },
+    {
+      name: 'kea-dr1',
+      site: 'DR',
+      role: 'standby',
+      url: getDrUrl(),
+      reachable: Boolean(both.dr && (both.dr.result ?? 1) === 0) && !both.drError,
+      state: drHb.state,
+      scopes: drHb.scopes,
+      lastHeartbeatAt: drHb.lastHeartbeatAt,
+    },
+  ];
+
+  const activeSite = resolveActiveSite(peers);
+
+  // Decide the recommended action for the auto-failback scheduler:
+  //   - switchover-to-dc: DC healthy, DR is currently active (failback)
+  //   - switchover-to-dr: DC unreachable, DR is standby (manual override)
+  //   - none:             normal state (DC active, DR standby)
+  //   - investigate:      something weird (both down, split-brain, etc.)
+  let recommendedAction: HaStateSnapshot['recommendedAction'] = 'none';
+  let reason = 'Normal operation (DC active, DR standby)';
+
+  const dc = peers.find((p) => p.site === 'DC');
+  const dr = peers.find((p) => p.site === 'DR');
+
+  if (!dc?.reachable && !dr?.reachable) {
+    recommendedAction = 'investigate';
+    reason = 'Both DC and DR unreachable — cannot determine state';
+  } else if (activeSite === 'DR' && dc?.reachable) {
+    recommendedAction = 'switchover-to-dc';
+    reason = 'DC recovered but DR is currently active — failback candidate';
+  } else if (activeSite === 'DC' && !dr?.reachable) {
+    recommendedAction = 'investigate';
+    reason = 'DC active but DR is unreachable — verify DR is being rebuilt';
+  } else if (dc?.state === 'partner-down' && dr?.state === 'unavailable') {
+    recommendedAction = 'switchover-to-dr';
+    reason = 'DC lost contact with DR — manual intervention recommended';
+  } else if (activeSite === 'DR' && !dc?.reachable) {
+    recommendedAction = 'none';
+    reason = 'DR is serving (DC down) — wait for DC to come back';
+  }
+
+  return {
+    activeSite,
+    peers,
+    recommendedAction,
+    reason,
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Trigger a graceful HA switchover by sending `ha-switch-partner` to the
+ * current primary. After the call, the two servers swap roles:
+ *   - The current primary demotes itself to standby
+ *   - The current standby promotes itself to primary
+ *
+ * IMPORTANT: This is a controlled operation with a brief gap (~1-3s)
+ * where neither server is serving DHCP. Existing leases are unaffected,
+ * but new DHCP requests during the gap will fail.
+ *
+ * @param site Which site is CURRENTLY primary. We send the command to
+ *             THAT site so it demotes itself.
+ */
+export async function switchHaPartner(currentPrimary: 'DC' | 'DR'): Promise<{
+  result: number;
+  text: string;
+  beforeState: HaStateSnapshot;
+}> {
+  const beforeState = await getHaState();
+  const target = currentPrimary === 'DC' ? 'dc' : 'dr';
+  const result = await keaCommand('ha-switch-partner', undefined, { target });
+  return {
+    result: Number(result.result ?? 1),
+    text: result.text || '',
+    beforeState,
+  };
+}
+
+/**
+ * Auto-failback status reported to the dashboard.
+ *
+ * In-memory only (lost on backend restart). For a persistent audit trail
+ * of failovers/failbacks, see the audit_log table — every switchover
+ * triggered by the scheduler or via the API is recorded there.
+ */
+export type AutoFailbackStatus = {
+  enabled: boolean;
+  lastCheckedAt: string | null;
+  lastFailoverAt: string | null;
+  lastFailbackAt: string | null;
+  lastFailbackReason: string | null;
+  lastFailbackFrom: 'DC' | 'DR' | null;
+  lastFailbackTo: 'DC' | 'DR' | null;
+  cooldownRemainingSeconds: number;
+  stabilityRequiredSeconds: number;
+  nextCheckAt: string | null;
+  recentEvents: Array<{
+    at: string;
+    kind: 'failover' | 'failback' | 'switchover' | 'check' | 'skip';
+    from: 'DC' | 'DR' | null;
+    to: 'DC' | 'DR' | null;
+    reason: string;
+  }>;
+};
 
 export async function listDhcpLeases(subnetId?: number): Promise<DhcpLease[]> {
   const [configResult, leasesResult] = await Promise.all([

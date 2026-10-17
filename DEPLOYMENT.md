@@ -219,7 +219,7 @@ Actions tab → **Deploy** → **Run workflow** → pick a branch/sha.
 | | `.tmp-cfg/` (configs in repo, kept) |
 | | `.tmp-hello.txt` (gitignored) |
 
-If you ever need to update Kea or Postgres, do it manually with a careful `docker compose -p netconsole -f /opt/netconsole/docker-compose.app.yml up -d --build postgres kea-dhcp1 kea-dhcp2` - **not** via the runner.
+If you ever need to update Kea or Postgres, do it manually with a careful `docker compose -p netconsole -f /opt/netconsole/docker-compose.app.yml up -d --build postgres kea-dc1` - **not** via the runner.
 
 ---
 

@@ -26,21 +26,15 @@
             {
               "this-server-name": "__THIS_SERVER_NAME__",
               "mode": "hot-standby",
-              "heartbeat-delay": 10000,
-              "max-response-delay": 60000,
-              "max-ack-delay": 5000,
+              "heartbeat-delay": __KEA_HEARTBEAT_DELAY_MS__,
+              "max-response-delay": __KEA_MAX_RESPONSE_DELAY_MS__,
+              "max-ack-delay": __KEA_MAX_ACK_DELAY_MS__,
               "max-unacked-clients": 0,
               "peers": [
                 {
-                  "name": "kea-primary",
-                  "url": "__KEA_PRIMARY_URL__",
-                  "role": "primary",
-                  "auto-failover": true
-                },
-                {
-                  "name": "kea-standby",
-                  "url": "__KEA_STANDBY_URL__",
-                  "role": "standby",
+                  "name": "__KEA_PEER_NAME__",
+                  "url": "__KEA_PEER_URL__",
+                  "role": "__KEA_PEER_ROLE__",
                   "auto-failover": true
                 }
               ]
@@ -120,6 +114,11 @@
     "loggers": [
       {
         "name": "kea-dhcp4",
+        "severity": "INFO",
+        "output_options": [{ "output": "stdout" }]
+      },
+      {
+        "name": "kea-dhcp4.hooks",
         "severity": "INFO",
         "output_options": [{ "output": "stdout" }]
       }

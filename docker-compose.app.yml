@@ -34,8 +34,8 @@ networks:
 
 volumes:
   netconsole_pgdata:
-  kea_primary_leases:
-  kea_standby_leases:
+  kea_dc_leases:
+  kea_dr_leases:
 
 services:
   postgres:
@@ -57,29 +57,46 @@ services:
       timeout: 5s
       retries: 10
 
-  # kea-dhcp1 = primary  → HA peer = 172.31.0.11 (kea-dhcp2)
-  kea-dhcp1:
+  # kea-dc1 = DC primary → HA peer = kea-dr1 (DR site, Tailscale IP)
+  # Topology: 1+1 hot-standby. DC active, DR standby. Both bind :67 (DR
+  # only binds on promote). Switch relay points to both 10.10.20.20 (DC)
+  # and 10.10.20.30 (DR); the alive one responds.
+  #
+  # Peer URL = Tailscale IP of the DR host. Kea HA heartbeat goes via
+  # :8000 (control agent). Tailscale ensures reachability across the
+  # public Internet without opening ports on the public NIC.
+  kea-dc1:
     build:
       context: ./lab/kea
-    container_name: netconsole-kea-primary
-    hostname: kea-primary
+    container_name: netconsole-kea-dc
+    hostname: kea-dc1
     restart: unless-stopped
     privileged: true
     environment:
-      KEA_SERVER_NAME: kea-primary
+      KEA_SERVER_NAME: kea-dc1
+      KEA_PEER_NAME: kea-dr1
+      KEA_PEER_URL: http://100.105.166.18:8000/
+      KEA_PEER_ROLE: standby
+      # Faster HA timing for failback in <30s. Trade-off: 2x heartbeat traffic.
+      KEA_HEARTBEAT_DELAY_MS: "5000"
+      KEA_MAX_RESPONSE_DELAY_MS: "10000"
+      KEA_MAX_ACK_DELAY_MS: "2000"
       KEA_SEED_LEASES: "false"
       KEA_DATA_MAP: ""
       KEA_HOST_OCTET: "2"
-      KEA_PRIMARY_URL: http://172.31.0.10:8000/
-      KEA_STANDBY_URL: http://172.31.0.11:8000/
       DHCP_RELAY_VIA: "172.31.0.254"
     volumes:
-      - kea_primary_leases:/var/lib/kea
+      - kea_dc_leases:/var/lib/kea
     networks:
       netconsole:
         ipv4_address: 172.31.0.10
     ports:
+      # DC DHCP server — :67 on 10.10.20.20 (DC host's lab NIC).
+      # Switch DHCP helper-address includes this IP.
       - "10.10.20.20:67:67/udp"
+      # Control agent for backend/dashboard/monitoring. Bound on the
+      # private NIC so the backend (172.31.0.3) and DR kea (via Tailscale)
+      # can both reach it without exposing on the public IP.
       - "10.10.20.20:8001:8000"
     healthcheck:
       test:
@@ -91,41 +108,14 @@ services:
       timeout: 5s
       retries: 25
 
-  # kea-dhcp2 = standby → HA peer = 172.31.0.10 (kea-dhcp1)
-  kea-dhcp2:
-    build:
-      context: ./lab/kea
-    container_name: netconsole-kea-standby
-    hostname: kea-standby
-    restart: unless-stopped
-    privileged: true
-    environment:
-      KEA_SERVER_NAME: kea-standby
-      KEA_SEED_LEASES: "false"
-      KEA_DATA_MAP: ""
-      KEA_HOST_OCTET: "3"
-      KEA_PRIMARY_URL: http://172.31.0.10:8000/
-      KEA_STANDBY_URL: http://172.31.0.11:8000/
-      DHCP_RELAY_VIA: "172.31.0.254"
-    volumes:
-      - kea_standby_leases:/var/lib/kea
-    networks:
-      netconsole:
-        ipv4_address: 172.31.0.11
-    ports:
-      - "10.10.20.20:8002:8000"
-    depends_on:
-      kea-dhcp1:
-        condition: service_healthy
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 25
+  # NOTE: kea-dr1 is NOT deployed on the DC host. It runs on the DR VPS
+  # (100.105.166.18) via docker-compose.kea-dr.yml. The DC kea-dc1
+  # reaches it over Tailscale using the KEA_PEER_URL above. Lease
+  # replication happens over the same Tailscale tunnel via libdhcp_ha.so.
+  #
+  # If you need to run both kea-dc1 and kea-dr1 on the same host for
+  # local testing, use docker-compose.lab.yml (single-host variant) and
+  # override the peer URLs to the local Docker bridge IPs.
 
   # Redis cache layer (Phase 2 — 2026-10-14).
   # Used for:
@@ -181,7 +171,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      kea-dhcp1:
+      kea-dc1:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
@@ -246,8 +236,19 @@ services:
       NXOS_API_USER: netconsole
       NXOS_API_PASSWORD: Admin@123
       KEA_API_URL: http://172.31.0.10:8000/
-      KEA_STANDBY_API_URL: http://172.31.0.11:8000/
+      # DR control agent — Tailscale IP of the DR VPS (100.105.166.18).
+      # Backend uses this to query HA state, trigger manual switchover,
+      # and run the auto-failback scheduler. Tailscale is the routing
+      # path — no public port exposure.
+      KEA_STANDBY_API_URL: http://100.105.166.18:8000/
       KEA_TIMEOUT_MS: "5000"
+      # Auto-failback: when DC recovers after a failover, scheduler
+      # will call ha-switch-partner to swap primary back to DC.
+      # Disabled by default until the DR pair is deployed in production.
+      KEA_AUTO_FAILBACK: "true"
+      KEA_FAILBACK_STABILITY_SECONDS: "300"
+      KEA_FAILBACK_COOLDOWN_SECONDS: "3600"
+      KEA_FAILBACK_CHECK_INTERVAL_SECONDS: "30"
       # NetBox sync — set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable
       # the periodic sync. The worker reads NETBOX_URL / NETBOX_TOKEN
       # to know where to push. Both should be set; if either is empty

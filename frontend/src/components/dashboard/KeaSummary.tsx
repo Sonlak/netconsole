@@ -88,18 +88,27 @@ export function KeaSummary({
           HA mode · <span className="nc-kea-ha-mode">{data.ha.mode}</span>
           {data.ha.active ? (
             <>
-              {' · '}active <span className="nc-kea-ha-active">{data.ha.active}</span>
+              {' · '}
+              <span className={`nc-kea-ha-active nc-kea-ha-active-${data.ha.active.toLowerCase()}`}>
+                {data.ha.active} active
+              </span>
             </>
           ) : null}
         </Typography.Text>
         <div className="nc-kea-peers">
           {(data.ha.peers ?? []).map((peer) => (
-            <Tooltip key={peer.name} title={`${peer.url}${peer.state ? ` · ${peer.state}` : ''}`}>
+            <Tooltip
+              key={peer.name}
+              title={`${peer.site} · ${peer.url}${peer.state ? ` · ${peer.state}` : ''}`}
+            >
               <div className="nc-kea-peer">
                 <StatusDot meta={peerStatusMeta(peer.reachable)} />
                 <div className="nc-kea-peer-meta">
-                  <span className="nc-kea-peer-name">{peer.name}</span>
-                  <span className="nc-kea-peer-role">{peer.role}</span>
+                  <span className="nc-kea-peer-name">{peer.site}</span>
+                  <span className="nc-kea-peer-role">
+                    {peer.state || peer.role}
+                    {data.ha.active === peer.site ? ' · active' : ''}
+                  </span>
                 </div>
               </div>
             </Tooltip>

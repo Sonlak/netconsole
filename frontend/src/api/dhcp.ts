@@ -1,4 +1,10 @@
-import type { DhcpDashboard, DhcpLease } from '../types/dhcp';
+import type {
+  AutoFailbackStatus,
+  DhcpDashboard,
+  DhcpLease,
+  HaStateResponse,
+  SwitchoverResult,
+} from '../types/dhcp';
 import { authJsonFetch, authFetch, handleResponse } from './http';
 
 const API_BASE = '/api/dhcp';
@@ -6,6 +12,46 @@ const API_BASE = '/api/dhcp';
 export async function fetchDhcpDashboard(): Promise<DhcpDashboard> {
   const response = await authFetch(`${API_BASE}/dashboard`);
   return handleResponse<DhcpDashboard>(response);
+}
+
+export async function fetchHaState(): Promise<HaStateResponse> {
+  const response = await authFetch(`${API_BASE}/ha-state`);
+  return handleResponse<HaStateResponse>(response);
+}
+
+export async function fetchAutoFailbackStatus(): Promise<AutoFailbackStatus> {
+  const response = await authFetch(`${API_BASE}/auto-failback`);
+  return handleResponse<AutoFailbackStatus>(response);
+}
+
+export async function setAutoFailback(enabled: boolean): Promise<AutoFailbackStatus> {
+  const response = await authJsonFetch<{ ok: true; status: AutoFailbackStatus }>(
+    `${API_BASE}/auto-failback`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  return response.status;
+}
+
+export async function triggerSwitchover(currentPrimary: 'DC' | 'DR'): Promise<SwitchoverResult> {
+  const response = await authJsonFetch<SwitchoverResult>(`${API_BASE}/switchover`, {
+    method: 'POST',
+    body: JSON.stringify({ currentPrimary }),
+  });
+  return response;
+}
+
+export async function triggerAutoFailbackCheck(): Promise<AutoFailbackStatus> {
+  const response = await authJsonFetch<{ ok: true; status: AutoFailbackStatus }>(
+    `${API_BASE}/auto-failback/check`,
+    {
+      method: 'POST',
+      body: JSON.stringify({}),
+    },
+  );
+  return response.status;
 }
 
 export async function fetchPoolLeases(subnetId: number): Promise<DhcpLease[]> {

@@ -1,10 +1,35 @@
 #!/bin/bash
 set -euo pipefail
 
-THIS_SERVER_NAME="${KEA_SERVER_NAME:-kea-primary}"
+# ─── Identity ────────────────────────────────────────────────────────────────
+THIS_SERVER_NAME="${KEA_SERVER_NAME:-kea-dc1}"
+
+# HA peer config (1+1 topology: this server <-> one peer)
+# Defaults assume DC↔DR split:
+#   DC:  PEER_NAME=kea-dr1, PEER_ROLE=standby, PEER_URL points to DR
+#   DR:  PEER_NAME=kea-dc1, PEER_ROLE=primary, PEER_URL points to DC
+KEA_PEER_NAME="${KEA_PEER_NAME:-kea-dr1}"
+KEA_PEER_URL="${KEA_PEER_URL:-http://172.31.0.11:8000/}"
+KEA_PEER_ROLE="${KEA_PEER_ROLE:-standby}"
+
+# HA timing (tunable for failback speed vs. network noise trade-off)
+# Defaults: heartbeat 5s, response window 10s, ack delay 2s
+# → failback detection ~10-15s after peer down, 1-3s swap gap
+KEA_HEARTBEAT_DELAY_MS="${KEA_HEARTBEAT_DELAY_MS:-5000}"
+KEA_MAX_RESPONSE_DELAY_MS="${KEA_MAX_RESPONSE_DELAY_MS:-10000}"
+KEA_MAX_ACK_DELAY_MS="${KEA_MAX_ACK_DELAY_MS:-2000}"
+
+# ─── Hook discovery ──────────────────────────────────────────────────────────
 HOOK_DIR="/usr/lib/x86_64-linux-gnu/kea/hooks"
-# Format: "eth1:10 eth2:20 eth3:30 eth4:40"  (iface:vlan -> 172.30.<vlan>.2)
-# Note: empty KEA_DATA_MAP must stay empty (standby). ${VAR:-default} would
+if [[ ! -f "${HOOK_DIR}/libdhcp_ha.so" ]]; then
+  if [[ -f /usr/lib/kea/hooks/libdhcp_ha.so ]]; then
+    HOOK_DIR="/usr/lib/kea/hooks"
+  fi
+fi
+
+# ─── Data plane (optional, only when container has extra NICs) ────────────────
+# Format: "eth1:10 eth2:20 eth3:30 eth4:40"  (iface:vlan -> 172.30.<vlan>.HOST_OCTET)
+# Note: empty KEA_DATA_MAP must stay empty. ${VAR:-default} would
 # incorrectly substitute the default when VAR is set to "".
 if [ "${KEA_DATA_MAP+x}" = "x" ]; then
   DATA_MAP="${KEA_DATA_MAP}"
@@ -13,17 +38,11 @@ else
 fi
 HOST_OCTET="${KEA_HOST_OCTET:-2}"
 
-if [[ ! -f "${HOOK_DIR}/libdhcp_ha.so" ]]; then
-  if [[ -f /usr/lib/kea/hooks/libdhcp_ha.so ]]; then
-    HOOK_DIR="/usr/lib/kea/hooks"
-  fi
-fi
-
 mkdir -p /var/run/kea /var/lib/kea /etc/kea /run/kea
 chmod 777 /var/run/kea /var/lib/kea /run/kea || true
 
 # Stale PID files survive docker stop/start and block Kea with
-# DHCP4_ALREADY_RUNNING / DCTL_ALREADY_RUNNING after Desktop reboot.
+# DHCP4_ALREADY_RUNNING / DCTL_ALREADY_RUNNING after host reboot.
 rm -f /run/kea/*.pid /var/run/kea/*.pid 2>/dev/null || true
 
 # Kea REQUIRES a usable IPv4 on each DHCP data interface.
@@ -46,16 +65,21 @@ if [[ -n "${DATA_MAP// }" ]]; then
   done
 fi
 
-PRIMARY_URL="${KEA_PRIMARY_URL:-http://172.30.0.21:8000/}"
-STANDBY_URL="${KEA_STANDBY_URL:-http://172.30.0.22:8000/}"
-
+# ─── Render config from template ──────────────────────────────────────────────
+# Subnets live inline in the template — both DC and DR MUST serve the same
+# subnet config so a failover doesn't change which addresses a client gets.
 sed \
   -e "s|__THIS_SERVER_NAME__|${THIS_SERVER_NAME}|g" \
-  -e "s|__KEA_PRIMARY_URL__|${PRIMARY_URL}|g" \
-  -e "s|__KEA_STANDBY_URL__|${STANDBY_URL}|g" \
+  -e "s|__KEA_PEER_NAME__|${KEA_PEER_NAME}|g" \
+  -e "s|__KEA_PEER_URL__|${KEA_PEER_URL}|g" \
+  -e "s|__KEA_PEER_ROLE__|${KEA_PEER_ROLE}|g" \
+  -e "s|__KEA_HEARTBEAT_DELAY_MS__|${KEA_HEARTBEAT_DELAY_MS}|g" \
+  -e "s|__KEA_MAX_RESPONSE_DELAY_MS__|${KEA_MAX_RESPONSE_DELAY_MS}|g" \
+  -e "s|__KEA_MAX_ACK_DELAY_MS__|${KEA_MAX_ACK_DELAY_MS}|g" \
   -e "s|/usr/lib/x86_64-linux-gnu/kea/hooks|${HOOK_DIR}|g" \
   /etc/kea/kea-dhcp4.conf.template > /etc/kea/kea-dhcp4.conf
 
+# ─── Routes back to relay (for DHCP replies) ─────────────────────────────────
 # DHCP replies are unicast to relay giaddr. Skip when DHCP_RELAY_VIA is empty.
 RELAY_VIA="${DHCP_RELAY_VIA-172.30.0.13}"
 RELAY_NETS="${DHCP_RELAY_NETS:-10.1.201.0/24 10.1.202.0/24 10.1.203.0/24 10.1.204.0/24}"
@@ -66,6 +90,8 @@ if [[ -n "${RELAY_VIA}" ]]; then
 fi
 
 echo "[kea] starting ${THIS_SERVER_NAME} (hooks=${HOOK_DIR})"
+echo "[kea] peer: ${KEA_PEER_NAME} @ ${KEA_PEER_URL} (role=${KEA_PEER_ROLE})"
+echo "[kea] HA timing: heartbeat=${KEA_HEARTBEAT_DELAY_MS}ms response=${KEA_MAX_RESPONSE_DELAY_MS}ms ack=${KEA_MAX_ACK_DELAY_MS}ms"
 ip -br addr || true
 ip route || true
 

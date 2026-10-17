@@ -21,7 +21,7 @@ echo "==> 2. Pull / build backend & frontend images"
 docker compose -f "${COMPOSE_FILE}" build --pull --no-cache backend frontend
 
 echo "==> 3. Start postgres + kea first (so backend can run prisma db push + seed)"
-docker compose -f "${COMPOSE_FILE}" up -d postgres kea-dhcp1 kea-dhcp2
+docker compose -f "${COMPOSE_FILE}" up -d postgres kea-dc1
 
 echo "==> 4. Wait for postgres to be healthy"
 for i in $(seq 1 30); do
@@ -31,10 +31,10 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-echo "==> 5. Wait for kea primary to be healthy"
+echo "==> 5. Wait for kea-dc1 to be healthy"
 for i in $(seq 1 40); do
-  status=$(docker inspect --format='{{.State.Health.Status}}' netconsole-kea-primary 2>/dev/null || echo "starting")
-  echo "    kea-primary status = ${status}"
+  status=$(docker inspect --format='{{.State.Health.Status}}' netconsole-kea-dc 2>/dev/null || echo "starting")
+  echo "    kea-dc1 status = ${status}"
   if [ "${status}" = "healthy" ]; then break; fi
   sleep 2
 done

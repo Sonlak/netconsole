@@ -23,6 +23,7 @@ import { startLogRetentionCleanup } from './services/logRetention.js';
 import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { scheduleNetboxSync } from './services/netboxSync.js';
+import { startKeccFailbackScheduler, stopKeaFailbackScheduler } from './services/keaFailback.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
@@ -144,6 +145,17 @@ const httpServer = app.listen(port, () => {
     console.log('NetBox sync scheduler disabled (set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable)');
   }
 
+  // Kea DC↔DR auto-failback scheduler. The scheduler is always started
+  // (so the /api/dhcp/auto-failback status endpoint works) but only
+  // ACTUALLY triggers switchovers when KEA_AUTO_FAILBACK=true AND the
+  // runtime flag (toggleable via API) is also true. Both must be set
+  // to avoid accidentally swapping primary during maintenance.
+  startKeccFailbackScheduler();
+  const keaFailbackWanted = process.env.KEA_AUTO_FAILBACK === 'true';
+  console.log(
+    `Kea auto-failback scheduler enabled (env flag: ${keaFailbackWanted ? 'on' : 'off (toggleable via API)'})`,
+  );
+
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
 
   // Start WebSocket terminal server
@@ -199,6 +211,8 @@ app.get('/api/health', (_req, res) => {
     jobRetentionDays,
     syslogUdpPort,
     keaApiUrl: process.env.KEA_API_URL || null,
+    keaStandbyApiUrl: process.env.KEA_STANDBY_API_URL || null,
+    keaAutoFailback: process.env.KEA_AUTO_FAILBACK === 'true',
     netboxEnabled: netboxSyncIntervalSeconds > 0,
     netboxSyncIntervalSeconds: netboxSyncIntervalSeconds > 0 ? netboxSyncIntervalSeconds : null,
     // Read version from package.json (written at build time by docker-compose)
@@ -249,6 +263,14 @@ async function gracefulShutdown(signal: string) {
       console.log('Syslog UDP receiver closed');
     } catch (error) {
       console.error('[shutdown] syslog receiver error:', error);
+    }
+
+    // Stop Kea failback scheduler (no in-flight action, just clear the interval)
+    try {
+      stopKeaFailbackScheduler();
+      console.log('Kea failback scheduler stopped');
+    } catch (error) {
+      console.error('[shutdown] kea-failback scheduler error:', error);
     }
 
     // Close database connection

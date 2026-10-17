@@ -28,14 +28,14 @@ import {
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
 import { PageSkeleton } from '@/components/common/PageSkeleton';
-import { StatusDot } from '@/components/common/StatusDot';
 import { StaleDataBanner } from '@/components/common/StaleDataBanner';
 import { DataTableShell } from '@/components/data-table/DataTableShell';
 import { DataTableToolbar } from '@/components/data-table/DataTableToolbar';
 import { TableFreshness } from '@/components/data-table/TableFreshness';
+import { KeaHaCard } from '@/components/dashboard/KeaHaCard';
 import { IpAddress, MacAddress, MonoValue } from '@/components/display/MonoValue';
 import { Timestamp } from '@/components/display/Timestamp';
-import { dhcpUtilMeta, peerStatusMeta } from '@/design/status';
+import { dhcpUtilMeta } from '@/design/status';
 import { SITES } from '@/data/bank';
 import { useSiteFilter } from '@/hooks/useSiteFilter';
 import { toError } from '@/lib/errors';
@@ -222,29 +222,10 @@ export default function DhcpPage() {
       {dashboard ? (
         <>
           <Row gutter={[12, 12]} style={{ marginBottom: 12 }}>
-            <Col xs={24} lg={8}>
-              <Card bordered={false} size="small" title="Kea DC HA">
-                <Typography.Text type="secondary">Mode: {dashboard.ha?.mode || '—'}</Typography.Text>
-                <Space direction="vertical" style={{ width: '100%', marginTop: 8 }} size={8}>
-                  {(dashboard.ha?.peers ?? []).map((peer) => (
-                    <Space key={peer.name} style={{ width: '100%', justifyContent: 'space-between' }}>
-                      <div>
-                        <Typography.Text strong>{peer.name}</Typography.Text>
-                        <div>
-                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                            {peer.role}
-                            {peer.state ? ` · ${peer.state}` : ''}
-                            {dashboard.ha?.active === peer.name ? ' · active' : ''}
-                          </Typography.Text>
-                        </div>
-                      </div>
-                      <StatusDot meta={peerStatusMeta(peer.reachable)} />
-                    </Space>
-                  ))}
-                </Space>
-              </Card>
+            <Col xs={24} lg={9}>
+              <KeaHaCard />
             </Col>
-            <Col xs={24} lg={16}>
+            <Col xs={24} lg={15}>
               <Card bordered={false} size="small" title="Pools">
                 {filteredPools.length === 0 ? (
                   <EmptyState title="No pools" />
@@ -266,7 +247,9 @@ export default function DhcpPage() {
                           >
                             <Space style={{ width: '100%', justifyContent: 'space-between' }}>
                               <Typography.Text strong>{pool.name}</Typography.Text>
-                              <StatusDot meta={util} />
+                              <Tag color={util.tone === 'error' ? 'error' : util.tone === 'warning' ? 'warning' : 'success'}>
+                                {pool.utilization}%
+                              </Tag>
                             </Space>
                             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                               {pool.site} · VLAN {pool.vlan}
