@@ -30,12 +30,17 @@
               "max-response-delay": __KEA_MAX_RESPONSE_DELAY_MS__,
               "max-ack-delay": __KEA_MAX_ACK_DELAY_MS__,
               "max-unacked-clients": 0,
+              "auto-failover": true,
               "peers": [
+                {
+                  "name": "__THIS_SERVER_NAME__",
+                  "url": "http://__THIS_SERVER_URL__:8001/",
+                  "role": "__THIS_SERVER_ROLE__"
+                },
                 {
                   "name": "__KEA_PEER_NAME__",
                   "url": "__KEA_PEER_URL__",
-                  "role": "__KEA_PEER_ROLE__",
-                  "auto-failover": true
+                  "role": "__KEA_PEER_ROLE__"
                 }
               ]
             }

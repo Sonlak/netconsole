@@ -74,6 +74,8 @@ services:
     privileged: true
     environment:
       KEA_SERVER_NAME: kea-dc1
+      KEA_SERVER_URL: "10.10.20.20"
+      KEA_SERVER_ROLE: "primary"
       KEA_PEER_NAME: kea-dr1
       # DR control agent — reachable via DC's same lab subnet
       # (10.10.20.0/24 is shared between the two VPSes). Kea HA heartbeat

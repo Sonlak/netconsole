@@ -55,6 +55,8 @@ services:
     privileged: true
     environment:
       KEA_SERVER_NAME: kea-dr1
+      KEA_SERVER_URL: "10.10.20.30"
+      KEA_SERVER_ROLE: "standby"
       KEA_PEER_NAME: kea-dc1
       # DC control agent — same lab subnet (10.10.20.0/24 shared via
       # the user's router). DC exposes 10.10.20.20:8001 (host) -> 8000

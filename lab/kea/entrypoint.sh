@@ -3,6 +3,8 @@ set -euo pipefail
 
 # ─── Identity ────────────────────────────────────────────────────────────────
 THIS_SERVER_NAME="${KEA_SERVER_NAME:-kea-dc1}"
+THIS_SERVER_URL="${KEA_SERVER_URL:-10.10.20.20}"
+THIS_SERVER_ROLE="${KEA_SERVER_ROLE:-primary}"
 
 # HA peer config (1+1 topology: this server <-> one peer)
 # Defaults assume DC↔DR split:
@@ -70,6 +72,8 @@ fi
 # subnet config so a failover doesn't change which addresses a client gets.
 sed \
   -e "s|__THIS_SERVER_NAME__|${THIS_SERVER_NAME}|g" \
+  -e "s|__THIS_SERVER_URL__|${THIS_SERVER_URL}|g" \
+  -e "s|__THIS_SERVER_ROLE__|${THIS_SERVER_ROLE}|g" \
   -e "s|__KEA_PEER_NAME__|${KEA_PEER_NAME}|g" \
   -e "s|__KEA_PEER_URL__|${KEA_PEER_URL}|g" \
   -e "s|__KEA_PEER_ROLE__|${KEA_PEER_ROLE}|g" \
