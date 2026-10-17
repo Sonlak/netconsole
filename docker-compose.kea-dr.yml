@@ -1,6 +1,6 @@
-# NetConsole Kea DR stack — runs ONLY on the DR VPS (100.105.166.18).
+# NetConsole Kea DR stack — runs ONLY on the DR VPS (10.10.20.30).
 #
-# Topology: 1+1 hot-standby with DC primary (kea-dc1 on 100.102.133.86).
+# Topology: 1+1 hot-standby with DC primary (kea-dc1 on 10.10.20.20).
 # This file is paired with docker-compose.app.yml running on the DC VPS.
 # They share the same lab/kea/ image and template, but each container has
 # its own KEA_PEER_* env vars pointing at the other site.
@@ -11,9 +11,9 @@
 # When DC is up: only DC replies. When DC dies: DR's Kea promotes and
 # binds :67 (after ~15-30s heartbeat detection) and starts replying.
 #
-# Backend (DC side) talks to this control agent via Tailscale at
-# http://100.105.166.18:8000/ to read HA state, trigger manual
-# switchover, and run the auto-failback scheduler.
+# Backend (DC side) talks to this control agent via the lab subnet at
+# http://10.10.20.30:8001/ to read HA state, trigger manual switchover,
+# and run the auto-failback scheduler. No Tailscale or public exposure.
 #
 # Deploy:
 #   1. Copy this file + ./lab/kea/ to the DR VPS
@@ -56,9 +56,10 @@ services:
     environment:
       KEA_SERVER_NAME: kea-dr1
       KEA_PEER_NAME: kea-dc1
-      # Tailscale IP of the DC VPS. HA heartbeat (HTTP :8000) flows over
-      # the same Tailscale tunnel used by SSH between the two hosts.
-      KEA_PEER_URL: http://100.102.133.86:8000/
+      # DC control agent — same lab subnet (10.10.20.0/24 shared via
+      # the user's router). DC exposes 10.10.20.20:8001 (host) -> 8000
+      # (container). HA heartbeat flows over this link, not Tailscale.
+      KEA_PEER_URL: http://10.10.20.20:8001/
       # From this server's perspective, the DC is the primary.
       KEA_PEER_ROLE: primary
       # Same timing as DC — keep the pair in lockstep.

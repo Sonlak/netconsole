@@ -75,7 +75,10 @@ services:
     environment:
       KEA_SERVER_NAME: kea-dc1
       KEA_PEER_NAME: kea-dr1
-      KEA_PEER_URL: http://100.105.166.18:8000/
+      # DR control agent — reachable via DC's same lab subnet
+      # (10.10.20.0/24 is shared between the two VPSes). Kea HA heartbeat
+      # goes over :8001 (host port) on the DR's lab NIC, not :8000.
+      KEA_PEER_URL: http://10.10.20.30:8001/
       KEA_PEER_ROLE: standby
       # Faster HA timing for failback in <30s. Trade-off: 2x heartbeat traffic.
       KEA_HEARTBEAT_DELAY_MS: "5000"
@@ -109,9 +112,9 @@ services:
       retries: 25
 
   # NOTE: kea-dr1 is NOT deployed on the DC host. It runs on the DR VPS
-  # (100.105.166.18) via docker-compose.kea-dr.yml. The DC kea-dc1
-  # reaches it over Tailscale using the KEA_PEER_URL above. Lease
-  # replication happens over the same Tailscale tunnel via libdhcp_ha.so.
+  # (10.10.20.30) via docker-compose.kea-dr.yml. The DC kea-dc1 reaches
+  # it via the shared lab subnet using KEA_PEER_URL above. Lease
+  # replication happens over the same link via libdhcp_ha.so.
   #
   # If you need to run both kea-dc1 and kea-dr1 on the same host for
   # local testing, use docker-compose.lab.yml (single-host variant) and
@@ -236,11 +239,11 @@ services:
       NXOS_API_USER: netconsole
       NXOS_API_PASSWORD: Admin@123
       KEA_API_URL: http://172.31.0.10:8000/
-      # DR control agent — Tailscale IP of the DR VPS (100.105.166.18).
-      # Backend uses this to query HA state, trigger manual switchover,
-      # and run the auto-failback scheduler. Tailscale is the routing
-      # path — no public port exposure.
-      KEA_STANDBY_API_URL: http://100.105.166.18:8000/
+      # DR control agent — same lab subnet as DC (10.10.20.0/24 shared
+      # between the two VPSes via router/site-to-site). Container exposes
+      # 10.10.20.30:8001 (host) -> 8000 (container). Backend (172.31.0.3)
+      # reaches it through the host's routing table.
+      KEA_STANDBY_API_URL: http://10.10.20.30:8001/
       KEA_TIMEOUT_MS: "5000"
       # Auto-failback: when DC recovers after a failover, scheduler
       # will call ha-switch-partner to swap primary back to DC.
