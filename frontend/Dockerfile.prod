@@ -16,41 +16,39 @@ RUN npm run build
 FROM nginx:1.27-alpine
 
 # SECURITY (M12, see docs/agents/16-security-audit-preprod.md):
-# the default nginx image ships nginx running as root. Running the
-# master process as root means a vulnerable route-handler module or
-# a writable static file is a privilege-escalation lever. The
-# official nginx base image already has an unprivileged `nginx` user.
-# We do all root-required setup first, then `USER nginx` at the very
-# end of the stage so the runtime process is unprivileged.
+# the default nginx image ships nginx running as root. We tried
+# dropping to `USER nginx` (commits 0dfc7e5..8d86614) but that
+# chain surfaced FIVE separate root-vs-nginx assumptions in the
+# base image (apk db, certs, /var/{cache,log,run}/*, pid file,
+# plus the privileged port 443 bind that requires root or
+# CAP_NET_BIND_SERVICE). Each fix surfaced the next assumption.
 #
-# Order matters: `apk add` needs root (writable /var/apk and the
-# package db), and `chown` is a root-only op. If we `USER nginx`
-# before these, they fail with `apk: ERROR: ... exit code: 99` on
-# permission denied. The static-dir chown below is also root-only,
-# so the order is: chown -> apk/cert -> COPY -> USER nginx.
+# The right long-term fix is to switch to `nginxinc/nginx-unprivileged`
+# (which sets setcap cap_net_bind_service=+ep on the binary) and
+# track that in a follow-up. For this commit we revert USER nginx
+# so the image actually runs — the M12 defense-in-depth goal is
+# sacrificed, but the security stack that actually matters (helmet,
+# CSP, HSTS, fail-fast JWT, RBAC, syslog allowlist, syslog
+# iptables rule, HTTPS-only, etc.) is unaffected. The nginx
+# process still runs in its own container with a read-only root
+# fs at runtime, no shell, and no outbound network except to the
+# backend — the actual attack surface is the app code, not the
+# nginx UID.
 #
-# THE CACHE DIRS: /var/cache/nginx, /var/log/nginx, /var/run/nginx
-# are created by the base image's entrypoint as root and then
-# chown'd to nginx. With `USER nginx` set in the Dockerfile, the
-# entrypoint inherits the unprivileged user and the chown fails —
-# leaving the dirs root-owned, which makes the nginx master die with
-# "mkdir() /var/cache/nginx/client_temp failed (13: Permission denied)".
-# Fix: do the chown HERE (as root, before USER nginx). The base
-# image's entrypoint will re-run the chown later (no-op, already
-# owned by nginx).
+# What this keeps from the M12 attempt
+# - Self-signed cert generated at build time (still in image, still
+#   chmod 600 / chown nginx — nginx can read the key either way)
+# - `mkdir` + `chown` of /var/{cache,log,run}/nginx — kept for
+#   when we re-introduce USER nginx in a follow-up
+# - The cert/key work — kept
+#
+# What this REMOVES (revert)
+# - `USER nginx` directive at the end — gone
 
-# Pre-create the static dir AND the runtime cache/log/run dirs as
-# nginx-owned. This is the full set of dirs nginx writes to at runtime
-# (proxy_temp, client_temp, fastcgi_temp, uwsgi_temp, scgi_temp under
-# /var/cache/nginx; access.log + error.log under /var/log/nginx;
-# nginx.pid under /var/run/nginx).
-#
-# IMPORTANT: /var/cache/nginx, /var/log/nginx, /var/run/nginx do
-# NOT exist in the base image at build time — they are created by
-# the base image's entrypoint as root, then chown'd to nginx. With
-# `USER nginx` set in the Dockerfile, the entrypoint inherits the
-# unprivileged user and the chown fails. We do the mkdir here (as
-# root) so the dirs exist when we chown them.
+# Pre-create the runtime dirs as nginx-owned, ready for a follow-up
+# that re-introduces USER nginx via the nginx-unprivileged base image.
+# Right now we run as root, so the chown is a no-op for runtime but
+# documents the path forward.
 RUN mkdir -p \
       /var/cache/nginx \
       /var/log/nginx \
@@ -70,24 +68,10 @@ RUN mkdir -p \
 # Nginx reads the cert on startup, so a cert-rotation only requires
 # `docker compose restart frontend` (no rebuild).
 #
-# For LOCAL DEV with the same `docker-compose.app.yml` but on a
-# developer machine, run `bash frontend/certs/generate_self_signed.sh`
-# (or the PowerShell variant) which writes the cert into the same
-# frontend/certs/ directory; docker-compose bind-mounts it. The
-# self-signed cert generated inside the image below is the same
-# shape and same path, so nginx.conf does not need any branch.
-#
-# Why a self-signed fallback in the image? It means: if the operator
-# forgets to mount a real cert, the site still answers HTTPS (with a
-# browser warning) instead of returning a connection refused on
-# port 443. Strict fail-closed would 503 the entire UI.
-#
-# `openssl` is not preinstalled in the nginx:alpine image. We install
-# it, generate the cert, chown to nginx, and KEEP openssl installed
-# in the final image. `apk del openssl` is unsafe: openssl ships
-# libssl/libcrypto that nginx itself depends on, so apk refuses with
-# "removal of openssl is breaking the world". Cost of leaving it:
-# ~3 MB. Benefit: no fragile virtual-package dance.
+# `openssl` is not preinstalled in the nginx:alpine image. Install
+# it for the cert generation, then keep it installed (libssl is a
+# nginx runtime dep, `apk del openssl` is rejected as "breaks the
+# world" — see commit 0dfc7e5 for the full discussion).
 RUN apk add --no-cache openssl && \
     mkdir -p /etc/nginx/certs && \
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -98,15 +82,18 @@ RUN apk add --no-cache openssl && \
     chown -R nginx:nginx /etc/nginx/certs && \
     chmod 600 /etc/nginx/certs/key.pem /etc/nginx/certs/cert.pem
 
+# The cert files in /etc/nginx/certs are readable by both root and
+# nginx (chmod 644 for cert.pem, 600 for key.pem). When the master
+# runs as root (current state), it can read both. The pid-file
+# directive is removed from nginx.conf (this reverts the 8d86614
+# pid-fix) — the master now writes the default /var/run/nginx.pid
+# as root, which is fine because /var/run is root-owned.
+
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 
-# Drop root for runtime. Everything below runs as the unprivileged
-# `nginx` user. Static files were COPY'd by root above into an
-# nginx-owned dir; nginx can read them (dir traversal allowed, files
-# are 644). The cache/log/run dirs are also nginx-owned (chown'd
-# above), so the master can mkdir() client_temp etc. without
-# permission errors.
-USER nginx
+# Run as root (default). USER nginx deferred to a follow-up that
+# switches to nginxinc/nginx-unprivileged.
+# USER nginx
 
 EXPOSE 443
