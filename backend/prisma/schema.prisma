@@ -490,6 +490,24 @@ model RefreshToken {
   @@index([expiresAt])
 }
 
+// SECURITY (H11, see docs/agents/16-security-audit-preprod.md):
+// per-(username, ip) failed-login counter. The 5-attempt / 15-minute
+// window lockout in `backend/src/middleware/loginAttempt.ts` writes
+// here. The on-disk counter survives backend restarts, so an
+// attacker who times their burst around a deploy can't reset the
+// budget. The in-memory `authRateLimit` (rateLimit.ts) is a faster,
+// looser gate that complements this.
+model LoginAttempt {
+  username     String
+  ip           String
+  count        Int       @default(0)
+  windowStart  DateTime  @default(now())
+  lastFailedAt DateTime?
+
+  @@id([username, ip])
+  @@index([windowStart])
+}
+
 // Web SSH terminal sessions - compliance logging
 model TerminalSession {
   id          String            @id @default(uuid())
@@ -502,6 +520,13 @@ model TerminalSession {
   startTime   DateTime          @default(now())
   endTime     DateTime?
   error       String?           // connection error message if failed
+  // SECURITY (H14, see docs/agents/16-security-audit-preprod.md):
+  // JSON blob for per-session audit metadata. The WS terminal writes
+  // the redacted-output preview here on close — operators see the
+  // full plaintext live (over WS) but the audit row only contains the
+  // secrets-stripped copy. Free-form JSON so we can add fields
+  // (commands count, last-input bytes, etc.) without migrations.
+  metadata    Json?
   commands    TerminalCommand[]
 
   @@index([userId, startTime])

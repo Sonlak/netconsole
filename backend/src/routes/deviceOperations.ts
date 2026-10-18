@@ -9,7 +9,7 @@ import {
 } from '../services/deviceOperations.js';
 import { collectArpForDevice } from '../services/arpAddress.js';
 import { collectMacForDevice } from '../services/macAddress.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 async function readOperation(deviceId: string, type: JobType, res: Response) {

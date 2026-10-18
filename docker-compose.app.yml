@@ -164,6 +164,17 @@ services:
         NETCONSOLE_GIT_COMMIT: "${NETCONSOLE_GIT_COMMIT:-unknown}"
     container_name: netconsole-backend
     restart: unless-stopped
+    # SECURITY (C7, see docs/agents/16-security-audit-preprod.md):
+    # JWT_SECRET / CORS_ORIGINS are referenced from `secrets.env`
+    # (which is gitignored and lives on the VPS at
+    # `/opt/netconsole/secrets.env`). The .env-file ${VAR:?...} syntax
+    # makes docker compose refuse to start if a required variable is
+    # missing — there is no more silent fallback to a guessable
+    # default. Production secrets are NEVER inside the committed
+    # compose file.
+    env_file:
+      - path: ${SECRETS_ENV:-./secrets.env}
+        required: false
     # Phase 1: graceful shutdown window. SIGTERM handler in
     # backend/src/index.ts sets isShuttingDown=true (returns 503 from
     # /api/health so any future LB drains), closes HTTP server, stops
@@ -207,39 +218,44 @@ services:
       JOB_RETENTION_DAYS: 30
       LOG_ALERT_INTERVAL_SECONDS: 30
       SYSLOG_UDP_PORT: 1514
+      # SECURITY (M1, see docs/agents/16-security-audit-preprod.md):
+      # vendor credentials (LAB_SSH_*, JUNOS_REST_PASSWORD,
+      # IOSXE_API_PASSWORD, EOS_API_PASSWORD, NXOS_API_PASSWORD) all
+      # reference secrets.env via ${VAR:?msg}. The committed literal
+      # `Admin@123` is gone — a fresh deploy won't work without the
+      # operator-provided secrets file. Lab dev: copy `secrets.env.dev`
+      # from your private notes (NOT committed).
+      SYSLOG_ALLOWED_CIDRS: "10.10.20.0/24,127.0.0.0/8"
+      SYSLOG_BIND_ADDRESS: "0.0.0.0"
       LAB_SSH_ENABLED: "true"
-      LAB_SSH_USER: netconsole
-      LAB_SSH_PASSWORD: Admin@123
+      LAB_SSH_USER: ${LAB_SSH_USER:?LAB_SSH_USER must be set}
+      LAB_SSH_PASSWORD: ${LAB_SSH_PASSWORD:?LAB_SSH_PASSWORD must be set}
       JUNOS_NETCONF_SSH_ENABLED: "true"
       JUNOS_NETCONF_SSH_PORT: "830"
       JUNOS_REST_ENABLED: "true"
       JUNOS_REST_SCHEME: http
       JUNOS_REST_PORT: "8443"
       JUNOS_REST_VERIFY_TLS: "false"
-      JUNOS_REST_USER: netconsole
-      JUNOS_REST_PASSWORD: Admin@123
+      JUNOS_REST_USER: ${JUNOS_REST_USER:?JUNOS_REST_USER must be set}
+      JUNOS_REST_PASSWORD: ${JUNOS_REST_PASSWORD:?JUNOS_REST_PASSWORD must be set}
       IOSXE_API_ENABLED: "true"
       IOSXE_API_SCHEME: https
       IOSXE_API_PORT: "443"
       IOSXE_API_VERIFY_TLS: "false"
-      IOSXE_API_USER: netconsole
-      IOSXE_API_PASSWORD: Admin@123
-      # Multi-vendor APIs (added 2026-09-07). ENABLE_*_API flags gate
-      # whether the vendor backend will be used for matching devices.
-      # Disabled by default; flip true on a per-host basis when you've
-      # provisioned a real Arista / Cisco device with matching creds.
+      IOSXE_API_USER: ${IOSXE_API_USER:?IOSXE_API_USER must be set}
+      IOSXE_API_PASSWORD: ${IOSXE_API_PASSWORD:?IOSXE_API_PASSWORD must be set}
       EOS_API_ENABLED: "true"
       EOS_API_SCHEME: https
       EOS_API_PORT: "443"
       EOS_API_VERIFY_TLS: "false"
-      EOS_API_USER: netconsole
-      EOS_API_PASSWORD: Admin@123
+      EOS_API_USER: ${EOS_API_USER:?EOS_API_USER must be set}
+      EOS_API_PASSWORD: ${EOS_API_PASSWORD:?EOS_API_PASSWORD must be set}
       NXOS_API_ENABLED: "true"
       NXOS_API_SCHEME: http
       NXOS_API_PORT: "80"
       NXOS_API_VERIFY_TLS: "false"
-      NXOS_API_USER: netconsole
-      NXOS_API_PASSWORD: Admin@123
+      NXOS_API_USER: ${NXOS_API_USER:?NXOS_API_USER must be set}
+      NXOS_API_PASSWORD: ${NXOS_API_PASSWORD:?NXOS_API_PASSWORD must be set}
       KEA_API_URL: http://172.31.0.10:8000/
       # DR control agent — same lab subnet as DC (10.10.20.0/24 shared
       # between the two VPSes via router/site-to-site). Container exposes
@@ -266,17 +282,20 @@ services:
       # name `netbox-netbox`) can reach NetBox via the host's port mapping.
       # Port 8080: netbox is mapped 8080:8080 (host:container) — port 8001
       # is occupied by netconsole-kea-primary's control channel.
-      NETBOX_URL: "http://42.119.165.109:8080/api/"
-      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
-      # Multi-instance NetBox — enables AI assistant tools and the
-      # frontend /netbox-import page to target any registered instance.
-      # Production + netbox2 (the second NetBox stack on port 8081).
-      # netbox2 token is auto-set by lab/netbox/init/02-init2.py.
-      NETBOX_INSTANCES: '{"production":{"url":"http://42.119.165.109:8080/api/","token":"0123456789abcdef0123456789abcdef01234567"},"netbox2":{"url":"http://42.119.165.109:8081/api/","token":"fedcba9876543210fedcba9876543210fedcba98"}}'
+      # NetBox sync — SECURITY (C10, see docs/agents/16-security-audit-preprod.md):
+      # tokens are now in `secrets.env`, not in this file. Reference via
+      # `${VAR:?msg}` — docker compose refuses to start if the secret
+      # is missing. Production tokens rotate by editing secrets.env +
+      # restarting backend/worker; no commit needed.
+      NETBOX_URL: "http://127.0.0.1:8080/api/"
+      NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
+      # Multi-instance NetBox JSON — derived from individual tokens so
+      # we don't need to keep a duplicate set elsewhere.
+      NETBOX_INSTANCES: '{"production":{"url":"http://127.0.0.1:8080/api/","token":"'${NETBOX_TOKEN:?}'"},"netbox2":{"url":"http://127.0.0.1:8081/api/","token":"'${NETBOX_TOKEN_NETBOX2:?}'"}}'
       NETBOX_DEFAULT_INSTANCE: "production"
       SEED_DISABLED: "false"
-      CORS_ORIGINS: "http://localhost:8443,http://localhost:5173,http://42.119.165.109:8443,http://127.0.0.1:8443,https://localhost:8443,https://42.119.165.109:8443,https://127.0.0.1:8443"
-      JWT_SECRET: "d97aklKZ_BKmRrHtXH6fLSZs48AlwJpAU8_RdcuCKqBm_0Jufe8Rx-FkpGhQT-cu"
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in secrets.env}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS must be set in secrets.env}
       # AI Assistant (OpenAI). Set OPENAI_API_KEY in the GitHub Actions
       # deploy.yml environment block (or in /opt/netconsole/backend/.env
       # on the VPS) before this will return anything other than 503.
@@ -303,7 +322,14 @@ services:
       # the lab NIC (`10.10.20.20`) into the container. Without this,
       # Docker doesn't install a DNAT rule for UDP and the host kernel
       # silently drops the packet after the socket bind check.
-      - "1514:1514/udp"
+      #
+      # SECURITY (H3, see docs/agents/16-security-audit-preprod.md):
+      # Bound to the lab NIC only — the backend also enforces an
+      # in-process `SYSLOG_ALLOWED_CIDRS` allowlist (default
+      # `10.10.20.0/24,127.0.0.0/8`). Anything from the public NIC
+      # is dropped at the iptables level (see deploy.yml's "Open
+      # iptables" step).
+      - "10.10.20.20:1514:1514/udp"
     # Resource cap (added 2026-09-18). Backend holds long-lived SSH
     # sockets for every interactive terminal session (one per WS
     # connection) — without a cap, a runaway admin or memory leak can
@@ -377,10 +403,10 @@ services:
       POLL_INTERVAL_SECONDS: 1
       WORKER_NAME: netconsole-worker
       WORKER_CONCURRENCY: "8"
-      WORKER_AUTH_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3b3JrZXIiLCJyb2xlIjoid29ya2VyIiwidHlwZSI6IndvcmtlciIsImlhdCI6MTc4ODYyMzI3OSwiZXhwIjoxODIwMTU5Mjc5fQ.bELHMgB561GkhTyo8jGiHUQKKa22O_DhnoUoSKsmJLU"
+      WORKER_AUTH_TOKEN: ${WORKER_AUTH_TOKEN:?WORKER_AUTH_TOKEN must be set in secrets.env}
       LAB_SSH_ENABLED: "true"
-      LAB_SSH_USER: netconsole
-      LAB_SSH_PASSWORD: Admin@123
+      LAB_SSH_USER: ${LAB_SSH_USER:?LAB_SSH_USER must be set}
+      LAB_SSH_PASSWORD: ${LAB_SSH_PASSWORD:?LAB_SSH_PASSWORD must be set}
       LAB_SSH_PORT: "22"
       JUNOS_NETCONF_SSH_ENABLED: "true"
       JUNOS_NETCONF_SSH_PORT: "830"
@@ -388,36 +414,30 @@ services:
       JUNOS_REST_SCHEME: http
       JUNOS_REST_PORT: "8443"
       JUNOS_REST_VERIFY_TLS: "false"
-      JUNOS_REST_USER: netconsole
-      JUNOS_REST_PASSWORD: Admin@123
-      # Multi-vendor APIs (added 2026-09-07). ENABLE_*_API flags gate
-      # whether the vendor backend will be used for matching devices.
-      # Disabled by default; flip true on a per-host basis when you've
-      # provisioned a real Arista / Cisco device with matching creds.
+      JUNOS_REST_USER: ${JUNOS_REST_USER:?JUNOS_REST_USER must be set}
+      JUNOS_REST_PASSWORD: ${JUNOS_REST_PASSWORD:?JUNOS_REST_PASSWORD must be set}
       EOS_API_ENABLED: "true"
       EOS_API_SCHEME: https
       EOS_API_PORT: "443"
       EOS_API_VERIFY_TLS: "false"
-      EOS_API_USER: netconsole
-      EOS_API_PASSWORD: Admin@123
+      EOS_API_USER: ${EOS_API_USER:?EOS_API_USER must be set}
+      EOS_API_PASSWORD: ${EOS_API_PASSWORD:?EOS_API_PASSWORD must be set}
       IOSXE_API_ENABLED: "true"
       IOSXE_API_SCHEME: https
       IOSXE_API_PORT: "443"
       IOSXE_API_VERIFY_TLS: "false"
-      IOSXE_API_USER: netconsole
-      IOSXE_API_PASSWORD: Admin@123
+      IOSXE_API_USER: ${IOSXE_API_USER:?IOSXE_API_USER must be set}
+      IOSXE_API_PASSWORD: ${IOSXE_API_PASSWORD:?IOSXE_API_PASSWORD must be set}
       NXOS_API_ENABLED: "true"
       NXOS_API_SCHEME: http
       NXOS_API_PORT: "80"
       NXOS_API_VERIFY_TLS: "false"
-      NXOS_API_USER: netconsole
-      NXOS_API_PASSWORD: Admin@123
-      # Cisco IOS (non-XE) — IOSexec HTTP API. Requires `ip http server`
-      # + `ip http authentication local` on the device. No NETCONF/RESTCONF needed.
+      NXOS_API_USER: ${NXOS_API_USER:?NXOS_API_USER must be set}
+      NXOS_API_PASSWORD: ${NXOS_API_PASSWORD:?NXOS_API_PASSWORD must be set}
       IOS_HTTP_ENABLED: "true"
       IOS_HTTP_PORT: "443"
       IOS_HTTP_USER: netconsole
-      IOS_HTTP_PASSWORD: Admin@123
+      IOS_HTTP_PASSWORD: ${IOS_HTTP_PASSWORD:?IOS_HTTP_PASSWORD must be set}
       # NetBox sync — must match the value on the backend so the worker
       # talks to the same NetBox instance. The literal is the dev token
       # created by lab/netbox/init/01-init.py — rotate for prod via
@@ -425,13 +445,13 @@ services:
       # Use the VPS public IP so the worker can reach NetBox through the
       # host port mapping (8080 → 8080 inside the netbox container).
       # Port 8080 chosen because 8001 is occupied by kea-primary.
-      NETBOX_URL: "http://42.119.165.109:8080/api/"
-      NETBOX_TOKEN: "0123456789abcdef0123456789abcdef01234567"
-      # Multi-instance NetBox (added 2026-10-15) — enables AI assistant
-      # tools and frontend /netbox-import page to target any registered
-      # instance. Production + netbox2 (the second NetBox stack on
-      # port 8081). netbox2 token is auto-set by lab/netbox/init/02-init2.py.
-      NETBOX_INSTANCES: '{"production":{"url":"http://42.119.165.109:8080/api/","token":"0123456789abcdef0123456789abcdef01234567"},"netbox2":{"url":"http://42.119.165.109:8081/api/","token":"fedcba9876543210fedcba9876543210fedcba98"}}'
+      # SECURITY (C10): NETBOX_TOKEN pulled from secrets.env. The
+      # worker reaches NetBox on the host's loopback (we bind :8080 to
+      # 127.0.0.1 in the netbox compose; see docker-compose.netbox.yml).
+      NETBOX_URL: "http://127.0.0.1:8080/api/"
+      NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
+      # Multi-instance NetBox JSON — derived from secrets.env.
+      NETBOX_INSTANCES: '{"production":{"url":"http://127.0.0.1:8080/api/","token":"'${NETBOX_TOKEN:?}'"},"netbox2":{"url":"http://127.0.0.1:8081/api/","token":"'${NETBOX_TOKEN_NETBOX2:?}'"}}'
       NETBOX_DEFAULT_INSTANCE: "production"
       # Management prefix for IPAM sync. Creates /24 prefix in NetBox IPAM
       # and populates primary_ip4 on each device. Change to match your lab subnet.
@@ -452,7 +472,14 @@ services:
     restart: unless-stopped
     depends_on: [backend]
     ports:
-      - "0.0.0.0:8443:80"
+      # SECURITY (C11, see docs/agents/16-security-audit-preprod.md):
+      # Frontend now serves HTTPS on 443 inside the container (nginx
+      # listens on 443 with the cert from /etc/nginx/certs/). The
+      # host publish is 0.0.0.0:8443 → 443. Once a real CA-signed
+      # cert replaces the self-signed one, the browser warning goes
+      # away. Until then, this is still TLS-encrypted — just MITM-
+      # vulnerable by cert trust.
+      - "0.0.0.0:8443:443"
     networks:
       netconsole:
         ipv4_address: 172.31.0.5

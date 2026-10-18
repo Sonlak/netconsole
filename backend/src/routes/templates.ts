@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 export const templatesRouter = Router();
@@ -132,7 +132,11 @@ templatesRouter.get('/:id', async (req, res) => {
 
 // POST /api/templates - Create template from uploaded file
 // Body: { name, description, content } or { name, description, fileContent, originalFilename }
-templatesRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
+// SECURITY (C3): CRUD on a Jinja2 template store — VIEWER can stash
+// malicious templates to be rendered when other users bulk-deploy.
+// OPERATOR+ only. The /render endpoint is also mutating (it executes
+// Jinja2 against user-supplied content) so requireRole same.
+templatesRouter.post('/', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req: AuthenticatedRequest, res) => {
   const { name, description, content, fileContent, originalFilename } = req.body;
 
   if (!name || typeof name !== 'string' || !name.trim()) {
@@ -171,7 +175,7 @@ templatesRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res)
 });
 
 // PUT /api/templates/:id - Update template
-templatesRouter.put('/:id', authMiddleware, async (req: AuthenticatedRequest, res) => {
+templatesRouter.put('/:id', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req: AuthenticatedRequest, res) => {
   const { name, description, content } = req.body;
   const id = req.params.id as string;
 
@@ -217,7 +221,7 @@ templatesRouter.put('/:id', authMiddleware, async (req: AuthenticatedRequest, re
 });
 
 // DELETE /api/templates/:id
-templatesRouter.delete('/:id', authMiddleware, async (req: AuthenticatedRequest, res) => {
+templatesRouter.delete('/:id', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req: AuthenticatedRequest, res) => {
   const id = req.params.id as string;
   const existing = await prisma.configTemplate.findUnique({
     where: { id },
@@ -236,7 +240,7 @@ templatesRouter.delete('/:id', authMiddleware, async (req: AuthenticatedRequest,
 
 // POST /api/templates/render - Preview render without saving
 // Body: { content } - returns { content, vendor, rendered }
-templatesRouter.post('/render', (req, res) => {
+templatesRouter.post('/render', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   const { content } = req.body;
 
   if (!content || typeof content !== 'string') {

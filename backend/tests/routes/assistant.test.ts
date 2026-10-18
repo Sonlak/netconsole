@@ -139,7 +139,7 @@ function makeAdminToken(): string {
   return jwt.sign(
     { sub: 'admin', userId: 'user-1', username: 'admin', role: 'ADMIN' },
     process.env.JWT_SECRET!,
-    { expiresIn: '1h' },
+    { expiresIn: '1h', issuer: 'netconsole-backend', audience: 'netconsole' },
   );
 }
 

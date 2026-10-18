@@ -5,6 +5,12 @@ import { getDeviceById, registerDeviceOperationRoutes } from './deviceOperations
 import { devicePingRouter } from './devicePing.js';
 import { pingAndUpdateDevice } from '../services/devicePing.js';
 import { deviceCache } from '../services/deviceCache.js';
+// SECURITY (C3, see docs/agents/16-security-audit-preprod.md): mutations
+// to the device inventory must require OPERATOR+ role. VIEWER, even
+// though logged in, should not be able to add / delete devices (a fake
+// device could trigger credential spraying via the managedCheck
+// scheduler; deletion is a DoS on the inventory).
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 
 export const devicesRouter = Router();
 
@@ -87,7 +93,7 @@ registerDeviceOperationRoutes(devicesRouter);
 
 devicesRouter.get('/:id', getDeviceById);
 
-devicesRouter.post('/', async (req, res) => {
+devicesRouter.post('/', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const parsed = parseDeviceBody(req.body);
   if ('error' in parsed) {
     res.status(400).json({ error: parsed.error });
@@ -108,7 +114,7 @@ devicesRouter.post('/', async (req, res) => {
   }
 });
 
-devicesRouter.patch('/:id', async (req, res) => {
+devicesRouter.patch('/:id', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const { rack, unit } = req.body as { rack?: string; unit?: string };
 
   const data: Record<string, unknown> = {};
@@ -126,7 +132,7 @@ devicesRouter.patch('/:id', async (req, res) => {
 
   try {
     const device = await prisma.device.update({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       data,
     });
     // Phase 2: invalidate device list cache after an update. Field
@@ -140,7 +146,7 @@ devicesRouter.patch('/:id', async (req, res) => {
   }
 });
 
-devicesRouter.put('/:id', async (req, res) => {
+devicesRouter.put('/:id', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const parsed = parseDeviceBody(req.body, true);
   if ('error' in parsed) {
     res.status(400).json({ error: parsed.error });
@@ -148,7 +154,7 @@ devicesRouter.put('/:id', async (req, res) => {
   }
 
   try {
-    const existing = await prisma.device.findUnique({ where: { id: req.params.id } });
+    const existing = await prisma.device.findUnique({ where: { id: String(req.params.id) } });
     if (!existing) {
       res.status(404).json({ error: 'Device not found' });
       return;
@@ -165,7 +171,7 @@ devicesRouter.put('/:id', async (req, res) => {
     }
 
     const device = await prisma.device.update({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       data: {
         ...parsed.data,
         status: nextStatus,
@@ -189,9 +195,9 @@ devicesRouter.put('/:id', async (req, res) => {
   }
 });
 
-devicesRouter.delete('/:id', async (req, res) => {
+devicesRouter.delete('/:id', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
-    await prisma.device.delete({ where: { id: req.params.id } });
+    await prisma.device.delete({ where: { id: String(req.params.id) } });
     // Phase 2: invalidate cache after deletion.
     void deviceCache.invalidate();
     res.status(204).send();

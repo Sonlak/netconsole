@@ -92,11 +92,19 @@ describe('worker auth on /jobs endpoints', () => {
   });
 
     function makeWorkerToken(role = 'worker'): string {
-    return jwt.sign({ sub: 'worker', role }, process.env.JWT_SECRET!, { expiresIn: '1h' });
-  }
-  function makeAdminToken(): string {
-    return jwt.sign({ sub: 'admin', role: 'ADMIN' }, process.env.JWT_SECRET!, { expiresIn: '1h' });
-  }
+      return jwt.sign(
+        { sub: 'worker', role },
+        process.env.JWT_SECRET!,
+        { expiresIn: '1h', issuer: 'netconsole-backend', audience: 'netconsole' },
+      );
+    }
+    function makeAdminToken(): string {
+      return jwt.sign(
+        { sub: 'admin', role: 'ADMIN' },
+        process.env.JWT_SECRET!,
+        { expiresIn: '1h', issuer: 'netconsole-backend', audience: 'netconsole' },
+      );
+    }
 
   it('GET /jobs/queue returns 401 without a token', async () => {
     const res = await fetch(`${baseUrl}/queue`);

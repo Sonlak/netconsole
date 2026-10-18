@@ -161,7 +161,13 @@ dhcpRouter.get('/pools/:subnetId/leases', async (req, res) => {
   }
 });
 
-dhcpRouter.delete('/leases/:ip', async (req, res) => {
+// SECURITY (C3, C5, see docs/agents/16-security-audit-preprod.md):
+// wipe/add/delete DHCP lease endpoints can DoS every device on a
+// subnet (bank branches lose IP). Mount-level authMiddleware applies
+// (so login required), but VIEWER must NOT trigger these. Wiping a
+// pool is the most destructive — restrict to ADMIN; mutations to a
+// single lease go through OPERATOR+.
+dhcpRouter.delete('/leases/:ip', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
     const result = await deleteDhcpLease(ip);
@@ -173,7 +179,7 @@ dhcpRouter.delete('/leases/:ip', async (req, res) => {
   }
 });
 
-dhcpRouter.post('/pools/:subnetId/wipe', async (req, res) => {
+dhcpRouter.post('/pools/:subnetId/wipe', authMiddleware, requireRole('ADMIN'), async (req, res) => {
   try {
     const subnetId = Number(req.params.subnetId);
     if (!Number.isFinite(subnetId)) {
@@ -189,7 +195,7 @@ dhcpRouter.post('/pools/:subnetId/wipe', async (req, res) => {
   }
 });
 
-dhcpRouter.post('/leases', async (req, res) => {
+dhcpRouter.post('/leases', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const body = req.body as {
       ip?: string;
@@ -215,7 +221,7 @@ dhcpRouter.post('/leases', async (req, res) => {
   }
 });
 
-dhcpRouter.post('/leases/:ip/fix-static', async (req, res) => {
+dhcpRouter.post('/leases/:ip/fix-static', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
     const body = req.body as {
@@ -243,7 +249,7 @@ dhcpRouter.post('/leases/:ip/fix-static', async (req, res) => {
   }
 });
 
-dhcpRouter.post('/leases/:ip/unfix-static', async (req, res) => {
+dhcpRouter.post('/leases/:ip/unfix-static', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
     const body = req.body as { subnetId?: number; mac?: string };

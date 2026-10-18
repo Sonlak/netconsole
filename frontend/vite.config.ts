@@ -13,6 +13,14 @@ export default defineConfig(({ mode }) => {
         '@': fileURLToPath(new URL('./src', import.meta.url)),
       },
     },
+    // SECURITY (M10, see docs/agents/16-security-audit-preprod.md):
+    // source maps OFF for production. Source maps expose TSX source code
+    // (including comments, internal route paths, and any string literal
+    // that wasn't built away by Vite). For a banking prod build we
+    // never want the source map to ship to the browser.
+    build: {
+      sourcemap: false,
+    },
     server: {
       port: 5173,
       host: true,

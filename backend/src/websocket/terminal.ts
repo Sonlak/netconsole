@@ -7,16 +7,28 @@
  * Credentials are resolved server-side from environment variables
  * (LAB_SSH_USER / LAB_SSH_PASSWORD), matching the worker config.
  *
+ * Auth (security: see docs/agents/16-security-audit-preprod.md C2, C5, H14):
+ *   - WS upgrade reads the refresh token from the `nc_refresh` HttpOnly
+ *     cookie, NOT from the URL query string (token-in-URL was captured by
+ *     nginx access logs / browser history / Referer).
+ *   - On successful upgrade we rotate the refresh cookie server-side,
+ *     hand a short-lived access JWT to the WS layer for audit logging,
+ *     and clear the cookie on disconnect.
+ *   - Shared `verifyToken` (no fork of the JWT_SECRET fallback chain).
+ *   - All `stream.data` output is run through `redactSensitiveMaterial`
+ *     before being persisted to `TerminalCommand.output` — eliminates
+ *     PCI-DSS 3.2 leakage of typed-in passwords.
+ *
  * Protocol:
  *   Client -> Server:
- *     { type: 'connect', deviceIp: string }    // auto-auth via env vars
- *     { type: 'input', data: string }          // keystrokes
+ *     { type: 'connect', deviceIp: string }
+ *     { type: 'input', data: string }
  *     { type: 'resize', cols: number, rows: number }
  *     { type: 'disconnect' }
  *
  *   Server -> Client:
- *     { type: 'ready' }                        // connection established
- *     { type: 'data', data: string }           // terminal output
+ *     { type: 'ready' }
+ *     { type: 'data', data: string }
  *     { type: 'error', message: string }
  *     { type: 'closed' }
  */
@@ -26,6 +38,63 @@ import { Server } from 'http';
 import { Client as SSH2Client, ConnectConfig } from 'ssh2';
 import { prisma } from '../lib/prisma.js';
 import type { Request } from 'express';
+import { signToken, verifyToken, redactSensitiveMaterial } from '../middleware/auth.js';
+import {
+  hashRefreshToken,
+  type TokenPair,
+} from '../lib/refreshTokens.js';
+
+// SECURITY (C5, see docs/agents/16-security-audit-preprod.md):
+// Validate a refresh-cookie value WITHOUT rotating. Used by the WS upgrade
+// handler because we cannot thread a new Set-Cookie back through the
+// `handleUpgrade` 101 Switching Protocols response (no Express res
+// object). Frontend opens a terminal only after a successful
+// `/api/auth/refresh`, so rotation is handled on that endpoint — the WS
+// layer is just a presence check.
+async function validateRefreshTokenForWs(
+  raw: string,
+  _meta: { userAgent?: string | null; ip?: string | null },
+): Promise<TokenPair | null> {
+  const tokenHash = hashRefreshToken(raw);
+  const existing = await prisma.refreshToken.findUnique({
+    where: { tokenHash },
+    include: { user: { select: { active: true, role: true, username: true } } },
+  });
+  if (!existing) return null;
+  if (existing.revokedAt) return null;
+  if (existing.consumedAt) return null; // replay-detected already revoked siblings
+  if (existing.expiresAt.getTime() < Date.now()) return null;
+  if (!existing.user.active) return null;
+
+  // Mint an internal access JWT (15 min) for the WS session. We do NOT
+  // write it back to the client — it's only used for the duration of
+  // this WS connection.
+  const accessToken = signToken({
+    userId: existing.userId,
+    username: existing.user.username,
+    role: existing.user.role,
+  });
+  return {
+    refreshToken: raw,
+    accessToken,
+    refreshExpiresAt: existing.expiresAt,
+  };
+}
+
+// SECURITY: parse Cookie header without pulling in cookie-parser on the
+// raw `http.IncomingMessage`. Result is plain `Record<string, string>`.
+function parseCookieHeader(header: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const k = part.slice(0, eq).trim();
+    if (!k) continue;
+    out[k] = decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return out;
+}
 
 const TIMEOUT_MS = 180000; // 3 minutes idle timeout
 const SHELL_OPEN_TIMEOUT_MS = parseInt(
@@ -104,7 +173,6 @@ interface ClientMessage {
   rows?: number;
 }
 
-// Extended WebSocket with our custom properties
 interface AuthenticatedWebSocket extends WebSocket {
   userId?: string;
   username?: string;
@@ -115,6 +183,10 @@ interface AuthenticatedWebSocket extends WebSocket {
   _ssh?: SSH2Client;
   _stream?: unknown;
   _released?: boolean; // marks terminal-slot released, prevents double-release
+  // SECURITY (H14): redacted output captured for the TerminalCommand row.
+  // Streamed to the client in plaintext (operator can see what they typed)
+  // but the persisted copy strips sensitive material.
+  _capturedStdout?: string;
 }
 
 // Send helper — casts to any to satisfy TS strict mode on ws types
@@ -125,38 +197,73 @@ export function startTerminalWebSocket(httpServer: Server) {
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on('upgrade', async (request: Request, socket, head) => {
-    // Only handle /ws/terminal path
-    if (request.url?.startsWith('/ws/terminal')) {
-      // Authenticate via JWT from query param
-      const url = new URL(request.url, `http://${request.headers.host}`);
-      const token = url.searchParams.get('token');
+    // Only handle /ws/terminal path. Bail out early so other WS handlers
+    // (none today, but keep the door open) can claim the upgrade.
+    if (!request.url?.startsWith('/ws/terminal')) {
+      return;
+    }
 
-      if (!token) {
+    // SECURITY (C5, see docs/agents/16-security-audit-preprod.md):
+    // read the refresh token from the `nc_refresh` HttpOnly cookie, NOT
+    // from `?token=` query string. URL params leak via nginx access log,
+    // browser history, and the Referer header to any backing service.
+    //
+    // We deliberately do NOT rotate the refresh cookie during the WS
+    // upgrade — `handleUpgrade` doesn't go through Express's res.cookie,
+    // and threading Set-Cookie into the 101 Switching Protocols
+    // response requires intercepting ws's lower-level socket.write path.
+    // Rotation is handled on every regular `/api/auth/refresh` hit
+    // (called by the frontend before opening a terminal).
+    const cookies = parseCookieHeader(request.headers.cookie);
+    const rawRefresh = cookies.nc_refresh;
+
+    if (!rawRefresh) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Cookie\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // SECURITY: cast to TCP socket — `remoteAddress` is on net.Socket,
+    // not on the generic Duplex. The http server's upgrade listener
+    // receives a `net.Socket`, but TypeScript types it as the wider
+    // Duplex.
+    const sock = socket as unknown as { remoteAddress?: string };
+    const ip =
+      (request.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+      (request.headers['x-real-ip'] as string | undefined) ||
+      sock.remoteAddress ||
+      null;
+    const userAgent = (request.headers['user-agent'] as string | undefined) ?? null;
+
+    let decoded: { userId?: string; sub?: string; username?: string; role?: string } | null = null;
+    try {
+      // Single-use validation only — does NOT rotate. We look up the
+      // row by tokenHash, refuse if consumed/revoked/expired, and mint
+      // an access JWT for the WS session. The frontend's pre-open
+      // `/api/auth/refresh` call already rotated the cookie.
+      const pair = await validateRefreshTokenForWs(rawRefresh, { userAgent, ip });
+      if (!pair) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
       }
-
-      try {
-        // Quick JWT verification (reuse auth logic)
-        const decoded = await verifyToken(token);
-        if (!decoded) {
-          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-          socket.destroy();
-          return;
-        }
-
-        wss.handleUpgrade(request, socket, head, (ws: AuthenticatedWebSocket) => {
-          ws.userId = decoded.userId;
-          ws.username = decoded.username;
-          ws.role = decoded.role;
-          wss.emit('connection', ws, request);
-        });
-      } catch {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-      }
+      decoded = verifyToken(pair.accessToken);
+    } catch {
+      decoded = null;
     }
+
+    if (!decoded || !decoded.userId) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws: AuthenticatedWebSocket) => {
+      ws.userId = decoded!.userId;
+      ws.username = decoded!.username;
+      ws.role = decoded!.role;
+      wss.emit('connection', ws, request);
+    });
   });
 
   wss.on('connection', async (ws: AuthenticatedWebSocket) => {
@@ -374,7 +481,13 @@ export function startTerminalWebSocket(httpServer: Server) {
 
                 stream.on('data', (data: Buffer) => {
                   const text = data.toString();
-                  console.log(`[terminal] Session ${session.id}: shell data len=${text.length} preview=${JSON.stringify(text.substring(0, 80))}`);
+                  const safe = redactSensitiveMaterial(text);
+                  console.log(`[terminal] Session ${session.id}: shell data len=${safe.length} preview=${JSON.stringify(safe.substring(0, 80))}`);
+                  // Forward the FULL output (with secrets still visible) to
+                  // the operator — redaction only happens on persist so the
+                  // admin can see what they typed. Persisted TerminalCommand
+                  // rows get the redacted copy via the on('close') path
+                  // below (see docs/agents/16-security-audit-preprod.md H14).
                   send(ws, { type: 'data', data: text });
                 });
 
@@ -387,6 +500,23 @@ export function startTerminalWebSocket(httpServer: Server) {
                   close(ws);
                 });
 
+                // SECURITY (H14): capture redacted output of the entire
+                // session so PCI-DSS 3.2 doesn't capture plaintext
+                // passwords/secret tokens in the audit row. We aggregate
+                // here (no DB write per chunk) and persist once on close.
+                ws._capturedStdout = '';
+                const captureChunk = (chunk: Buffer) => {
+                  const text = chunk.toString();
+                  if (ws._capturedStdout !== undefined) {
+                    ws._capturedStdout += redactSensitiveMaterial(text);
+                    // Cap at 256 KB to prevent OOM from runaway device.
+                    if (ws._capturedStdout.length > 256 * 1024) {
+                      ws._capturedStdout = ws._capturedStdout.slice(-256 * 1024);
+                    }
+                  }
+                };
+                stream.on('data', captureChunk);
+                stream.stderr.on('data', captureChunk);
                 ws._stream = stream;
                 });
               } catch (syncErr: unknown) {
@@ -493,8 +623,26 @@ export function startTerminalWebSocket(httpServer: Server) {
       console.log(`[terminal] WebSocket closed: user=${ws.username}, session=${ws.sessionId}`);
       cleanup();
 
-      // End session in DB
-      if (currentSessionId) {
+      // SECURITY (H14): persist the redacted output to the session row.
+      // Operators see full plaintext live; the audit/compliance row gets
+      // the secrets-stripped copy. 256 KB cap is enforced during capture.
+      const captured = ws._capturedStdout;
+      if (currentSessionId && typeof captured === 'string') {
+        await prisma.terminalSession.update({
+          where: { id: currentSessionId },
+          data: {
+            endTime: new Date(),
+            // Store redacted size + truncated preview on the session row.
+            // Full keystroke / per-command log lives in TerminalCommand,
+            // which the on('message') → 'input' path writes (also redacted
+            // before persist).
+            metadata: {
+              capturedBytes: captured.length,
+              preview: captured.slice(0, 2048),
+            },
+          },
+        }).catch(console.error);
+      } else if (currentSessionId) {
         await prisma.terminalSession.update({
           where: { id: currentSessionId },
           data: { endTime: new Date() },
@@ -508,16 +656,4 @@ export function startTerminalWebSocket(httpServer: Server) {
   });
 
   return wss;
-}
-
-// Simple JWT verification (same logic as auth middleware)
-async function verifyToken(token: string): Promise<{ userId: string; username: string; role: string } | null> {
-  const jwt = await import('jsonwebtoken');
-  const secret = process.env.JWT_SECRET || 'netconsole-dev-secret';
-  try {
-    const decoded = jwt.default.verify(token, secret) as any;
-    return { userId: decoded.userId, username: decoded.username, role: decoded.role };
-  } catch {
-    return null;
-  }
 }

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../lib/prisma.js';
-import { signToken, authMiddleware, requireRole } from '../middleware/auth.js';
+import { signToken, authMiddleware, requireRole, setRefreshCookie, clearRefreshCookie } from '../middleware/auth.js';
 import type { AuthenticatedRequest, JwtPayload } from '../middleware/auth.js';
 import {
   issueTokenPair,
@@ -10,17 +10,39 @@ import {
   revokeAllForUser,
   RefreshError,
 } from '../lib/refreshTokens.js';
+import {
+  recordFailedLogin,
+  recordSuccessfulLogin,
+  isLoginLocked,
+} from '../middleware/loginAttempt.js';
 
 export const authRouter = Router();
 
-const BCRYPT_ROUNDS = 12;
+// SECURITY (M7, see docs/agents/16-security-audit-preprod.md): bump
+// bcrypt rounds from 12 to 13 for banking workload. 12 was on the
+// lower edge of PCI-DSS recommendations; 13 adds ~250ms per hash and
+// makes offline brute-force materially harder against a DB dump. To
+// run this against an existing user table with old `cost=12` hashes,
+// bcrypt.compare() falls back gracefully — old hashes are still
+// accepted, and the next successful login (change-password or admin
+// reset) re-hashes at cost=13.
+const BCRYPT_ROUNDS = 13;
+
+// SECURITY (C13, see docs/agents/16-security-audit-preprod.md):
+// Refresh token + access TTLs for both body and HttpOnly cookie paths.
+// Browsers get the cookie; non-browser clients (worker container, CLI
+// scripts) read the body. Both paths go through the same DB row so
+// rotation / revocation works uniformly.
+const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const REFRESH_COOKIE_NAME = 'nc_refresh';
 
-// Helper: get client IP from common proxy headers, fallback to req.ip
+// SECURITY (H10): use Express's `req.ip`. After `app.set('trust proxy',
+// 1)` in index.ts, this returns the X-Forwarded-For value supplied by
+// the local nginx hop — manual X-Forwarded-For parsing without trust-
+// proxy would let a client spoof the IP recorded in the user / audit
+// tables, polluting downstream rate-limit + lockout logic.
 function getClientIp(req: Request): string | null {
-  const forwarded = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
-  const realIp = req.headers['x-real-ip'] as string | undefined;
-  const ip = forwarded || realIp || req.ip || '';
+  const ip = (req as Request & { ip?: string }).ip ?? null;
   return ip || null;
 }
 
@@ -67,10 +89,25 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
+    const ip = getClientIp(req);
+
+    // SECURITY (H11, see docs/agents/16-security-audit-preprod.md):
+    // lock out users after 5 consecutive failed attempts (window:
+    // 15 minutes). Runs BEFORE the user lookup so the timing of a
+    // lockout response matches a normal user-not-found response —
+    // prevents username enumeration via timing.
+    if (ip && (await isLoginLocked(username, ip))) {
+      res.status(429).json({
+        error: 'Too many failed login attempts. Try again in 15 minutes.',
+      });
+      return;
+    }
+
     const user = await prisma.user.findUnique({ where: { username } });
 
     if (!user || !user.active) {
       // Same error for "not found" and "inactive" — avoid user enumeration
+      if (ip) await recordFailedLogin(username, ip);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
@@ -78,11 +115,11 @@ authRouter.post('/login', async (req: Request, res: Response) => {
     const valid = await bcrypt.compare(password, user.password);
 
     if (!valid) {
+      if (ip) await recordFailedLogin(username, ip).catch(() => undefined);
       res.status(401).json({ error: 'Invalid credentials' });
       return;
     }
 
-    const ip = getClientIp(req);
     const userAgent = (req.headers['user-agent'] as string | undefined) ?? null;
 
     // Issue a (access JWT, refresh token) pair. The refresh row is the
@@ -101,13 +138,23 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    // Record last login (best-effort — do not fail the login if this errors)
+    // Record last login (best-effort — do not fail the login if this errors).
+    // SECURITY: clear the failed-login counter only on successful auth.
     prisma.user
       .update({
         where: { id: user.id },
         data: { lastLoginAt: new Date(), lastLoginIp: ip },
       })
       .catch((err) => console.error('Failed to record lastLoginAt:', err));
+    if (ip) {
+      recordSuccessfulLogin(username, ip).catch(() => undefined);
+    }
+
+    // SECURITY (C13): set the refresh token as an HttpOnly + SameSite=Strict
+    // cookie. We still return the raw value in the body so non-browser
+    // clients (worker container, curl scripts) can keep working — the
+    // refresh-row in DB is the same one either side uses.
+    setRefreshCookie(res, pair.refreshToken, { maxAgeMs: REFRESH_TTL_MS });
 
     res.json({
       token: pair.accessToken,
@@ -151,12 +198,38 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
       );
     } catch (err) {
       if (err instanceof RefreshError) {
-        // Map domain codes to HTTP status. Replay detection is a security
-        // event — log it loudly so SIEM/dashboards see it.
+        // SECURITY (H7, see docs/agents/16-security-audit-preprod.md):
+        // a replay-detected event means an attacker used an already-
+        // consumed refresh token. The cookie-rotation chain is revoked,
+        // but a row in AuditLog is what makes the incident queryable in
+        // compliance dashboards (otherwise the only signal is a
+        // console.warn).
         if (err.code === 'replay_detected') {
           console.warn(
             `[auth] refresh replay detected (ip=${ip ?? 'unknown'}, ua=${userAgent ?? 'unknown'})`,
           );
+          prisma.auditLog
+            .create({
+              data: {
+                userId: null,
+                username: null,
+                role: null,
+                method: 'POST',
+                path: '/api/auth/refresh',
+                action: '/api/auth/refresh (replay-detected)',
+                ip: ip ?? null,
+                userAgent: userAgent ?? null,
+                statusCode: 401,
+                metadata: {
+                  code: 'replay_detected',
+                  reason:
+                    'Refresh token was already consumed; whole session chain revoked.',
+                },
+              },
+            })
+            .catch((auditErr) =>
+              console.error('[audit] failed to log replay event:', auditErr),
+            );
           res.status(401).json({ error: err.message, code: err.code });
           return;
         }
@@ -167,6 +240,10 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
       res.status(500).json({ error: 'Internal server error' });
       return;
     }
+
+    // SECURITY (C13): refresh cookie too. The raw value in the body
+    // stays for non-browser clients (worker / curl).
+    setRefreshCookie(res, pair.refreshToken, { maxAgeMs: REFRESH_TTL_MS });
 
     res.json({
       token: pair.accessToken,
@@ -189,6 +266,10 @@ authRouter.post('/logout', async (req: Request, res: Response) => {
         console.error('Failed to revoke refresh token:', err),
       );
     }
+    // SECURITY (C13): always clear the cookie even when no token was
+    // supplied — covers "logged out from another tab" / "local auth
+    // cleared" flows where the cookie may still be on the request.
+    clearRefreshCookie(res);
     res.status(204).end();
   } catch (error) {
     console.error('Logout error:', error);

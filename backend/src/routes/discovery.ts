@@ -5,6 +5,7 @@ import {
   syncDiscoveryResults,
 } from '../services/discoveryScan.js';
 import { normalizeCidr } from '../utils/subnet.js';
+import { requireRole } from '../middleware/auth.js';
 
 export const discoveryRouter = Router();
 
@@ -37,7 +38,13 @@ discoveryRouter.get('/scans/:id', async (req, res) => {
   res.json(scan);
 });
 
-discoveryRouter.post('/scans', async (req, res) => {
+// SECURITY (C3, see docs/agents/16-security-audit-preprod.md):
+// VIEWER must not be able to trigger subnet scans. Scan uses backend
+// SSH/API credentials to probe every IP in the supplied CIDR — a
+// weaponised SSRF / credential-spraying tool if the CIDR is not
+// restricted. OPERATOR+ only. Login is enforced by the mount-level
+// authMiddleware in index.ts.
+discoveryRouter.post('/scans', requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const { subnet, site, floor } = req.body as {
     subnet?: string;
     site?: string;
@@ -60,7 +67,7 @@ discoveryRouter.post('/scans', async (req, res) => {
   }
 });
 
-discoveryRouter.post('/scans/:id/sync', async (req, res) => {
+discoveryRouter.post('/scans/:id/sync', requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const { resultIds, site, floor } = req.body as {
     resultIds?: string[];
     site?: string;

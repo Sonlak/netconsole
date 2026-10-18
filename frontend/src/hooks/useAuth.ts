@@ -97,7 +97,16 @@ export function useAuth() {
     try {
       const response = await apiLogin(credentials);
       saveToken(response.token);
-      saveRefreshToken(response.refreshToken, response.refreshExpiresAt);
+      // SECURITY (C13, see docs/agents/16-security-audit-preprod.md):
+      // refresh token is now primarily in the HttpOnly cookie. The
+      // body field is still present (workers / non-browser clients
+      // rely on it), but for browsers we only mirror it to
+      // localStorage as a best-effort fallback for the in-tab
+      // refresh coordinator. The actual rotation goes through the
+      // cookie on the next /api/auth/refresh call.
+      if (response.refreshToken && response.refreshExpiresAt) {
+        saveRefreshToken(response.refreshToken, response.refreshExpiresAt);
+      }
       const user = buildUser(response);
       setStoredUser(user);
       setState({

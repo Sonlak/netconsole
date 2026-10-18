@@ -15,7 +15,24 @@ RUN npm run build
 
 FROM nginx:1.27-alpine
 
+# SECURITY (M12, see docs/agents/16-security-audit-preprod.md):
+# the default nginx image ships nginx running as root. Running the
+# master process as root means a vulnerable route-handler module or
+# a writable static file is a privilege-escalation lever. The
+# official nginx base image already has an unprivileged `nginx` user;
+# we just swap to it. /var/cache/nginx + /var/run + /var/log/nginx
+# are pre-created and chown'd in the entrypoint of the base image.
+RUN chown -R nginx:nginx /usr/share/nginx/html /etc/nginx/conf.d
+USER nginx
+
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+# TLS material lives in /etc/nginx/certs. We copy cert files only
+# when they exist; otherwise nginx will fail to start, which is the
+# correct behaviour for prod (a missing cert is a deploy failure, not
+# a silent fallback to HTTP).
+# For local dev (no cert), use `nginx-http.conf` via an override
+# compose service OR set LISTEN_HTTP_ONLY=1 + a self-signed cert with
+# `python3 frontend/certs/generate_self_signed.py` first.
 COPY certs/cert.pem /etc/nginx/certs/cert.pem
 COPY certs/key.pem  /etc/nginx/certs/key.pem
 COPY --from=build /app/dist /usr/share/nginx/html

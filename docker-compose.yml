@@ -1,4 +1,10 @@
 services:
+  # SECURITY (C2 / H1, see docs/agents/16-security-audit-preprod.md):
+  # Postgres 5432 was previously published on `0.0.0.0:5432` in the
+  # dev compose. That binds the database to every interface with the
+  # default `netconsole/netconsole` credential. Restricted to
+  # loopback so a fresh `docker compose up` from this file does not
+  # expose a Postgres instance to the public NIC.
   postgres:
     image: postgres:16-alpine
     container_name: netconsole-postgres
@@ -8,7 +14,7 @@ services:
       POSTGRES_PASSWORD: netconsole
       POSTGRES_DB: netconsole
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - netconsole_pgdata:/var/lib/postgresql/data
 

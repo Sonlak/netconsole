@@ -88,8 +88,16 @@ export async function handleResponse<T>(response: Response): Promise<T> {
 }
 
 export function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  // SECURITY (C13, see docs/agents/16-security-audit-preprod.md):
+  // every authenticated request must include credentials so the
+  // browser sends the HttpOnly refresh cookie. Without this, the
+  // browser would NOT send the cookie and the user would be forced
+  // to log in every 15 minutes (when the access JWT expires).
+  // The backend uses `SameSite=Strict` so this only flows on
+  // same-origin requests.
   return fetch(url, {
     ...options,
+    credentials: 'include',
     headers: {
       ...authHeaders(),
       ...(options.headers || {}),

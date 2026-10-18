@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { JobStatus, JobType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
-import { authMiddleware, verifyToken } from '../middleware/auth.js';
+import { authMiddleware, verifyToken, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 import { applyManagedCheckResult } from '../services/managedCheck.js';
 import { applyCollectedDeviceFacts } from '../services/deviceIdentity.js';
@@ -16,8 +16,13 @@ export const jobsRouter = Router();
 /**
  * Worker-only auth. Accepts a Bearer JWT signed with JWT_SECRET whose payload
  * has `role: "worker"`. Returns 401 otherwise.
+ *
+ * SECURITY (C4, see docs/agents/16-security-audit-preprod.md):
+ * apply-ssh in routes/interfaces.ts used to be reachable by any logged-in
+ * user, including VIEWER. We export this so other routes can mount
+ * it and lock the path to worker-only.
  */
-const workerAuth = (req: AuthenticatedRequest, res: import('express').Response, next: import('express').NextFunction): void => {
+export const workerAuth = (req: AuthenticatedRequest, res: import('express').Response, next: import('express').NextFunction): void => {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Unauthorized: worker credentials required' });
@@ -441,7 +446,10 @@ jobsRouter.patch('/:id/complete', workerAuth, async (req, res) => {
   }
 });
 
-jobsRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
+// SECURITY (C3): POST /api/jobs creates a job (often APPLY_CONFIG /
+// INTERFACE_ACTION / ROLLBACK_CONFIG). VIEWER must not be able to
+// queue destructive jobs. OPERATOR+ only.
+jobsRouter.post('/', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req: AuthenticatedRequest, res) => {
   if (!req.user) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
@@ -536,7 +544,7 @@ jobsRouter.post('/', authMiddleware, async (req: AuthenticatedRequest, res) => {
  * everything" button. Idempotent — running it twice in a row produces
  * the same NetBox state (PATCH on existing, POST on new).
  */
-jobsRouter.post('/netbox-sync-all', authMiddleware, async (req: AuthenticatedRequest, res) => {
+jobsRouter.post('/netbox-sync-all', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req: AuthenticatedRequest, res) => {
   if (!req.user) {
     res.status(401).json({ error: 'Unauthorized' });
     return;

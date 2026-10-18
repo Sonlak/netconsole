@@ -58,12 +58,18 @@ export function rateLimit(options: RateLimitOptions) {
 
 // Pre-configured rate limiters
 // Internal lab: keep limits very high so reads from the dashboard never trip during normal use.
-export const strictRateLimit = rateLimit({ windowMs: 60 * 1000, max: 600 }); // 600 requests per minute
+export const strictRateLimit = rateLimit({ windowMs: 60 * 1000, max: 200 }); // 200 requests per minute
 export const moderateRateLimit = rateLimit({ windowMs: 60 * 1000, max: 600 }); // 600 requests per minute
-// Auth rate-limit keyed by username (or ip if no body) so NAT'd users don't share counters
+// SECURITY (H11, see docs/agents/16-security-audit-preprod.md):
+// the in-memory `authRateLimit` is the FAST gate before the DB-backed
+// lockout in loginAttempt.ts kicks in. PCI-DSS guidance is 5-10
+// attempts. We use 10/15 min here (in addition to the 5-strike
+// lockout) so a single attacker can't drive the DB into a tight loop
+// even before the lockout fires. After 5 consecutive fails, the
+// DB lockout responds 429 faster than this middleware would.
 export const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: 10,
   message: 'Too many login attempts, please try again after 15 minutes',
   keyGenerator: (req) => {
     try {
@@ -72,5 +78,5 @@ export const authRateLimit = rateLimit({
     } catch {}
     return `ip:${req.ip || 'unknown'}`;
   },
-}); // 200 attempts per 15 minutes per username
+}); // 10 attempts per 15 minutes per username
 export const scanRateLimit = rateLimit({ windowMs: 60 * 1000, max: 30, message: 'Too many scan requests, please wait' }); // 30 scans per minute

@@ -5,6 +5,7 @@ import {
 } from '../services/macAddress.js';
 import { runIosxeSshCommand } from '../services/labSsh.js';
 import { prisma } from '../lib/prisma.js';
+import { requireRole } from '../middleware/auth.js';
 
 export const macAddressesRouter = Router();
 
@@ -13,7 +14,7 @@ macAddressesRouter.get('/', async (_req, res) => {
   res.json(inventory);
 });
 
-macAddressesRouter.post('/collect', async (_req, res) => {
+macAddressesRouter.post('/collect', requireRole('OPERATOR', 'ADMIN'), async (_req, res) => {
   const result = await collectMacAddressesForManagedDevices();
   res.status(202).json(result);
 });

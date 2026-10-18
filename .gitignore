@@ -147,6 +147,23 @@ worker/_*.py
 
 # Cursor/agent scratch helpers (exploration scripts, probes, dumps)
 .tmp-cfg/
+# NetConsole security artifacts (NEVER commit, see docs/agents/16-security-audit-preprod.md)
+#   * login.json — contained plaintext admin password (removed 2026-10-18)
+#   * secrets.env — production secrets (JWT_SECRET, WORKER_AUTH_TOKEN, vendor API creds)
+#   * frontend/certs/*.pem — TLS material; use scripts/install_real_cert.sh on the VPS
+/login.json
+/secrets.env
+/secrets.env.local
+/secrets.*.env
+/frontend/certs/cert.pem
+/frontend/certs/key.pem
+/frontend/certs/*.csr
+/.ua/.trash-*/
+/.ua/.ua-trash-*/
+/.ua/intermediate/
+/.ua/knowledge-graph.json
+/.ua/meta.json
+/.ua/fingerprints.json
 
 # Cache directories
 .ruff_cache/

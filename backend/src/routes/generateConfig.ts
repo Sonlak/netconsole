@@ -8,7 +8,7 @@ import {
   type ConfigRole,
 } from '../services/labConfigTemplates.js';
 import { tryCreateDeviceJob } from '../services/deviceOperations.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 export const generateConfigRouter = Router();
@@ -200,7 +200,11 @@ function validateConfigPayload(
   return { ok: true };
 }
 
-generateConfigRouter.post('/devices/:id/commit', authMiddleware, (req: AuthenticatedRequest, res) => {
+// SECURITY (C3): committing a config to a network device is the most
+// destructive action in the app — VIEWER must never be able to push
+// config. OPERATOR+ only. (Bulk-commit further down restricted the
+// same way.)
+generateConfigRouter.post('/devices/:id/commit', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req: AuthenticatedRequest, res) => {
   void (async () => {
     const device = await prisma.device.findUnique({
       where: { id: req.params.id as string },
@@ -281,7 +285,7 @@ generateConfigRouter.post('/devices/:id/commit', authMiddleware, (req: Authentic
   })();
 });
 
-generateConfigRouter.post('/devices/:id/rollback', authMiddleware, (req: AuthenticatedRequest, res) => {
+generateConfigRouter.post('/devices/:id/rollback', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req: AuthenticatedRequest, res) => {
   void (async () => {
     const device = await prisma.device.findUnique({
       where: { id: req.params.id as string },
@@ -320,7 +324,7 @@ generateConfigRouter.post('/devices/:id/rollback', authMiddleware, (req: Authent
  *
  * Caps at 64 devices per request to keep the response bounded.
  */
-generateConfigRouter.post('/bulk-commit', authMiddleware, (req, res) => {
+generateConfigRouter.post('/bulk-commit', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   void (async () => {
     const userId = (req as AuthenticatedRequest).user?.userId ?? null;
 

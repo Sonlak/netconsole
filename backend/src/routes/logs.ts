@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { LogFacility, LogSeverity } from '@prisma/client';
 import { strictRateLimit, moderateRateLimit } from '../middleware/rateLimit.js';
 import { isAllowedLogFilename, JUNOS_LOG_FILES } from '../lib/junosLogFiles.js';
+import { requireRole } from '../middleware/auth.js';
 import {
   deleteLogsForDevice,
   listLogs,
@@ -101,7 +102,13 @@ logsRouter.get('/files', strictRateLimit, (_req, res) => {
   res.json({ files: JUNOS_LOG_FILES, default: 'messages' });
 });
 
-logsRouter.post('/collect', moderateRateLimit, async (req, res) => {
+// SECURITY (C3, see docs/agents/16-security-audit-preprod.md): log
+// paths are state-changing AND carry forensic weight (deleting logs
+// for a device is anti-forensics; injecting alert rules with attacker
+// regex is a ReDoS vector). All mutating log endpoints restricted to
+// OPERATOR+ — DELETE on a device's logs and on alert rows are ADMIN
+// only (admin-only destructive actions get an extra gate).
+logsRouter.post('/collect', moderateRateLimit, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const body = (req.body ?? {}) as { filename?: unknown; deviceIds?: unknown; force?: unknown };
   const filename = typeof body.filename === 'string' && body.filename ? body.filename : 'messages';
   if (!isAllowedLogFilename(filename)) {
@@ -116,7 +123,7 @@ logsRouter.post('/collect', moderateRateLimit, async (req, res) => {
   res.status(202).json(result);
 });
 
-logsRouter.delete('/device/:deviceId', moderateRateLimit, async (req, res) => {
+logsRouter.delete('/device/:deviceId', moderateRateLimit, requireRole('ADMIN'), async (req, res) => {
   const result = await deleteLogsForDevice(String(req.params.deviceId));
   res.json(result);
 });
@@ -131,7 +138,7 @@ logsRouter.get('/rules', strictRateLimit, async (req, res) => {
 });
 
 // POST /api/logs/rules
-logsRouter.post('/rules', moderateRateLimit, async (req, res) => {
+logsRouter.post('/rules', moderateRateLimit, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const { name, description, deviceId, minSeverity, messagePattern, facility } = body;
 
@@ -178,7 +185,7 @@ logsRouter.post('/rules', moderateRateLimit, async (req, res) => {
 });
 
 // PUT /api/logs/rules/:id
-logsRouter.put('/rules/:id', moderateRateLimit, async (req, res) => {
+logsRouter.put('/rules/:id', moderateRateLimit, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const body = (req.body ?? {}) as Record<string, unknown>;
   const { name, description, deviceId, minSeverity, messagePattern, facility, enabled } = body;
 
@@ -221,7 +228,7 @@ logsRouter.put('/rules/:id', moderateRateLimit, async (req, res) => {
 });
 
 // DELETE /api/logs/rules/:id
-logsRouter.delete('/rules/:id', moderateRateLimit, async (req, res) => {
+logsRouter.delete('/rules/:id', moderateRateLimit, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const ok = await deleteAlertRule(String(req.params.id));
   if (!ok) {
     res.status(404).json({ error: 'Rule not found' });
@@ -268,7 +275,7 @@ logsRouter.post('/alerts/:id/acknowledge', moderateRateLimit, async (req, res) =
 });
 
 // DELETE /api/logs/alerts/:id
-logsRouter.delete('/alerts/:id', moderateRateLimit, async (req, res) => {
+logsRouter.delete('/alerts/:id', moderateRateLimit, requireRole('ADMIN'), async (req, res) => {
   const ok = await deleteAlert(String(req.params.id));
   if (!ok) {
     res.status(404).json({ error: 'Alert not found' });

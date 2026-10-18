@@ -7,8 +7,13 @@ import {
 } from '../services/interfaces.js';
 import { prisma } from '../lib/prisma.js';
 import { runIosxeSshApply } from '../services/labSsh.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import type { AuthenticatedRequest } from '../middleware/auth.js';
+// SECURITY (C4, see docs/agents/16-security-audit-preprod.md):
+// apply-ssh used to be a public-mutating endpoint with no auth at all.
+// Now it's worker-only — the same path the worker reaches during its
+// fallback after SSH produces zero output.
+import { workerAuth } from './jobs.js';
 
 export const interfacesRouter = Router();
 
@@ -57,7 +62,9 @@ interfacesRouter.get('/:deviceId', async (req, res) => {
   });
 });
 
-interfacesRouter.post('/:deviceId/collect', authMiddleware, (req, res) => {
+// SECURITY (C3): forcing an interface re-collect can DoS the device
+// with SSH/RESTCONF probe storms. OPERATOR+ only.
+interfacesRouter.post('/:deviceId/collect', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   void (async () => {
     const deviceId = String(req.params.deviceId);
     const userId = (req as AuthenticatedRequest).user?.userId ?? null;
@@ -72,7 +79,9 @@ interfacesRouter.post('/:deviceId/collect', authMiddleware, (req, res) => {
   })();
 });
 
-interfacesRouter.post('/:deviceId/actions', authMiddleware, (req, res) => {
+// SECURITY (C3): shutting / no-shutting an interface is destructive.
+// VIEWER must NEVER be able to flip a port. OPERATOR+ only.
+interfacesRouter.post('/:deviceId/actions', authMiddleware, requireRole('OPERATOR', 'ADMIN'), (req, res) => {
   void (async () => {
     const deviceId = String(req.params.deviceId);
     const userId = (req as AuthenticatedRequest).user?.userId ?? null;
@@ -183,7 +192,11 @@ interfacesRouter.get('/:deviceId/show-run', async (req, res) => {
  * IOS-XE. Real prod devices with NETCONF/candidate support should still
  * flow through the normal queue (see backend config gotcha #14).
  */
-interfacesRouter.post('/:deviceId/apply-ssh', async (req, res) => {
+// SECURITY (C4): this used to be reachable by any authenticated user
+// including VIEWER, with no auth at all. Restrict to worker tokens
+// (mirrors how IOSxeBackend.apply_config reaches this endpoint from
+// the worker container).
+interfacesRouter.post('/:deviceId/apply-ssh', workerAuth, async (req, res) => {
   const deviceId = String(req.params.deviceId);
   const commandsRaw: unknown[] = Array.isArray(req.body?.commands) ? req.body.commands : [];
   if (commandsRaw.length === 0) {

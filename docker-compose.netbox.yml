@@ -103,22 +103,25 @@ services:
       REDIS_DB: 0
       # Allow both host (via :8001) and the in-network alias
       ALLOWED_HOSTS: "*"
-      # SECRET_KEY must be at least 50 chars (NetBox's Django check
-      # rejects shorter keys at startup — causes 'Models aren't loaded
-      # yet' because Django.setup() aborts before the app registry is
-      # built). Pad with non-secret noise here; rotate for prod via
-      # `docker exec netbox-netbox python /opt/netbox/netbox/generate_secret_key.py`.
-      SECRET_KEY: "netbox-dev-secret-CHANGE-ME-in-prod-9kj3hdks02-padding-1234"
+      # SECURITY: SECRET_KEY referenced from secrets.env. The literal
+      # `netbox-dev-secret-CHANGE-ME-in-prod-...` was a known committed
+      # secret. Replace by:
+      #    python3 -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+      # and paste into secrets.env as NETBOX_SECRET_KEY.
+      SECRET_KEY: ${NETBOX_SECRET_KEY:?NETBOX_SECRET_KEY must be set in secrets.env}
+      # SECURITY: SUPERUSER_PASSWORD pulled from secrets.env. Default
+      # `Admin@123` is removed. To bootstrap the first admin:
+      #   1. Put a strong password in secrets.env (NETBOX_SUPERUSER_PASSWORD)
+      #   2. First `docker compose up` runs lab/netbox/init/01-init.py
+      #      which sets the password from this env.
       SUPERUSER_NAME: admin
-      SUPERUSER_PASSWORD: Admin@123
+      SUPERUSER_PASSWORD: ${NETBOX_SUPERUSER_PASSWORD:?NETBOX_SUPERUSER_PASSWORD must be set in secrets.env}
       SUPERUSER_EMAIL: admin@netconsole.local
       SKIP_STARTUP_SCRIPTS: "false"
-      # Skip the supervisord housekeeping that pulls git, runs Housekeeping
-      # commands, etc. — none of which is needed for a local dev/test instance.
-      # Set to "true" to make the container run NetBox in a single process for
-      # faster startup. We use it because we don't have a real Redis cache
-      # background process to manage.
-      DEBUG: "true"
+      # SECURITY: DEBUG off in production. The previous `true` was
+      # letting stack traces leak DB schema + SECRET_KEY on any 500
+      # response. With DEBUG=false, NetBox returns a generic 500 page.
+      DEBUG: "false"
     volumes:
       - netbox_config:/etc/netbox/config:rw
       # Init scripts: API token + custom field. See lab/netbox/init/*.
@@ -127,23 +130,22 @@ services:
       netconsole:
         ipv4_address: 172.31.0.22
     ports:
-      # Bind on ALL interfaces so the worker container (on the
-      # netconsole bridge network) can reach NetBox via the host's
-      # public IP. Service-name DNS (`netbox-netbox`) was unreliable
-      # on the VPS — direct IP is simpler.
+      # SECURITY (C9, H1, see docs/agents/16-security-audit-preprod.md):
+      # Bound to the docker host's loopback only — the worker reaches
+      # NetBox via the host's 127.0.0.1:8080, the same address
+      # referenced in NETBOX_URL in docker-compose.app.yml. NetBox
+      # is no longer reachable from the public NIC.
       #
       # PORT NOTE: 8001 is already taken by netconsole-kea-primary
       # (mapped to 10.10.20.20:8001 for the Kea control channel).
-      # We use 8080 instead → 8001 on the host. NetBox's internal
+      # We use 8080 instead → 8080 on the host. NetBox's internal
       # HTTP server listens on 8080 (env DEBUG=true skips the
       # supervisord reverse-proxy), so this maps straight through.
       #
-      # Note: this exposes NetBox to the public internet. Auth is
-      # enforced by the admin superuser + API token (no anonymous
-      # access). For production you may want to bind to a
-      # Tailscale-only IP or put an nginx reverse-proxy with TLS
-      # in front.
-      - "8080:8080"
+      # Note: For an emergency off-host probe (e.g. on-call SSH tunnel)
+      # the operator can `ssh -L 8080:127.0.0.1:8080 ...` — the loopback
+      # bind is the intended default.
+      - "127.0.0.1:8080:8080"
     healthcheck:
       # NetBox does NOT expose `/api/health/` (404), so the previous
       # endpoint silently kept the container in "(unhealthy)" state

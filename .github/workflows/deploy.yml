@@ -270,6 +270,24 @@ jobs:
           # added 2026-10-13 still help gpt-4o-mini route
           # correctly for ARP/MAC queries.
           echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
+          # SECURITY (C7, see docs/agents/16-security-audit-preprod.md):
+          # lock down secrets.env on the VPS. If a previous deploy left
+          # it world-readable, fix it now. `chmod 600` makes the file
+          # readable only by the file owner (sonnx). Docker compose reads
+          # it via the same UID via env_file.
+          if [ -f "$DEPLOY_DIR/secrets.env" ]; then
+            chmod 600 "$DEPLOY_DIR/secrets.env"
+            chown "$(stat -c '%U' "$DEPLOY_DIR"):$(stat -c '%G' "$DEPLOY_DIR")" "$DEPLOY_DIR/secrets.env" 2>/dev/null || true
+          fi
+          # SECURITY (H3): apply iptables rule for syslog UDP on the
+          # lab NIC ONLY. After this, packets from the public NIC are
+          # dropped at the kernel layer, so even if the
+          # SYSLOG_ALLOWED_CIDRS allowlist in code regresses, the
+          # attacker has no path to the syslog socket. Idempotent —
+          # duplicate rule is a no-op.
+          iptables -C INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP 2>/dev/null \
+            || iptables -I INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP -m comment --comment "netconsole-syslog" 2>/dev/null \
+            || echo "::warning::Could not install iptables rule for :1514 — check sudo / docker socket access"
           echo "==> Starting fresh containers..."
           # NOTE: NO --build flag. Images are built in CI (push-images job)
           # and pulled here. This is Phase 3 of the deploy-pipeline perf plan:

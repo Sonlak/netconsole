@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../lib/prisma.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import {
   getDeviceCounterHistory,
   getLatestCounters,
@@ -59,7 +59,7 @@ interfaceCountersRouter.get('/:deviceId/interface-counters/history', async (req,
  *   Marked auth-protected — same as apply_config. Be light: never block on
  *   this from inside the chart polling loop.
  */
-interfaceCountersRouter.post('/:deviceId/interface-counters/refresh', async (req, res) => {
+interfaceCountersRouter.post('/:deviceId/interface-counters/refresh', requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   const deviceId = String(req.params.deviceId);
   const r = await pollDeviceCounters(deviceId);
   if (!r.ok) {
@@ -83,7 +83,10 @@ interfaceCountersRouter.post('/:deviceId/interface-counters/refresh', async (req
 //   Returns the raw SSH output for vendor parsing (no DB insert). Used by
 //   agents to debug "parser missed a line" without redeploying — gated by
 //   DEBUG_COUNTERS=1 env var so it never leaks raw device output in prod.
-interfaceCountersRouter.post('/:deviceId/interface-counters/debug-ssh', async (req, res) => {
+// Debug endpoint — gated on DEBUG_COUNTERS=1 in env. Still, VIEWER
+// must not be able to issue live SSH/RESTCONF reads against devices
+// (operational fingerprinting risk). OPERATOR+.
+interfaceCountersRouter.post('/:deviceId/interface-counters/debug-ssh', requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   if (process.env.DEBUG_COUNTERS !== '1') {
     res.status(404).end();
     return;

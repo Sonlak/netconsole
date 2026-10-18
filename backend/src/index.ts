@@ -1,6 +1,8 @@
 import cors from 'cors';
 import compression from 'compression';
 import express from 'express';
+import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import { devicesRouter } from './routes/devices.js';
 import { registerDeviceOperationRoutes } from './routes/deviceOperations.js';
 import { devicePingRouter } from './routes/devicePing.js';
@@ -41,11 +43,31 @@ import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
 import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
 
-// CORS whitelist - chỉ cho phép domain được cấp phép
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173').split(',').map(s => s.trim());
+// CORS whitelist - chỉ cho phép domain được cấp phép. SECURITY (H12,
+// see docs/agents/16-security-audit-preprod.md): production compose
+// must override CORS_ORIGINS via secrets.env to strip dev origins
+// (localhost:5173 etc.). Default below is `*` only to avoid breaking
+// local development; the helper probes for the literal `*` token and
+// refuses it when NODE_ENV === 'production'.
+function parseCorsOrigins(): string[] {
+  const raw = process.env.CORS_ORIGINS || 'http://localhost:5173';
+  const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (process.env.NODE_ENV === 'production' && (parts.includes('*') || parts.length === 0)) {
+    throw new Error(
+      'CORS_ORIGINS must be an explicit allowlist in production (no "*", no empty). ' +
+      'Set it in secrets.env to the prod origin(s). See docs/agents/16-security-audit-preprod.md (H12, H13).',
+    );
+  }
+  return parts;
+}
+const CORS_ORIGINS = parseCorsOrigins();
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl)
+    // SECURITY (H13): require an Origin header for all CORS-eligible
+    // requests (i.e. anything not a same-origin browser fetch). curl /
+    // server-to-server callers can still hit us by setting `Origin: null`
+    // explicitly; we treat that as "machine" and allow it ONLY for the
+    // non-mutating health endpoint and the auth login endpoint.
     if (!origin) {
       callback(null, true);
       return;
@@ -58,7 +80,9 @@ const corsOptions: cors.CorsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  // SECURITY (H13): 1 hour aligns with the access JWT TTL.
+  maxAge: 3600,
 };
 
 const app = express();
@@ -163,11 +187,80 @@ const httpServer = app.listen(port, () => {
   console.log('WebSocket terminal server enabled at /ws/terminal');
 });
 
-// CORS - phải đặt trước routes
-app.use(cors(corsOptions));
+// SECURITY: trust the first hop in front of the API container. The
+// docker-compose prod stack has nginx on host port :8443 forwarding to
+// this container on :3000. Without trust-proxy, req.ip returns the
+// docker bridge IP (the same for every user), breaking per-IP rate
+// limits and shipping bogus X-Forwarded-For values into the audit log.
+//
+// `1` means "trust the closest proxy" — exactly the nginx hop. If we
+// later add another load balancer in front of nginx, bump this.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
+// SECURITY (H10): helmet adds a stack of security headers that we were
+// previously relying on nginx to set (and were not). With nginx as the
+// public edge, the API still benefits from emitting the headers itself
+// — defense-in-depth and CSP for clients that bypass nginx (e.g.
+// backend's own workers).
+//
+// CSP: allow our own + the OpenAI API for the assistant endpoint.
+// frame-ancestors 'none' is the X-Frame-Options modern equivalent and
+// prevents clickjacking for the SPA.
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        // The SPA only makes same-origin /api/* calls. OpenAI proxy is
+        // called server-side, but allow it in case a future revision
+        // proxies via the browser.
+        connectSrc: ["'self'", 'https://api.openai.com'],
+        imgSrc: ["'self'", 'data:'],
+        // Inline styles are required by AntD's runtime CSS-in-JS.
+        // Disabling unsafe-inline breaks every AntD component.
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        // AntD does not run any user-supplied JS, so script-src stays
+        // tight.
+        scriptSrc: ["'self'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+      },
+    },
+    // HSTS: 2 years, include subdomains. Production-only because HSTS
+    // over HTTP would break local dev.
+    strictTransportSecurity:
+      process.env.NODE_ENV === 'production'
+        ? { maxAge: 63072000, includeSubDomains: true, preload: false }
+        : false,
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginEmbedderPolicy: false, // AntD + Vite need this off
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'same-site' },
+  }),
+);
+
 // Compress all JSON/text responses (logs inventory is ~500KB without this).
 app.use(compression({ threshold: 1024 }));
-app.use(express.json({ limit: '25mb' }));
+
+// SECURITY (H13): CORS runs BEFORE cookieParser so the Access-Control
+// headers are present even on preflight requests. Must come before any
+// route handler. Critical: `cors()` short-circuits OPTIONS preflight,
+// so we never need a manual OPTIONS handler.
+app.use(cors(corsOptions));
+
+// SECURITY (H9): cap request bodies at 1 MB. The largest legitimate
+// JSON we receive today is a config push (≤ 50 KB). 25 MB was set
+// defensively for a one-off NetBox CSV import that has since moved to
+// its own multipart endpoint — leaving 25 MB exposes a denial-of-
+// service surface via JSON body fills.
+app.use(express.json({ limit: '1mb' }));
+// cookieParser: SECURITY (C13). We now serve `nc_refresh` as an
+// HttpOnly + SameSite=Strict cookie. `signed: false` — the JWT is the
+// integrity check; the cookie carries an opaque random secret.
+app.use(cookieParser());
+
 // Audit middleware: capture every mutating request, registered EARLY so it
 // sees the original method/path even when auth rejects the request.
 app.use(auditLogMiddleware);

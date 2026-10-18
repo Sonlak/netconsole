@@ -18,17 +18,29 @@ import type { AuthenticatedRequest } from './auth.js';
  */
 
 const AUDIT_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+// SECURITY (M6, see docs/agents/16-security-audit-preprod.md):
+//   * /api/auth/refresh — body contains the refresh token. The bodyKeys
+//     log would record `refreshToken` as a key, low risk (value not
+//     persisted) but still: skip to keep the audit table clean.
+//   * /api/auth/logout — same body shape, harmless but noisy.
+//   * /api/auth/me (GET) — not mutating, dropped by AUDIT_METHODS.
 const SKIP_PATHS = new Set([
   '/api/health',
   '/api/auth/login',
   '/api/auth/password',
+  '/api/auth/refresh',
+  '/api/auth/logout',
+  '/api/auth/logout-all',
 ]);
 
+// SECURITY (H10): use Express's `req.ip`. After `app.set('trust proxy',
+// 1)` in index.ts, this returns the X-Forwarded-For value supplied by
+// the local nginx hop. Manual parsing of X-Forwarded-For without trust-
+// proxy would let a client spoof the IP stored in the audit log, which
+// in turn poisons every per-IP rate-limit bucket.
 function clientIp(req: Request): string | null {
-  const xff = (req.headers['x-forwarded-for'] as string | undefined)
-    ?.split(',')[0]
-    ?.trim();
-  return xff || (req.headers['x-real-ip'] as string | undefined) || req.ip || null;
+  const ip = (req as Request & { ip?: string }).ip ?? null;
+  return ip || null;
 }
 
 function routeShape(req: Request): string {
