@@ -213,6 +213,7 @@ jobs:
             --exclude '*.pid' \
             --exclude '/logs/' \
             --exclude '/backups/' \
+            --exclude '/secrets.env' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
@@ -239,21 +240,23 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Stop + rm old containers FIRST so we can pull fresh images
-          # without "container name conflict" errors from docker compose.
-          # --no-deps: don't touch kea/postgres (they hold persistent state)
+          # --env-file is REQUIRED for every docker compose call below:
+          # the compose file references ${JWT_SECRET:?msg} and similar
+          # fail-fast interpolations, and docker compose refuses to
+          # parse the YAML if those vars are unset. We pass secrets.env
+          # (operator-managed, never committed) to every invocation.
+          # stop/rm use || true because they are idempotent and may
+          # fail on first deploy (no containers yet).
+          COMPOSE_BASE=(docker compose
+            -p "$COMPOSE_PROJECT"
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml"
+            --env-file "$DEPLOY_DIR/secrets.env")
           echo "==> Stopping old containers..."
-          docker compose -p "$COMPOSE_PROJECT" \
-            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
-            stop $DEPLOY_SERVICES || true
+          "${COMPOSE_BASE[@]}" stop $DEPLOY_SERVICES || true
           echo "==> Removing old containers..."
-          docker compose -p "$COMPOSE_PROJECT" \
-            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
-            rm -sf $DEPLOY_SERVICES || true
+          "${COMPOSE_BASE[@]}" rm -sf $DEPLOY_SERVICES || true
           echo "==> Pulling fresh images from GHCR (tag: main)..."
-          docker compose -p "$COMPOSE_PROJECT" \
-            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
-            pull $DEPLOY_SERVICES
+          "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES
           # Pull OPENAI_API_KEY from the GitHub Actions secret store and pass
           # it to docker compose via the .env substitution. The compose file
           # uses `${OPENAI_API_KEY:-}` so a missing secret keeps the assistant
@@ -293,10 +296,9 @@ jobs:
           # and pulled here. This is Phase 3 of the deploy-pipeline perf plan:
           # the VPS no longer compiles TypeScript / runs apt-get — it just
           # pulls a pre-baked image and restarts the container.
-          docker compose -p "$COMPOSE_PROJECT" \
-            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml" \
-            --env-file "$DEPLOY_DIR/.env" \
-            up -d --no-deps $DEPLOY_SERVICES
+          # Use COMPOSE_BASE (defined above with --env-file secrets.env) so
+          # the up command sees the same fail-fast vars as the pull.
+          "${COMPOSE_BASE[@]}" up -d --no-deps $DEPLOY_SERVICES
 
           # ── NetBox stack ────────────────────────────────────────────
           # Bring up the netbox compose side-by-side. We do NOT rebuild it
