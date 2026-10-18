@@ -291,7 +291,12 @@ services:
       NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
       # Multi-instance NetBox JSON — derived from individual tokens so
       # we don't need to keep a duplicate set elsewhere.
-      NETBOX_INSTANCES: '{"production":{"url":"http://127.0.0.1:8080/api/","token":"'${NETBOX_TOKEN:?}'"},"netbox2":{"url":"http://127.0.0.1:8081/api/","token":"'${NETBOX_TOKEN_NETBOX2:?}'"}}'
+      # NOTE: This MUST be a YAML double-quoted string with \" escapes —
+      # a YAML single-quoted string cannot contain unescaped single quotes
+      # (the inner `"` delimiters from the JSON would also break single-
+      # quoted YAML). Docker compose still substitutes ${NETBOX_TOKEN:?}
+      # at parse time, so the missing-secret fail-fast still works.
+      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://127.0.0.1:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://127.0.0.1:8081/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
       NETBOX_DEFAULT_INSTANCE: "production"
       SEED_DISABLED: "false"
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in secrets.env}
@@ -451,7 +456,11 @@ services:
       NETBOX_URL: "http://127.0.0.1:8080/api/"
       NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
       # Multi-instance NetBox JSON — derived from secrets.env.
-      NETBOX_INSTANCES: '{"production":{"url":"http://127.0.0.1:8080/api/","token":"'${NETBOX_TOKEN:?}'"},"netbox2":{"url":"http://127.0.0.1:8081/api/","token":"'${NETBOX_TOKEN_NETBOX2:?}'"}}'
+      # See backend block above for the YAML-quoting rules: this MUST
+      # be a double-quoted string with \" escapes, otherwise the inner
+      # single quotes from the JSON delimiters break YAML parsing
+      # (single-quoted YAML strings cannot contain unescaped ').
+      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://127.0.0.1:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://127.0.0.1:8081/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
       NETBOX_DEFAULT_INSTANCE: "production"
       # Management prefix for IPAM sync. Creates /24 prefix in NetBox IPAM
       # and populates primary_ip4 on each device. Change to match your lab subnet.
