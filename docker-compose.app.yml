@@ -489,32 +489,38 @@ services:
       # below), the browser warning goes away. Until then, this is
       # still TLS-encrypted — just MITM-vulnerable by cert trust.
       - "0.0.0.0:8443:443"
-    volumes:
-      # TLS cert material. The image ships with a self-signed cert
-      # (built into /etc/nginx/certs/ by Dockerfile.prod) so it
-      # boots out of the box. This volume mount REPLACES the
-      # image's cert with the operator-provided one.
-      #
-      # Production (VPS):
-      #   - `scripts/install_lets_encrypt.sh <domain>` populates
-      #     /etc/letsencrypt/live/<domain>/{fullchain,privkey}.pem
-      #   - uncomment the LETSENCRYPT_MOUNT line below (and the
-      #     /etc/letsencrypt read-only mount) to swap in the real cert
-      #   - `docker compose restart frontend` picks it up — no rebuild
-      #
-      # Local dev (Windows / macOS dev machine):
-      #   - run `bash frontend/certs/generate_self_signed.sh` (or
-      #     `.ps1`) once; the file lands in frontend/certs/
-      #   - uncomment the LOCAL_DEV_MOUNT line below to bind-mount it
-      #   - browse https://localhost:8443, accept the cert warning
-      #
-      # Default (no mount): image's self-signed cert is used. Site
-      # still works over HTTPS, just with a browser warning.
-      #
-      # LETSENCRYPT_MOUNT:
-      #   - /etc/letsencrypt:/etc/letsencrypt:ro
-      # LOCAL_DEV_MOUNT:
-      #   - ./frontend/certs:/etc/nginx/certs:ro
+    # TLS cert material. The image ships with a self-signed cert
+    # (built into /etc/nginx/certs/ by Dockerfile.prod) so it boots
+    # out of the box. NO `volumes:` block is set here by default —
+    # the image's self-signed cert is used. To swap in a real cert
+    # in production, uncomment one of the two blocks below and
+    # `docker compose restart frontend` (no rebuild).
+    #
+    # Production (VPS, Let's Encrypt):
+    #   1. Run `scripts/install_lets_encrypt.sh <domain>` once
+    #      — populates /etc/letsencrypt/live/<domain>/{fullchain,privkey}.pem
+    #   2. Replace the empty volumes list below with:
+    #        volumes:
+    #          - /etc/letsencrypt:/etc/letsencrypt:ro
+    #   3. `docker compose -f docker-compose.app.yml restart frontend`
+    #
+    # Local dev (Windows / macOS dev machine):
+    #   1. Run `bash frontend/certs/generate_self_signed.sh` (or
+    #      `.ps1`) once — file lands in frontend/certs/{cert,key}.pem
+    #   2. Replace the empty volumes list below with:
+    #        volumes:
+    #          - ./frontend/certs:/etc/nginx/certs:ro
+    #   3. Browse https://localhost:8443, accept the cert warning.
+    #      The same cert is also used for the WebSocket wss:// so
+    #      terminal sessions work end-to-end.
+    #
+    # Why no default `volumes:` block? An empty list (`volumes: []`)
+    # makes `docker compose config` error with "must be a array"
+    # because Docker Compose refuses an explicit empty list (only a
+    # missing key is OK). Commenting out the block keeps the
+    # no-mount path working AND documents how to enable a real
+    # mount without breaking the file.
+    # volumes: []  # keep commented — uncomment the lines above when needed
     networks:
       netconsole:
         ipv4_address: 172.31.0.5
