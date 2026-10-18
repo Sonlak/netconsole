@@ -44,7 +44,18 @@ FROM nginx:1.27-alpine
 # (proxy_temp, client_temp, fastcgi_temp, uwsgi_temp, scgi_temp under
 # /var/cache/nginx; access.log + error.log under /var/log/nginx;
 # nginx.pid under /var/run/nginx).
-RUN chown -R nginx:nginx \
+#
+# IMPORTANT: /var/cache/nginx, /var/log/nginx, /var/run/nginx do
+# NOT exist in the base image at build time — they are created by
+# the base image's entrypoint as root, then chown'd to nginx. With
+# `USER nginx` set in the Dockerfile, the entrypoint inherits the
+# unprivileged user and the chown fails. We do the mkdir here (as
+# root) so the dirs exist when we chown them.
+RUN mkdir -p \
+      /var/cache/nginx \
+      /var/log/nginx \
+      /var/run/nginx && \
+    chown -R nginx:nginx \
       /usr/share/nginx/html \
       /etc/nginx/conf.d \
       /var/cache/nginx \
