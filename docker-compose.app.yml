@@ -473,13 +473,39 @@ services:
     depends_on: [backend]
     ports:
       # SECURITY (C11, see docs/agents/16-security-audit-preprod.md):
-      # Frontend now serves HTTPS on 443 inside the container (nginx
+      # Frontend serves HTTPS on 443 inside the container (nginx
       # listens on 443 with the cert from /etc/nginx/certs/). The
       # host publish is 0.0.0.0:8443 → 443. Once a real CA-signed
-      # cert replaces the self-signed one, the browser warning goes
-      # away. Until then, this is still TLS-encrypted — just MITM-
-      # vulnerable by cert trust.
+      # cert replaces the self-signed one (via the volume mount
+      # below), the browser warning goes away. Until then, this is
+      # still TLS-encrypted — just MITM-vulnerable by cert trust.
       - "0.0.0.0:8443:443"
+    volumes:
+      # TLS cert material. The image ships with a self-signed cert
+      # (built into /etc/nginx/certs/ by Dockerfile.prod) so it
+      # boots out of the box. This volume mount REPLACES the
+      # image's cert with the operator-provided one.
+      #
+      # Production (VPS):
+      #   - `scripts/install_lets_encrypt.sh <domain>` populates
+      #     /etc/letsencrypt/live/<domain>/{fullchain,privkey}.pem
+      #   - uncomment the LETSENCRYPT_MOUNT line below (and the
+      #     /etc/letsencrypt read-only mount) to swap in the real cert
+      #   - `docker compose restart frontend` picks it up — no rebuild
+      #
+      # Local dev (Windows / macOS dev machine):
+      #   - run `bash frontend/certs/generate_self_signed.sh` (or
+      #     `.ps1`) once; the file lands in frontend/certs/
+      #   - uncomment the LOCAL_DEV_MOUNT line below to bind-mount it
+      #   - browse https://localhost:8443, accept the cert warning
+      #
+      # Default (no mount): image's self-signed cert is used. Site
+      # still works over HTTPS, just with a browser warning.
+      #
+      # LETSENCRYPT_MOUNT:
+      #   - /etc/letsencrypt:/etc/letsencrypt:ro
+      # LOCAL_DEV_MOUNT:
+      #   - ./frontend/certs:/etc/nginx/certs:ro
     networks:
       netconsole:
         ipv4_address: 172.31.0.5
