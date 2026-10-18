@@ -19,11 +19,19 @@ FROM nginx:1.27-alpine
 # the default nginx image ships nginx running as root. Running the
 # master process as root means a vulnerable route-handler module or
 # a writable static file is a privilege-escalation lever. The
-# official nginx base image already has an unprivileged `nginx` user;
-# we just swap to it. /var/cache/nginx + /var/run + /var/log/nginx
-# are pre-created and chown'd in the entrypoint of the base image.
+# official nginx base image already has an unprivileged `nginx` user.
+# We do all root-required setup first, then `USER nginx` at the very
+# end of the stage so the runtime process is unprivileged.
+#
+# Order matters: `apk add` needs root (writable /var/apk and the
+# package db), and `chown` is a root-only op. If we `USER nginx`
+# before these, they fail with `apk: ERROR: ... exit code: 99` on
+# permission denied. The static-dir chown below is also root-only,
+# so the order is: chown -> apk/cert -> COPY -> USER nginx.
+
+# Pre-create the static dir as nginx-owned so the COPY below writes
+# into a dir the unprivileged runtime can read.
 RUN chown -R nginx:nginx /usr/share/nginx/html /etc/nginx/conf.d
-USER nginx
 
 # Generate a self-signed cert at build time (1-year expiry,
 # 2048-bit RSA, CN=localhost). The image boots out of the box with
@@ -45,8 +53,12 @@ USER nginx
 # browser warning) instead of returning a connection refused on
 # port 443. Strict fail-closed would 503 the entire UI.
 #
-# `openssl` is not preinstalled in the nginx:alpine image (the base
-# image is stripped to keep CVE surface small). Install it inline.
+# `openssl` is not preinstalled in the nginx:alpine image. We install
+# it, generate the cert, chown to nginx, and KEEP openssl installed
+# in the final image. `apk del openssl` is unsafe: openssl ships
+# libssl/libcrypto that nginx itself depends on, so apk refuses with
+# "removal of openssl is breaking the world". Cost of leaving it:
+# ~3 MB. Benefit: no fragile virtual-package dance.
 RUN apk add --no-cache openssl && \
     mkdir -p /etc/nginx/certs && \
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -55,10 +67,15 @@ RUN apk add --no-cache openssl && \
       -subj "/CN=localhost/O=NetConsole-Image-Fallback" \
       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" && \
     chown -R nginx:nginx /etc/nginx/certs && \
-    chmod 600 /etc/nginx/certs/key.pem /etc/nginx/certs/cert.pem && \
-    apk del openssl
+    chmod 600 /etc/nginx/certs/key.pem /etc/nginx/certs/cert.pem
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
+
+# Drop root for runtime. Everything below runs as the unprivileged
+# `nginx` user. Static files were COPY'd by root above into an
+# nginx-owned dir; nginx can read them (dir traversal allowed, files
+# are 644).
+USER nginx
 
 EXPOSE 443
