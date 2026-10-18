@@ -28,10 +28,28 @@ FROM nginx:1.27-alpine
 # before these, they fail with `apk: ERROR: ... exit code: 99` on
 # permission denied. The static-dir chown below is also root-only,
 # so the order is: chown -> apk/cert -> COPY -> USER nginx.
+#
+# THE CACHE DIRS: /var/cache/nginx, /var/log/nginx, /var/run/nginx
+# are created by the base image's entrypoint as root and then
+# chown'd to nginx. With `USER nginx` set in the Dockerfile, the
+# entrypoint inherits the unprivileged user and the chown fails —
+# leaving the dirs root-owned, which makes the nginx master die with
+# "mkdir() /var/cache/nginx/client_temp failed (13: Permission denied)".
+# Fix: do the chown HERE (as root, before USER nginx). The base
+# image's entrypoint will re-run the chown later (no-op, already
+# owned by nginx).
 
-# Pre-create the static dir as nginx-owned so the COPY below writes
-# into a dir the unprivileged runtime can read.
-RUN chown -R nginx:nginx /usr/share/nginx/html /etc/nginx/conf.d
+# Pre-create the static dir AND the runtime cache/log/run dirs as
+# nginx-owned. This is the full set of dirs nginx writes to at runtime
+# (proxy_temp, client_temp, fastcgi_temp, uwsgi_temp, scgi_temp under
+# /var/cache/nginx; access.log + error.log under /var/log/nginx;
+# nginx.pid under /var/run/nginx).
+RUN chown -R nginx:nginx \
+      /usr/share/nginx/html \
+      /etc/nginx/conf.d \
+      /var/cache/nginx \
+      /var/log/nginx \
+      /var/run/nginx
 
 # Generate a self-signed cert at build time (1-year expiry,
 # 2048-bit RSA, CN=localhost). The image boots out of the box with
@@ -75,7 +93,9 @@ COPY --from=build /app/dist /usr/share/nginx/html
 # Drop root for runtime. Everything below runs as the unprivileged
 # `nginx` user. Static files were COPY'd by root above into an
 # nginx-owned dir; nginx can read them (dir traversal allowed, files
-# are 644).
+# are 644). The cache/log/run dirs are also nginx-owned (chown'd
+# above), so the master can mkdir() client_temp etc. without
+# permission errors.
 USER nginx
 
 EXPOSE 443
