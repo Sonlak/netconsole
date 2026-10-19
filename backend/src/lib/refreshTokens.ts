@@ -143,9 +143,16 @@ export async function rotateRefreshToken(
           revokedAt: null,
           consumedAt: null,
           expiresAt: { gt: new Date() },
-          // Minted AFTER the consumed token, otherwise we could be
-          // returning a token the user is actively rotating elsewhere.
-          createdAt: { gt: existing.consumedAt },
+          // Exclude the consumed row itself (would match via the
+          // `consumedAt: null` filter anyway, but a different
+          // userId+timestamp collision is theoretically possible).
+          // Note: we deliberately do NOT require
+          // `createdAt > existing.consumedAt` — the rotation
+          // transaction does INSERT-then-UPDATE in the same
+          // millisecond (`timestamp(3)` precision), so the new
+          // row's createdAt and the old row's consumedAt can be
+          // equal. Restricting to `gt` would silently fail the
+          // grace path on every single same-tx rotation.
         },
         orderBy: { createdAt: 'desc' },
         include: { user: { select: { username: true, role: true, active: true } } },
