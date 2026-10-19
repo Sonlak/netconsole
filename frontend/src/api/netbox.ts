@@ -43,24 +43,26 @@ export type NetBoxInstances = {
 // ─── READ ──────────────────────────────────────────────────────────────────────
 
 export async function fetchNetboxInstances(): Promise<NetBoxInstances> {
-  const res = await fetch('/api/netbox/instances', { credentials: 'include' });
-  if (!res.ok) throw new Error(`NetBox instances HTTP ${res.status}`);
-  return res.json();
+  // SECURITY: use authJsonFetch (not raw `fetch`) so a stale access JWT
+  // is silently refreshed + retried. Without this, clicking the NetBox
+  // Import tab >15 min after login threw "NetBox instances HTTP 401" on
+  // first mount and the page errored out — users thought the app had
+  // logged them out.
+  const res = await authJsonFetch<NetBoxInstances>('/api/netbox/instances');
+  return res;
 }
 
 export async function fetchNetboxHealth(instance?: string): Promise<{ ok: boolean; instance: string }> {
   const qs = instance ? `?instance=${encodeURIComponent(instance)}` : '';
-  const res = await fetch(`/api/netbox/health${qs}`, { credentials: 'include' });
-  if (!res.ok) throw new Error(`NetBox health HTTP ${res.status}`);
-  return res.json();
+  return authJsonFetch<{ ok: boolean; instance: string }>(`/api/netbox/health${qs}`);
 }
 
 export async function fetchNetboxPrefixes(instance?: string, limit = 1000): Promise<NetBoxPrefix[]> {
   const params = new URLSearchParams({ limit: String(limit) });
   if (instance) params.set('instance', instance);
-  const res = await fetch(`/api/netbox/prefixes?${params}`, { credentials: 'include' });
-  if (!res.ok) throw new Error(`NetBox prefixes HTTP ${res.status}`);
-  const body = await res.json();
+  // Same auto-refresh rationale as fetchNetboxInstances — the page
+  // renders nothing useful if the first list call 401s and we don't retry.
+  const body = await authJsonFetch<{ prefixes?: NetBoxPrefix[] }>(`/api/netbox/prefixes?${params}`);
   return body.prefixes ?? [];
 }
 
@@ -160,10 +162,12 @@ export async function exportPrefixesCsv(
     const params = new URLSearchParams({ limit: String(pageSize) });
     params.set('instance', instance);
     if (offset > 0) params.set('offset', String(offset));
-    const res = await fetch(`/api/netbox/prefixes?${params}`, { credentials: 'include' });
-    if (!res.ok) throw new Error(`NetBox prefixes HTTP ${res.status}`);
-    const body = await res.json();
-    const page = (body.prefixes ?? []) as NetBoxPrefix[];
+    // SECURITY: authJsonFetch (not raw `fetch`) so a stale access JWT
+    // is silently refreshed + retried on the first page hit. Without
+    // this, an export started >15 min after login aborts on page 0
+    // with HTTP 401 and the user has to reload to retry.
+    const body = await authJsonFetch<{ prefixes?: NetBoxPrefix[] }>(`/api/netbox/prefixes?${params}`);
+    const page = body.prefixes ?? [];
     allRows.push(...page);
     if (page.length < pageSize) break;
     offset += pageSize;

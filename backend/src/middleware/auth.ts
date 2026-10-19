@@ -158,28 +158,41 @@ export interface RefreshCookieOptions {
   maxAgeMs: number;
   /** `SameSite` policy. Default `'strict'`. */
   sameSite?: 'strict' | 'lax' | 'none';
-  /** Cookie `Path`. Default `'/api/auth'`. */
+  /** Cookie `Path`. Default `'/'` (whole site) so the WebSocket terminal
+   *  upgrade at `/ws/terminal` also receives the cookie. */
   path?: string;
 }
 
 export function setRefreshCookie(res: Response, rawToken: string, opts: RefreshCookieOptions): void {
   const cookieSecure = opts.secure ?? process.env.NODE_ENV === 'production';
+  // SECURITY (C13): cookie path is `/` so the browser sends it on
+  // every same-origin request — required for the WebSocket terminal
+  // upgrade at `/ws/terminal` (browser Path-matching would otherwise
+  // block the cookie on any non-`/api/auth` path → 401 on every WS
+  // connection). The cookie is still HttpOnly + Secure + SameSite=Strict
+  // so the wider path does not weaken XSS resistance: JS cannot read
+  // it (HttpOnly), it cannot leak over plain HTTP (Secure in prod), and
+  // it never cross-sites (Strict). See commit history for the original
+  // narrow-path experiment and the follow-up that reverted it.
   res.cookie(REFRESH_COOKIE_NAME, rawToken, {
     httpOnly: true,
     secure: cookieSecure,
     sameSite: opts.sameSite ?? 'strict',
-    path: opts.path ?? '/api/auth',
+    path: opts.path ?? '/',
     maxAge: opts.maxAgeMs,
   });
 }
 
 export function clearRefreshCookie(res: Response, opts?: { secure?: boolean; path?: string }): void {
   const cookieSecure = opts?.secure ?? process.env.NODE_ENV === 'production';
+  // MUST use the same path as setRefreshCookie — otherwise `res.clearCookie`
+  // is a no-op for the browser (Set-Cookie with a different Path than the
+  // original does not clear the original). See comment on setRefreshCookie.
   res.clearCookie(REFRESH_COOKIE_NAME, {
     httpOnly: true,
     secure: cookieSecure,
     sameSite: 'strict',
-    path: opts?.path ?? '/api/auth',
+    path: opts?.path ?? '/',
   });
 }
 
