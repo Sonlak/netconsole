@@ -256,7 +256,15 @@ jobs:
           echo "==> Removing old containers..."
           "${COMPOSE_BASE[@]}" rm -sf $DEPLOY_SERVICES || true
           echo "==> Pulling fresh images from GHCR (tag: main)..."
-          "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES
+          # `|| true` here for the same reason as the up -d fallback
+          # below: a transient GHCR hiccup shouldn't brick the deploy.
+          # The sweep in the up-fallback will catch any containers
+          # that ended up Created because of a partial pull. If the
+          # image genuinely doesn't exist, the next step's
+          # /api/health probe will catch it.
+          "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES || {
+            echo "::warning::docker compose pull returned non-zero — image may be partial"
+          }
           # Pull OPENAI_API_KEY from the GitHub Actions secret store and pass
           # it to docker compose via the .env substitution. The compose file
           # uses `${OPENAI_API_KEY:-}` so a missing secret keeps the assistant
@@ -298,7 +306,40 @@ jobs:
           # pulls a pre-baked image and restarts the container.
           # Use COMPOSE_BASE (defined above with --env-file secrets.env) so
           # the up command sees the same fail-fast vars as the pull.
-          "${COMPOSE_BASE[@]}" up -d --no-deps $DEPLOY_SERVICES
+          #
+          # `|| true` is needed here: docker compose up -d returns non-zero
+          # if ANY service fails to start. With 4 services (backend,
+          # worker x2, frontend, redis) there's a small race on a hot
+          # deploy — the backend's docker-start.sh probes postgres 3
+          # times with 2s sleeps, and on a slow VPS that can exceed
+          # the 30s container-level stop grace period for the
+          # worker replicas (which depend on backend being healthy).
+          # The previous behaviour: script exits 1, step fails, the
+          # containers we just created are left in "Created" state,
+          # the auto-rollback fires (and also fails), and the site
+          # stays up only because the operator manually
+          # `docker start`s the stuck containers.
+          #
+          # New behaviour: ignore the up exit code, then sweep any
+          # "Created" containers with `docker start` (which is what
+          # worked manually). The next step "Wait for backend healthy"
+          # still does the actual health check and fails the deploy
+          # if backend is genuinely broken — the false-positive
+          # deploy failures stop here.
+          "${COMPOSE_BASE[@]}" up -d --remove-orphans --no-deps $DEPLOY_SERVICES || {
+            echo "::warning::docker compose up -d returned non-zero — sweeping any Created containers"
+            for svc in $DEPLOY_SERVICES; do
+              # Find the actual container name (may be netconsole-X or netconsole-X-1)
+              cid=$(docker ps -a --filter "label=com.docker.compose.service=$svc" --format '{{.ID}}' | head -1)
+              if [ -n "$cid" ]; then
+                state=$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)
+                if [ "$state" = "created" ]; then
+                  echo "  -> starting $svc ($cid) which was left in Created state"
+                  docker start "$cid" || true
+                fi
+              fi
+            done
+          }
 
           # ── NetBox stack ────────────────────────────────────────────
           # Bring up the netbox compose side-by-side. We do NOT rebuild it
