@@ -7,12 +7,12 @@
 #
 # Prerequisites:
 #   1. Install age:  https://github.com/FiloSottile/age/releases
-#   2. Install sops: https://github.com/mozilla/sops/releases
+#   2. Install sops: https://github.com/getsops/sops/releases
 #      (macOS: brew install age sops)
 #      (Linux: download the binary from GitHub releases)
 #   3. Generate an age key pair:
 #        age-keygen -o ~/.sops-age-key.txt
-#      The public key goes in .sops.yaml (replace the PLACEHOLDER).
+#      The public key goes in .sops.yaml.
 #   4. Set the private key on the VPS:
 #        scp ~/.sops-age-key.txt sonnx@100.102.133.86:/opt/netconsole/.sops-age-key.txt
 #        ssh sonnx@100.102.133.86 chmod 600 /opt/netconsole/.sops-age-key.txt
@@ -26,8 +26,9 @@
 #
 # What it does:
 #   1. Reads .sops.yaml to find the age public key.
-#   2. Encrypts secrets.env → secrets.env.enc (values only; structure
-#      and comments remain readable in git diff).
+#   2. Encrypts secrets.env → secrets.env.enc (whole file; selective
+#      value encryption via `encrypted_regex` has a bug in SOPS 3.10.x
+#      with dotenv output, so we encrypt the whole file instead).
 #   3. Overwrites secrets.env.enc in-place.
 #   4. Prints a diff of what changed (before/after line count).
 # =============================================================================
@@ -43,8 +44,8 @@ ENCRYPTED="secrets.env.enc"
 # ── Prerequisites check ────────────────────────────────────────────────────────
 if ! command -v sops &>/dev/null; then
   echo "ERROR: sops is not installed."
-  echo "  macOS: brew install age sops"
-  echo "  Linux: download from https://github.com/mozilla/sops/releases"
+  echo "  macOS: brew install sops"
+  echo "  Linux: download from https://github.com/getsops/sops/releases"
   echo "  Then re-run $0"
   exit 1
 fi
@@ -87,12 +88,21 @@ if [ -f "$ENCRYPTED" ]; then
   echo "    (backed up old $ENCRYPTED)"
 fi
 
-# Encrypt.  The .sops.yaml creation_rules define encrypted_regex so only
-# sensitive values are encrypted; comments and key names stay visible.
-# --input-type=env tells sops to treat input as KEY=VALUE lines.
-# --output-type=dotenv gives clean .env-compatible output.
-sops --input-type=dotenv --output-type=dotenv \
-  --encrypt "$SECRETS" > "$ENCRYPTED"
+# We need the encrypted file to have the .enc extension so SOPS's
+# path_regex matches. Workaround: copy the file with the new name,
+# encrypt in-place, then move back.
+cp -p "$SECRETS" "$ENCRYPTED"
+trap 'rm -f "$ENCRYPTED"' EXIT
+
+# Encrypt. --input-type=dotenv + --output-type=dotenv so SOPS treats
+# the file as KEY=VALUE lines (the format our deploy expects). Both
+# args are MANDATORY for this version of SOPS — the .enc extension
+# alone makes SOPS default to binary output, which we don't want.
+sops --config .sops.yaml \
+  --input-type dotenv --output-type dotenv \
+  --encrypt "$ENCRYPTED" > "$ENCRYPTED.tmp"
+mv "$ENCRYPTED.tmp" "$ENCRYPTED"
+trap - EXIT
 
 echo "✅ Encrypted $SECRETS → $ENCRYPTED"
 echo ""

@@ -31,7 +31,7 @@ AGE_KEY_CMD="${SOPS_AGE_KEY_CMD:-}"
 # Priority: env override > .sops-age-key.txt > ~/.config/sops/age/key.txt
 if [ -n "$AGE_KEY_CMD" ]; then
   # Use AGE key from env var (used by the deploy workflow).
-  export AGE_SOPS_KEY="$AGE_KEY_CMD"
+  export SOPS_AGE_KEY_CMD="$AGE_KEY_CMD"
   echo "==> Using age key from SOPS_AGE_KEY_CMD env var"
 elif [ -f "$AGE_KEY_FILE" ]; then
   export SOPS_AGE_KEY_FILE="$AGE_KEY_FILE"
@@ -57,7 +57,7 @@ fi
 if ! command -v sops &>/dev/null; then
   echo "ERROR: sops not installed."
   echo "  Run: sudo apt install -y sops   # Debian/Ubuntu"
-  echo "  Or:  download from https://github.com/mozilla/sops/releases"
+  echo "  Or:  download from https://github.com/getsops/sops/releases"
   exit 1
 fi
 
@@ -69,8 +69,11 @@ if [ -f "$DECRYPTED" ]; then
   cp -p "$DECRYPTED" "${DECRYPTED}.bak.$(date +%Y%m%d_%H%M%S)"
 fi
 
-# Decrypt.  --input-type=dotenv matches the --output-type=sops used in encrypt.
-sops --input-type=dotenv --output-type=dotenv \
+# Decrypt. The .enc extension makes SOPS default to binary input/output
+# — we override with explicit dotenv on both ends so the result is a
+# plain KEY=VALUE file that docker-compose can read directly.
+sops --config .sops.yaml \
+  --input-type dotenv --output-type dotenv \
   --decrypt "$ENCRYPTED" > "$DECRYPTED"
 
 chmod 600 "$DECRYPTED"

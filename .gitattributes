@@ -8,3 +8,8 @@
 *.pem      text eol=lf
 *.key      text eol=lf
 *.crt      text eol=lf
+# SOPS-encrypted files: MUST stay LF. SOPS writes each key=value
+# on its own line; a CRLF would break the line-based parser and
+# produce a corrupted ciphertext on the next decrypt.
+*.env.enc  text eol=lf
+*.enc      text eol=lf
