@@ -73,12 +73,16 @@ env:
   DEPLOY_SERVICES: "backend worker frontend"
   # Last-resort fallback when ALL marker logic fails.
   # Update this when a new "known-good" is confirmed in production.
-  # Current: 2026-10-13 12:00 — `8dab6659` (assistant tool fix + gpt-4.1
-  # upgrade) verified after rollback #245 from failed `adb1c95` deploy.
-  # Rollback workflow now uses the prod overlay (see "Rebuild and restart
-  # app services" step) to pull the GHCR image instead of rebuilding
-  # locally with a cached schema.
-  FALLBACK_SHA: 8dab6659c3f4b6c0ce06bd4920b6706b6b20c2fa
+  # Current: 2026-10-19 09:00 — `2113812` (verified working on VPS at
+  # 12:51 EDT before the disk-pressure incident that took down 1446576).
+  # The disk ran 100% full on `/var/lib/containerd` (61G of unused
+  # overlay layers + 15G of orphaned blobs) and the deploy failed at
+  # step 8 "Wait for backend healthy" because containerd could not
+  # create the new snapshot. The site is now back up at the same
+  # backend/worker/frontend image contents as 2113812 (the backend
+  # Dockerfile hasn't changed since), so this fallback is the
+  # "default-safe" target if markers are ever wiped again.
+  FALLBACK_SHA: 21138126739c7a029cea2c997dda3f412f1e08a6
   FALLBACK_REF: main
 
 jobs:

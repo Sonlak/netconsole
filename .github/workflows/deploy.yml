@@ -251,6 +251,40 @@ jobs:
             -p "$COMPOSE_PROJECT"
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml"
             --env-file "$DEPLOY_DIR/secrets.env")
+          # ── Disk-pressure guard (added 2026-10-19) ──────────────────────
+          # Self-hosted runner on a 70G root filesystem. Without this,
+          # every deploy accumulates Docker images in `/var/lib/docker`
+          # and `/var/lib/containerd`. After ~10 deploys the disk
+          # hits 100% and `docker compose up` fails with:
+          #   failed to create temp dir: mkdir /var/lib/containerd/...:
+          #        no space left on device
+          # That looks like a backend/healthcheck failure to the CI job
+          # even though the root cause is pre-deploy. We:
+          #   1. Log current usage (so failures are diagnosable).
+          #   2. Aggressively prune old images (all "unused" tags) and
+          #      stopped containers BEFORE pulling the new images.
+          #      Doing it here (not after pull) keeps the failure mode
+          #      obvious: if prune frees space, pull will succeed.
+          #   3. Keep the last 3 image tags per service as a safety net
+          #      for emergency rollback.
+          # `|| true` on every line so a prune error never blocks the
+          # deploy (the up step will surface the real problem).
+          echo "==> Disk-pressure check"
+          df -h / | head -3 || true
+          AVAIL=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          if [ "${AVAIL:-0}" -lt 5 ]; then
+            echo "::warning::Disk space low (${AVAIL:-0}G available). Pruning old Docker artefacts…"
+            # Remove stopped containers
+            sudo -n docker container prune -f 2>&1 | tail -3 || true
+            # Remove all images not currently used by any container
+            sudo -n docker image prune -a -f 2>&1 | tail -5 || true
+            # Remove dangling volumes
+            sudo -n docker volume prune -f 2>&1 | tail -3 || true
+            # Re-check
+            df -h / | head -3 || true
+          else
+            echo "✅ Disk space OK (${AVAIL}G available)"
+          fi
           echo "==> Stopping old containers..."
           "${COMPOSE_BASE[@]}" stop $DEPLOY_SERVICES || true
           echo "==> Removing old containers..."
