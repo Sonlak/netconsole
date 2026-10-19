@@ -14,6 +14,7 @@ import {
   MenuUnfoldOutlined,
   MoonOutlined,
   RadarChartOutlined,
+  SafetyCertificateOutlined,
   SearchOutlined,
   SettingOutlined,
   SunOutlined,
@@ -542,6 +543,17 @@ export default function AppLayout() {
                       disabled: true,
                     },
                     { type: 'divider' },
+                    {
+                      // P2 hardening: self-service link to the
+                      // TOTP setup / management page. Every user
+                      // can self-enroll from here.
+                      key: 'totp-setup',
+                      icon: <SafetyCertificateOutlined />,
+                      label: 'Two-factor authentication',
+                      onClick: () => {
+                        navigate('/totp-setup');
+                      },
+                    },
                     {
                       key: 'logout',
                       icon: <LogoutOutlined />,

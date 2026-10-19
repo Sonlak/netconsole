@@ -17,20 +17,33 @@ export interface LoginRequest {
   password: string;
 }
 
+// P2 hardening: the login response can be EITHER a full session (no
+// TOTP) OR an MFA challenge. The client code branches on `requireTotp`.
+// Without this distinction the frontend would have to infer TOTP from
+// some other signal (e.g. the absence of a token) — fragile.
 export interface LoginResponse {
-  token: string;
+  token?: string;
   // SECURITY: refreshToken is still in the body for non-browser
   // clients (worker, curl scripts, dev tools). Browsers should rely
   // on the Set-Cookie header — keep the field optional in TS so the
   // type doesn't lie about what the server actually returns.
   refreshToken?: string;
-  refreshExpiresAt: string;
-  user: {
+  refreshExpiresAt?: string;
+  // If true, the server accepted the password but the user has TOTP
+  // enabled; the client must call verifyMfa() with the 6-digit code
+  // (or a backup code) to complete login.
+  requireTotp?: boolean;
+  mfaToken?: string;
+  // Methods accepted at /api/auth/mfa/verify. Tells the frontend
+  // whether to show a backup-code fallback link.
+  methods?: ('totp' | 'backup-code')[];
+  user?: {
     id: string;
     username: string;
     email: string;
     role: string;
     lastLoginAt?: string | null;
+    mustChangePassword?: boolean;
   };
 }
 
@@ -46,9 +59,34 @@ export interface User {
   email: string;
   role: string;
   active: boolean;
+  // P2 hardening: surface mustChangePassword + totpEnabled to the
+  // frontend so the route guard can redirect users appropriately.
+  mustChangePassword?: boolean;
+  totpEnabled?: boolean;
   lastLoginAt?: string | null;
   lastLoginIp?: string | null;
   createdAt: string;
+}
+
+// P2 hardening: TOTP-related types.
+export interface TotpSetupResponse {
+  // Base32 secret. The user can paste it into a hardware token
+  // authenticator that doesn't support QR.
+  secret: string;
+  // otpauth:// URL the QR encodes.
+  otpAuthUrl: string;
+  // PNG data URL of the QR. Frontend displays it as <img src={...}>.
+  qrCodeDataUrl: string;
+  // 10 single-use recovery codes. Shown ONCE — the user must save
+  // them somewhere safe (e.g. password manager).
+  backupCodes: string[];
+}
+
+export interface TotpStatus {
+  enabled: boolean;
+  enrolledAt: string | null;
+  backupCodesRemaining: number;
+  lastTotpAt: string | null;
 }
 
 export type UserRole = 'ADMIN' | 'OPERATOR' | 'VIEWER';
@@ -83,6 +121,23 @@ export async function login(request: LoginRequest): Promise<LoginResponse> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
+    credentials: 'include',
+  });
+  return handleResponse<LoginResponse>(response);
+}
+
+// P2 hardening: complete a TOTP-protected login. Called by the
+// LoginPage after a successful password+`requireTotp=true` response.
+// Returns the same shape as a normal login (token, refresh, user).
+export async function verifyMfa(
+  mfaToken: string,
+  code: string,
+  method: 'totp' | 'backup-code' = 'totp',
+): Promise<LoginResponse> {
+  const response = await fetch(`${API_BASE}/mfa/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mfaToken, code, method }),
     credentials: 'include',
   });
   return handleResponse<LoginResponse>(response);

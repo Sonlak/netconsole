@@ -62,7 +62,7 @@ function resolveJwtSecret(): string {
 // `require('./middleware/auth.js')` cheap and idempotent for tools that
 // only import types.
 let _cachedSecret: string | null = null;
-function getSecret(): string {
+export function getSecret(): string {
   if (!_cachedSecret) {
     _cachedSecret = resolveJwtSecret();
   }
@@ -116,6 +116,15 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
 
   if (!payload) {
     res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
+    return;
+  }
+
+  // SECURITY (P2): reject MFA challenge tokens at all regular auth endpoints.
+  // MFA tokens are short-lived (5 min) and purpose-bound — they can only
+  // be exchanged at /api/auth/mfa/verify. If a leaked MFA token reaches a
+  // regular endpoint, the user data cannot be accessed.
+  if ('purpose' in payload && payload.purpose === 'mfa') {
+    res.status(401).json({ error: 'Unauthorized: MFA token cannot be used here' });
     return;
   }
 

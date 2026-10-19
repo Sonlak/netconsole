@@ -33,6 +33,7 @@ import { fabricRouter } from './routes/fabric.js';
 import { logsRouter } from './routes/logs.js';
 import { netboxRouter } from './routes/netbox.js';
 import { authRouter } from './routes/auth.js';
+import { totpRouter } from './routes/totp.js';
 import { auditLogRouter } from './routes/auditLog.js';
 import { searchRouter } from './routes/search.js';
 import { terminalRouter } from './routes/terminal.js';
@@ -316,6 +317,10 @@ app.get('/api/health', (_req, res) => {
 
 // Auth routes - không cần auth để login/register
 app.use('/api/auth', authRateLimit, authRouter);
+
+// TOTP management — all endpoints require authentication.
+// Mounted after authRouter so /api/auth/mfa/verify is handled there.
+app.use('/api/totp', authMiddleware, totpRouter);
 
 // Register per-device operation routes (config/arp/mac/connect) on the devices router
 registerDeviceOperationRoutes(devicesRouter);

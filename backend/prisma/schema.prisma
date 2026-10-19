@@ -400,6 +400,25 @@ model User {
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
+  // SECURITY (P2 hardening, 2026-10-19): per-user TOTP 2FA.
+  // totpSecret: base32-encoded shared secret, generated at enrollment
+  //   (POST /api/totp/setup). NULL until user finishes enrollment.
+  // totpEnabled: TRUE only after user has confirmed a valid code from
+  //   their authenticator app (POST /api/totp/verify). Until then the
+  //   secret exists but is NOT enforced at login.
+  // totpEnrolledAt: stamp of successful enrollment. NULL = never enrolled.
+  // totpBackupCodes: 10 single-use recovery codes (bcrypt-hashed). When the
+  //   user loses their device, they can paste one of these to pass 2FA
+  //   instead of a TOTP code. Each code is consumed on use.
+  // lastTotpAt: last successful TOTP verify. The TOTP window is 30s; an
+  //   already-verified code within the window is rejected to prevent
+  //   replay. Stamped only on success.
+  totpEnabled    Boolean   @default(false)
+  totpSecret     String?
+  totpEnrolledAt DateTime?
+  totpBackupCodes String[]
+  lastTotpAt     DateTime?
+
   // Back-relation for RefreshToken. `onDelete: Cascade` because a deleted
   // user's refresh rows have no business meaning.
   refreshTokens RefreshToken[]

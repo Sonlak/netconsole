@@ -23,6 +23,7 @@ import {
   EditOutlined,
   KeyOutlined,
   PlusOutlined,
+  QrcodeOutlined,
   ReloadOutlined,
   StopOutlined,
   UserSwitchOutlined,
@@ -36,6 +37,7 @@ import {
   type User,
   type UserRole,
 } from '../../api/auth';
+import { adminResetUserTotp } from '../../api/totp';
 import { useAuth } from '../../hooks/useAuth';
 
 const { Text } = Typography;
@@ -154,8 +156,27 @@ export default function UsersPanel() {
       const values = await resetForm.validateFields();
       setBusy(true);
       await resetUserPassword(resetting.id, values.newPassword);
-      message.success(`Password updated for "${resetting.username}".`);
+      message.success(`Password updated for "${resetting.username}". User will be prompted to change it on next login.`);
       setResetting(null);
+    } catch (err) {
+      if (err instanceof Error) message.error(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // P2 hardening: clear another user's TOTP enrollment. Used when
+  // the user has lost their authenticator AND their backup codes —
+  // there is no other way to regain access. Frontend requires
+  // confirmation because this is a "trust the admin with the user's
+  // 2FA" operation; an attacker who phishes an admin password can
+  // take over any 2FA-protected account.
+  async function handleResetTotp(user: User) {
+    try {
+      setBusy(true);
+      await adminResetUserTotp(user.id);
+      message.success(`TOTP cleared for "${user.username}". User will be prompted to re-enroll on next login.`);
+      await refresh();
     } catch (err) {
       if (err instanceof Error) message.error(err.message);
     } finally {
@@ -231,6 +252,41 @@ export default function UsersPanel() {
       ),
     },
     {
+      // P2 hardening: 2FA status column. Visible at a glance which
+      // accounts are protected (and which high-privilege accounts
+      // are NOT). Operators/admins who don't have 2FA on a high-
+      // privilege account are flagged in the compliance audit.
+      title: '2FA',
+      dataIndex: 'totpEnabled',
+      key: 'totpEnabled',
+      render: (totpEnabled: boolean) =>
+        totpEnabled ? (
+          <Tag icon={<CheckCircleOutlined />} color="success">
+            Enabled
+          </Tag>
+        ) : (
+          <Tag color="default">Off</Tag>
+        ),
+    },
+    {
+      // P2 hardening: visual indicator for accounts that have not
+      // yet completed the forced-rotation flow.
+      title: 'Password',
+      dataIndex: 'mustChangePassword',
+      key: 'mustChangePassword',
+      width: 110,
+      render: (mustChange: boolean) =>
+        mustChange ? (
+          <Tooltip title="User must rotate password on next login">
+            <Tag color="warning">Pending</Tag>
+          </Tooltip>
+        ) : (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            OK
+          </Text>
+        ),
+    },
+    {
       title: 'Last login',
       dataIndex: 'lastLoginAt',
       key: 'lastLoginAt',
@@ -279,6 +335,36 @@ export default function UsersPanel() {
               disabled={busy}
             />
           </Tooltip>
+          {/* P2 hardening: admin reset-TOTP. Only shown when the
+              user has 2FA enrolled (no point resetting an empty
+              enrollment). Confirmation modal is inline here because
+              Popconfirm's OK button is hard to read. */}
+          {row.totpEnabled && (
+            <Popconfirm
+              title={`Clear TOTP for "${row.username}"?`}
+              description={
+                <div style={{ maxWidth: 280 }}>
+                  Use this if the user has lost their authenticator device AND all
+                  backup codes. The user will be required to re-enroll on next
+                  login.
+                </div>
+              }
+              okText="Reset TOTP"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => handleResetTotp(row)}
+              disabled={busy}
+            >
+              <Tooltip title="Reset TOTP (user lost their device + backup codes)">
+                <Button
+                  size="small"
+                  type="text"
+                  danger
+                  icon={<QrcodeOutlined />}
+                  disabled={busy}
+                />
+              </Tooltip>
+            </Popconfirm>
+          )}
           <Popconfirm
             title={`Delete user "${row.username}"?`}
             description="This action cannot be undone."

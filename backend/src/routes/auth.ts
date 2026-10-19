@@ -15,6 +15,8 @@ import {
   recordSuccessfulLogin,
   isLoginLocked,
 } from '../middleware/loginAttempt.js';
+import { signMfaToken, verifyMfaToken } from '../lib/mfaToken.js';
+import { verifyTotpCode, verifyBackupCode, currentStepTimestamp } from '../lib/totp.js';
 
 export const authRouter = Router();
 
@@ -66,6 +68,12 @@ function shapeUser(user: {
   lastLoginAt: Date | null;
   lastLoginIp: string | null;
   createdAt: Date;
+  // P2 hardening: mustChangePassword + totpEnabled included so the
+  // frontend can route the user appropriately.
+  mustChangePassword?: boolean;
+  totpEnabled?: boolean;
+  // password is optional — callers from Prisma selects omit it.
+  password?: string;
 }) {
   return {
     id: user.id,
@@ -76,6 +84,8 @@ function shapeUser(user: {
     lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
     lastLoginIp: user.lastLoginIp ?? null,
     createdAt: user.createdAt.toISOString(),
+    mustChangePassword: user.mustChangePassword ?? false,
+    totpEnabled: user.totpEnabled ?? false,
   };
 }
 
@@ -122,6 +132,26 @@ authRouter.post('/login', async (req: Request, res: Response) => {
 
     const userAgent = (req.headers['user-agent'] as string | undefined) ?? null;
 
+    // SECURITY (P2, 2026-10-19): per-user TOTP 2FA gate. If the user has
+    // enrolled TOTP, the password alone is not enough — issue a 5-minute
+    // mfa challenge token and have the client call /api/auth/mfa/verify
+    // with a 6-digit code. The mfa token has no other authority; the
+    // /api/auth/me endpoint rejects it (authMiddleware check) so a
+    // leaked mfa token is only good for 5 min and only at the verify
+    // endpoint.
+    if (user.totpEnabled) {
+      const mfaToken = signMfaToken(user.id);
+      res.status(200).json({
+        requireTotp: true,
+        mfaToken,
+        // Hint to the client: which methods are accepted. Backup codes
+        // are always available (until exhausted) so the UI offers them
+        // as a fallback when the user has lost their device.
+        methods: ['totp', 'backup-code'],
+      });
+      return;
+    }
+
     // Issue a (access JWT, refresh token) pair. The refresh row is the
     // source of truth for session lifetime — access JWTs are short-lived
     // (15 min) and stateless.
@@ -166,10 +196,158 @@ authRouter.post('/login', async (req: Request, res: Response) => {
         email: user.email,
         role: user.role,
         lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
+        // P2 hardening: tell the frontend to redirect to the
+        // change-password page on first login. The frontend should
+        // already enforce this via ProtectedRoute, but exposing it in
+        // the login response means non-browser clients (CLI scripts)
+        // also know they must rotate the password before doing
+        // anything else.
+        mustChangePassword: user.mustChangePassword,
       },
     });
   } catch (error) {
     console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// SECURITY (P2, 2026-10-19): POST /api/auth/mfa/verify — complete the
+// second factor of a TOTP-protected login. Accepts either a 6-digit
+// TOTP code or a single-use backup code. On success, issues the
+// canonical (access, refresh) pair just like a non-TOTP login would.
+authRouter.post('/mfa/verify', async (req: Request, res: Response) => {
+  try {
+    const { mfaToken, code, method } = req.body as {
+      mfaToken?: string;
+      code?: string;
+      method?: 'totp' | 'backup-code';
+    };
+
+    if (!mfaToken || !code) {
+      res.status(400).json({ error: 'mfaToken and code are required' });
+      return;
+    }
+    if (typeof code !== 'string' || code.length < 6 || code.length > 20) {
+      res.status(400).json({ error: 'Invalid code format' });
+      return;
+    }
+
+    const payload = verifyMfaToken(mfaToken);
+    if (!payload) {
+      res.status(401).json({ error: 'MFA token invalid or expired' });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+    if (!user || !user.active || !user.totpEnabled || !user.totpSecret) {
+      // Race: admin disabled TOTP between password verify and mfa verify.
+      // Treat as a fresh login (return 401 so the client starts over).
+      res.status(401).json({ error: 'MFA not available; restart login' });
+      return;
+    }
+
+    let success = false;
+    let newBackupCodes = user.totpBackupCodes;
+
+    if (method === 'backup-code') {
+      // Consume a backup code. Codes are bcrypt-hashed; we check the
+      // list, find a match, and rewrite the column to drop the consumed
+      // code. If `code` doesn't match any, return 401 (without leaking
+      // how many codes the user has left).
+      const result = await verifyBackupCode(user.totpBackupCodes, code);
+      if (result.valid) {
+        success = true;
+        newBackupCodes = result.remaining;
+      }
+    } else {
+      // Default to TOTP code path.
+      const codeOk = verifyTotpCode(user.totpSecret, code, user.lastTotpAt);
+      if (codeOk) {
+        success = true;
+      }
+    }
+
+    if (!success) {
+      res.status(401).json({ error: 'Invalid code' });
+      return;
+    }
+
+    const ip = getClientIp(req);
+    const userAgent = (req.headers['user-agent'] as string | undefined) ?? null;
+
+    // Issue the real (access, refresh) pair. Update user row in the
+    // same transaction so a half-success (token issued, but row
+    // update failed) cannot leave a TOTP code replayable.
+    let pair;
+    try {
+      pair = await prisma.$transaction(async (tx) => {
+        const newPair = await issueTokenPair(
+          user.id,
+          { userAgent, ip },
+          (p) => signToken(p),
+        );
+        await tx.user.update({
+          where: { id: user.id },
+          data: {
+            lastTotpAt: currentStepTimestamp(),
+            totpBackupCodes: newBackupCodes,
+            lastLoginAt: new Date(),
+            lastLoginIp: ip,
+          },
+        });
+        return newPair;
+      });
+    } catch (err) {
+      console.error('MFA verify: failed to issue tokens:', err);
+      res.status(500).json({ error: 'Internal server error' });
+      return;
+    }
+
+    if (ip) {
+      recordSuccessfulLogin(user.username, ip).catch(() => undefined);
+    }
+
+    setRefreshCookie(res, pair.refreshToken, { maxAgeMs: REFRESH_TTL_MS });
+
+    // SECURITY: audit-log the mfa success. We use a distinct code so
+    // compliance dashboards can separate "password login" from
+    // "password + TOTP login" without parsing the user-agent.
+    prisma.auditLog
+      .create({
+        data: {
+          userId: user.id,
+          username: user.username,
+          role: user.role,
+          method: 'POST',
+          path: '/api/auth/mfa/verify',
+          action: '/api/auth/mfa/verify (success)',
+          ip: ip ?? null,
+          userAgent: userAgent ?? null,
+          statusCode: 200,
+          metadata: {
+            code: 'totp_success',
+            method: method === 'backup-code' ? 'backup_code' : 'totp',
+            backupCodesRemaining: newBackupCodes.length,
+          },
+        },
+      })
+      .catch(() => undefined);
+
+    res.json({
+      token: pair.accessToken,
+      refreshToken: pair.refreshToken,
+      refreshExpiresAt: pair.refreshExpiresAt.toISOString(),
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
+        mustChangePassword: user.mustChangePassword,
+      },
+    });
+  } catch (error) {
+    console.error('MFA verify error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -374,6 +552,10 @@ authRouter.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Res
         email: true,
         role: true,
         active: true,
+        // P2 hardening: expose mustChangePassword + totpEnabled so the
+        // frontend can route the user to the right setup page.
+        mustChangePassword: true,
+        totpEnabled: true,
         lastLoginAt: true,
         lastLoginIp: true,
         createdAt: true,
@@ -385,7 +567,7 @@ authRouter.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Res
       return;
     }
 
-    res.json({ user: shapeUser(user) });
+    res.json({ user: shapeUser({ ...user, password: '' }) });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -427,12 +609,31 @@ authRouter.put('/password', authMiddleware, async (req: AuthenticatedRequest, re
 
     const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        password: hashed,
-      },
-    });
+    // P2 hardening: when the user changes their password (self-service
+    // OR admin reset), clear the `mustChangePassword` flag so they
+    // don't get redirected to the change-password page forever.
+    // Also revoke all existing refresh tokens so a stolen old session
+    // can't survive a forced rotation.
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: {
+          password: hashed,
+          mustChangePassword: false,
+        },
+      }),
+      // SECURITY: force-logout the user from every other session. If
+      // the rotation was triggered by a forgotten-password flow, the
+      // attacker with the old session can no longer refresh.
+      prisma.refreshToken.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    // Clear the refresh cookie on the current response (the rotation
+    // above invalidated the cookie the browser is sending).
+    clearRefreshCookie(res);
 
     res.json({ message: 'Password updated successfully' });
   } catch (error) {
@@ -451,6 +652,11 @@ authRouter.get('/users', authMiddleware, requireRole('ADMIN'), async (_req: Auth
         email: true,
         role: true,
         active: true,
+        // P2 hardening: expose totpEnabled + mustChangePassword so the
+        // admin user-management page can show which users have 2FA on
+        // and which accounts need a forced rotation.
+        totpEnabled: true,
+        mustChangePassword: true,
         lastLoginAt: true,
         lastLoginIp: true,
         createdAt: true,
@@ -458,7 +664,7 @@ authRouter.get('/users', authMiddleware, requireRole('ADMIN'), async (_req: Auth
       orderBy: { createdAt: 'desc' },
     });
 
-    res.json({ users: users.map(shapeUser) });
+    res.json({ users: users.map((u) => shapeUser({ ...u, password: '' })) });
   } catch (error) {
     console.error('List users error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -529,7 +735,7 @@ authRouter.patch('/users/:id', authMiddleware, requireRole('ADMIN'), async (req:
 authRouter.post('/users/:id/reset-password', authMiddleware, requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = String(req.params.id);
-    const { newPassword } = req.body;
+    const { newPassword, forceChange = true } = req.body;
 
     if (!newPassword) {
       res.status(400).json({ error: 'New password is required' });
@@ -552,16 +758,104 @@ authRouter.post('/users/:id/reset-password', authMiddleware, requireRole('ADMIN'
 
     const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
-    await prisma.user.update({
-      where: { id },
-      data: {
-        password: hashed,
-      },
-    });
+    // P2 hardening: admin-set passwords ALWAYS mark
+    // `mustChangePassword = true` by default (so the user must
+    // rotate on next login), revoke all existing refresh tokens
+    // (the old sessions are dead — only the new password works),
+    // and audit-log the action.
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id },
+        data: {
+          password: hashed,
+          mustChangePassword: Boolean(forceChange),
+        },
+      }),
+      prisma.refreshToken.updateMany({
+        where: { userId: id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    prisma.auditLog
+      .create({
+        data: {
+          userId: req.user!.userId,
+          username: req.user!.username,
+          role: req.user!.role,
+          method: 'POST',
+          path: `/api/auth/users/${id}/reset-password`,
+          action: '/api/auth/users/:id/reset-password',
+          ip: getClientIp(req),
+          userAgent: (req.headers['user-agent'] as string | undefined) ?? null,
+          statusCode: 200,
+          metadata: {
+            targetUserId: id,
+            targetUsername: target.username,
+            forceChange: Boolean(forceChange),
+          },
+        },
+      })
+      .catch(() => undefined);
 
     res.json({ message: 'Password reset successfully.' });
   } catch (error) {
     console.error('Reset password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/users/:id/reset-totp (Admin only) — clear the user's
+// TOTP enrollment. Used when the user has lost their authenticator
+// device AND lost their backup codes. The user will be prompted to
+// re-enroll on next login.
+authRouter.post('/users/:id/reset-totp', authMiddleware, requireRole('ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const id = String(req.params.id);
+    const target = await prisma.user.findUnique({ where: { id } });
+    if (!target) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id },
+      data: {
+        totpEnabled: false,
+        totpSecret: null,
+        totpEnrolledAt: null,
+        totpBackupCodes: [],
+        lastTotpAt: null,
+      },
+    });
+
+    // Audit log the TOTP reset. Distinct from reset-password so the
+    // compliance dashboard can flag a "user lost their 2FA" pattern
+    // (multiple TOTP resets for the same user in a short window = red
+    // flag for social engineering).
+    prisma.auditLog
+      .create({
+        data: {
+          userId: req.user!.userId,
+          username: req.user!.username,
+          role: req.user!.role,
+          method: 'POST',
+          path: `/api/auth/users/${id}/reset-totp`,
+          action: '/api/auth/users/:id/reset-totp',
+          ip: getClientIp(req),
+          userAgent: (req.headers['user-agent'] as string | undefined) ?? null,
+          statusCode: 200,
+          metadata: {
+            targetUserId: id,
+            targetUsername: target.username,
+          },
+        },
+      })
+      .catch(() => undefined);
+
+    res.json({ message: 'TOTP enrollment cleared. User will be prompted to re-enroll on next login.' });
+  } catch (error) {
+    console.error('Reset TOTP error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
