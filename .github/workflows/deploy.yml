@@ -562,17 +562,22 @@ jobs:
 
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          # Same fail-fast env-file as the up step — docker compose
+          # parses the YAML on every invocation, and `${VAR:?msg}`
+          # tokens need the env_file context to resolve.
+          COMPOSE_BASE: --env-file ${{ env.DEPLOY_DIR }}/secrets.env
         run: |
           set -euo pipefail
           echo "## 🎉 Deployment complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Container status" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          docker compose $COMPOSE_BASE -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
           echo "----- Final docker compose ps -----"
-          docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps
+          docker compose $COMPOSE_BASE -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps
 
   # Auto-rollback is handled by .github/workflows/rollback.yml (separate file).
   # Rationale: rollback must NOT be affected by a bad commit that modifies
