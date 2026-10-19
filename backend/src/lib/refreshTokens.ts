@@ -17,6 +17,15 @@ export interface TokenPair {
   refreshToken: string;
   accessToken: string;
   refreshExpiresAt: Date;
+  /**
+   * `true` if the caller was racing a parallel refresh within
+   * `REPLAY_GRACE_MS` and we returned the new access JWT but did
+   * NOT rotate again. The caller (the auth route) should skip the
+   * Set-Cookie in this case — the parallel POST already set the
+   * cookie, and overwriting it with a value derived from the same
+   * hash would be a no-op or worse, churn the cookie.
+   */
+  graceHit?: boolean;
 }
 
 export async function issueTokenPair(
@@ -62,7 +71,34 @@ export async function issueTokenPair(
  *
  * If a *consumed* token is replayed, the entire chain for that user is
  * revoked as a defence against token theft.
+ *
+ * Race-tolerance (added 2026-10-19):
+ *   The previous behaviour was a hard `replay_detected` for ANY
+ *   already-consumed token. The cost was that benign parallel refreshes
+ *   (e.g. NetBox Import page mounts → fires `fetchNetboxInstances` +
+ *   `fetchNetboxHealth` simultaneously, both hit 401, both kick
+ *   coordinatedRefresh; OR two tabs of the same user land on 401 at the
+ *   same millisecond) produced an unavoidable double-POST to /api/auth/refresh
+ *   → second one ALWAYS fired replay_detected → entire refresh chain
+ *   revoked → user kicked out, has to log in again. Logged 06:18-06:19
+ *   on 2026-10-19 as admin@118.69.212.253 with three logins in 2 min.
+ *
+ *   The fix: if the consumed token was consumed within `REPLAY_GRACE_MS`
+ *   (5s) AND the same user already has an un-consumed, un-revoked token
+ *   that is NOT the one just consumed, the new token is returned instead
+ *   of throwing. The stolen-token defence (revoke the whole chain) only
+ *   fires when the consumed token is older than the grace window — by
+ *   then it's almost certainly an attacker replaying a token the
+ *   legitimate user discarded hours/days ago.
+ *
+ *   Tunable: 5s is enough to absorb same-millisecond double-POSTs from
+ *   any number of tabs (cross-tab coordination normally prevents this,
+ *   but BroadcastChannel can be blocked by extension, private mode, or
+ *   same-millisecond race on the first call after a tab open). Going
+ *   beyond ~10s starts to weaken the stolen-token defence materially.
  */
+const REPLAY_GRACE_MS = 5_000;
+
 export async function rotateRefreshToken(
   raw: string,
   meta: { userAgent?: string | null; ip?: string | null },
@@ -82,7 +118,63 @@ export async function rotateRefreshToken(
     throw new RefreshError('revoked_token', 'Refresh token was revoked');
   }
   if (existing.consumedAt) {
-    // Replay attack: invalidate every still-valid token for this user.
+    // ── Race-tolerant path (2026-10-19) ───────────────────────────────
+    // The token was just consumed by a parallel POST that the same
+    // user almost certainly also initiated (cross-tab refresh, page
+    // mount firing multiple authJsonFetch, etc.). If the consume was
+    // within the last REPLAY_GRACE_MS AND the user has a fresh
+    // un-consumed, un-revoked token minted around the same time, hand
+    // back a fresh access JWT but DO NOT mint a new refresh token —
+    // the parallel POST already did that and updated the browser
+    // cookie. The raw value of the new refresh token is unrecoverable
+    // (DB only stores the hash), so we set `graceHit: true` and let
+    // the auth route skip Set-Cookie — the browser cookie from the
+    // parallel POST is the source of truth.
+    //
+    //   The stolen-token defence (revoke the whole chain) only
+    //   fires when the consumed token is older than the grace
+    //   window — by then it's almost certainly an attacker replaying
+    //   a token the legitimate user discarded hours/days ago.
+    const consumedMsAgo = Date.now() - existing.consumedAt.getTime();
+    if (consumedMsAgo <= REPLAY_GRACE_MS) {
+      const fresh = await prisma.refreshToken.findFirst({
+        where: {
+          userId: existing.userId,
+          revokedAt: null,
+          consumedAt: null,
+          expiresAt: { gt: new Date() },
+          // Minted AFTER the consumed token, otherwise we could be
+          // returning a token the user is actively rotating elsewhere.
+          createdAt: { gt: existing.consumedAt },
+        },
+        orderBy: { createdAt: 'desc' },
+        include: { user: { select: { username: true, role: true, active: true } } },
+      });
+      if (fresh && fresh.user.active) {
+        console.log(
+          `[auth] refresh grace hit (ip=${meta.ip ?? 'unknown'}, user=${fresh.user.username}, ` +
+          `consumedMsAgo=${consumedMsAgo})`,
+        );
+        const accessToken = signAccess({
+          userId: fresh.userId,
+          username: fresh.user.username,
+          role: fresh.user.role,
+        });
+        return {
+          // Marker string; the auth route will refuse to set-cookie
+          // when graceHit is true. The client gets a fresh access
+          // JWT and keeps whatever refresh cookie the browser
+          // already has (set by the parallel POST).
+          refreshToken: '__grace_hit__',
+          accessToken,
+          refreshExpiresAt: fresh.expiresAt,
+          graceHit: true,
+        };
+      }
+    }
+    // Genuine replay — the consumed token is stale (or the user has
+    // no fresh replacement). Invalidate every still-valid token for
+    // this user.
     await prisma.refreshToken.updateMany({
       where: { userId: existing.userId, revokedAt: null, consumedAt: null },
       data: { revokedAt: new Date() },

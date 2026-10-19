@@ -241,13 +241,17 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
       return;
     }
 
-    // SECURITY (C13): refresh cookie too. The raw value in the body
-    // stays for non-browser clients (worker / curl).
-    setRefreshCookie(res, pair.refreshToken, { maxAgeMs: REFRESH_TTL_MS });
+    // SECURITY (C13): refresh cookie too, UNLESS this was a grace hit
+    // (a parallel POST just rotated the cookie already — sending
+    // another Set-Cookie would either be a no-op or churn the cookie
+    // for no reason). The raw body stays for non-browser clients.
+    if (!pair.graceHit) {
+      setRefreshCookie(res, pair.refreshToken, { maxAgeMs: REFRESH_TTL_MS });
+    }
 
     res.json({
       token: pair.accessToken,
-      refreshToken: pair.refreshToken,
+      refreshToken: pair.graceHit ? undefined : pair.refreshToken,
       refreshExpiresAt: pair.refreshExpiresAt.toISOString(),
     });
   } catch (error) {
