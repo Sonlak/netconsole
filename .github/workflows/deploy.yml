@@ -263,12 +263,12 @@ jobs:
           esac
 
           echo "==> Installing sops v$SOPS_VERSION (linux-$SOPS_ARCH)"
-          curl -sSLo sops "https://github.com/mozilla/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH"
+          curl -sSL "https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH" -o sops
           sudo install -m 0755 sops /usr/local/bin/sops
           sops --version
 
           echo "==> Installing age v$AGE_VERSION (linux-$AGE_ARCH)"
-          curl -sSLo age.tar.gz "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz"
+          curl -sSL "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz" -o age.tar.gz
           tar xzf age.tar.gz
           sudo install -m 0755 "age/age" "age/age-keygen" /usr/local/bin/
           age --version
