@@ -261,6 +261,7 @@ jobs:
             --exclude '/.last-deploy-*' \
             --exclude '/.rollback-before-deploy-*' \
             --exclude '/secrets.env' \
+            --exclude '/.env' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
