@@ -285,16 +285,22 @@ jobs:
           # because the cached schema no longer matches the DB. The deploy
           # job already uses this overlay (see deploy.yml "Build & restart");
           # rollback must do the same.
+          # Both env files are passed (same as deploy.yml) so JWT_SECRET,
+          # WORKER_AUTH_TOKEN, vendor creds (secrets.env) AND deploy-time
+          # OPENAI_API_KEY (.env) are all available. docker compose's
+          # env-file loads later files with higher precedence.
           echo "==> Pulling fresh images from GHCR (tag: $PREV_SHA)..."
           export GITHUB_SHA="${{ steps.marker.outputs.PREV_SHA }}"
           docker compose -p "$COMPOSE_PROJECT" \
             -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" \
+            --env-file "$DEPLOY_DIR/secrets.env" \
             --env-file "$DEPLOY_DIR/.env" \
             pull $DEPLOY_SERVICES 2>&1 || echo "::warning::pull failed; falling back to recreate"
 
           echo "==> Recreating containers from pulled images..."
           if docker compose -p "$COMPOSE_PROJECT" \
                -f "$COMPOSE_FILE" -f "$PROD_COMPOSE_FILE" \
+               --env-file "$DEPLOY_DIR/secrets.env" \
                --env-file "$DEPLOY_DIR/.env" \
                up -d --no-deps --force-recreate $DEPLOY_SERVICES 2>&1; then
             echo "✅ Recreate from GHCR images succeeded"
@@ -303,6 +309,8 @@ jobs:
 
           echo "::warning::Recreate from pulled images failed; trying local build fallback"
           if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+               --env-file "$DEPLOY_DIR/secrets.env" \
+               --env-file "$DEPLOY_DIR/.env" \
                up -d --build --no-deps $DEPLOY_SERVICES; then
             echo "✅ Local build + recreate succeeded"
             exit 0
@@ -310,13 +318,15 @@ jobs:
 
           echo "::warning::Local build failed; trying compose restart as last resort"
           if docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
+               --env-file "$DEPLOY_DIR/secrets.env" \
+               --env-file "$DEPLOY_DIR/.env" \
                restart $DEPLOY_SERVICES 2>&1; then
             echo "✅ Restart succeeded"
             exit 0
           fi
 
           echo "::error::All recovery attempts failed. Containers are down."
-          echo "::error::Manual fix: ssh to VPS and run 'cd /opt/netconsole && GITHUB_SHA=8dab6659c3f4b6c0ce06bd4920b6706b6b20c2fa docker compose -p netconsole -f docker-compose.app.yml -f docker-compose.app.prod.yml --env-file .env up -d --force-recreate'"
+          echo "::error::Manual fix: ssh to VPS and run 'cd /opt/netconsole && GITHUB_SHA=${{ steps.marker.outputs.PREV_SHA }} docker compose -p netconsole -f docker-compose.app.yml -f docker-compose.app.prod.yml --env-file secrets.env --env-file .env up -d --force-recreate'"
           docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps || true
           exit 1
 

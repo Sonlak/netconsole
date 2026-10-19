@@ -250,7 +250,8 @@ jobs:
           COMPOSE_BASE=(docker compose
             -p "$COMPOSE_PROJECT"
             -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml"
-            --env-file "$DEPLOY_DIR/secrets.env")
+            --env-file "$DEPLOY_DIR/secrets.env"
+            --env-file "$DEPLOY_DIR/.env")
           # ── Disk-pressure guard (added 2026-10-19) ──────────────────────
           # Self-hosted runner on a 70G root filesystem. Without this,
           # every deploy accumulates Docker images in `/var/lib/docker`
@@ -289,6 +290,23 @@ jobs:
           "${COMPOSE_BASE[@]}" stop $DEPLOY_SERVICES || true
           echo "==> Removing old containers..."
           "${COMPOSE_BASE[@]}" rm -sf $DEPLOY_SERVICES || true
+          # Create .env (deploy-time overrides) BEFORE pull so COMPOSE_BASE
+          # has both env files available. We pull OPENAI_API_KEY +
+          # OPENAI_MODEL from GH secrets and write them here. secrets.env
+          # (operator-managed) is the source of truth for everything else.
+          # docker compose's env-file loads later files with higher
+          # precedence, so .env overrides secrets.env on OPENAI_API_KEY.
+          : > "$DEPLOY_DIR/.env"  # truncate
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
+          # gpt-4o-mini — reverted 2026-10-13 at user request
+          # ("như ban đầu"). Was gpt-4.1 (full, not mini) for ~7h
+          # to test tool routing; user prefers the original cheaper
+          # gpt-4o-mini even if tool selection is occasionally
+          # wrong. The list_arp_entries / list_mac_entries tools
+          # added 2026-10-13 still help gpt-4o-mini route
+          # correctly for ARP/MAC queries.
+          echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
+          chmod 600 "$DEPLOY_DIR/.env" 2>/dev/null || true
           echo "==> Pulling fresh images from GHCR (tag: main)..."
           # `|| true` here for the same reason as the up -d fallback
           # below: a transient GHCR hiccup shouldn't brick the deploy.
@@ -299,22 +317,6 @@ jobs:
           "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES || {
             echo "::warning::docker compose pull returned non-zero — image may be partial"
           }
-          # Pull OPENAI_API_KEY from the GitHub Actions secret store and pass
-          # it to docker compose via the .env substitution. The compose file
-          # uses `${OPENAI_API_KEY:-}` so a missing secret keeps the assistant
-          # endpoint disabled (returns 503 with a clear error) rather than
-          # crashing the backend on startup. The cost is a 2-line change in
-          # docker-compose.app.yml — the backend already checks for the env
-          # var at first request, not at process start.
-          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
-          # gpt-4o-mini — reverted 2026-10-13 at user request
-          # ("như ban đầu"). Was gpt-4.1 (full, not mini) for ~7h
-          # to test tool routing; user prefers the original cheaper
-          # gpt-4o-mini even if tool selection is occasionally
-          # wrong. The list_arp_entries / list_mac_entries tools
-          # added 2026-10-13 still help gpt-4o-mini route
-          # correctly for ARP/MAC queries.
-          echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
           # SECURITY (C7, see docs/agents/16-security-audit-preprod.md):
           # lock down secrets.env on the VPS. If a previous deploy left
           # it world-readable, fix it now. `chmod 600` makes the file
@@ -599,8 +601,12 @@ jobs:
         env:
           # Same fail-fast env-file as the up step — docker compose
           # parses the YAML on every invocation, and `${VAR:?msg}`
-          # tokens need the env_file context to resolve.
-          COMPOSE_BASE: --env-file ${{ env.DEPLOY_DIR }}/secrets.env
+          # tokens need the env_file context to resolve. Both files
+          # are passed: secrets.env provides long-lived operator-managed
+          # values (JWT_SECRET, vendor creds); .env provides deploy-time
+          # values (OPENAI_API_KEY from GH secrets). Later wins, so
+          # .env overrides secrets.env on conflicts.
+          COMPOSE_BASE: --env-file ${{ env.DEPLOY_DIR }}/secrets.env --env-file ${{ env.DEPLOY_DIR }}/.env
         run: |
           set -euo pipefail
           echo "## 🎉 Deployment complete" >> $GITHUB_STEP_SUMMARY
