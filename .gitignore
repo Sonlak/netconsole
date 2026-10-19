@@ -155,6 +155,11 @@ worker/_*.py
 /secrets.env
 /secrets.env.local
 /secrets.*.env
+# SOPS age private key (PUBLIC key goes in .sops.yaml; private key stays local)
+/.sops-age-key.txt
+/.sops-age-key
+/age-priv.txt
+/age.key
 /frontend/certs/cert.pem
 /frontend/certs/key.pem
 /frontend/certs/*.csr

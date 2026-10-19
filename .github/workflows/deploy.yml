@@ -229,6 +229,105 @@ jobs:
           echo "--- Synced. DEPLOY_DIR contents:"
           ls -la "$DEPLOY_DIR" | head -25
 
+      # =============================================================================
+      # SOPS + age: decrypt secrets.env.enc → secrets.env
+      # =============================================================================
+      # secrets.env is the canonical source of truth for production
+      # secrets (JWT_SECRET, WORKER_AUTH_TOKEN, vendor creds). It is
+      # NEVER committed in plaintext — instead, secrets.env.enc is
+      # committed (encrypted with age, see .sops.yaml) and decrypted
+      # here using the SOPS_AGE_KEY GitHub Actions secret.
+      #
+      # This is the P1 hardening (SOPS + age for secrets.env). The
+      # encrypted file can safely live in git history; only operators
+      # with the age private key can decrypt it.
+      #
+      # Failure modes:
+      #   - SOPS_AGE_KEY not set in repo secrets → step fails fast
+      #   - secrets.env.enc missing → step fails fast
+      #   - Wrong key / .sops.yaml changed → sops fails fast
+      - name: Install SOPS + age
+        run: |
+          set -euo pipefail
+          SOPS_VERSION="3.10.2"
+          AGE_VERSION="1.2.1"
+          TMPDIR=$(mktemp -d)
+          cd "$TMPDIR"
+
+          # Detect architecture
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) SOPS_ARCH=amd64; AGE_ARCH=amd64 ;;
+            aarch64) SOPS_ARCH=arm64; AGE_ARCH=arm64 ;;
+            *) echo "ERROR: unsupported arch: $ARCH"; exit 1 ;;
+          esac
+
+          echo "==> Installing sops v$SOPS_VERSION (linux-$SOPS_ARCH)"
+          curl -sSLo sops "https://github.com/mozilla/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH"
+          sudo install -m 0755 sops /usr/local/bin/sops
+          sops --version
+
+          echo "==> Installing age v$AGE_VERSION (linux-$AGE_ARCH)"
+          curl -sSLo age.tar.gz "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz"
+          tar xzf age.tar.gz
+          sudo install -m 0755 "age/age" "age/age-keygen" /usr/local/bin/
+          age --version
+
+          cd /tmp && rm -rf "$TMPDIR"
+
+      - name: Decrypt secrets.env.enc
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOPS_AGE_KEY:-}" ]; then
+            echo "::error::SOPS_AGE_KEY secret is not set in GitHub Actions."
+            echo "  Generate a key pair:"
+            echo "    age-keygen -o /tmp/age.key"
+            echo "    cat /tmp/age.key    # the AGE-SECRET-KEY-... line"
+            echo "  Then: repo → Settings → Secrets → Actions → New secret"
+            echo "    Name:  SOPS_AGE_KEY"
+            echo "    Value: <paste the line above>"
+            echo ""
+            echo "  Also update .sops.yaml with the public key (the second line"
+            echo "  of age-keygen's output, the one starting with 'age1...')."
+            exit 1
+          fi
+
+          cd "$DEPLOY_DIR"
+          if [ ! -f "secrets.env.enc" ]; then
+            echo "::error::secrets.env.enc not found at $DEPLOY_DIR — was it committed?"
+            exit 1
+          fi
+          if [ ! -f ".sops.yaml" ]; then
+            echo "::error::.sops.yaml not found at $DEPLOY_DIR"
+            exit 1
+          fi
+
+          # Check the placeholder is still in .sops.yaml.
+          if grep -q "PLACEHOLDER" .sops.yaml; then
+            echo "::error::.sops.yaml still contains the PLACEHOLDER public key."
+            echo "  See docs/agents/16-security-audit-preprod.md for the key-rotation procedure."
+            exit 1
+          fi
+
+          echo "==> Decrypting secrets.env.enc → secrets.env"
+          SOPS_AGE_KEY_CMD="$SOPS_AGE_KEY" ./scripts/sops_decrypt.sh
+
+          # Sanity check: required vars must be present.
+          for required in JWT_SECRET WORKER_AUTH_TOKEN; do
+            if ! grep -q "^${required}=" secrets.env; then
+              echo "::error::$required missing from decrypted secrets.env"
+              exit 1
+            fi
+            val=$(grep "^${required}=" secrets.env | head -1 | cut -d= -f2-)
+            if [ -z "$val" ]; then
+              echo "::error::$required is empty in decrypted secrets.env"
+              exit 1
+            fi
+          done
+          echo "✅ secrets.env decrypted; required vars present"
+
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
         env:

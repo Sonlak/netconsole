@@ -164,6 +164,27 @@ for i in $(seq 1 30); do
       echo
       echo "⚠️  All user sessions invalidated. Users must log in again."
       echo "Worker token TTL: ${WORKER_TTL_HOURS}h (rotated)."
+      echo
+      # P1 hardening: secrets.env is now SOPS-encrypted in git. The plaintext
+      # file we just rotated lives only on the VPS. To make the new values
+      # durable across deploys, the operator must re-encrypt and commit.
+      if [ -f "/opt/netconsole/secrets.env.enc" ]; then
+        echo "==> Re-encrypt secrets.env → secrets.env.enc?"
+        echo "    Run on the VPS (requires age key at /opt/netconsole/.sops-age-key.txt):"
+        echo "      SOPS_AGE_KEY_CMD=\"\$(cat /opt/netconsole/.sops-age-key.txt)\" \\"
+        echo "        ./scripts/sops_decrypt.sh   # already done; backs up the OLD encrypted file"
+        echo "      # Re-encrypt in place (overwrites secrets.env.enc):"
+        echo "      sops --input-type=dotenv --output-type=dotenv \\"
+        echo "        --encrypt secrets.env > secrets.env.enc"
+        echo "      # Then commit + push from the VPS:"
+        echo "      cd /opt/netconsole"
+        echo "      git add secrets.env.enc"
+        echo "      git commit -m 'chore: rotate JWT_SECRET + WORKER_AUTH_TOKEN'"
+        echo "      git push origin main"
+        echo
+        echo "    (Or run ./scripts/sops_encrypt.sh from your local machine after"
+        echo "     scp-ing the new secrets.env to your dev box.)"
+      fi
       exit 0
     fi
     sleep 2

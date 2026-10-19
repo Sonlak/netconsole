@@ -1,0 +1,42 @@
+# =============================================================================
+# SOPS configuration for NetConsole
+#
+# Uses age (https://age-encryption.org) — modern, fast, no-Dependency-hell
+# encryption. Public-key encryption: encrypt once with a public key; any
+# holder of the matching private key can decrypt.
+#
+# KEY MANAGEMENT:
+#   - The private key is stored in GitHub Actions as the secret `SOPS_AGE_KEY`.
+#   - In production (VPS), it is stored at /opt/netconsole/.sops-age-key.txt
+#     (chmod 600, gitignored).
+#   - The public key (shown below) is committed; it identifies WHO can
+#     decrypt this file.
+#
+# HOW TO GENERATE A NEW KEY PAIR:
+#   age-keygen -o age-priv.txt
+#   cat age-priv.txt
+#   # AGE-SECRET-KEY-1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+#   # age1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX   <-- public key
+#
+#   Copy the public key into this file (replace the placeholder below).
+#   Store the private key in:
+#     (a) GitHub repo → Settings → Secrets → Actions → New secret → SOPS_AGE_KEY
+#     (b) VPS  → /opt/netconsole/.sops-age-key.txt  (chmod 600)
+#
+# HOW TO ENCRYPT A NEW secrets.env:
+#   # Locally (requires age binary + this .sops.yaml):
+#   sops --encrypt secrets.env > secrets.env.enc
+#   git add secrets.env.enc && git commit -m "chore: update encrypted secrets"
+#
+#   # Or use the convenience script:
+#   scripts/sops_encrypt.sh
+# =============================================================================
+
+creation_rules:
+  - path_regex: secrets\.env\.enc$
+    encrypted_regex: '^(JWT_SECRET|WORKER_AUTH_TOKEN|NETBOX_TOKEN|NETBOX_TOKEN_NETBOX2|LAB_SSH_PASSWORD|JUNOS_REST_PASSWORD|IOSXE_API_PASSWORD|EOS_API_PASSWORD|NXOS_API_PASSWORD|IOS_HTTP_PASSWORD|OPENAI_API_KEY|AGE_KEY)=.*$
+    age: >-
+      # REPLACE THIS PLACEHOLDER with your real age public key.
+      # Run: age-keygen
+      # Then paste the "age1..." line here.
+      age1PLACEHOLDERREPLACEMEWITHYOURACTUALPUBLICKEY
