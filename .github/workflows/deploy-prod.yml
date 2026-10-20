@@ -1,0 +1,415 @@
+# =============================================================================
+# NetConsole Deploy to Production VPS — via vps-prod-01
+#
+# Runs on: vps-prod-01 (new VPS, dedicated production)
+#
+# Triggers:
+#   1. Push a version tag: git tag v0.3.0 && git push --tags
+#      → Always deploys the tagged commit.
+#
+#   2. Push to main (after PR merge with branch protection)
+#      → Auto-deploys the latest main. Requires branch protection so
+#        only reviewed PRs trigger this.
+#
+#   3. Manual: GitHub Actions UI → Deploy Prod → Run workflow
+#      → Deploys any ref you choose.
+#
+# DEV/TEST: use deploy-dev.yml (auto-triggers on every branch push)
+# =============================================================================
+name: Deploy Prod
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (branch / tag / sha). Default: main"
+        required: false
+        default: "main"
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: true
+
+env:
+  DEPLOY_DIR: /opt/netconsole
+  COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
+  NETBOX_COMPOSE_FILE: /opt/netconsole/docker-compose.netbox.yml
+  COMPOSE_PROJECT: netconsole
+  DEPLOY_SERVICES: "backend worker frontend redis"
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: vps-prod-01
+    needs: push-images
+    timeout-minutes: 25
+
+    steps:
+      - name: Display deployment info
+        run: |
+          echo "## Deploy Prod starting" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner:** $(hostname) (vps-prod-01)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          fetch-depth: 0
+          path: src
+
+      - name: Show commit log
+        working-directory: src
+        run: |
+          echo "## Last 5 commits" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          git log --oneline -5 >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Save rollback marker (current VPS state — before deploy)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPLOY_DIR"
+
+          if [ ! -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+            if [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
+              cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+              cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref" 2>/dev/null || true
+              echo "Backed up current rollback target: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
+            else
+              echo "No existing .last-deploy-sha to back up"
+            fi
+          else
+            echo "Rollback anchor already exists: $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
+          fi
+
+          if [ -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ -s "$DEPLOY_DIR/.last-deploy-sha" ]; then
+            CURRENT_SHA=$(cat "$DEPLOY_DIR/.last-deploy-sha")
+            CURRENT_REF=$(cat "$DEPLOY_DIR/.last-deploy-ref" 2>/dev/null || echo "unknown")
+          else
+            if [ -d "$DEPLOY_DIR/.git" ]; then
+              CURRENT_SHA=$(git -C "$DEPLOY_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+              CURRENT_REF=$(git -C "$DEPLOY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+            else
+              CURRENT_SHA="unknown"; CURRENT_REF="unknown"
+            fi
+          fi
+          printf '%s\n' "$CURRENT_SHA" > "$DEPLOY_DIR/.last-deploy-sha"
+          printf '%s\n' "$CURRENT_REF" > "$DEPLOY_DIR/.last-deploy-ref"
+          printf '%s\n' "push" > "$DEPLOY_DIR/.last-deploy-event"
+          echo "Pre-deploy marker saved: sha=$CURRENT_SHA ref=$CURRENT_REF"
+
+      - name: Sync source to ${{ env.DEPLOY_DIR }}
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/src
+        run: |
+          set -euo pipefail
+          if [ ! -d "$SOURCE_DIR" ] || [ ! -d "$DEPLOY_DIR" ]; then
+            echo "::error::Missing dirs: SOURCE=$SOURCE_DIR DEPLOY=$DEPLOY_DIR"
+            exit 1
+          fi
+          set +e
+          rsync -a --delete --ignore-errors \
+            --exclude '/.git/hooks/' --exclude '/.git/info/' \
+            --exclude '/data/' --exclude '/volumes/' \
+            --exclude '/netconsole-app.tar.gz' --exclude '/.tmp-hello.txt' \
+            --exclude '/.tmp-cfg/' --exclude '/scripts/ci-rsa-*.bak' \
+            --exclude '*.pid' --exclude '/logs/' --exclude '/backups/' \
+            --exclude '/secrets.env' --exclude '/.env' \
+            --exclude '/.sops-age-key.txt' \
+            "$SOURCE_DIR/" "$DEPLOY_DIR/"
+          rsync_rc=$?
+          set -e
+          if [ "$rsync_rc" -eq 0 ]; then
+            echo "rsync OK"
+          elif [ "$rsync_rc" -eq 23 ] || [ "$rsync_rc" -eq 24 ]; then
+            echo "rsync partial (benign): exit $rsync_rc"
+          else
+            echo "::error::rsync failed: exit $rsync_rc"; exit "$rsync_rc"
+          fi
+
+      - name: Install SOPS + age
+        run: |
+          set -euo pipefail
+          SOPS_VERSION="3.10.2"; AGE_VERSION="1.2.1"
+          TMPDIR=$(mktemp -d); cd "$TMPDIR"
+          ARCH=$(uname -m)
+          case "$ARCH" in x86_64) SA=amd64; AA=amd64 ;; aarch64) SA=arm64; AA=arm64 ;; *) echo "ERROR: unsupported arch"; exit 1 ;; esac
+
+          if command -v sops >/dev/null 2>&1 && \
+             [ "$(sops --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')" = "$SOPS_VERSION" ] && \
+             command -v age >/dev/null 2>&1; then
+            echo "sops $SOPS_VERSION + age already installed"; cd /tmp && rm -rf "$TMPDIR"; exit 0
+          fi
+
+          try_fetch() { local u="$1" o="$2"; curl -sSLf --max-time 60 -o "$o" "$u" && [ -s "$o" ] && return 0; rm -f "$o"; return 1; }
+
+          for url in "https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SA" "https://gh-proxy.com/https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SA"; do
+            try_fetch "$url" sops && echo "sops OK: $url" && break
+          done
+          chmod +x sops && sudo install -m 0755 sops /usr/local/bin/sops
+
+          for url in "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AA.tar.gz" "https://gh-proxy.com/https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AA.tar.gz"; do
+            try_fetch "$url" age.tar.gz && echo "age OK: $url" && break
+          done
+          tar xzf age.tar.gz && sudo install -m 0755 age/age age/age-keygen /usr/local/bin/
+          cd /tmp && rm -rf "$TMPDIR"
+
+      - name: Decrypt secrets.env.enc
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          SOPS_AGE_KEY_FILE: /opt/netconsole/.sops-age-key.txt
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          if [ ! -f "secrets.env.enc" ] || [ ! -f ".sops.yaml" ]; then
+            echo "::error::secrets.env.enc or .sops.yaml missing"; exit 1
+          fi
+          if grep -q "PLACEHOLDER" .sops.yaml; then
+            echo "::error::.sops.yaml has PLACEHOLDER — rotate key first"; exit 1
+          fi
+          key_source=""
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            key_source="GH secret"
+          elif [ -f "${SOPS_AGE_KEY_FILE}" ]; then
+            key_source="local file"
+          else
+            echo "::error::No age key — set SOPS_AGE_KEY in GH secrets or copy to ${SOPS_AGE_KEY_FILE}"; exit 1
+          fi
+          echo "Decrypting (key from: $key_source)"
+          bash ./scripts/sops_decrypt.sh
+          for required in JWT_SECRET WORKER_AUTH_TOKEN; do
+            if ! grep -q "^${required}=" secrets.env || [ -z "$(grep "^${required}=" secrets.env | cut -d= -f2-)" ]; then
+              echo "::error::$required missing/empty in secrets.env"; exit 1
+            fi
+          done
+          echo "secrets.env OK"
+
+      - name: Build & restart app services
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          COMPOSE_BASE=(docker compose
+            -p "$COMPOSE_PROJECT"
+            -f "$COMPOSE_FILE" -f "$DEPLOY_DIR/docker-compose.app.prod.yml"
+            --env-file "$DEPLOY_DIR/secrets.env"
+            --env-file "$DEPLOY_DIR/.env")
+
+          echo "Disk check:"
+          df -h / | head -3 || true
+          AVAIL=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          if [ "${AVAIL:-0}" -lt 5 ]; then
+            echo "Low disk (${AVAIL}G). Pruning..."
+            sudo -n docker container prune -f 2>&1 | tail -3 || true
+            sudo -n docker image prune -a -f 2>&1 | tail -5 || true
+            sudo -n docker volume prune -f 2>&1 | tail -3 || true
+          else
+            echo "Disk OK (${AVAIL}G)"
+          fi
+
+          "${COMPOSE_BASE[@]}" stop $DEPLOY_SERVICES || true
+          "${COMPOSE_BASE[@]}" rm -sf $DEPLOY_SERVICES || true
+
+          : > "$DEPLOY_DIR/.env"
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
+          echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
+          chmod 600 "$DEPLOY_DIR/.env" 2>/dev/null || true
+
+          "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES || echo "Pull warning (non-fatal)"
+
+          if [ -f "$DEPLOY_DIR/secrets.env" ]; then
+            chmod 600 "$DEPLOY_DIR/secrets.env"
+          fi
+
+          iptables -C INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP 2>/dev/null \
+            || iptables -I INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP -m comment --comment "netconsole-syslog" 2>/dev/null \
+            || echo "warning: iptables :1514 rule failed"
+
+          "${COMPOSE_BASE[@]}" up -d --remove-orphans --no-deps $DEPLOY_SERVICES || {
+            echo "Warning: up returned non-zero — sweeping Created containers"
+            for svc in $DEPLOY_SERVICES; do
+              cid=$(docker ps -a --filter "label=com.docker.compose.service=$svc" --format '{{.ID}}' | head -1)
+              state=$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)
+              if [ "$state" = "created" ]; then
+                echo "  Starting $svc ($cid)"
+                docker start "$cid" || true
+              fi
+            done
+          }
+
+          if [ -f "$NETBOX_COMPOSE_FILE" ]; then
+            echo "NetBox stack..."
+            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$NETBOX_COMPOSE_FILE" \
+              up -d --force-recreate netbox || echo "NetBox warning (non-fatal)"
+            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$NETBOX_COMPOSE_FILE" \
+              up -d netbox-postgres netbox-redis || true
+          fi
+
+      - name: Wait for backend healthy
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 45); do
+            if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
+              echo "Backend healthy (attempt $i)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Backend not healthy in 90s"
+          docker logs --tail 40 netconsole-backend || true
+          exit 1
+
+      - name: Verify frontend reachable
+        run: |
+          set -euo pipefail
+          sleep 3
+          code=$(curl -k -s -o /dev/null -w "%{http_code}" --max-time 5 https://127.0.0.1:8443/ || echo "000")
+          if [ "$code" = "200" ]; then
+            echo "Frontend OK (HTTPS $code)"
+          else
+            echo "Frontend HTTPS $code"; docker logs --tail 30 netconsole-frontend || true; exit 1
+          fi
+
+      - name: Verify kea + postgres untouched
+        run: |
+          docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
+            --filter "name=netconsole-kea-primary" --filter "name=netconsole-kea-standby" \
+            --filter "name=netconsole-postgres" \
+            --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+
+      - name: Save deploy marker (for future auto-rollback)
+        run: |
+          set -euo pipefail
+          mkdir -p "$DEPLOY_DIR"
+          printf '%s\n' "${{ github.sha }}" > "$DEPLOY_DIR/.last-deploy-sha"
+          printf '%s\n' "${{ github.ref_name }}" > "$DEPLOY_DIR/.last-deploy-ref"
+          printf '%s\n' "${{ github.event_name }}" > "$DEPLOY_DIR/.last-deploy-event"
+          cp "$DEPLOY_DIR/.last-deploy-sha" "$DEPLOY_DIR/.rollback-before-deploy-sha"
+          cp "$DEPLOY_DIR/.last-deploy-ref" "$DEPLOY_DIR/.rollback-before-deploy-ref"
+          echo "Marker saved: $(cat "$DEPLOY_DIR/.last-deploy-sha")"
+
+      - name: Open iptables port for NetBox (8080)
+        run: |
+          set +e
+          ADD_RULE() {
+            iptables -C INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>/dev/null && return 0
+            sudo -n iptables -I INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
+            iptables -I INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
+            echo "warning: iptables :8080 rule failed"
+            return 1
+          }
+          ADD_RULE; set -e
+
+      - name: Wait for NetBox healthy
+        run: |
+          set -euo pipefail
+          if docker ps --format '{{.Names}}\t{{.Status}}' | grep -E '^(netbox-netbox)\s+Up' >/dev/null 2>&1; then
+            echo "NetBox container Up — skipping wait"
+            curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1" && echo "NetBox reachable" \
+              || echo "warning: NetBox Up but API probe failed"
+            exit 0
+          fi
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
+              echo "NetBox healthy (attempt $i)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "warning: NetBox not healthy in 5 min"
+
+      - name: Final state
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          echo "## Deployment complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **Ref:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Container status" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker compose --env-file "$DEPLOY_DIR/secrets.env" --env-file "$DEPLOY_DIR/.env" \
+            -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker compose --env-file "$DEPLOY_DIR/secrets.env" --env-file "$DEPLOY_DIR/.env" \
+            -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" ps
+
+  push-images:
+    name: Push ${{ matrix.service }} to GHCR
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) ||
+      github.event_name == 'workflow_dispatch'
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: backend
+            context: backend
+            dockerfile: backend/Dockerfile
+          - service: worker
+            context: worker
+            dockerfile: worker/Dockerfile
+          - service: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile.prod
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for ${{ matrix.service }}
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/sonlak/netconsole-${{ matrix.service }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build + push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+          build-args: |
+            NETCONSOLE_VERSION=${{ github.ref_name }}
+            NETCONSOLE_GIT_COMMIT=${{ github.sha }}
+
+      - name: Summary
+        if: ${{ matrix.service == 'backend' }}
+        run: |
+          echo "## Images pushed to GHCR" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-backend" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-worker" >> $GITHUB_STEP_SUMMARY
+          echo "- ghcr.io/sonlak/netconsole-frontend" >> $GITHUB_STEP_SUMMARY

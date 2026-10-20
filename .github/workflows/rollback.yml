@@ -88,7 +88,7 @@ env:
 jobs:
   rollback:
     name: Auto-rollback to last known-good
-    runs-on: self-hosted
+    runs-on: vps-prod-01
     # Run when:
     #   - workflow_run trigger AND Deploy failed (auto path)
     #   - OR workflow_dispatch (manual path — no workflow_run context exists)
