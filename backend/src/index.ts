@@ -42,7 +42,7 @@ import { assistantRouter } from './routes/assistant.js';
 import { startTerminalWebSocket } from './websocket/terminal.js';
 import { authMiddleware } from './middleware/auth.js';
 import { auditLogMiddleware } from './middleware/auditLog.js';
-import { strictRateLimit, moderateRateLimit, authRateLimit, scanRateLimit } from './middleware/rateLimit.js';
+import { strictRateLimit, moderateRateLimit, scanRateLimit } from './middleware/rateLimit.js';
 
 // CORS whitelist - chỉ cho phép domain được cấp phép. SECURITY (H12,
 // see docs/agents/16-security-audit-preprod.md): production compose
@@ -315,8 +315,15 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-// Auth routes - không cần auth để login/register
-app.use('/api/auth', authRateLimit, authRouter);
+// Auth routes - không cần auth để login/register. NOTE (2026-10-20):
+// the `authRateLimit` middleware is no longer applied GLOBALLY here —
+// only to the credential-challenge endpoints inside `authRouter`
+// (`POST /login` and `POST /mfa/verify`). Read-write endpoints like
+// `/api/auth/me`, `/api/auth/refresh`, etc. are not credential
+// challenges and were tripping when the frontend auto-re-logged-in
+// after session drops. See `rateLimit.ts` for the new failuresOnly
+// behaviour that lets successful logins NOT consume the budget.
+app.use('/api/auth', authRouter);
 
 // TOTP management — all endpoints require authentication.
 // Mounted after authRouter so /api/auth/mfa/verify is handled there.

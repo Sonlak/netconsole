@@ -15,6 +15,7 @@ import {
   recordSuccessfulLogin,
   isLoginLocked,
 } from '../middleware/loginAttempt.js';
+import { authRateLimit } from '../middleware/rateLimit.js';
 import { signMfaToken, verifyMfaToken } from '../lib/mfaToken.js';
 import { verifyTotpCode, verifyBackupCode, currentStepTimestamp } from '../lib/totp.js';
 
@@ -90,7 +91,16 @@ function shapeUser(user: {
 }
 
 // POST /api/auth/login
-authRouter.post('/login', async (req: Request, res: Response) => {
+// SECURITY (2026-10-20): the `authRateLimit` middleware is attached
+// ONLY to this route (and to `POST /mfa/verify` below). It used to
+// live on a global `app.use('/api/auth', ...)` in index.ts and was
+// tripping after ~7 successful re-logins because the in-memory gate
+// counted every request — including 200 OK responses — toward the
+// budget. Now `authRateLimit` has `failuresOnly: true` so successful
+// logins roll the increment back via `res.on('finish')`, and the
+// DB-backed `loginAttempt.ts` lockout (5 consecutive bad passwords)
+// remains the authoritative credential-stuffing gate.
+authRouter.post('/login', authRateLimit, async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
 
@@ -215,7 +225,7 @@ authRouter.post('/login', async (req: Request, res: Response) => {
 // second factor of a TOTP-protected login. Accepts either a 6-digit
 // TOTP code or a single-use backup code. On success, issues the
 // canonical (access, refresh) pair just like a non-TOTP login would.
-authRouter.post('/mfa/verify', async (req: Request, res: Response) => {
+authRouter.post('/mfa/verify', authRateLimit, async (req: Request, res: Response) => {
   try {
     const { mfaToken, code, method } = req.body as {
       mfaToken?: string;

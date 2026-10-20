@@ -22,26 +22,41 @@ export interface RateLimitOptions {
   max: number; // Max requests per window
   keyGenerator?: (req: Request) => string;
   message?: string;
+  /**
+   * When `true`, the per-key counter only accumulates on FAILED responses
+   * (4xx/5xx). Successful responses (2xx/3xx) roll the just-added +1 back
+   * out via a `res.on('finish')` listener so a user who is logging in
+   * repeatedly (e.g. session drops forcing a re-login every few minutes)
+   * does not hit the limit. The DB-backed lockout in loginAttempt.ts is
+   * unchanged and still fires after 5 consecutive bad passwords — this
+   * option is for the in-memory FAST gate, not the security gate.
+   */
+  failuresOnly?: boolean;
 }
 
 export function rateLimit(options: RateLimitOptions) {
-  const { windowMs, max, keyGenerator = ((req: Request) => req.ip || 'unknown'), message = 'Too many requests, please try again later' } = options;
+  const {
+    windowMs,
+    max,
+    keyGenerator = ((req: Request) => req.ip || 'unknown'),
+    message = 'Too many requests, please try again later',
+    failuresOnly = false,
+  } = options;
 
   return (req: Request, res: Response, _next: NextFunction): void => {
     const key = keyGenerator(req);
     const now = Date.now();
-    const windowStart = now - windowMs;
 
+    // Increment unconditionally; if `failuresOnly`, the rollback happens
+    // in the `finish` listener below. Increment first so X-RateLimit-*
+    // headers reflect the worst-case for this request.
+    let incrementedForThisRequest = false;
     if (!store[key] || store[key].resetTime < now) {
       store[key] = { count: 1, resetTime: now + windowMs };
-      res.setHeader('X-RateLimit-Limit', max.toString());
-      res.setHeader('X-RateLimit-Remaining', (max - 1).toString());
-      res.setHeader('X-RateLimit-Reset', store[key].resetTime.toString());
-      _next();
-      return;
+    } else {
+      store[key].count++;
     }
-
-    store[key].count++;
+    incrementedForThisRequest = true;
 
     res.setHeader('X-RateLimit-Limit', max.toString());
     res.setHeader('X-RateLimit-Remaining', Math.max(0, max - store[key].count).toString());
@@ -49,7 +64,22 @@ export function rateLimit(options: RateLimitOptions) {
 
     if (store[key].count > max) {
       res.status(429).json({ error: message, retryAfter: Math.ceil((store[key].resetTime - now) / 1000) });
+      // Counted as a failure — keep the increment.
       return;
+    }
+
+    if (failuresOnly) {
+      res.on('finish', () => {
+        // Only roll back if we actually incremented this request AND the
+        // response was a success (2xx/3xx). 401/400/429/etc. all keep
+        // the +1.
+        if (!incrementedForThisRequest) return;
+        if (res.statusCode < 200 || res.statusCode >= 400) return;
+        const entry = store[key];
+        if (entry && entry.count > 0) {
+          entry.count--;
+        }
+      });
     }
 
     _next();
@@ -60,23 +90,45 @@ export function rateLimit(options: RateLimitOptions) {
 // Internal lab: keep limits very high so reads from the dashboard never trip during normal use.
 export const strictRateLimit = rateLimit({ windowMs: 60 * 1000, max: 200 }); // 200 requests per minute
 export const moderateRateLimit = rateLimit({ windowMs: 60 * 1000, max: 600 }); // 600 requests per minute
+
 // SECURITY (H11, see docs/agents/16-security-audit-preprod.md):
-// the in-memory `authRateLimit` is the FAST gate before the DB-backed
-// lockout in loginAttempt.ts kicks in. PCI-DSS guidance is 5-10
-// attempts. We use 10/15 min here (in addition to the 5-strike
-// lockout) so a single attacker can't drive the DB into a tight loop
-// even before the lockout fires. After 5 consecutive fails, the
-// DB lockout responds 429 faster than this middleware would.
+//
+// authRateLimit is the FAST in-memory gate that sits BEFORE the DB-
+// backed lockout in `loginAttempt.ts`. Its job is to stop a single
+// attacker from driving the bcrypt+prisma round-trip on every request
+// even before the 5-strike DB lockout fires.
+//
+// Two design choices fixed in 2026-10-20 (incident: legitimate user
+// hit "Too many login attempts" after ~7 successful re-logins caused
+// by session drops):
+//
+// 1. `failuresOnly: true` — successful logins (200) DO NOT contribute
+//    to the counter. Only 401/400/429 (or any 4xx/5xx) increment it.
+//    A user whose session drops and who has to re-type their
+//    password 20 times in an hour can no longer lock themselves out.
+//
+// 2. Apply only to credential-challenge endpoints (`POST /login` and
+//    `POST /mfa/verify`). NOT applied globally to `/api/auth/*` —
+//    `/auth/me`, `/auth/refresh`, `/auth/logout` etc. are not
+//    credential challenges and must remain at moderateRateLimit (or
+//    no limit) so they don't trip during normal dashboard polling.
+//
+// Note that the DB-backed `recordFailedLogin` lockout at 5 consecutive
+// bad passwords (15-min window) is still the authoritative gate —
+// `authRateLimit` is the cheap upstream filter and now only counts
+// failures, so its budget should stay generous (we keep 30 / 15 min /
+// per IP+username pair).
 export const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max: 30,
+  failuresOnly: true,
   message: 'Too many login attempts, please try again after 15 minutes',
   keyGenerator: (req) => {
     try {
       const u = (req.body && (req.body.username || req.body.user)) || '';
-      if (typeof u === 'string' && u.length > 0) return `user:${u}`;
+      if (typeof u === 'string' && u.length > 0) return `login:user:${u}`;
     } catch {}
-    return `ip:${req.ip || 'unknown'}`;
+    return `login:ip:${req.ip || 'unknown'}`;
   },
-}); // 10 attempts per 15 minutes per username
+}); // 30 failed attempts per 15 minutes per (username, ip)
 export const scanRateLimit = rateLimit({ windowMs: 60 * 1000, max: 30, message: 'Too many scan requests, please wait' }); // 30 scans per minute
