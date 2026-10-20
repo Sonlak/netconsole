@@ -39,6 +39,7 @@ cd /opt/netconsole
 
 SECRETS_FILE=/opt/netconsole/secrets.env
 EXAMPLE_FILE=/opt/netconsole/secrets.env.example
+DEPLOY_DIR=/opt/netconsole
 
 WORKER_TTL_HOURS=24
 INITIAL=0
@@ -153,8 +154,50 @@ PYEOF
 chmod 600 "$SECRETS_FILE"
 
 # 6. Restart the two services that consume these env vars.
-docker compose -p netconsole -f /opt/netconsole/docker-compose.app.yml \
-  up -d --no-deps --force-recreate backend worker
+# SECURITY+correctness: must pass --env-file secrets.env (the deploy
+# workflow does this on every invocation; we have to mirror it here,
+# otherwise docker compose refuses to parse the YAML because of the
+# `${VAR:?msg}` fail-fast interpolations in docker-compose.app.yml).
+# We also pass --env-file .env (created by deploy.yml; redeploy-build
+# populates it with OPENAI_API_KEY/OPENAI_MODEL from GH secrets). If
+# .env doesn't exist (operator-only rotation, no deploy) it's fine —
+# the bash array skips undefined elements.
+#
+# IMPORTANT: must include -f docker-compose.app.prod.yml too. The base
+# file declares `build:` only (no `image:` for backend/worker/frontend),
+# which makes `up` try to build. The prod overlay replaces `build:` with
+# `image: ghcr.io/sonlak/netconsole-*:${GITHUB_SHA:-main}` — that's how
+# the deploy workflow gets away without rebuilding. Rotation must do
+# the same.
+# Without the overlay, `up -d` fails with
+# `Container ... Recreate   Error response from daemon: No such image:
+#  netconsole-backend:latest`.
+#
+# GITHUB_SHA: deploy.yml sets it to the running commit SHA so the
+# pinned image is pulled. Operator-only rotation has no $GITHUB_SHA,
+# so we fall back to whatever's currently running — read .last-deploy-sha
+# (the marker deploy.yml maintains). If that file is missing, fall
+# back to :main and let the user accept the (small) risk of pulling
+# a different commit than what was previously running.
+if [ -z "${GITHUB_SHA:-}" ] && [ -f "$DEPLOY_DIR/.last-deploy-sha" ]; then
+  GITHUB_SHA="$(cat "$DEPLOY_DIR/.last-deploy-sha")"
+  export GITHUB_SHA
+fi
+
+ENV_FILE_ARGS=(--env-file "$SECRETS_FILE")
+if [ -f "$DEPLOY_DIR/.env" ]; then
+  ENV_FILE_ARGS+=(--env-file "$DEPLOY_DIR/.env")
+fi
+docker compose -p netconsole \
+  -f /opt/netconsole/docker-compose.app.yml \
+  -f /opt/netconsole/docker-compose.app.prod.yml \
+  "${ENV_FILE_ARGS[@]}" \
+  stop backend worker 2>/dev/null || true
+docker compose -p netconsole \
+  -f /opt/netconsole/docker-compose.app.yml \
+  -f /opt/netconsole/docker-compose.app.prod.yml \
+  "${ENV_FILE_ARGS[@]}" \
+  up -d --no-deps --no-build --pull=never backend worker
 
 # 7. Health check.
 echo "Waiting for backend to come back up..."
