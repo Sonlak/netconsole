@@ -271,6 +271,23 @@ jobs:
             *) echo "ERROR: unsupported arch: $ARCH"; exit 1 ;;
           esac
 
+          # Skip the binary download if the right version is already
+          # installed. The GitHub Releases download has been flaky
+          # (~2 min timeout each on the sops and age URLs, with
+          # gh-proxy.com fallback also occasionally returning 0-byte
+          # files), and on a long-lived runner the binary rarely
+          # changes between deploys. 2026-10-20: deploy #39365600890
+          # hit a 60s curl timeout on both sops and age downloads and
+          # the whole deploy failed even though /usr/local/bin/sops
+          # and /usr/local/bin/age were already correctly installed.
+          if command -v sops >/dev/null 2>&1 && \
+             [ "$(sops --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')" = "$SOPS_VERSION" ] && \
+             command -v age >/dev/null 2>&1; then
+            echo "==> sops $SOPS_VERSION and age already installed — skipping download"
+            cd /tmp && rm -rf "$TMPDIR"
+            exit 0
+          fi
+
           # try_fetch URL OUTPUT_FILE — downloads URL, returns 0 on success
           # (non-empty file, 200 response), 1 on any failure.
           try_fetch() {
