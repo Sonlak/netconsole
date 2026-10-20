@@ -397,6 +397,23 @@ model User {
   mustChangePassword Boolean   @default(false)
   lastLoginAt        DateTime?
   lastLoginIp        String?
+
+  // SECURITY (2026-10-20): stamp of the last password rotation.
+  //
+  // `authMiddleware` rejects any access token whose `iat` is EARLIER
+  // than this value. This is the "Revoke active console sessions" half
+  // of AWS IAM's two-part reset flow — the other half is revoking the
+  // RefreshToken rows, which already happens. Without this check the
+  // old ACCESS token (15 min TTL) stays usable after the user rotates
+  // their password, so a stolen or observed pre-rotation token keeps
+  // working for its remaining lifetime. AWS enforces the same rule
+  // with a `DateLessThan: aws:TokenIssueTime` condition on an inline
+  // policy (docs.aws.amazon.com/IAM/latest/UserGuide/
+  // id_credentials_passwords_admin-change-user.html).
+  //
+  // NULL = never rotated since this column was added, so every token
+  // issued before the deploy is still valid (no surprise logout storm).
+  passwordChangedAt  DateTime?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 

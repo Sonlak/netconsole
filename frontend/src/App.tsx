@@ -8,7 +8,6 @@ import AppLayout from './layouts/AppLayout';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
 import TotpSetupPage from './pages/TotpSetupPage';
-import ChangePasswordRequiredPage from './pages/ChangePasswordRequiredPage';
 
 const DevicesPage = lazy(() => import('./pages/DevicesPage'));
 const DeviceDetailPage = lazy(() => import('./pages/DeviceDetailPage'));
@@ -32,18 +31,6 @@ export default function App() {
         <Suspense fallback={<PageLoader />}>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
-            {/* P2 hardening: forced password change page. Authenticated
-                but blocked from everywhere else until the user rotates
-                the password. Implemented via the mustChangePassword
-                flag in ProtectedRoute. */}
-            <Route
-              path="/change-password-required"
-              element={
-                <ProtectedRoute>
-                  <ChangePasswordRequiredPage />
-                </ProtectedRoute>
-              }
-            />
             {/* P2 hardening: TOTP enrollment + management. Any
                 authenticated user can self-enroll / disable. Admin
                 reset (for lost devices) lives under the user-management

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../lib/prisma.js';
-import { signToken, authMiddleware, requireRole, setRefreshCookie, clearRefreshCookie } from '../middleware/auth.js';
+import { signToken, authMiddleware, requireRole, setRefreshCookie, clearRefreshCookie, invalidatePasswordCache } from '../middleware/auth.js';
 import type { AuthenticatedRequest, JwtPayload } from '../middleware/auth.js';
 import {
   issueTokenPair,
@@ -630,6 +630,12 @@ authRouter.put('/password', authMiddleware, async (req: AuthenticatedRequest, re
         data: {
           password: hashed,
           mustChangePassword: false,
+          // SECURITY (2026-10-20): stamp the rotation so authMiddleware
+          // can reject any access token minted before this moment. See the
+          // block comment above `tokenPredatesPasswordChange` in
+          // middleware/auth.ts.
+          // NOT set here for admin resets — see note at the admin reset block.
+          passwordChangedAt: new Date(),
         },
       }),
       // SECURITY: force-logout the user from every other session. If
@@ -640,6 +646,10 @@ authRouter.put('/password', authMiddleware, async (req: AuthenticatedRequest, re
         data: { revokedAt: new Date() },
       }),
     ]);
+
+    // SECURITY (2026-10-20): drop the in-process cache entry so the
+    // next request on this process does NOT serve a stale value.
+    invalidatePasswordCache(user.id);
 
     // Clear the refresh cookie on the current response (the rotation
     // above invalidated the cookie the browser is sending).

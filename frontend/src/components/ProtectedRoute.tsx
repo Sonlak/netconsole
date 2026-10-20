@@ -24,15 +24,10 @@ export function ProtectedRoute({ children, requiredRoles }: ProtectedRouteProps)
     return <Navigate to="/login" state={{ from: location.pathname }} replace />;
   }
 
-  // P2 hardening: forced password change gate. Admins can set
-  // `mustChangePassword` on a user (e.g. on the first login after
-  // a reset, or as part of onboarding). Until the user rotates
-  // their password, every protected page redirects to the
-  // change-password screen. The change-password screen itself is
-  // allowed to render so the user can submit the form.
-  if (user?.mustChangePassword && location.pathname !== '/change-password-required') {
-    return <Navigate to="/change-password-required" replace />;
-  }
+  // NOTE: mustChangePassword gating is handled inline in LoginPage,
+  // not here. The user is shown the change-password form before ever
+  // reaching a protected route, so ProtectedRoute only needs to check
+  // authentication + roles.
 
   if (requiredRoles && user && !requiredRoles.includes(user.role)) {
     return (
@@ -45,3 +40,5 @@ export function ProtectedRoute({ children, requiredRoles }: ProtectedRouteProps)
 
   return <>{children}</>;
 }
+
+export default ProtectedRoute;

@@ -1,11 +1,18 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
+import { prisma } from '../lib/prisma.js';
 
 export interface JwtPayload {
   userId: string;
   username: string;
   role: string;
+  /**
+   * Issued-at, seconds since epoch. Set by `jsonwebtoken` automatically
+   * unless `noTimestamp` is set. Used by the `passwordChangedAt` gate
+   * in `authMiddleware` to reject tokens minted before a rotation.
+   */
+  iat?: number;
 }
 
 /**
@@ -17,6 +24,9 @@ export interface JwtPayloadLoose {
   sub?: string;
   username?: string;
   role?: string;
+  /** `iat` claim — used by the password-rotation gate below. */
+  iat?: number;
+  [key: string]: unknown;
 }
 
 export interface AuthenticatedRequest extends Request {
@@ -103,7 +113,92 @@ export function verifyToken(token: string): JwtPayloadLoose | null {
   }
 }
 
-export function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+// -----------------------------------------------------------------------------
+// Password-rotation gate (2026-10-20)
+// -----------------------------------------------------------------------------
+// When a user rotates their password, the RefreshToken rows are revoked
+// (see routes/auth.ts) and the HttpOnly cookie is cleared. That alone
+// leaves a 15-minute hole: the ACCESS token already sitting in the
+// browser (or in a proxy log, or in an attacker's hands) stays valid
+// until it expires on its own.
+//
+// AWS closes the same hole with a "Revoke active console sessions"
+// toggle that installs an inline policy denying any request whose
+// `aws:TokenIssueTime` predates the reset. We do the equivalent by
+// comparing the token's `iat` against `User.passwordChangedAt`.
+//
+// The check is a primary-key lookup on User, cached in-process for
+// STALE_WINDOW_MS so a burst of API calls doesn't turn into a burst of
+// queries. The cache entry is dropped synchronously inside
+// invalidatePasswordCache() on rotation, so the user who just changed
+// their password is locked out of the old token immediately on this
+// process; a multi-instance deployment would see at most
+// STALE_WINDOW_MS of lag, which is far inside the 15-minute token TTL
+// this is meant to bound.
+const PASSWORD_CACHE_TTL_MS = 30_000;
+const passwordChangedAtCache = new Map<string, number | null>();
+
+function cacheGet(key: string): { hit: boolean; value: number | null } {
+  const entry = passwordChangedAtCache.get(key);
+  // `Map.get` returns `undefined` only for a MISSING key; a key present
+  // with a cached value of `null` ("never rotated") returns `null`,
+  // which is a hit. So the `undefined` sentinel is unambiguous.
+  if (entry === undefined) return { hit: false, value: null };
+  return { hit: true, value: entry };
+}
+
+export function invalidatePasswordCache(userId: string): void {
+  passwordChangedAtCache.delete(userId);
+}
+
+/**
+ * Returns true when the token predates the user's last password
+ * rotation and must therefore be rejected.
+ */
+async function tokenPredatesPasswordChange(userId: string, iat: number | undefined): Promise<boolean> {
+  if (typeof iat !== 'number') {
+    // No `iat` claim — can't prove the token is stale, so let it
+    // through. Every token we mint sets `iat`, so this only affects
+    // hand-crafted tokens, which would already need a valid signature.
+    return false;
+  }
+
+  const cached = cacheGet(userId);
+  let changedAtSec: number | null;
+  if (cached.hit) {
+    changedAtSec = cached.value;
+  } else {
+    try {
+      const row = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { passwordChangedAt: true },
+      });
+      // User not found: the token references a deleted account. The
+      // per-request user lookups downstream would reject it anyway;
+      // report "not stale" and let those produce the 404/401.
+      changedAtSec = row?.passwordChangedAt
+        ? Math.floor(row.passwordChangedAt.getTime() / 1000)
+        : null;
+      passwordChangedAtCache.set(userId, changedAtSec);
+      // Re-insert with a TTL by scheduling an eviction. Using a timer
+      // per entry is fine at this scale (one per active user).
+      setTimeout(() => passwordChangedAtCache.delete(userId), PASSWORD_CACHE_TTL_MS).unref?.();
+    } catch (err) {
+      // DB unavailable. The signature check already passed, so the
+      // caller is genuinely authenticated; failing the whole request
+      // here would turn a transient DB blip into a site-wide logout.
+      console.warn('[auth] password-rotation check skipped (DB error):', err);
+      return false;
+    }
+  }
+
+  if (changedAtSec === null) return false;
+  // Allow a 1-second slack so a token minted in the same second as the
+  // rotation is not rejected on a clock-granularity technicality.
+  return iat < changedAtSec - 1;
+}
+
+export async function authMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -125,6 +220,13 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
   // regular endpoint, the user data cannot be accessed.
   if ('purpose' in payload && payload.purpose === 'mfa') {
     res.status(401).json({ error: 'Unauthorized: MFA token cannot be used here' });
+    return;
+  }
+
+  // SECURITY (2026-10-20): reject access tokens minted before the user's
+  // last password rotation. See the block comment above.
+  if (payload.userId && (await tokenPredatesPasswordChange(payload.userId, payload.iat))) {
+    res.status(401).json({ error: 'Unauthorized: Session invalidated by password change' });
     return;
   }
 
