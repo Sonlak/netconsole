@@ -247,6 +247,13 @@ jobs:
       #   - SOPS_AGE_KEY not set in repo secrets → step fails fast
       #   - secrets.env.enc missing → step fails fast
       #   - Wrong key / .sops.yaml changed → sops fails fast
+      #
+      # 2026-10-20: VPS self-hosted runner cannot reach GitHub's release
+      # CDN (release-assets.githubusercontent.com / objects.githubusercontent.com)
+      # — direct curl times out at 15s. gh-proxy.com works fine from the VPS
+      # (200 OK in <3s for both sops and age). The install uses a fallback
+      # chain: try GitHub direct first (fast on most networks), then
+      # gh-proxy.com if direct fails or returns empty.
       - name: Install SOPS + age
         run: |
           set -euo pipefail
@@ -263,13 +270,56 @@ jobs:
             *) echo "ERROR: unsupported arch: $ARCH"; exit 1 ;;
           esac
 
-          echo "==> Installing sops v$SOPS_VERSION (linux-$SOPS_ARCH)"
-          curl -sSL "https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH" -o sops
+          # try_fetch URL OUTPUT_FILE — downloads URL, returns 0 on success
+          # (non-empty file, 200 response), 1 on any failure.
+          try_fetch() {
+            local url="$1" out="$2"
+            # -f: fail on HTTP >= 400. --max-time 60: bound total time.
+            if curl -sSLf --max-time 60 -o "$out" "$url" && [ -s "$out" ]; then
+              return 0
+            fi
+            rm -f "$out"
+            return 1
+          }
+
+          # sops: try GitHub direct first, then gh-proxy.com
+          echo "==> Fetching sops v$SOPS_VERSION (linux-$SOPS_ARCH)"
+          sops_src=""
+          for url in \
+            "https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH" \
+            "https://gh-proxy.com/https://github.com/getsops/sops/releases/download/v$SOPS_VERSION/sops-v$SOPS_VERSION.linux.$SOPS_ARCH"; do
+            echo "  trying: $url"
+            if try_fetch "$url" sops; then
+              sops_src="$url"
+              break
+            fi
+          done
+          if [ -z "$sops_src" ]; then
+            echo "::error::Failed to fetch sops from any mirror"
+            exit 1
+          fi
+          echo "  ✅ got sops from: $sops_src"
+          chmod +x sops
           sudo install -m 0755 sops /usr/local/bin/sops
           sops --version
 
-          echo "==> Installing age v$AGE_VERSION (linux-$AGE_ARCH)"
-          curl -sSL "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz" -o age.tar.gz
+          # age: try GitHub direct first, then gh-proxy.com
+          echo "==> Fetching age v$AGE_VERSION (linux-$AGE_ARCH)"
+          age_src=""
+          for url in \
+            "https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz" \
+            "https://gh-proxy.com/https://github.com/FiloSottile/age/releases/download/v$AGE_VERSION/age-v$AGE_VERSION-linux-$AGE_ARCH.tar.gz"; do
+            echo "  trying: $url"
+            if try_fetch "$url" age.tar.gz; then
+              age_src="$url"
+              break
+            fi
+          done
+          if [ -z "$age_src" ]; then
+            echo "::error::Failed to fetch age from any mirror"
+            exit 1
+          fi
+          echo "  ✅ got age from: $age_src"
           tar xzf age.tar.gz
           sudo install -m 0755 "age/age" "age/age-keygen" /usr/local/bin/
           age --version
