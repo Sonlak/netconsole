@@ -215,6 +215,7 @@ jobs:
             --exclude '/backups/' \
             --exclude '/secrets.env' \
             --exclude '/.env' \
+            --exclude '/.sops-age-key.txt' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
@@ -328,23 +329,17 @@ jobs:
 
       - name: Decrypt secrets.env.enc
         env:
+          # Primary: read the age private key directly from the GH secret
+          # (operator pastes the AGE-SECRET-KEY-1... line into GH → SOPS_AGE_KEY).
+          # Fallback: read from a VPS-local file at /opt/netconsole/.sops-age-key.txt
+          # (operator scp's the same file in step 3 of the runbook; chmod 600).
+          # The script chooses whichever is present. We intentionally allow
+          # both paths so the operator doesn't need GH admin access to set
+          # the secret — a local file works just as well.
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          SOPS_AGE_KEY_FILE: /opt/netconsole/.sops-age-key.txt
         run: |
           set -euo pipefail
-          if [ -z "${SOPS_AGE_KEY:-}" ]; then
-            echo "::error::SOPS_AGE_KEY secret is not set in GitHub Actions."
-            echo "  Generate a key pair:"
-            echo "    age-keygen -o /tmp/age.key"
-            echo "    cat /tmp/age.key    # the AGE-SECRET-KEY-... line"
-            echo "  Then: repo → Settings → Secrets → Actions → New secret"
-            echo "    Name:  SOPS_AGE_KEY"
-            echo "    Value: <paste the line above>"
-            echo ""
-            echo "  Also update .sops.yaml with the public key (the second line"
-            echo "  of age-keygen's output, the one starting with 'age1...')."
-            exit 1
-          fi
-
           cd "$DEPLOY_DIR"
           if [ ! -f "secrets.env.enc" ]; then
             echo "::error::secrets.env.enc not found at $DEPLOY_DIR — was it committed?"
@@ -354,7 +349,6 @@ jobs:
             echo "::error::.sops.yaml not found at $DEPLOY_DIR"
             exit 1
           fi
-
           # Check the placeholder is still in .sops.yaml.
           if grep -q "PLACEHOLDER" .sops.yaml; then
             echo "::error::.sops.yaml still contains the PLACEHOLDER public key."
@@ -362,8 +356,38 @@ jobs:
             exit 1
           fi
 
-          echo "==> Decrypting secrets.env.enc → secrets.env"
-          SOPS_AGE_KEY_CMD="$SOPS_AGE_KEY" ./scripts/sops_decrypt.sh
+          # Pick the key source. Priority:
+          #   1. secrets.SOPS_AGE_KEY env var (operator-pasted in GH)
+          #   2. SOPS_AGE_KEY_FILE path that exists on the VPS
+          # If neither, fail with clear instructions on both paths.
+          key_source=""
+          if [ -n "${SOPS_AGE_KEY:-}" ]; then
+            key_source="GH secret SOPS_AGE_KEY"
+          elif [ -f "${SOPS_AGE_KEY_FILE}" ]; then
+            export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}"
+            key_source="local file ${SOPS_AGE_KEY_FILE}"
+          else
+            echo "::error::No age private key available. Choose ONE of:"
+            echo "  Option A — set GH secret (recommended, never leaves Actions):"
+            echo "    repo → Settings → Secrets → Actions → New secret"
+            echo "      Name:  SOPS_AGE_KEY"
+            echo "      Value: <contents of age-priv.txt (AGE-SECRET-KEY-1...)>"
+            echo ""
+            echo "  Option B — copy the key file to the VPS (simpler, no GH admin needed):"
+            echo "    scp age-priv.txt sonnx@100.102.133.86:/opt/netconsole/.sops-age-key.txt"
+            echo "    ssh sonnx@100.102.133.86 'chmod 600 /opt/netconsole/.sops-age-key.txt'"
+            echo ""
+            echo "  Expected locations checked:"
+            echo "    - GH secret SOPS_AGE_KEY : unset"
+            echo "    - VPS file ${SOPS_AGE_KEY_FILE} : missing"
+            exit 1
+          fi
+          echo "==> Decrypting secrets.env.enc → secrets.env (key from: $key_source)"
+
+          # sops_decrypt.sh picks up SOPS_AGE_KEY_FILE / SOPS_AGE_KEY_CMD
+          # by itself (see scripts/sops_decrypt.sh). We do NOT need to set
+          # any extra env here — the script handles both paths.
+          ./scripts/sops_decrypt.sh
 
           # Sanity check: required vars must be present.
           for required in JWT_SECRET WORKER_AUTH_TOKEN; do
