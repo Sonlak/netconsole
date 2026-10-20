@@ -1,3 +1,4 @@
+# dev-runner-verify: test commit
 # =============================================================================
 # CI: lint + type-check + test + build for backend, frontend, worker, compose
 # Runs on every push (including feature branches) and every PR targeting any
