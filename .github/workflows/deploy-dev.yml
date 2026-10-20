@@ -40,7 +40,7 @@ env:
 jobs:
   deploy-dev:
     name: Deploy to dev
-    runs-on: vps-dev-01
+    runs-on: self-hosted
     timeout-minutes: 25
 
     steps:
