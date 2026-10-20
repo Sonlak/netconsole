@@ -281,7 +281,7 @@ jobs:
           # the whole deploy failed even though /usr/local/bin/sops
           # and /usr/local/bin/age were already correctly installed.
           if command -v sops >/dev/null 2>&1 && \
-             [ "$(sops --version 2>/dev/null | awk '{print $2}' | sed 's/^v//')" = "$SOPS_VERSION" ] && \
+             [ "$(sops --version 2>/dev/null | grep '^sops' | awk '{print $2}' | sed 's/^v//')" = "$SOPS_VERSION" ] && \
              command -v age >/dev/null 2>&1; then
             echo "==> sops $SOPS_VERSION and age already installed — skipping download"
             cd /tmp && rm -rf "$TMPDIR"
