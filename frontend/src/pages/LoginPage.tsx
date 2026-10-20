@@ -462,7 +462,6 @@ export default function LoginPage() {
     user,
   } = useAuth();
 
-  const [stage, setStage] = useState<Stage>('credentials');
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -471,12 +470,29 @@ export default function LoginPage() {
   // Keep the username so we can pre-fill after password change
   const usernameRef = useRef('');
 
-  // ── Redirect if user already authenticated (and no pending action)
+  // ── Stage is DERIVED from auth state, never stored ──────────────────────────
+  // An earlier revision kept `stage` in useState and updated it from an effect.
+  // That desynced right after a successful OTP verify: `verifyMfaCode` set
+  // `pendingMfa` to null and `isAuthenticated` to true, but nothing moved
+  // `stage` off 'mfa'. The redirect below was gated on
+  // `stage === 'credentials'`, so it never fired and the user was dumped back
+  // on the login form even though the session was valid — they had to reload
+  // before `hydrate()` picked the token up out of localStorage.
+  // Deriving removes the whole class of bug: there is no second copy to drift.
+  const stage: Stage = pendingMfa
+    ? 'mfa'
+    : isAuthenticated && user?.mustChangePassword
+      ? 'change-password'
+      : 'credentials';
+
+  // ── Redirect to the app once we hold a usable session ───────────────────────
+  // Fires for BOTH the plain-password path and the post-OTP path, because
+  // `stage` is already back to 'credentials' the moment `pendingMfa` clears.
   useEffect(() => {
-    if (isAuthenticated && stage === 'credentials' && !user?.mustChangePassword) {
+    if (stage === 'credentials' && isAuthenticated && !user?.mustChangePassword) {
       navigate('/', { replace: true });
     }
-  }, [isAuthenticated, stage, user, navigate]);
+  }, [stage, isAuthenticated, user, navigate]);
 
   // ── Login ──────────────────────────────────────────────────────────────────
 
@@ -499,20 +515,6 @@ export default function LoginPage() {
     },
     [login],
   );
-
-  // ── After login state update: branch on TOTP vs mustChangePassword ──────────
-
-  // This useEffect reacts to changes in auth state after login.
-  // It picks the right stage: MFA if TOTP is pending, change-password if
-  // mustChangePassword, otherwise the user is authenticated and the
-  // useEffect above will navigate to dashboard.
-  useEffect(() => {
-    if (pendingMfa && stage !== 'mfa') {
-      setStage('mfa');
-    } else if (user?.mustChangePassword && stage !== 'change-password') {
-      setStage('change-password');
-    }
-  }, [pendingMfa, user?.mustChangePassword, stage]);
 
   // ── MFA verify ───────────────────────────────────────────────────────────────
 
@@ -539,20 +541,17 @@ export default function LoginPage() {
   const handleBackToLogin = useCallback(() => {
     mfaForm.resetFields();
     cancelMfa();
-    setStage('credentials');
   }, [mfaForm, cancelMfa]);
 
   // ── Password change complete → sign out and show success ─────────────────────
 
   const handlePasswordChangeDone = useCallback(() => {
-    // Clear all local auth state (logout is fire-and-forget + sync state reset)
+    // `logout()` clears isAuthenticated + token + pendingMfa synchronously, so
+    // `stage` re-derives to 'credentials' on the next render and the login form
+    // comes back with the success banner. No manual stage reset needed.
     logout();
-    // Reset to credentials form with a success message.
-    setStage('credentials');
     setLocalError(null);
     setSuccessMessage('Password updated successfully. Sign in with your new password.');
-    // Pre-fill the username field so the user only has to type the new password.
-    // We re-render the credentials form below; use the usernameRef.
   }, [logout]);
 
   // ── Render by stage ─────────────────────────────────────────────────────────
