@@ -350,8 +350,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "Waiting for backend after rollback..."
+          # Probe the published port (127.0.0.1:3000), not the container IP.
+          # Host -> container-bridge traffic is dropped by the FORWARD/Tailscale
+          # rules on the VPS, so 172.31.0.3 is unreachable from the runner host.
           for i in $(seq 1 40); do
-            if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
+            if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3000/api/health; then
               echo "✅ Backend healthy after rollback (attempt $i)"
               break
             fi
