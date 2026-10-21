@@ -92,6 +92,9 @@ jobs:
             --exclude '/netconsole-app.tar.gz' \
             --exclude '/.tmp-hello.txt' \
             --exclude '/.tmp-cfg/' \
+            --exclude 'node_modules/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
             --exclude '/scripts/ci-rsa-*.bak' \
             --exclude '*.pid' \
             --exclude '/logs/' \

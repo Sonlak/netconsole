@@ -251,6 +251,9 @@ jobs:
             --exclude '/.git/info/' \
             --exclude '/data/' \
             --exclude '/volumes/' \
+            --exclude 'node_modules/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
             --exclude '/netconsole-app.tar.gz' \
             --exclude '/.tmp-hello.txt' \
             --exclude '/.tmp-cfg/' \

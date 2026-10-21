@@ -119,6 +119,7 @@ jobs:
           rsync -a --delete --ignore-errors \
             --exclude '/.git/hooks/' --exclude '/.git/info/' \
             --exclude '/data/' --exclude '/volumes/' \
+            --exclude 'node_modules/' --exclude '.venv/' --exclude '__pycache__/' \
             --exclude '/netconsole-app.tar.gz' --exclude '/.tmp-hello.txt' \
             --exclude '/.tmp-cfg/' --exclude '/scripts/ci-rsa-*.bak' \
             --exclude '*.pid' --exclude '/logs/' --exclude '/backups/' \
