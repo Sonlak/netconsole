@@ -103,6 +103,9 @@ jobs:
             --exclude '/.env' \
             --exclude '/.sops-age-key.txt' \
             --exclude '/secrets.age.key' \
+            --exclude '/.last-deploy-sha' --exclude '/.last-deploy-ref' \
+            --exclude '/.last-deploy-event' \
+            --exclude '/.rollback-before-deploy-sha' --exclude '/.rollback-before-deploy-ref' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
