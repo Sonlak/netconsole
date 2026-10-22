@@ -229,36 +229,38 @@ jobs:
             echo "Disk OK (${AVAIL}G)"
           fi
 
-          echo "==> Stopping services..."
-          "${COMPOSE_BASE[@]}" stop $DEPLOY_SERVICES || true
-          "${COMPOSE_BASE[@]}" rm -sf $DEPLOY_SERVICES || true
-
           : > "$DEPLOY_DIR/.env"
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
           echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
           chmod 600 "$DEPLOY_DIR/.env" 2>/dev/null || true
 
-          echo "==> Pulling images from GHCR..."
-          "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES || echo "Pull warning (non-fatal)"
-
           if [ -f "$DEPLOY_DIR/secrets.env" ]; then
             chmod 600 "$DEPLOY_DIR/secrets.env"
           fi
 
-          echo "==> Starting services..."
-          "${COMPOSE_BASE[@]}" up -d --remove-orphans --no-deps $DEPLOY_SERVICES || {
-            echo "Warning: up returned non-zero — sweeping Created containers"
-            for svc in $DEPLOY_SERVICES; do
-              cid=$(docker ps -a --filter "label=com.docker.compose.service=$svc" --format '{{.ID}}' | head -1)
-              if [ -n "$cid" ]; then
-                state=$(docker inspect --format '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)
-                if [ "$state" = "created" ]; then
-                  echo "  Starting $svc ($cid)"
-                  docker start "$cid" || true
-                fi
-              fi
-            done
-          }
+          echo "==> Pulling images from GHCR..."
+          if ! "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES; then
+            echo "::warning::image pull reported errors -- continuing with cached images"
+          fi
+
+          echo "==> Starting services (recreate in place)..."
+          # Deliberately NOT doing `stop` + `rm -sf` first. Removing the
+          # containers up front means any later failure leaves the whole app
+          # stack gone and the health check has nothing left to probe, so the
+          # real error is lost. `up -d --force-recreate` swaps changed
+          # containers in place and keeps the old one up until the new one is
+          # created. Dependency order (redis -> backend -> frontend) is also
+          # honoured now that --no-deps is gone.
+          if ! "${COMPOSE_BASE[@]}" up -d --force-recreate --remove-orphans $DEPLOY_SERVICES; then
+            echo "::error::docker compose up failed -- dumping state below"
+            docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' || true
+            "${COMPOSE_BASE[@]}" ps -a || true
+            exit 1
+          fi
+
+          echo "==> Containers after up"
+          docker ps -a --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
+            --format '{{.Names}} | {{.Status}}' || true
 
       - name: Wait for backend healthy
         run: |
@@ -275,8 +277,15 @@ jobs:
             fi
             sleep 2
           done
-          echo "Backend not healthy in 120s"
-          docker logs --tail 40 netconsole-backend || true
+          echo "::error::Backend not healthy in 120s -- diagnostics:"
+          echo "=== containers ==="
+          docker ps -a --format 'table {{.Names}}\t{{.Status}}' || true
+          echo "=== backend state ==="
+          docker inspect netconsole-backend --format 'State={{.State.Status}} ExitCode={{.State.ExitCode}} Restarts={{.RestartCount}} Started={{.State.StartedAt}}' 2>&1 || true
+          echo "=== backend logs (last 60) ==="
+          docker logs --tail 60 netconsole-backend 2>&1 || true
+          echo "=== listening on 3000/8443 ==="
+          sudo -n ss -lntp 2>/dev/null | grep -E ':3000|:8443' || true
           exit 1
 
       - name: Verify frontend reachable
