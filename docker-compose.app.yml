@@ -76,11 +76,22 @@ services:
       KEA_SERVER_NAME: kea-dc1
       KEA_SERVER_URL: "${KEA_SERVER_URL:-10.10.20.20}"
       KEA_SERVER_ROLE: "primary"
+      # KEA_HA_ENABLED (2026-10-22): prod sets this to "false" via .env so
+      # the container renders a standalone DHCP4 with NO libdhcp_ha hook.
+      # Reason: the DR host does not exist yet, and prod's kea-dc1 was
+      # pointed at the SAME peer (10.10.20.30) that the dev/lab VPS's
+      # kea-dc1 already uses as its partner -- two "primary" servers sharing
+      # one peer is an invalid hot-standby topology and the HA state machine
+      # stalls. Re-enable this (together with KEA_PEER_URL) in the same
+      # commit that builds the real DR server. Dev/lab leaves it unset ->
+      # defaults to "true", unchanged.
+      KEA_HA_ENABLED: "${KEA_HA_ENABLED:-true}"
       KEA_PEER_NAME: kea-dr1
       # DR control agent — reachable via DC's same lab subnet
       # (10.10.20.0/24 is shared between the two VPSes). Kea HA heartbeat
       # goes over :8001 (host port) on the DR's lab NIC, not :8000.
-      KEA_PEER_URL: http://10.10.20.30:8001/
+      # Unused while KEA_HA_ENABLED=false.
+      KEA_PEER_URL: "${KEA_PEER_URL:-http://10.10.20.30:8001/}"
       KEA_PEER_ROLE: standby
       # Faster HA timing for failback in <30s. Trade-off: 2x heartbeat traffic.
       KEA_HEARTBEAT_DELAY_MS: "5000"
@@ -282,17 +293,24 @@ services:
       # Disabled by default so a fresh deploy does not hammer an absent
       # NetBox instance. Set to e.g. 300 for a 5-minute cycle.
       NETBOX_SYNC_INTERVAL_SECONDS: "300"
-      # Use the VPS public IP so the worker (which is on the netconsole
-      # docker network but cannot reliably resolve the netbox container
-      # name `netbox-netbox`) can reach NetBox via the host's port mapping.
-      # Port 8080: netbox is mapped 8080:8080 (host:container) — port 8001
-      # is occupied by netconsole-kea-primary's control channel.
+      # NetBox is a CONTAINER on the same `netconsole` bridge as backend,
+      # so they talk directly over the bridge at its static IP 172.31.0.22
+      # (declared in docker-compose.netbox.yml).
+      #
+      # CHANGED 2026-10-22: was `http://127.0.0.1:8080/api/`. Inside a
+      # container, 127.0.0.1 is that CONTAINER's own loopback, NOT the
+      # docker host - the host-published 127.0.0.1:8080 is unreachable
+      # from backend/worker. Every sync therefore failed silently (backend
+      # logged "bulk sync applied: updated=0 failed=0" on every cycle, and
+      # with 0 devices imported the failure never surfaced in the UI).
+      # Port 8080 inside the netbox container; 8001 is taken by kea's
+      # control channel on the host.
       # NetBox sync — SECURITY (C10, see docs/agents/16-security-audit-preprod.md):
       # tokens are now in `secrets.env`, not in this file. Reference via
-      # `${VAR:?msg}` — docker compose refuses to start if the secret
-      # is missing. Production tokens rotate by editing secrets.env +
+      # `${VAR:?msg}` — docker compose refuses to start if the secret is
+      # missing. Production tokens rotate by editing secrets.env +
       # restarting backend/worker; no commit needed.
-      NETBOX_URL: "http://127.0.0.1:8080/api/"
+      NETBOX_URL: "http://172.31.0.22:8080/api/"
       NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
       # Multi-instance NetBox JSON — derived from individual tokens so
       # we don't need to keep a duplicate set elsewhere.
@@ -301,7 +319,7 @@ services:
       # (the inner `"` delimiters from the JSON would also break single-
       # quoted YAML). Docker compose still substitutes ${NETBOX_TOKEN:?}
       # at parse time, so the missing-secret fail-fast still works.
-      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://127.0.0.1:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://127.0.0.1:8081/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
+      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://172.31.0.22:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://172.31.0.42:8080/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
       NETBOX_DEFAULT_INSTANCE: "production"
       SEED_DISABLED: "false"
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in secrets.env}
@@ -456,16 +474,17 @@ services:
       # host port mapping (8080 → 8080 inside the netbox container).
       # Port 8080 chosen because 8001 is occupied by kea-primary.
       # SECURITY (C10): NETBOX_TOKEN pulled from secrets.env. The
-      # worker reaches NetBox on the host's loopback (we bind :8080 to
-      # 127.0.0.1 in the netbox compose; see docker-compose.netbox.yml).
-      NETBOX_URL: "http://127.0.0.1:8080/api/"
+      # worker reaches NetBox over the docker bridge at its static IP
+      # 172.31.0.22 - NOT 127.0.0.1, which inside a container is the
+      # container's own loopback (same fix as the backend block above).
+      NETBOX_URL: "http://172.31.0.22:8080/api/"
       NETBOX_TOKEN: ${NETBOX_TOKEN:?NETBOX_TOKEN must be set in secrets.env}
       # Multi-instance NetBox JSON — derived from secrets.env.
       # See backend block above for the YAML-quoting rules: this MUST
       # be a double-quoted string with \" escapes, otherwise the inner
       # single quotes from the JSON delimiters break YAML parsing
       # (single-quoted YAML strings cannot contain unescaped ').
-      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://127.0.0.1:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://127.0.0.1:8081/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
+      NETBOX_INSTANCES: "{\"production\":{\"url\":\"http://172.31.0.22:8080/api/\",\"token\":\"${NETBOX_TOKEN:?}\"},\"netbox2\":{\"url\":\"http://172.31.0.42:8080/api/\",\"token\":\"${NETBOX_TOKEN_NETBOX2:?}\"}}"
       NETBOX_DEFAULT_INSTANCE: "production"
       # Management prefix for IPAM sync. Creates /24 prefix in NetBox IPAM
       # and populates primary_ip4 on each device. Change to match your lab subnet.

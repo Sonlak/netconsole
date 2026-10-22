@@ -230,9 +230,34 @@ jobs:
           # refuses to bind it here ("cannot assign requested address") and
           # kea-dc1 never starts -> backend (depends_on kea healthy) never
           # starts -> deploy fails. Dev keeps the default (10.10.20.20).
-          echo "KEA_HOST_IP=10.10.20.40" >> "$DEPLOY_DIR/.env"
-          # Kea HA "this server" URL — the peer uses it to reach us.
-          echo "KEA_SERVER_URL=10.10.20.40" >> "$DEPLOY_DIR/.env"
+          #
+          # CHANGED 2026-10-22: the switch's DHCP relay points at
+          # 192.168.81.171 (ens33, the LAN office NIC) - NOT the lab NIC
+          # 10.10.20.40. Verified on the host:
+          #   ens33 = 192.168.81.171/24   <- LAN văn phòng (relay target)
+          #   ens34 = 10.10.20.40/24       <- lab subnet (peer + syslog src)
+          # The old value 10.10.20.40 published DHCP on the wrong NIC, so
+          # the switch could never reach the relay helper address.
+          echo "KEA_HOST_IP=192.168.81.171" >> "$DEPLOY_DIR/.env"
+          # Kea HA "this server" URL - the peer uses it to reach us.
+          echo "KEA_SERVER_URL=192.168.81.171" >> "$DEPLOY_DIR/.env"
+          # KEA_HA_ENABLED=false (2026-10-22): prod's kea-dc1 runs as a
+          # STANDALONE DHCP4 server - the libdhcp_ha hook is not loaded.
+          #
+          # Why: the DR host does not exist yet, and prod's kea-dc1 was
+          # pointed at 10.10.20.30 - the SAME peer the dev/lab VPS's
+          # kea-dc1 already uses. Two servers both configured as `primary`
+          # sharing one peer is an invalid hot-standby topology; Kea flags
+          # the peer mismatch and the state machine stalls. The operator
+          # confirmed: prod runs standalone until the DR server is built.
+          # Re-enable (together with KEA_PEER_URL) in the same commit that
+          # brings up the DR host.
+          echo "KEA_HA_ENABLED=false" >> "$DEPLOY_DIR/.env"
+          # NetBox UI bind address (2026-10-22): the operator reaches the
+          # console over the LAN IP, so NetBox's UI must be reachable the
+          # same way. Backend/worker talk to NetBox over the docker bridge
+          # at 172.31.0.22 - this publish is for BROWSER access only.
+          echo "NETBOX_BIND_IP=192.168.81.171" >> "$DEPLOY_DIR/.env"
           chmod 600 "$DEPLOY_DIR/.env" 2>/dev/null || true
 
           if ! "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES; then
@@ -243,8 +268,21 @@ jobs:
             chmod 600 "$DEPLOY_DIR/secrets.env"
           fi
 
-          iptables -C INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP 2>/dev/null \
-            || iptables -I INPUT -p udp --dport 1514 ! -s 10.10.20.0/24 -j DROP -m comment --comment "netconsole-syslog" 2>/dev/null \
+          # Syslog ingress filter (M1). Devices send syslog to the
+          # published :1514 on ${KEA_HOST_IP}. CHANGED 2026-10-22: the
+          # published address moved from 10.10.20.40 to 192.168.81.171,
+          # and the real device fleet sits on the office LAN
+          # 192.168.81.0/24 - so BOTH subnets must be allowed, otherwise
+          # the DROP rule silently ate every syslog packet from the
+          # devices. The backend also enforces SYSLOG_ALLOWED_CIDRS
+          # in-process (see docker-compose.app.yml).
+          for subnet in 192.168.81.0/24 10.10.20.0/24; do
+            iptables -C INPUT -p udp --dport 1514 -s "$subnet" -j ACCEPT -m comment --comment "netconsole-syslog-allow" 2>/dev/null \
+              || sudo -n iptables -I INPUT -p udp --dport 1514 -s "$subnet" -j ACCEPT -m comment --comment "netconsole-syslog-allow" 2>/dev/null \
+              || echo "warning: iptables :1514 allow rule for $subnet failed"
+          done
+          iptables -C INPUT -p udp --dport 1514 ! -s 192.168.81.0/24 ! -s 10.10.20.0/24 -j DROP 2>/dev/null \
+            || sudo -n iptables -I INPUT -p udp --dport 1514 ! -s 192.168.81.0/24 ! -s 10.10.20.0/24 -j DROP -m comment --comment "netconsole-syslog" 2>/dev/null \
             || echo "warning: iptables :1514 rule failed"
 
           echo "==> Starting services (recreate in place)..."
@@ -267,11 +305,37 @@ jobs:
             --format '{{.Names}} | {{.Status}}' || true
 
           if [ -f "$NETBOX_COMPOSE_FILE" ]; then
-            echo "NetBox stack..."
-            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$NETBOX_COMPOSE_FILE" \
-              up -d --force-recreate netbox || echo "NetBox warning (non-fatal)"
-            docker compose -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$NETBOX_COMPOSE_FILE" \
-              up -d netbox-postgres netbox-redis || true
+            echo "==> NetBox stack..."
+            # CHANGED 2026-10-22: the previous version of this step was
+            # broken in two ways and the error was swallowed by
+            # `|| echo "NetBox warning (non-fatal)"`:
+            #   1. No --env-file, so the compose file's
+            #      `${NETBOX_SECRET_KEY:?...}` / `${NETBOX_SUPERUSER_PASSWORD:?...}`
+            #      fail-fast aborted the whole command. NetBox never started.
+            #   2. Wrong start order: `netbox` was started BEFORE its
+            #      dependencies (netbox-postgres / netbox-redis). NetBox
+            #      has `depends_on: condition: service_healthy` on both, so
+            #      compose would refuse to start it anyway.
+            # Correct order: databases/redis first, then the netbox app.
+            NETBOX_COMPOSE=(docker compose
+              -p "$COMPOSE_PROJECT"
+              -f "$COMPOSE_FILE" -f "$NETBOX_COMPOSE_FILE"
+              --env-file "$DEPLOY_DIR/secrets.env"
+              --env-file "$DEPLOY_DIR/.env")
+
+            if ! "${NETBOX_COMPOSE[@]}" up -d netbox-postgres netbox-redis; then
+              echo "::error::NetBox datastore failed to start"
+              "${NETBOX_COMPOSE[@]}" ps -a || true
+              exit 1
+            fi
+
+            if ! "${NETBOX_COMPOSE[@]}" up -d --force-recreate netbox; then
+              echo "::error::NetBox failed to start"
+              "${NETBOX_COMPOSE[@]}" ps -a || true
+              docker logs --tail 50 netbox-netbox 2>&1 || true
+              exit 1
+            fi
+            echo "NetBox stack started"
           fi
 
       - name: Wait for backend healthy
@@ -330,10 +394,15 @@ jobs:
       - name: Open iptables port for NetBox (8080)
         run: |
           set +e
+          # CHANGED 2026-10-22: NetBox is published on the LAN address
+          # 192.168.81.171:8080 (NETBOX_BIND_IP), so the ACCEPT rule is
+          # scoped to the office LAN. The previous unconditional
+          # `-p tcp --dport 8080 -j ACCEPT` also opened the port on the
+          # public-facing side.
           ADD_RULE() {
-            iptables -C INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>/dev/null && return 0
-            sudo -n iptables -I INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
-            iptables -I INPUT -p tcp --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
+            iptables -C INPUT -p tcp -s 192.168.81.0/24 --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>/dev/null && return 0
+            sudo -n iptables -I INPUT -p tcp -s 192.168.81.0/24 --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
+            iptables -I INPUT -p tcp -s 192.168.81.0/24 --dport 8080 -j ACCEPT -m comment --comment "netbox-sync" 2>&1 && return 0
             echo "warning: iptables :8080 rule failed"
             return 1
           }
@@ -342,19 +411,19 @@ jobs:
       - name: Wait for NetBox healthy
         run: |
           set -euo pipefail
-          if docker ps --format '{{.Names}}\t{{.Status}}' | grep -E '^(netbox-netbox)\s+Up' >/dev/null 2>&1; then
-            echo "NetBox container Up — skipping wait"
-            curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1" && echo "NetBox reachable" \
-              || echo "warning: NetBox Up but API probe failed"
-            exit 0
-          fi
+          # CHANGED 2026-10-22: NetBox is published on ${NETBOX_BIND_IP}
+          # (192.168.81.171 on prod), NOT on 127.0.0.1. Probing
+          # 127.0.0.1:8080 therefore always failed with a connection
+          # refused and the step fell through to the 5-minute timeout.
+          NETBOX_PROBE_URL="http://192.168.81.171:8080/api/dcim/sites/?limit=1"
           for i in $(seq 1 60); do
-            if curl -sf -o /dev/null --max-time 5 "http://127.0.0.1:8080/api/dcim/sites/?limit=1"; then
+            if curl -sf -o /dev/null --max-time 5 "$NETBOX_PROBE_URL"; then
               echo "NetBox healthy (attempt $i)"; exit 0
             fi
             sleep 5
           done
-          echo "warning: NetBox not healthy in 5 min"
+          echo "::warning::NetBox not healthy in 5 min"
+          docker logs --tail 40 netbox-netbox 2>&1 || true
 
       - name: Final state
         working-directory: ${{ env.DEPLOY_DIR }}

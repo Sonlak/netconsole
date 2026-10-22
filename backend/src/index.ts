@@ -62,29 +62,88 @@ function parseCorsOrigins(): string[] {
   return parts;
 }
 const CORS_ORIGINS = parseCorsOrigins();
-const corsOptions: cors.CorsOptions = {
-  origin: (origin, callback) => {
-    // SECURITY (H13): require an Origin header for all CORS-eligible
-    // requests (i.e. anything not a same-origin browser fetch). curl /
-    // server-to-server callers can still hit us by setting `Origin: null`
-    // explicitly; we treat that as "machine" and allow it ONLY for the
-    // non-mutating health endpoint and the auth login endpoint.
-    if (!origin) {
-      callback(null, true);
-      return;
-    }
-    if (CORS_ORIGINS.includes(origin) || CORS_ORIGINS.includes('*')) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS: Origin ${origin} not allowed`));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  // SECURITY (H13): 1 hour aligns with the access JWT TTL.
-  maxAge: 3600,
-};
+
+/**
+ * Same-origin detection (2026-10-22).
+ *
+ * The frontend is served by the SAME nginx that reverse-proxies `/api/*`
+ * to this backend, so every browser call to `/api/...` is same-origin.
+ * But the browser still sends an `Origin` header on every POST/PUT/PATCH/
+ * DELETE (same-origin or not), and the strict allowlist below rejected it
+ * with "CORS not allowed" whenever the operator reached the console through
+ * an address that was not in CORS_ORIGINS (e.g. the LAN IP 192.168.81.171
+ * while the allowlist only had the public IP).
+ *
+ * Fix: accept an Origin whose host matches the host the request was made
+ * to (the `Host` / `X-Forwarded-Host` header nginx forwards). That is the
+ * definition of same-origin, so it grants nothing extra. The explicit
+ * allowlist is still honoured for genuinely cross-origin callers.
+ */
+function isSameOrigin(origin: string, req: { headers: Record<string, unknown> }): boolean {
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  const candidates: string[] = [];
+  const forwardedHost = req.headers['x-forwarded-host'];
+  if (typeof forwardedHost === 'string') candidates.push(forwardedHost);
+  const host = req.headers.host;
+  if (typeof host === 'string') candidates.push(host);
+  for (const candidate of candidates) {
+    // A forwarded-host header may carry a comma-separated chain
+    // ("a, b") - only the first entry is the original client host.
+    const first = candidate.split(',')[0].trim().toLowerCase();
+    if (!first) continue;
+    if (first === originHost) return true;
+    // Compare hostname only as a fallback: nginx's `proxy_set_header
+    // Host $host` drops the port, so a request to https://host:8443
+    // arrives with Host: host. Ports on the same hostname are still
+    // "same site", and the refresh cookie is SameSite=Strict, so no
+    // extra credential is exposed by accepting it.
+    const firstHost = first.split(':')[0];
+    const originHostname = originHost.split(':')[0];
+    if (firstHost && firstHost === originHostname) return true;
+  }
+  return false;
+}
+
+/**
+ * The `cors` package's `origin` callback only receives the origin string,
+ * not the request, so the same-origin check needs the request object.
+ * Use the dynamic-options form: `cors((req, callback) => ...)`.
+ */
+const corsMiddleware = cors((req, callback) => {
+  const origin = req.headers.origin;
+  const base: cors.CorsOptions = {
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    // SECURITY (H13): 1 hour aligns with the access JWT TTL.
+    maxAge: 3600,
+  };
+
+  // SECURITY (H13): require an Origin header for all CORS-eligible
+  // requests (i.e. anything not a same-origin browser fetch). curl /
+  // server-to-server callers can still hit us by setting `Origin: null`
+  // explicitly; we treat that as "machine" and allow it.
+  if (!origin) {
+    callback(null, { ...base, origin: true });
+    return;
+  }
+  if (CORS_ORIGINS.includes(origin) || CORS_ORIGINS.includes('*')) {
+    callback(null, { ...base, origin: true });
+    return;
+  }
+  // Same-origin request that reached the backend through the nginx
+  // reverse proxy. See isSameOrigin() above.
+  if (isSameOrigin(origin, req)) {
+    callback(null, { ...base, origin: true });
+    return;
+  }
+  callback(new Error(`CORS: Origin ${origin} not allowed`));
+});
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -249,7 +308,7 @@ app.use(compression({ threshold: 1024 }));
 // headers are present even on preflight requests. Must come before any
 // route handler. Critical: `cors()` short-circuits OPTIONS preflight,
 // so we never need a manual OPTIONS handler.
-app.use(cors(corsOptions));
+app.use(corsMiddleware);
 
 // SECURITY (H9): cap request bodies at 1 MB. The largest legitimate
 // JSON we receive today is a config push (≤ 50 KB). 25 MB was set

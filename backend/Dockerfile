@@ -34,6 +34,15 @@ COPY prisma ./prisma
 COPY tsconfig.json ./
 COPY src ./src
 COPY scripts/docker-start.sh ./scripts/docker-start.sh
+# bootstrap-admin.mjs is invoked on demand from inside the running
+# container: `docker exec netconsole-backend node
+# scripts/bootstrap-admin.mjs`. It creates the first ADMIN user on a fresh
+# database (prod shipped with an empty `User` table, so every login 401'd).
+# It is plain JS, not part of the compiled `dist/` output, so it must be
+# baked into BOTH stages explicitly - without the runtime COPY below the
+# exec dies with ERR_MODULE_NOT_FOUND. Safe to re-run: the script no-ops
+# once a user or an ADMIN exists.
+COPY scripts/bootstrap-admin.mjs ./scripts/bootstrap-admin.mjs
 
 RUN chmod +x scripts/docker-start.sh \
     && npx prisma generate \
@@ -58,6 +67,10 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/scripts/docker-start.sh ./scripts/docker-start.sh
+# See the build-stage COPY above for why this is needed: the script is run
+# via `docker exec`, not as part of the compiled app, so it must exist in
+# the runtime image.
+COPY --from=build /app/scripts/bootstrap-admin.mjs ./scripts/bootstrap-admin.mjs
 COPY --from=build /app/package.json ./package.json
 
 # Guard: the Prisma engine matching THIS platform must be in the image.

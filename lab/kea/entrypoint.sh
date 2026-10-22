@@ -6,8 +6,21 @@ THIS_SERVER_NAME="${KEA_SERVER_NAME:-kea-dc1}"
 THIS_SERVER_URL="${KEA_SERVER_URL:-10.10.20.20}"
 THIS_SERVER_ROLE="${KEA_SERVER_ROLE:-primary}"
 
+# ─── HA toggle (2026-10-22) ──────────────────────────────────────────────────
+# KEA_HA_ENABLED=false renders the config WITHOUT the libdhcp_ha hook, i.e.
+# a plain single-server DHCP4. This is what production uses until the DR
+# host exists: prod's kea-dc1 and the lab VPS's kea-dc1 were both
+# configured as `primary` with the SAME peer (10.10.20.30), which is an
+# invalid HA topology -- two primaries, one peer. Kea logs a peer-mismatch
+# and the hot-standby state machine stalls. Since the DR server is a later
+# phase, prod runs standalone and HA gets re-enabled together with DR.
+#
+# Default stays `true` so the dev/lab stack (which DOES have a live peer)
+# keeps working unchanged.
+KEA_HA_ENABLED="${KEA_HA_ENABLED:-true}"
+
 # HA peer config (1+1 topology: this server <-> one peer)
-# Defaults assume DC↔DR split:
+# Defaults assume DC<->DR split:
 #   DC:  PEER_NAME=kea-dr1, PEER_ROLE=standby, PEER_URL points to DR
 #   DR:  PEER_NAME=kea-dc1, PEER_ROLE=primary, PEER_URL points to DC
 KEA_PEER_NAME="${KEA_PEER_NAME:-kea-dr1}"
@@ -94,10 +107,24 @@ if [[ -n "${RELAY_VIA}" ]]; then
 fi
 
 echo "[kea] starting ${THIS_SERVER_NAME} (hooks=${HOOK_DIR})"
-echo "[kea] peer: ${KEA_PEER_NAME} @ ${KEA_PEER_URL} (role=${KEA_PEER_ROLE})"
-echo "[kea] HA timing: heartbeat=${KEA_HEARTBEAT_DELAY_MS}ms response=${KEA_MAX_RESPONSE_DELAY_MS}ms ack=${KEA_MAX_ACK_DELAY_MS}ms"
+if [ "${KEA_HA_ENABLED}" = "true" ]; then
+  echo "[kea] peer: ${KEA_PEER_NAME} @ ${KEA_PEER_URL} (role=${KEA_PEER_ROLE})"
+  echo "[kea] HA timing: heartbeat=${KEA_HEARTBEAT_DELAY_MS}ms response=${KEA_MAX_RESPONSE_DELAY_MS}ms ack=${KEA_MAX_ACK_DELAY_MS}ms"
+else
+  echo "[kea] HA DISABLED (KEA_HA_ENABLED=false) - standalone DHCP4, no peer"
+fi
 ip -br addr || true
 ip route || true
+
+if [ "${KEA_HA_ENABLED}" != "true" ]; then
+  # Strip the libdhcp_ha hook block from the rendered config. jq is already
+  # installed in the image (used by nothing else here, but present via the
+  # Dockerfile apt list) so this needs no extra tooling.
+  echo "[kea] removing libdhcp_ha hook from rendered config (standalone mode)"
+  jq 'del(.Dhcp4["hooks-libraries"][] | select(.library | test("libdhcp_ha")))' \
+    /etc/kea/kea-dhcp4.conf > /etc/kea/kea-dhcp4.conf.tmp \
+    && mv /etc/kea/kea-dhcp4.conf.tmp /etc/kea/kea-dhcp4.conf
+fi
 
 kea-dhcp4 -c /etc/kea/kea-dhcp4.conf &
 DHCP_PID=$!

@@ -130,22 +130,20 @@ services:
       netconsole:
         ipv4_address: 172.31.0.22
     ports:
-      # SECURITY (C9, H1, see docs/agents/16-security-audit-preprod.md):
-      # Bound to the docker host's loopback only — the worker reaches
-      # NetBox via the host's 127.0.0.1:8080, the same address
-      # referenced in NETBOX_URL in docker-compose.app.yml. NetBox
-      # is no longer reachable from the public NIC.
+      # SECURITY (C9, H1): the docker host publish below is for OPERATOR
+      # BROWSER access only. Sync traffic (backend/worker -> NetBox)
+      # goes over the docker bridge to the static IP 172.31.0.22:8080
+      # and does NOT use this publish at all.
       #
-      # PORT NOTE: 8001 is already taken by netconsole-kea-primary
-      # (mapped to 10.10.20.20:8001 for the Kea control channel).
-      # We use 8080 instead → 8080 on the host. NetBox's internal
-      # HTTP server listens on 8080 (env DEBUG=true skips the
-      # supervisord reverse-proxy), so this maps straight through.
+      # Default bind is loopback. deploy-prod.yml sets
+      # NETBOX_BIND_IP=192.168.81.171 (the LAN NIC) so the UI is
+      # reachable from an operator's browser on 192.168.81.0/24.
+      # Never set it to the public/NIC-facing address.
       #
-      # Note: For an emergency off-host probe (e.g. on-call SSH tunnel)
-      # the operator can `ssh -L 8080:127.0.0.1:8080 ...` — the loopback
-      # bind is the intended default.
-      - "127.0.0.1:8080:8080"
+      # PORT NOTE: 8001 is already taken by kea's control channel
+      # (${KEA_HOST_IP}:8001). We use 8080 -> 8080 on the host.
+      # NetBox's internal HTTP server listens on 8080.
+      - "${NETBOX_BIND_IP:-127.0.0.1}:8080:8080"
     healthcheck:
       # NetBox does NOT expose `/api/health/` (404), so the previous
       # endpoint silently kept the container in "(unhealthy)" state
