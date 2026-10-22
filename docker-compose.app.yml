@@ -199,6 +199,11 @@ services:
       REDIS_URL: redis://172.31.0.23:6379/0
       PORT: 3000
       NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      # The Prisma CLI phones home for a version check on every start.
+      # The production VPS has no direct internet egress, so the call can
+      # stall the container start. Disable it — the version is pinned by
+      # the lockfile anyway.
+      CHECKPOINT_DISABLE: "1"
       PING_INTERVAL_SECONDS: 60
       PING_TIMEOUT_MS: 3000
       # Managed check every 3 min (was 10 min). The previous 600s value
