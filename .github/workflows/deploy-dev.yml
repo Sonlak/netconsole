@@ -292,6 +292,28 @@ jobs:
           sudo -n ss -lntp 2>/dev/null | grep -E ':3000|:8443' || true
           exit 1
 
+      - name: Bootstrap admin user
+        run: |
+          set -euo pipefail
+          # Idempotent safety net: if the `User` table is empty (fresh DB,
+          # wiped volume, or a failed seed) this creates the first ADMIN so
+          # the console is not locked out. No-op when an ADMIN already
+          # exists. The password comes from secrets.env (SEED_ADMIN_*),
+          # which compose already injects into the backend container via
+          # `env_file` - so the script reads it from process.env and the
+          # value never appears in the host process list.
+          # `printenv NAME` exits 0 when the variable is set and 1 when it
+          # is not. Do NOT use `printenv | grep -q` here: grep exits on the
+          # first match and kills printenv with SIGPIPE, which `pipefail`
+          # turns into a failed pipeline - the check would then wrongly
+          # report "not set" and skip the bootstrap.
+          if ! docker exec netconsole-backend printenv SEED_ADMIN_PASSWORD >/dev/null 2>&1; then
+            echo "::warning::SEED_ADMIN_PASSWORD not present in the backend container environment - skipping admin bootstrap"
+            exit 0
+          fi
+
+          docker exec netconsole-backend node scripts/bootstrap-admin.mjs 2>&1 | tee /tmp/bootstrap-admin.log
+
       - name: Verify frontend reachable
         run: |
           set -euo pipefail

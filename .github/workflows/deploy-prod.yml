@@ -362,6 +362,46 @@ jobs:
           sudo -n ss -lntp 2>/dev/null | grep -E ':3000|:8443' || true
           exit 1
 
+      - name: Bootstrap admin user
+        run: |
+          set -euo pipefail
+          # WHY (2026-10-22): the production database was deployed EMPTY -
+          # the `User` table had ZERO rows, so every login returned 401
+          # "Invalid credentials" no matter what password was used. The
+          # prisma seed is not run in production (it also creates demo
+          # devices), and nothing in the pipeline created the first ADMIN.
+          #
+          # `backend/scripts/bootstrap-admin.mjs` is idempotent:
+          #   - user already exists    -> no-op
+          #   - an ADMIN already exists -> no-op (never creates a second one)
+          # so it is safe to run on EVERY deploy.
+          #
+          # The password comes from `secrets.env` (SEED_ADMIN_PASSWORD),
+          # which is decrypted from the git-tracked `secrets.env.enc` a few
+          # steps earlier. The backend service mounts that file via
+          # compose `env_file`, so SEED_ADMIN_* is ALREADY in the running
+          # container's environment - the script picks it up from
+          # process.env without the password ever appearing in the
+          # process list of the host.
+          #
+          # The script is executed INSIDE the running backend container so
+          # it uses the same DATABASE_URL as the app.
+          # `printenv NAME` exits 0 when the variable is set and 1 when it
+          # is not. Do NOT use `printenv | grep -q` here: grep exits on the
+          # first match and kills printenv with SIGPIPE, which `pipefail`
+          # turns into a failed pipeline - the check would then wrongly
+          # report "not set" and skip the bootstrap.
+          if ! docker exec netconsole-backend printenv SEED_ADMIN_PASSWORD >/dev/null 2>&1; then
+            echo "::warning::SEED_ADMIN_PASSWORD not present in the backend container environment - skipping admin bootstrap"
+            exit 0
+          fi
+
+          docker exec netconsole-backend node scripts/bootstrap-admin.mjs 2>&1 | tee /tmp/bootstrap-admin.log
+
+          echo "=== admin users in DB ==="
+          docker exec netconsole-postgres psql -U netconsole -d netconsole -c \
+            "select username, email, role, active, \"mustChangePassword\" from \"User\" order by \"createdAt\";"
+
       - name: Verify frontend reachable
         run: |
           set -euo pipefail
