@@ -160,6 +160,8 @@ worker/_*.py
 /.sops-age-key
 /age-priv.txt
 /age.key
+/secrets.age.key
+/secrets.*.age.key
 /frontend/certs/cert.pem
 /frontend/certs/key.pem
 /frontend/certs/*.csr

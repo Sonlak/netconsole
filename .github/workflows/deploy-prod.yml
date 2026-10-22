@@ -125,6 +125,7 @@ jobs:
             --exclude '*.pid' --exclude '/logs/' --exclude '/backups/' \
             --exclude '/secrets.env' --exclude '/.env' \
             --exclude '/.sops-age-key.txt' \
+            --exclude '/secrets.age.key' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
@@ -220,6 +221,15 @@ jobs:
           : > "$DEPLOY_DIR/.env"
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
           echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
+          # Lab-NIC IP of THIS host (prod). docker-compose.app.yml publishes
+          # kea DHCP :67, kea ctrl-agent :8001 and the backend syslog :1514
+          # on ${KEA_HOST_IP}. Hardcoded to the dev VPS's 10.10.20.20, Docker
+          # refuses to bind it here ("cannot assign requested address") and
+          # kea-dc1 never starts -> backend (depends_on kea healthy) never
+          # starts -> deploy fails. Dev keeps the default (10.10.20.20).
+          echo "KEA_HOST_IP=10.10.20.40" >> "$DEPLOY_DIR/.env"
+          # Kea HA "this server" URL — the peer uses it to reach us.
+          echo "KEA_SERVER_URL=10.10.20.40" >> "$DEPLOY_DIR/.env"
           chmod 600 "$DEPLOY_DIR/.env" 2>/dev/null || true
 
           if ! "${COMPOSE_BASE[@]}" pull $DEPLOY_SERVICES; then

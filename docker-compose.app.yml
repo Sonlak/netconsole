@@ -74,7 +74,7 @@ services:
     privileged: true
     environment:
       KEA_SERVER_NAME: kea-dc1
-      KEA_SERVER_URL: "10.10.20.20"
+      KEA_SERVER_URL: "${KEA_SERVER_URL:-10.10.20.20}"
       KEA_SERVER_ROLE: "primary"
       KEA_PEER_NAME: kea-dr1
       # DR control agent — reachable via DC's same lab subnet
@@ -98,11 +98,11 @@ services:
     ports:
       # DC DHCP server — :67 on 10.10.20.20 (DC host's lab NIC).
       # Switch DHCP helper-address includes this IP.
-      - "10.10.20.20:67:67/udp"
+      - "${KEA_HOST_IP:-10.10.20.20}:67:67/udp"
       # Control agent for backend/dashboard/monitoring. Bound on the
       # private NIC so the backend (172.31.0.3) and DR kea (via Tailscale)
       # can both reach it without exposing on the public IP.
-      - "10.10.20.20:8001:8000"
+      - "${KEA_HOST_IP:-10.10.20.20}:8001:8000"
     healthcheck:
       test:
         [
@@ -334,7 +334,7 @@ services:
       # `10.10.20.0/24,127.0.0.0/8`). Anything from the public NIC
       # is dropped at the iptables level (see deploy.yml's "Open
       # iptables" step).
-      - "10.10.20.20:1514:1514/udp"
+      - "${KEA_HOST_IP:-10.10.20.20}:1514:1514/udp"
     # Resource cap (added 2026-09-18). Backend holds long-lived SSH
     # sockets for every interactive terminal session (one per WS
     # connection) — without a cap, a runaway admin or memory leak can

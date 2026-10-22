@@ -38,7 +38,13 @@ name: Rollback
 
 on:
   workflow_run:
-    workflows: ["Deploy"]
+    # The dev/prod split (commit 0e4658e) renamed the workflows to
+    # "Deploy Dev" and "Deploy Prod". The old name "Deploy" no longer
+    # exists, so this trigger matched NOTHING and auto-rollback was dead
+    # without any error. This workflow rolls back the PRODUCTION host
+    # (runs-on: vps-prod-01, DEPLOY_DIR=/opt/netconsole), so it must
+    # react to "Deploy Prod" only — never to a dev deploy.
+    workflows: ["Deploy Prod"]
     types: [completed]
     branches: [main]
   # Allow manual rollback from GitHub Actions UI.
@@ -168,6 +174,34 @@ jobs:
           PREV_REF=""
           PREV_SOURCE=""
 
+          # --- Fresh-host guard ---
+          # A host that has NEVER had a successful deploy has nothing to
+          # roll back to. Falling through to FALLBACK_SHA would deploy an
+          # old commit (2113812) onto a brand-new production host — worse
+          # than leaving the failed deploy for a human to inspect.
+          # Only applies to the auto (workflow_run) path; a manual
+          # workflow_dispatch with an explicit ref is an operator's call.
+          FRESH_HOST=false
+          if [ ! -f "$DEPLOY_DIR/.last-deploy-sha" ] && [ ! -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
+            FRESH_HOST=true
+          fi
+          if [ "$FRESH_HOST" = "true" ]; then
+            echo "::notice::Fresh host — no previous deploy marker, nothing to roll back to."
+            echo "::notice::Skipping rollback (FALLBACK_SHA ${FALLBACK_SHA:-<empty>} NOT used)."
+            echo "## ⏪ Auto-rollback SKIPPED" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Fresh host** — no previous successful deploy on this VPS." >> $GITHUB_STEP_SUMMARY
+            echo "Nothing to roll back to; FALLBACK_SHA was NOT used." >> $GITHUB_STEP_SUMMARY
+            echo "The failed deploy is left in place for inspection." >> $GITHUB_STEP_SUMMARY
+            {
+              echo "PREV_SHA="
+              echo "PREV_REF="
+              echo "PREV_SOURCE=fresh-host-no-prior-deploy"
+              echo "SKIP_ROLLBACK=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # --- Path 1: .rollback-before-deploy-sha (anchor set by previous good deploy) ---
           if [ -f "$DEPLOY_DIR/.rollback-before-deploy-sha" ] && [ -s "$DEPLOY_DIR/.rollback-before-deploy-sha" ]; then
             PREV_SHA=$(tr -d '[:space:]' < "$DEPLOY_DIR/.rollback-before-deploy-sha")
@@ -222,6 +256,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout previous (good) commit
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.marker.outputs.PREV_SHA }}
@@ -229,6 +264,7 @@ jobs:
           path: src
 
       - name: Sync good commit to ${{ env.DEPLOY_DIR }}
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         env:
           SOURCE_DIR: ${{ github.workspace }}/src
         run: |
@@ -266,6 +302,7 @@ jobs:
             --exclude '/secrets.env' \
             --exclude '/.env' \
             --exclude '/.sops-age-key.txt' \
+            --exclude '/secrets.age.key' \
             "$SOURCE_DIR/" "$DEPLOY_DIR/"
           rsync_rc=$?
           set -e
@@ -280,6 +317,7 @@ jobs:
           echo "✅ Synced to $DEPLOY_DIR"
 
       - name: Rebuild and restart app services
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -uo pipefail
@@ -350,6 +388,7 @@ jobs:
           exit 1
 
       - name: Health-check restored deploy
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         run: |
           set -euo pipefail
           echo "Waiting for backend after rollback..."
@@ -375,6 +414,7 @@ jobs:
           echo "✅ Frontend OK after rollback (HTTP $code)"
 
       - name: Update deploy marker after rollback
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         run: |
           set -uo pipefail
           # Pure local writes (runner IS the VPS — see deploy.yml for the same pattern).
@@ -388,6 +428,7 @@ jobs:
           echo "    .rollback-before-deploy-sha= $(cat "$DEPLOY_DIR/.rollback-before-deploy-sha")"
 
       - name: Final state after rollback
+        if: steps.marker.outputs.SKIP_ROLLBACK != 'true'
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           echo "## ⏪ Auto-rollback complete" >> $GITHUB_STEP_SUMMARY
