@@ -40,7 +40,7 @@ env:
   COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
   NETBOX_COMPOSE_FILE: /opt/netconsole/docker-compose.netbox.yml
   COMPOSE_PROJECT: netconsole
-  DEPLOY_SERVICES: "backend worker frontend redis"
+  DEPLOY_SERVICES: "backend worker frontend redis kea-dc1"
 
 jobs:
   deploy:
@@ -392,6 +392,14 @@ jobs:
           - service: frontend
             context: frontend
             dockerfile: frontend/Dockerfile.prod
+          # kea is built here instead of on the VPS: the production VPS has
+          # no direct internet egress, and Docker does not forward the
+          # client's proxy env into `docker build`, so a local kea build
+          # on the runner cannot run `apt-get update` (see
+          # docker-compose.app.prod.yml for the full explanation).
+          - service: kea
+            context: lab/kea
+            dockerfile: lab/kea/Dockerfile
 
     steps:
       - uses: actions/checkout@v4

@@ -18,13 +18,22 @@
 #       * keep deploy atomic: pull → stop → recreate → up. No
 #         possibility of a half-built image sitting on the VPS.
 #
-# The kea-dhcp* services are NOT overridden here because they are
-# built ONCE (locally, on first deploy) and never rebuilt — their
-# data lives in `kea_{primary,standby}_leases` volumes.
+# The kea-dhcp* services WERE originally not overridden here because they
+# were "built once, locally, on first deploy". That assumption only holds
+# on a host with direct internet access. The production VPS has no direct
+# egress at all (every outbound connection must go through the site HTTP
+# proxy), and Docker does not inject the client's proxy environment into
+# `docker build`, so `apt-get update` inside the kea build found no
+# package index and the build died with:
+#     E: Unable to locate package kea-dhcp4-server
+#     E: Package 'ca-certificates' has no installation candidate
+# while backend/worker/frontend built fine (they are built by the CI
+# job on a GitHub-hosted runner, which does have direct egress).
 #
-# Local dev still uses docker-compose.app.yml alone (with `build:`),
-# so the `image:` override only applies when the prod overlay is
-# passed.
+# kea-dc1 is therefore built by the same push-images CI job and pulled
+# from GHCR here, exactly like the other three services. Local dev still
+# uses docker-compose.app.yml alone (with `build:`), so the dev VPS keeps
+# building kea locally as before.
 #
 # Image tag: pinned to the running commit SHA. The deploy runs
 # SEQUENTIALLY after push-images (`needs: push-images` in the
@@ -32,7 +41,6 @@
 # the pull runs. This eliminates the race condition where a
 # parallel deploy could pull the previous :main image before the
 # new push completes. See deploy.yml for the full analysis.
-
 services:
   backend:
     image: ghcr.io/sonlak/netconsole-backend:${GITHUB_SHA:-main}
@@ -44,4 +52,8 @@ services:
 
   frontend:
     image: ghcr.io/sonlak/netconsole-frontend:${GITHUB_SHA:-main}
+    pull_policy: always
+
+  kea-dc1:
+    image: ghcr.io/sonlak/netconsole-kea:${GITHUB_SHA:-main}
     pull_policy: always
