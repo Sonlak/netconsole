@@ -6,6 +6,24 @@
 
 ---
 
+## ⚠️ PROD VPS = 2 HOPS (đọc file này trước khi đụng prod)
+
+Prod **KHÔNG** truy cập trực tiếp được. Đường vào đúng (đã test 2026-10-26):
+
+```
+Windows (Tailscale 100.68.137.102)
+  └─ ssh sonnx@100.102.133.86      → VPS netconsole (dev)   [netconsole-vps]
+       └─ ssh sonnx@10.10.20.40    → VPS PROD               [netconsole-pd]
+```
+
+Console prod: `https://192.168.81.171:8443` — user `admin`,
+password `NCP-Admin-2026xQ7` (KHÔNG phải `Admin@123`, cái đó là của VPS dev).
+
+**Chi tiết đầy đủ + review prod + checklist + lỗi đang mở:
+`docs/agents/18-prod-vps-access.md`** (đọc file đó trước).
+
+---
+
 ## Auto-rollback: how it works (since 2026-09-16)
 
 `rollback.yml` runs as a `workflow_run` triggered by `deploy.yml` failure.
