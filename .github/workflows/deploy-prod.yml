@@ -455,7 +455,15 @@ jobs:
           # (192.168.81.171 on prod), NOT on 127.0.0.1. Probing
           # 127.0.0.1:8080 therefore always failed with a connection
           # refused and the step fell through to the 5-minute timeout.
-          NETBOX_PROBE_URL="http://192.168.81.171:8080/api/dcim/sites/?limit=1"
+          #
+          # FIXED 2026-10-26: the probe used `/api/dcim/sites/?limit=1`
+          # WITHOUT a token -> NetBox 4.x answers 403 (API needs auth)
+          # -> every deploy burned the full 5-minute timeout and ended
+          # with "::warning::NetBox not healthy in 5 min". Probe the
+          # auth-free `/login/` endpoint instead (200 when the Django
+          # app is serving). The API-level check is done separately by
+          # the NetBox sync job, which carries the real token.
+          NETBOX_PROBE_URL="http://192.168.81.171:8080/login/"
           for i in $(seq 1 60); do
             if curl -sf -o /dev/null --max-time 5 "$NETBOX_PROBE_URL"; then
               echo "NetBox healthy (attempt $i)"; exit 0

@@ -145,14 +145,14 @@ services:
       # NetBox's internal HTTP server listens on 8080.
       - "${NETBOX_BIND_IP:-127.0.0.1}:8080:8080"
     healthcheck:
-      # NetBox does NOT expose `/api/health/` (404), so the previous
-      # endpoint silently kept the container in "(unhealthy)" state
-      # for 5+ days until the gunicorn workers deadlocked and the
-      # real failure cascaded. `/api/` returns 200 with the NetBox
-      # version payload and is a reliable liveness probe. Interval
-      # widened to 30s (was 10s) to avoid hammering the slow
-      # first-query path after restart.
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/api/"]
+      # FIXED 2026-10-26 (prod review): NetBox 4.x answers `/api/` with
+      # **403** for anonymous requests (the REST API requires a token),
+      # so `curl -sf .../api/` ALWAYS failed and the container stayed
+      # "(unhealthy)" forever (observed FailingStreak 10826 on prod).
+      # `/login/` is served by the Django app and returns 200 without
+      # auth -> reliable liveness probe. Interval widened to 30s (was
+      # 10s) to avoid hammering the slow first-query path after restart.
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/login/"]
       interval: 30s
       timeout: 5s
       retries: 5
