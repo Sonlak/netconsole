@@ -26,6 +26,7 @@ import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { scheduleNetboxSync } from './services/netboxSync.js';
 import { startKeccFailbackScheduler, stopKeaFailbackScheduler } from './services/keaFailback.js';
+import { isHaEnabled, isDrConfigured } from './services/keaDhcp.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
@@ -239,6 +240,13 @@ const httpServer = app.listen(port, () => {
   console.log(
     `Kea auto-failback scheduler enabled (env flag: ${keaFailbackWanted ? 'on' : 'off (toggleable via API)'})`,
   );
+  // 2026-10-27: make the deployment topology explicit in the startup log.
+  // "HA on but no DR peer" and "HA off" look identical from the outside
+  // but behave completely differently (the latter never fails over).
+  console.log(
+    `Kea HA topology: haEnabled=${isHaEnabled()} drConfigured=${isDrConfigured()} ` +
+      `drUrl=${process.env.KEA_STANDBY_API_URL || '(unset)'}`,
+  );
 
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
 
@@ -365,6 +373,13 @@ app.get('/api/health', (_req, res) => {
     syslogUdpPort,
     keaApiUrl: process.env.KEA_API_URL || null,
     keaStandbyApiUrl: process.env.KEA_STANDBY_API_URL || null,
+    // NEW 2026-10-27: the backend must agree with the Kea server on
+    // whether the DC↔DR HA pair exists. A standalone Kea (no libdhcp_ha
+    // hook) answers `ha-heartbeat` with result=3, which used to be read
+    // as "DC unreachable" and made the prod dashboard point at a DR peer
+    // that was never configured.
+    keaHaEnabled: isHaEnabled(),
+    keaDrConfigured: isDrConfigured(),
     keaAutoFailback: process.env.KEA_AUTO_FAILBACK === 'true',
     netboxEnabled: netboxSyncIntervalSeconds > 0,
     netboxSyncIntervalSeconds: netboxSyncIntervalSeconds > 0 ? netboxSyncIntervalSeconds : null,

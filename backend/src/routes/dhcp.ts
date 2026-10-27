@@ -15,6 +15,7 @@ import {
   fixStaticReservation,
   getDhcpDashboard,
   getHaState,
+  isDrConfigured,
   listDhcpLeases,
   switchHaPartner,
   unfixStaticReservation,
@@ -68,6 +69,16 @@ dhcpRouter.post('/switchover', authMiddleware, requireRole('ADMIN'), async (req,
   const body = req.body as { currentPrimary?: string };
   if (body.currentPrimary !== 'DC' && body.currentPrimary !== 'DR') {
     res.status(400).json({ error: 'currentPrimary must be "DC" or "DR"' });
+    return;
+  }
+  // 400 (not 502): there is no DR peer to switch over to on a standalone
+  // deployment. This is a configuration state, not an upstream failure.
+  if (!isDrConfigured()) {
+    res.status(400).json({
+      error:
+        'Kea HA is not configured on this deployment — no DR peer. ' +
+        'Set KEA_STANDBY_API_URL and enable the libdhcp_ha hook first.',
+    });
     return;
   }
   try {

@@ -28,6 +28,37 @@ function getDrUrl() {
 const getPrimaryUrl = getDcUrl;
 const getStandbyUrl = getDrUrl;
 
+/**
+ * Is the DC↔DR HA pair enabled for this deployment?
+ *
+ * `KEA_HA_ENABLED` mirrors the flag the Kea container uses to decide
+ * whether to render the `libdhcp_ha` hook (see docker-compose.app.yml).
+ * When it is false the Kea server runs STANDALONE:
+ *   - `ha-heartbeat` is not a supported command → the control agent
+ *     answers with result=3 ("unsupported command"), NOT a transport error
+ *   - there is no peer to talk to, so no failover / failback semantics
+ *
+ * The backend MUST follow the same flag, otherwise it reads result=3 as
+ * "DC unreachable" and treats whatever URL sits in `KEA_STANDBY_API_URL`
+ * (on prod that is the *dev* lab host) as a live DR site — which produced
+ * false "failover DC → DR" events and a dashboard that pointed at the
+ * wrong Kea server entirely.
+ */
+export function isHaEnabled(): boolean {
+  const raw = (process.env.KEA_HA_ENABLED ?? '').trim();
+  if (!raw) return true; // not set → assume the default (HA enabled)
+  return /^(1|true|yes|on)$/i.test(raw);
+}
+
+/**
+ * True when a DR peer is genuinely configured: HA enabled AND an explicit
+ * peer URL is set. An empty `KEA_STANDBY_API_URL` means "no DR site".
+ */
+export function isDrConfigured(): boolean {
+  if (!isHaEnabled()) return false;
+  return (process.env.KEA_STANDBY_API_URL ?? '').trim().length > 0;
+}
+
 function timeoutMs() {
   return Number(process.env.KEA_TIMEOUT_MS) || 5000;
 }
@@ -40,14 +71,24 @@ export async function keaCommand(
   options?: { target?: KeaTarget },
 ): Promise<KeaCommandResult> {
   const target = options?.target ?? 'auto';
+
+  if ((target === 'dr' || target === 'standby') && !isDrConfigured()) {
+    throw new Error(
+      'Kea DR site is not configured (KEA_HA_ENABLED=false or KEA_STANDBY_API_URL unset)',
+    );
+  }
+
+  // With no DR peer configured there is nothing to fail over to — the DC
+  // is the only site. Sending the command to a stale peer URL would talk
+  // to an unrelated Kea instance (e.g. the dev/lab host).
   const urls =
     target === 'dr' || target === 'standby'
       ? [getDrUrl()]
       : target === 'dc' || target === 'primary'
         ? [getDcUrl()]
-        : target === 'all'
+        : isDrConfigured()
           ? [getDcUrl(), getDrUrl()]
-          : [getDcUrl(), getDrUrl()];
+          : [getDcUrl()];
 
   let lastError: Error | null = null;
 
@@ -92,6 +133,12 @@ export async function keaCommand(
  * site keyed by `dc` / `dr`. Failures are reported per-site rather than
  * throwing, so the caller can render a "DC healthy, DR down" picture in
  * one round-trip (used by the auto-failback scheduler + dashboard).
+ *
+ * IMPORTANT: a non-null `dc` / `dr` means the control agent ANSWERED
+ * (HTTP 200 + parsable body). The Kea `result` code inside may still be
+ * non-zero — e.g. `ha-heartbeat` returns result=3 ("unsupported command")
+ * when the `libdhcp_ha` hook is not loaded. Reachability must therefore be
+ * derived from the presence of a response, NOT from `result === 0`.
  */
 export async function keaCommandBoth(
   command: string,
@@ -116,13 +163,26 @@ export async function keaCommandBoth(
         return { ok: false as const, error: `HTTP ${response.status}` };
       }
       const payload = (await response.json()) as KeaCommandResult | KeaCommandResult[];
-      return { ok: true as const, result: Array.isArray(payload) ? payload[0] : payload };
+      const result = Array.isArray(payload) ? payload[0] : payload;
+      if (!result) {
+        return { ok: false as const, error: 'Empty Kea response' };
+      }
+      // `ok` here means "the control agent answered". The Kea `result`
+      // code inside may still be non-zero (e.g. result=3 "unsupported
+      // command" when the HA hook is not loaded).
+      return { ok: true as const, result };
     } catch (error) {
       return { ok: false as const, error: error instanceof Error ? error.message : String(error) };
     }
   };
 
-  const [dcRes, drRes] = await Promise.all([send(getDcUrl()), send(getDrUrl())]);
+  // When no DR peer is configured we must NOT probe the DR URL: on prod
+  // `KEA_STANDBY_API_URL` still points at the dev/lab host (10.10.20.30),
+  // and probing it made the backend report a live DR site and render the
+  // dev server's DHCP data as if it were prod's.
+  const [dcRes, drRes] = isDrConfigured()
+    ? await Promise.all([send(getDcUrl()), send(getDrUrl())])
+    : [await send(getDcUrl()), { ok: false as const, error: 'DR peer not configured' }];
   return {
     dc: dcRes.ok ? dcRes.result : null,
     dr: drRes.ok ? drRes.result : null,
@@ -307,11 +367,10 @@ async function savePrimaryDhcp4(dhcp4: Record<string, unknown>) {
 }
 
 export async function getDhcpDashboard() {
-  const [configResult, leasesResult, haPrimary, haStandby] = await Promise.all([
+  const [configResult, leasesResult, ha] = await Promise.all([
     keaCommand('config-get', undefined, { target: 'auto' }),
     keaCommand('lease4-get-all', undefined, { target: 'auto' }),
-    keaCommand('ha-heartbeat', undefined, { target: 'primary' }).catch(() => null),
-    keaCommand('ha-heartbeat', undefined, { target: 'standby' }).catch(() => null),
+    getHaState().catch(() => null),
   ]);
 
   if ((configResult.result ?? 1) !== 0) {
@@ -386,42 +445,24 @@ export async function getDhcpDashboard() {
     utilization: site.poolSize > 0 ? Math.round((site.leased / site.poolSize) * 1000) / 10 : 0,
   }));
 
-  const haArgs = (args?: KeaCommandResult | null) =>
-    (args?.arguments ?? {}) as { state?: string; scopes?: string[]; 'date-time'?: string };
-
-  const dcHeartbeat = haArgs(haPrimary);
-  const drHeartbeat = haArgs(haStandby);
-
-  const peers: DhcpHaPeer[] = [
+  // `getHaState()` owns the peer list and the active-site resolution —
+  // it is the single source of truth for "is the DC alive" and "which
+  // site serves". If it throws we still want to report the DC peer
+  // rather than an empty list (which would read as "no Kea at all").
+  const peers: DhcpHaPeer[] = ha?.peers ?? [
     {
       name: 'kea-dc1',
       site: 'DC',
       role: 'primary',
       url: getDcUrl(),
-      reachable: Boolean(haPrimary && (haPrimary.result ?? 1) === 0),
-      state: dcHeartbeat.state || '',
-      scopes: Array.isArray(dcHeartbeat.scopes) ? dcHeartbeat.scopes : [],
-      lastHeartbeatAt: dcHeartbeat['date-time'] || null,
-    },
-    {
-      name: 'kea-dr1',
-      site: 'DR',
-      role: 'standby',
-      url: getDrUrl(),
-      reachable: Boolean(haStandby && (haStandby.result ?? 1) === 0),
-      state: drHeartbeat.state || '',
-      scopes: Array.isArray(drHeartbeat.scopes) ? drHeartbeat.scopes : [],
-      lastHeartbeatAt: drHeartbeat['date-time'] || null,
+      reachable: false,
+      state: '',
+      scopes: [],
+      lastHeartbeatAt: null,
     },
   ];
 
-  // Active site = the one that is currently serving DHCP. Determined by
-  // combination of role + state:
-  //   - DC's state 'partner-down'        → DC is serving alone (DR down)
-  //   - DR's state 'partner-down'        → DR is serving (DC was down, now DR up)
-  //   - DC 'hot-standby' + DR 'partner-down' → DR is serving (DR promoted)
-  //   - both 'hot-standby'              → DC serving (normal state)
-  const active = resolveActiveSite(peers);
+  const active = ha?.activeSite ?? null;
 
   return {
     sites,
@@ -434,7 +475,7 @@ export async function getDhcpDashboard() {
       name: pool.name,
     })),
     ha: {
-      mode: 'hot-standby',
+      mode: ha?.mode ?? (isDrConfigured() ? 'hot-standby' : 'standalone'),
       peers,
       active,
     },
@@ -506,6 +547,12 @@ export type HaStateSnapshot = {
   recommendedAction: 'none' | 'switchover-to-dc' | 'switchover-to-dr' | 'investigate';
   reason: string;
   capturedAt: string;
+  /**
+   * HA mode of the pair.
+   *   - "hot-standby" — DC↔DR pair with the libdhcp_ha hook loaded
+   *   - "standalone"  — single Kea server, no DR peer configured
+   */
+  mode: 'hot-standby' | 'standalone';
 };
 
 export async function getHaState(): Promise<HaStateSnapshot> {
@@ -523,28 +570,56 @@ export async function getHaState(): Promise<HaStateSnapshot> {
   const dcHb = parseHeartbeat(both.dc);
   const drHb = parseHeartbeat(both.dr);
 
+  // Reachability is TRANSPORT-level: the control agent answered the
+  // request. A standalone Kea (no libdhcp_ha hook) replies to
+  // `ha-heartbeat` with HTTP 200 + result=2 ("'ha-heartbeat' command not
+  // supported.") — that is a healthy server that simply has no HA hook,
+  // NOT an unreachable one. Deriving reachability from `result === 0`
+  // made prod report the DC as down and handed the "active site" to a DR
+  // that was never configured.
+  const dcReachable = Boolean(both.dc) && !both.dcError;
+  const drReachable = Boolean(both.dr) && !both.drError;
+
+  // The agent answered but the HA hook is not loaded → the server runs
+  // standalone. Kea says so explicitly ("'ha-heartbeat' command not
+  // supported."). Only that case is labelled 'standalone' — any other
+  // error keeps the state empty so it is not mislabelled.
+  const haUnsupported = (result: KeaCommandResult | null) =>
+    result != null &&
+    (result.result ?? 0) !== 0 &&
+    /not\s+supported/i.test(result.text ?? '');
+
+  const dcState = dcHb.state || (dcReachable && haUnsupported(both.dc) ? 'standalone' : '');
+  const drState = drHb.state || (drReachable && haUnsupported(both.dr) ? 'standalone' : '');
+
   const peers: DhcpHaPeer[] = [
     {
       name: 'kea-dc1',
       site: 'DC',
       role: 'primary',
       url: getDcUrl(),
-      reachable: Boolean(both.dc && (both.dc.result ?? 1) === 0) && !both.dcError,
-      state: dcHb.state,
+      reachable: dcReachable,
+      state: dcState,
       scopes: dcHb.scopes,
       lastHeartbeatAt: dcHb.lastHeartbeatAt,
     },
-    {
+  ];
+
+  // Only advertise the DR peer when one is actually configured. Listing
+  // a phantom DR peer made the dashboard show a permanent red "DR
+  // unreachable" and pushed the active-site resolution to DR.
+  if (isDrConfigured()) {
+    peers.push({
       name: 'kea-dr1',
       site: 'DR',
       role: 'standby',
       url: getDrUrl(),
-      reachable: Boolean(both.dr && (both.dr.result ?? 1) === 0) && !both.drError,
-      state: drHb.state,
+      reachable: drReachable,
+      state: drState,
       scopes: drHb.scopes,
       lastHeartbeatAt: drHb.lastHeartbeatAt,
-    },
-  ];
+    });
+  }
 
   const activeSite = resolveActiveSite(peers);
 
@@ -559,7 +634,18 @@ export async function getHaState(): Promise<HaStateSnapshot> {
   const dc = peers.find((p) => p.site === 'DC');
   const dr = peers.find((p) => p.site === 'DR');
 
-  if (!dc?.reachable && !dr?.reachable) {
+  if (!dr) {
+    // Standalone deployment: no DR peer configured. The DC is the only
+    // server and it is serving. Nothing to fail back from.
+    recommendedAction = 'none';
+    if (!dc?.reachable) {
+      reason = 'Standalone mode — the DC Kea server is unreachable';
+    } else {
+      reason = isHaEnabled()
+        ? 'Standalone mode — no DR peer configured (set KEA_STANDBY_API_URL to enable HA)'
+        : 'Standalone mode — HA is disabled (KEA_HA_ENABLED=false)';
+    }
+  } else if (!dc?.reachable && !dr?.reachable) {
     recommendedAction = 'investigate';
     reason = 'Both DC and DR unreachable — cannot determine state';
   } else if (activeSite === 'DR' && dc?.reachable) {
@@ -582,6 +668,7 @@ export async function getHaState(): Promise<HaStateSnapshot> {
     recommendedAction,
     reason,
     capturedAt: new Date().toISOString(),
+    mode: isDrConfigured() ? 'hot-standby' : 'standalone',
   };
 }
 
@@ -603,6 +690,11 @@ export async function switchHaPartner(currentPrimary: 'DC' | 'DR'): Promise<{
   text: string;
   beforeState: HaStateSnapshot;
 }> {
+  if (!isDrConfigured()) {
+    throw new Error(
+      'Kea HA is not configured on this deployment — no DR peer to switch over to',
+    );
+  }
   const beforeState = await getHaState();
   const target = currentPrimary === 'DC' ? 'dc' : 'dr';
   const result = await keaCommand('ha-switch-partner', undefined, { target });

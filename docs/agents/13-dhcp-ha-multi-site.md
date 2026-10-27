@@ -1,8 +1,67 @@
 # Kea DHCP HA Multi-Site Design (DC + DR)
 
-> **Status:** Planning only — not yet implemented.
-> **Date:** 2026-09-17
+> **Status:** Phase 1–2 partially implemented. The DC↔DR 1+1 hot-standby pair
+> exists on the dev/lab stack. **Prod runs standalone** (no DR host yet).
+> **Date:** 2026-09-17 (design), 2026-10-27 (standalone-mode contract)
 > **Author:** Agent review
+
+---
+
+## Deployment topology contract (2026-10-27)
+
+The backend and the Kea container must agree on whether a DR peer exists.
+Two env vars drive this, both set in `docker-compose.app.yml`:
+
+| Var | Set by | Meaning |
+| --- | --- | --- |
+| `KEA_HA_ENABLED` | `lab/kea/entrypoint.sh` (Kea container) **and** `docker-compose.app.yml` (backend) | `false` → Kea renders a DHCP4 config WITHOUT the `libdhcp_ha` hook. The server is standalone. |
+| `KEA_STANDBY_API_URL` | `docker-compose.app.yml` (backend) | URL of the DR control agent. **Must be EMPTY on a deployment with no DR site.** |
+
+### Rules
+
+1. **Reachability is transport-level.** A standalone Kea answers `ha-heartbeat`
+   with `HTTP 200` + `{"result": 2, "text": "'ha-heartbeat' command not supported."}`.
+   The agent *answered* — the server is healthy. Only a network failure
+   (connection refused, timeout, non-200) means "unreachable".
+   Deriving reachability from `result === 0` marked a healthy prod DC as DOWN.
+2. **No DR peer → no DR peer in the API response.** `getHaState()` only
+   includes the DR entry when `isDrConfigured()` is true. A phantom DR peer
+   rendered a permanent red "DR unreachable" dot and pushed the active-site
+   resolution to DR.
+3. **`target: 'auto'` never falls through to an unconfigured DR URL.** With no
+   DR peer, `auto` means the DC only.
+4. **`target: 'dr'` is rejected** with a clear error when no DR is configured.
+5. **Auto-failback is inert without a DR peer.** The scheduler returns early
+   and never records failover events. There is nothing to fail back from.
+6. **Manual switchover returns HTTP 400** (not 502) when HA is not configured.
+
+### What went wrong on prod (2026-10-26 → 2026-10-27)
+
+prod's `kea-dc1` runs standalone (`KEA_HA_ENABLED=false`), but the backend still
+had `KEA_STANDBY_API_URL=http://10.10.20.30:8001/` — the **dev lab host**.
+Combined with the `result === 0` reachability bug:
+
+- prod's DC showed `reachable: false` (it answered with result=2)
+- the dev server showed `reachable: true, state: hot-standby`
+- `activeSite` resolved to **DR** — the wrong site, on the wrong host
+- the auto-failback scheduler logged a bogus `failover DC → DR` event
+- the DHCP dashboard rendered the dev server's lease data as if it were prod's
+
+Fix: `isHaEnabled()` / `isDrConfigured()` in `backend/src/services/keaDhcp.ts`,
+plus `KEA_STANDBY_API_URL=` (empty) in `deploy-prod.yml`.
+
+### Enabling HA on a new site
+
+1. Bring up the DR host with `docker-compose.kea-dr.yml` (kea-dr1, `:8001`).
+2. On the DC: set `KEA_HA_ENABLED=true` and `KEA_PEER_URL=http://<DR_IP>:8001/`.
+3. On the DC backend: set `KEA_STANDBY_API_URL=http://<DR_IP>:8001/`.
+4. Set `KEA_HA_ENABLED=true` for the backend too — it is the SAME flag.
+5. Verify: `/api/dhcp/ha-state` shows two peers, both `reachable: true`,
+   `mode: "hot-standby"`, `activeSite: "DC"`.
+
+Do **not** point two deployments at the same peer URL: a `primary` and a
+`primary` sharing one peer is an invalid hot-standby topology and Kea's
+state machine stalls.
 
 ---
 

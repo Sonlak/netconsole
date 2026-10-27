@@ -277,8 +277,21 @@ services:
       # between the two VPSes via router/site-to-site). Container exposes
       # 10.10.20.30:8001 (host) -> 8000 (container). Backend (172.31.0.3)
       # reaches it through the host's routing table.
-      KEA_STANDBY_API_URL: http://10.10.20.30:8001/
+      #
+      # Overridable via .env: on a deployment with NO DR site (prod), set
+      # KEA_HA_ENABLED=false — the backend then stops probing this URL
+      # entirely instead of talking to an unrelated Kea instance.
+      # NOTE: `${VAR-default}` (no colon) on purpose — an explicitly EMPTY
+      # value in .env must stay empty. `${VAR:-default}` would silently
+      # substitute the dev URL back in.
+      KEA_STANDBY_API_URL: ${KEA_STANDBY_API_URL-http://10.10.20.30:8001/}
       KEA_TIMEOUT_MS: "5000"
+      # Mirrors the flag the kea-dc1 container uses to decide whether to
+      # load the libdhcp_ha hook. The backend MUST agree with the Kea
+      # server: a standalone Kea answers `ha-heartbeat` with result=3
+      # ("unsupported command"), which used to be read as "DC down" and
+      # handed the active site to a DR peer that was never configured.
+      KEA_HA_ENABLED: ${KEA_HA_ENABLED:-true}
       # Auto-failback: when DC recovers after a failover, scheduler
       # will call ha-switch-partner to swap primary back to DC.
       # Disabled by default until the DR pair is deployed in production.

@@ -31,6 +31,7 @@
 import {
   type AutoFailbackStatus,
   getHaState,
+  isDrConfigured,
   switchHaPartner,
 } from './keaDhcp.js';
 
@@ -69,8 +70,12 @@ type Runtime = {
 };
 
 const runtime: Runtime = {
-  enabled: envBool('KEA_AUTO_FAILBACK', false),
-  runtimeEnabled: envBool('KEA_AUTO_FAILBACK', false),
+  // Auto-failback only makes sense when a DR peer exists. On a
+  // standalone deployment (no DR configured) the scheduler is inert:
+  // there is nothing to fail back from, and treating "DR missing" as a
+  // failover produced bogus failover events on prod.
+  enabled: envBool('KEA_AUTO_FAILBACK', false) && isDrConfigured(),
+  runtimeEnabled: envBool('KEA_AUTO_FAILBACK', false) && isDrConfigured(),
   dcHealthySince: null,
   lastFailoverAt: null,
   lastFailbackAt: null,
@@ -147,6 +152,14 @@ export async function runFailbackCheck(trigger: 'scheduled' | 'manual' = 'schedu
   runtime.lastCheckedAt = Date.now();
   runtime.isRunning = true;
   try {
+    // Standalone deployment: there is no DR peer, so there is nothing to
+    // fail back from and no failover to detect. Bail out before touching
+    // any Kea state — this is what produced the bogus "failover DC → DR"
+    // event on prod.
+    if (!isDrConfigured()) {
+      return { status: getAutoFailbackStatus(), switched: false };
+    }
+
     const state = await getHaState();
     const dc = state.peers.find((p) => p.site === 'DC');
 
@@ -237,6 +250,9 @@ export async function runFailbackCheck(trigger: 'scheduled' | 'manual' = 'schedu
 function computeCanFailback(
   state: Awaited<ReturnType<typeof getHaState>>,
 ): { ok: true; reason: string } | { ok: false; reason: string } {
+  if (!isDrConfigured()) {
+    return { ok: false, reason: 'HA is not configured on this deployment (no DR peer)' };
+  }
   if (state.activeSite !== 'DR') {
     return { ok: false, reason: `Active site is ${state.activeSite ?? 'unknown'}, not DR` };
   }

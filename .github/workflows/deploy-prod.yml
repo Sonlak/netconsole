@@ -253,6 +253,13 @@ jobs:
           # Re-enable (together with KEA_PEER_URL) in the same commit that
           # brings up the DR host.
           echo "KEA_HA_ENABLED=false" >> "$DEPLOY_DIR/.env"
+          # KEA_STANDBY_API_URL= (2026-10-27): prod has NO DR peer, so the
+          # backend must not have one to talk to. The compose default points
+          # at 10.10.20.30 - the DEV lab host - so with the default in place
+          # the prod backend probed the dev server's Kea, reported it as a
+          # live "DR active" peer, and logged bogus failover events. Empty
+          # value (compose uses ${VAR-default}, no colon) keeps it empty.
+          echo "KEA_STANDBY_API_URL=" >> "$DEPLOY_DIR/.env"
           # NetBox UI bind address (2026-10-22): the operator reaches the
           # console over the LAN IP, so NetBox's UI must be reachable the
           # same way. Backend/worker talk to NetBox over the docker bridge

@@ -46,7 +46,7 @@ const peerStateColor = (state: string | undefined): string => {
   if (state === 'partner-down') return 'warning';
   if (state === 'unavailable' || state === 'waiting' || state === 'syncing') return 'processing';
   if (state === 'communication-recovered') return 'cyan';
-  if (state === 'terminated') return 'default';
+  if (state === 'terminated' || state === 'standalone') return 'default';
   return 'default';
 };
 
@@ -194,6 +194,12 @@ export function KeaHaCard() {
   const { ha, autoFailback } = data;
   const dc = siteStateSummary('DC', ha);
   const dr = siteStateSummary('DR', ha);
+  // "standalone" = this deployment has a single Kea server, no DR peer.
+  // Switchover and auto-failback are meaningless there, so the UI says
+  // so instead of offering a button that would fail.
+  const haMode = ha.mode ?? 'hot-standby';
+  const standalone = haMode === 'standalone';
+  const drPeer = ha.peers.find((p) => p.site === 'DR');
 
   const nextCheckIn =
     autoFailback.nextCheckAt != null
@@ -229,7 +235,7 @@ export function KeaHaCard() {
       <Space direction="vertical" style={{ width: '100%' }} size={10}>
         <div>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Mode: <Typography.Text code>hot-standby</Typography.Text>
+            Mode: <Typography.Text code>{haMode}</Typography.Text>
             {ha.recommendedAction !== 'none' ? ` · ${ha.reason}` : null}
           </Typography.Text>
         </div>
@@ -240,11 +246,9 @@ export function KeaHaCard() {
             peer={ha.peers.find((p) => p.site === 'DC')}
             active={dc.active}
           />
-          <SiteBlock
-            site="DR"
-            peer={ha.peers.find((p) => p.site === 'DR')}
-            active={dr.active}
-          />
+          {drPeer ? (
+            <SiteBlock site="DR" peer={drPeer} active={dr.active} />
+          ) : null}
         </div>
 
         <AutoFailbackPanel
@@ -253,17 +257,24 @@ export function KeaHaCard() {
           onToggle={onToggleAutoFailback}
           onCheckNow={onCheckNow}
           busy={busy}
+          standalone={standalone}
         />
 
         <FailoverHistory events={autoFailback.recentEvents} />
 
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-          <Tooltip title={`Manual switchover (active: ${ha.activeSite ?? '?'})`}>
+          <Tooltip
+            title={
+              standalone
+                ? 'HA is not configured on this deployment (no DR peer)'
+                : `Manual switchover (active: ${ha.activeSite ?? '?'})`
+            }
+          >
             <Button
               size="small"
               danger
               icon={<SwapOutlined />}
-              disabled={!ha.activeSite || busy}
+              disabled={standalone || !ha.activeSite || busy}
               onClick={() => onSwitchover(ha.activeSite as 'DC' | 'DR')}
             >
               Manual switchover
@@ -334,12 +345,14 @@ function AutoFailbackPanel({
   onToggle,
   onCheckNow,
   busy,
+  standalone,
 }: {
   status: AutoFailbackStatus;
   nextCheckIn: number | null;
   onToggle: (next: boolean) => void;
   onCheckNow: () => void;
   busy: boolean;
+  standalone?: boolean;
 }) {
   const cooldownMinutes = Math.ceil(status.cooldownRemainingSeconds / 60);
   return (
@@ -366,10 +379,16 @@ function AutoFailbackPanel({
         <Switch
           size="small"
           checked={status.enabled}
-          disabled={busy}
+          disabled={busy || standalone}
           onChange={onToggle}
         />
       </Space>
+      {standalone ? (
+        <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 4 }}>
+          HA is not configured on this deployment — a single Kea server, no DR peer to fail back
+          from.
+        </Typography.Text>
+      ) : null}
       <Descriptions size="small" column={1} style={{ marginTop: 6 }} colon={false}>
         <Descriptions.Item label={<Typography.Text type="secondary" style={{ fontSize: 11 }}>Stability</Typography.Text>}>
           <Typography.Text style={{ fontSize: 11 }}>

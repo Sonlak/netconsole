@@ -79,6 +79,11 @@ export type HaStateSnapshot = {
   recommendedAction: 'none' | 'switchover-to-dc' | 'switchover-to-dr' | 'investigate';
   reason: string;
   capturedAt: string;
+  /**
+   * "hot-standby" — DC↔DR pair with the libdhcp_ha hook loaded.
+   * "standalone"  — single Kea server, no DR peer configured.
+   */
+  mode?: 'hot-standby' | 'standalone';
 };
 
 /** Auto-failback scheduler status (in-memory on the backend). */
