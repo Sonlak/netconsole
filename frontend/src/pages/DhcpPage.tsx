@@ -228,7 +228,10 @@ export default function DhcpPage() {
             <Col xs={24} lg={15}>
               <Card bordered={false} size="small" title="Pools">
                 {filteredPools.length === 0 ? (
-                  <EmptyState title="No pools" />
+                  <EmptyState
+                    title="No pools"
+                    description="This Kea server has no DHCP pool configured yet. Add a subnet to start serving addresses."
+                  />
                 ) : (
                   <Row gutter={[8, 8]}>
                     {filteredPools.map((pool) => {

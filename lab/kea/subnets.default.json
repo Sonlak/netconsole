@@ -1,0 +1,58 @@
+[
+  {
+    "id": 201,
+    "subnet": "10.1.201.0/24",
+    "pools": [{ "pool": "10.1.201.10 - 10.1.201.199" }],
+    "option-data": [
+      { "name": "routers", "data": "10.1.201.254" }
+    ],
+    "user-context": {
+      "site": "LAB",
+      "vlan": 201,
+      "name": "Tang-01 VLAN201",
+      "gateway": "10.1.201.254"
+    }
+  },
+  {
+    "id": 202,
+    "subnet": "10.1.202.0/24",
+    "pools": [{ "pool": "10.1.202.10 - 10.1.202.199" }],
+    "option-data": [
+      { "name": "routers", "data": "10.1.202.254" }
+    ],
+    "user-context": {
+      "site": "LAB",
+      "vlan": 202,
+      "name": "Tang-02 VLAN202",
+      "gateway": "10.1.202.254"
+    }
+  },
+  {
+    "id": 203,
+    "subnet": "10.1.203.0/24",
+    "pools": [{ "pool": "10.1.203.10 - 10.1.203.199" }],
+    "option-data": [
+      { "name": "routers", "data": "10.1.203.254" }
+    ],
+    "user-context": {
+      "site": "LAB",
+      "vlan": 203,
+      "name": "Tang-03 VLAN203",
+      "gateway": "10.1.203.254"
+    }
+  },
+  {
+    "id": 204,
+    "subnet": "10.1.204.0/24",
+    "pools": [{ "pool": "10.1.204.10 - 10.1.204.199" }],
+    "option-data": [
+      { "name": "routers", "data": "10.1.204.254" }
+    ],
+    "user-context": {
+      "site": "LAB",
+      "vlan": 204,
+      "name": "Tang-04 VLAN204",
+      "gateway": "10.1.204.254"
+    }
+  }
+]

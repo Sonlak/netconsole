@@ -788,6 +788,16 @@ export async function listDhcpLeases(subnetId?: number): Promise<DhcpLease[]> {
     if (!ip) {
       continue;
     }
+    // ORPHAN LEASE FILTER (2026-10-28): a lease whose subnet-id is not in the
+    // live Kea config does not belong to any configured pool. Such leases
+    // linger in the memfile lease DB after a subnet is removed (or after the
+    // pool list of a deployment is replaced — e.g. prod switching from the
+    // lab pool list to an empty one). Surfacing them made the prod console
+    // show lab/dev addresses that the running server does not serve.
+    // Only leases of CONFIGURED subnets are reported.
+    if (!subnetMeta.has(id)) {
+      continue;
+    }
     const mac = (lease['hw-address'] || '').toLowerCase();
     const meta = subnetMeta.get(id);
     const cltt = typeof lease.cltt === 'number' ? lease.cltt : null;

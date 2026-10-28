@@ -427,6 +427,37 @@ jobs:
             --filter "name=netconsole-postgres" \
             --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
 
+      - name: Verify prod Kea serves no lab subnets
+        run: |
+          set -euo pipefail
+          # 2026-10-28: prod used to serve the LAB subnet list
+          # (10.1.201.0/24 ... 10.1.204.0/24) because the list was baked
+          # into the image template, so the prod console showed the dev
+          # pools. The list now comes from lab/kea/subnets.prod.json.
+          # This step fails the deploy if any lab subnet reappears.
+          LAB_SUBNETS="10.1.201. 10.1.202. 10.1.203. 10.1.204."
+          # The control agent is published on ${KEA_HOST_IP}:8001 (not on
+          # 127.0.0.1), so probe it INSIDE the container where it listens
+          # on 127.0.0.1:8000.
+          RESP="$(docker exec netconsole-kea-dc curl -sf --max-time 5 -X POST http://127.0.0.1:8000/ \
+            -H 'Content-Type: application/json' \
+            -d '{"command":"config-get","service":["dhcp4"]}' 2>/dev/null || true)"
+          if [ -z "$RESP" ]; then
+            echo "::warning::Kea control agent not answering on 127.0.0.1:8001 — skipping subnet check"
+            exit 0
+          fi
+          echo "$RESP" > /tmp/kea-config.json
+          POOL_SUBNETS="$(python3 -c "import json;d=json.load(open('/tmp/kea-config.json'));print(chr(10).join(s.get('subnet','') for s in d[0].get('arguments',{}).get('Dhcp4',{}).get('subnet4',[])))" 2>/dev/null || true)"
+          echo "Configured subnets:"
+          echo "${POOL_SUBNETS:-<none>}"
+          for bad in $LAB_SUBNETS; do
+            if echo "$POOL_SUBNETS" | grep -q "$bad"; then
+              echo "::error::prod Kea is serving LAB subnet $bad — aborting deploy"
+              exit 1
+            fi
+          done
+          echo "OK: no lab subnets configured on prod"
+
       - name: Save deploy marker (for future auto-rollback)
         run: |
           set -euo pipefail

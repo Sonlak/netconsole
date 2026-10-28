@@ -15,6 +15,11 @@ RUN apt-get update \
 
 COPY kea-ctrl-agent.conf /etc/kea/kea-ctrl-agent.conf
 COPY kea-dhcp4.conf.template /etc/kea/kea-dhcp4.conf.template
+# Default subnet list (the LAB/dev pools). A deployment overrides this by
+# mounting its own file at /etc/kea/subnets.json — production mounts
+# subnets.prod.json ([] = no pools) so the prod dashboard never shows
+# lab subnets. See lab/kea/entrypoint.sh::SUBNETS_FILE.
+COPY subnets.default.json /etc/kea/subnets.json
 COPY entrypoint.sh /entrypoint.sh
 COPY seed-leases.sh /usr/local/bin/seed-leases.sh
 

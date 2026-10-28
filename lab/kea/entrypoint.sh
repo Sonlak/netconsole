@@ -81,8 +81,27 @@ if [[ -n "${DATA_MAP// }" ]]; then
 fi
 
 # ─── Render config from template ──────────────────────────────────────────────
-# Subnets live inline in the template — both DC and DR MUST serve the same
-# subnet config so a failover doesn't change which addresses a client gets.
+# The subnet list is NOT hardcoded in the template any more (2026-10-28).
+# It used to live inline in kea-dhcp4.conf.template, which meant the PRODUCTION
+# deployment also served the LAB subnets (10.1.201.0/24 ... 10.1.204.0/24)
+# and the prod dashboard showed the dev/lab pools. Subnets now come from a
+# per-deployment JSON file (KEA_SUBNETS_FILE), which prod mounts as
+# subnets.prod.json -> [] (no pools until the real bank subnets are onboarded).
+#
+# Both DC and DR MUST be given the SAME subnet list so a failover doesn't
+# change which addresses a client gets.
+SUBNETS_FILE="${KEA_SUBNETS_FILE:-/etc/kea/subnets.json}"
+if [[ ! -f "${SUBNETS_FILE}" ]]; then
+  echo "[kea] FATAL: subnet file ${SUBNETS_FILE} not found"
+  exit 1
+fi
+if ! jq -e 'type == "array"' "${SUBNETS_FILE}" >/dev/null 2>&1; then
+  echo "[kea] FATAL: ${SUBNETS_FILE} is not a JSON array"
+  exit 1
+fi
+SUBNET_COUNT="$(jq 'length' "${SUBNETS_FILE}")"
+echo "[kea] subnet file: ${SUBNETS_FILE} (${SUBNET_COUNT} subnet(s))"
+
 sed \
   -e "s|__THIS_SERVER_NAME__|${THIS_SERVER_NAME}|g" \
   -e "s|__THIS_SERVER_URL__|${THIS_SERVER_URL}|g" \
@@ -96,11 +115,22 @@ sed \
   -e "s|/usr/lib/x86_64-linux-gnu/kea/hooks|${HOOK_DIR}|g" \
   /etc/kea/kea-dhcp4.conf.template > /etc/kea/kea-dhcp4.conf
 
+# Inject the per-deployment subnet list into the rendered config.
+jq --slurpfile subnets "${SUBNETS_FILE}" '.Dhcp4.subnet4 = $subnets[0]' \
+  /etc/kea/kea-dhcp4.conf > /etc/kea/kea-dhcp4.conf.tmp \
+  && mv /etc/kea/kea-dhcp4.conf.tmp /etc/kea/kea-dhcp4.conf
+
 # ─── Routes back to relay (for DHCP replies) ─────────────────────────────────
 # DHCP replies are unicast to relay giaddr. Skip when DHCP_RELAY_VIA is empty.
 RELAY_VIA="${DHCP_RELAY_VIA-172.30.0.13}"
-RELAY_NETS="${DHCP_RELAY_NETS:-10.1.201.0/24 10.1.202.0/24 10.1.203.0/24 10.1.204.0/24}"
-if [[ -n "${RELAY_VIA}" ]]; then
+if [[ -n "${DHCP_RELAY_NETS+x}" ]]; then
+  RELAY_NETS="${DHCP_RELAY_NETS:-}"
+else
+  # Derive the relay networks from the configured subnets so a deployment
+  # never installs routes for subnets it does not serve.
+  RELAY_NETS="$(jq -r '.[].subnet' "${SUBNETS_FILE}" | tr '\n' ' ')"
+fi
+if [[ -n "${RELAY_VIA}" && -n "${RELAY_NETS// }" ]]; then
   for net in ${RELAY_NETS}; do
     ip route replace "$net" via "$RELAY_VIA" 2>/dev/null || true
   done

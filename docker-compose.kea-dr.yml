@@ -79,8 +79,14 @@ services:
       # DR host's kernel routing table (since the relay is on the
       # 10.10.20.0/24 subnet that 10.10.20.30 belongs to).
       DHCP_RELAY_VIA: ""
+      # Subnet list — the DR MUST serve the SAME subnets as the DC, otherwise
+      # a failover would hand out different addresses. The file ships with
+      # the LAB list; override with a mount when the real bank subnets are
+      # onboarded (see docker-compose.app.prod.yml for the prod mount).
+      KEA_SUBNETS_FILE: /etc/kea/subnets.json
     volumes:
       - kea_dr_leases:/var/lib/kea
+      - ./lab/kea/subnets.default.json:/etc/kea/subnets.json:ro
     networks:
       kea-dr:
         ipv4_address: 172.31.0.11
