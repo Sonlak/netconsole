@@ -32,8 +32,57 @@
 import OpenAI from 'openai';
 import type { ChatCompletionChunk } from 'openai/resources/chat/completions';
 import type { Stream } from 'openai/streaming';
+import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 let _client: OpenAI | null = null;
+
+/**
+ * Proxy-aware fetch (2026-10-29).
+ *
+ * The PRODUCTION VPS has NO direct internet egress: every outbound
+ * connection must go through the site HTTP proxy (`192.168.154.101:1985`
+ * on the prod host — see `/etc/environment` + `/etc/profile.d/proxy.sh`).
+ * Node's built-in `fetch` (undici) does NOT read `HTTPS_PROXY` by default,
+ * so the OpenAI SDK timed out with `UND_ERR_CONNECT_TIMEOUT` against
+ * api.openai.com and the assistant never produced a single token.
+ *
+ * Two ways out, both implemented here:
+ *   1. `OPENAI_PROXY_URL` (or `HTTPS_PROXY`/`HTTP_PROXY`) set → we build a
+ *      `ProxyAgent` and hand it to the OpenAI SDK via `fetchOptions.dispatcher`.
+ *   2. Node >= 24 `NODE_USE_ENV_PROXY=1` would do it globally, but the prod
+ *      image runs Node 22 — hence the explicit dispatcher below.
+ *
+ * `NO_PROXY` / `no_proxy` is honoured by undici's EnvHttpProxyAgent but
+ * NOT by `ProxyAgent` (which proxies everything), so we only create the
+ * dispatcher when a proxy is configured. Internal traffic (Kea, Postgres,
+ * Redis) never goes through the OpenAI client, so it is unaffected.
+ */
+function resolveProxyUrl(): string | null {
+  const raw =
+    process.env.OPENAI_PROXY_URL ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    '';
+  const url = raw.trim();
+  if (!url) return null;
+  try {
+    // Validate early so a malformed value fails with a clear message
+    // instead of an opaque undici error at request time.
+    const parsed = new URL(url.includes('://') ? url : `http://${url}`);
+    if (!parsed.hostname) return null;
+    return parsed.toString();
+  } catch {
+    console.warn(`[assistant] invalid proxy URL, ignoring: ${raw}`);
+    return null;
+  }
+}
+
+/** Test helper — exposes the proxy resolution without touching the network. */
+export function _resolveProxyUrl(): string | null {
+  return resolveProxyUrl();
+}
 
 function getClient(): OpenAI {
   if (_client) return _client;
@@ -43,7 +92,26 @@ function getClient(): OpenAI {
       'OPENAI_API_KEY is not set. Add it to backend/.env or docker-compose.app.yml and restart the backend container.',
     );
   }
-  _client = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 1 });
+
+  const proxyUrl = resolveProxyUrl();
+  const options: ConstructorParameters<typeof OpenAI>[0] = {
+    apiKey,
+    timeout: 60_000,
+    maxRetries: 1,
+  };
+
+  if (proxyUrl) {
+    const dispatcher = new ProxyAgent(proxyUrl);
+    options.fetch = undiciFetch as unknown as typeof fetch;
+    // `dispatcher` is an undici extension — the OpenAI SDK's
+    // MergedRequestInit type does not know about it, hence the cast.
+    options.fetchOptions = { dispatcher } as unknown as NonNullable<
+      ConstructorParameters<typeof OpenAI>[0]
+    >['fetchOptions'];
+    console.log(`[assistant] OpenAI requests routed through proxy ${proxyUrl}`);
+  }
+
+  _client = new OpenAI(options);
   return _client;
 }
 
@@ -70,11 +138,21 @@ const PRICING = {
 
 export type AssistantModel = keyof typeof PRICING;
 
+/**
+ * Default model: `gpt-4o-mini`.
+ *
+ * The code default used to be `gpt-4.1-mini`, which was inconsistent with
+ * the compose file (`OPENAI_MODEL: gpt-4o-mini`) and with the operational
+ * finding from 2026-10-13: with 55+ tool definitions, `gpt-4.1-mini` routed
+ * poorly (it called `list_dhcp_leases` for ARP questions and
+ * `queue_collect` for "tổng hợp MAC"), while `gpt-4o-mini` handles the
+ * same prompts noticeably better and costs less.
+ */
 export function defaultModel(): AssistantModel {
-  const env = (process.env.OPENAI_MODEL ?? 'gpt-4.1-mini').trim();
+  const env = (process.env.OPENAI_MODEL ?? 'gpt-4o-mini').trim();
   if (env in PRICING) return env as AssistantModel;
-  console.warn(`[assistant] Unknown OPENAI_MODEL=${env}, falling back to gpt-4.1-mini`);
-  return 'gpt-4.1-mini';
+  console.warn(`[assistant] Unknown OPENAI_MODEL=${env}, falling back to gpt-4o-mini`);
+  return 'gpt-4o-mini';
 }
 
 export type UsageInfo = {

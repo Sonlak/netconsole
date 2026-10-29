@@ -260,6 +260,19 @@ jobs:
           # live "DR active" peer, and logged bogus failover events. Empty
           # value (compose uses ${VAR-default}, no colon) keeps it empty.
           echo "KEA_STANDBY_API_URL=" >> "$DEPLOY_DIR/.env"
+          # OPENAI_PROXY_URL (2026-10-29): prod has NO direct internet
+          # egress — every outbound connection must go through the site
+          # HTTP proxy (see /etc/environment + /etc/profile.d/proxy.sh on
+          # the prod host). Node's built-in fetch (undici) does NOT read
+          # HTTPS_PROXY, so the OpenAI SDK timed out with
+          # UND_ERR_CONNECT_TIMEOUT and the AI assistant never produced a
+          # token. llmClient.ts installs an undici ProxyAgent when this
+          # variable (or HTTPS_PROXY) is set.
+          #
+          # The proxy host is on the office LAN (192.168.154.0/24), which
+          # the prod host reaches through ens33 (192.168.81.171). Keep it
+          # overridable via the GH secret in case the site proxy moves.
+          echo "OPENAI_PROXY_URL=${OPENAI_PROXY_URL:-http://192.168.154.101:1985}" >> "$DEPLOY_DIR/.env"
           # NetBox UI bind address (2026-10-22): the operator reaches the
           # console over the LAN IP, so NetBox's UI must be reachable the
           # same way. Backend/worker talk to NetBox over the docker bridge
@@ -457,6 +470,39 @@ jobs:
             fi
           done
           echo "OK: no lab subnets configured on prod"
+
+      - name: Verify AI assistant can reach OpenAI
+        run: |
+          set -euo pipefail
+          # 2026-10-29: the AI assistant never worked on prod — the VPS has
+          # no direct internet egress and Node's built-in fetch (undici)
+          # does not read HTTPS_PROXY, so the OpenAI SDK timed out.
+          # llmClient.ts now installs an undici ProxyAgent dispatcher when
+          # OPENAI_PROXY_URL / HTTPS_PROXY is set.
+          #
+          # This probe does a REAL (tiny) streaming completion through the
+          # same code path the assistant uses, so a broken proxy config is
+          # caught at deploy time instead of by the operator.
+          docker exec netconsole-backend node -e "
+            const { defaultModel } = await import('/app/dist/services/assistant/llmClient.js');
+            const { streamChat } = await import('/app/dist/services/assistant/llmClient.js');
+            let text = '';
+            for await (const ev of streamChat({
+              model: defaultModel(),
+              systemMessage: 'You are a connectivity probe. Reply with a single word.',
+              tools: [],
+              messages: [{ role: 'user', content: 'Reply with exactly: PONG' }],
+              maxOutputTokens: 10,
+            })) {
+              if (ev.type === 'text') text += ev.delta;
+            }
+            if (!text.trim()) { console.error('EMPTY RESPONSE'); process.exit(1); }
+            console.log('Assistant OK ->', JSON.stringify(text.trim()));
+          " 2>&1 | tee /tmp/assistant-probe.log
+          if ! grep -q 'Assistant OK' /tmp/assistant-probe.log; then
+            echo "::error::AI assistant cannot reach the OpenAI API — check OPENAI_PROXY_URL / OPENAI_API_KEY"
+            exit 1
+          fi
 
       - name: Save deploy marker (for future auto-rollback)
         run: |

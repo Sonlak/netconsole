@@ -352,6 +352,20 @@ services:
       # For local dev, override OPENAI_MODEL=gpt-4.1-mini in .env.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
+      # AI Assistant — HTTP proxy (2026-10-29).
+      #
+      # The PRODUCTION VPS has NO direct internet egress: every outbound
+      # connection must go through the site HTTP proxy. Node's built-in
+      # `fetch` (undici) does NOT read HTTPS_PROXY by default, so the
+      # OpenAI SDK timed out against api.openai.com and the assistant
+      # never produced a token. `llmClient.ts` reads OPENAI_PROXY_URL
+      # (falling back to HTTPS_PROXY/HTTP_PROXY) and installs an
+      # undici ProxyAgent dispatcher on the OpenAI client.
+      #
+      # NOTE: `${VAR-default}` (no colon) on purpose — an explicitly EMPTY
+      # value in .env must stay empty so a host WITHOUT a proxy keeps the
+      # direct connection path.
+      OPENAI_PROXY_URL: ${OPENAI_PROXY_URL-}
     networks:
       netconsole:
         ipv4_address: 172.31.0.3

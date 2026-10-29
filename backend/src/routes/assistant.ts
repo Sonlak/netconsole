@@ -83,6 +83,32 @@ function roleAllows(actual: AssistantRole, required: AssistantRole): boolean {
 }
 
 /**
+ * GET /api/assistant/status
+ *
+ * Cheap, LLM-free probe of the assistant configuration. Used by the
+ * operator UI and by CI to tell "assistant is misconfigured" apart from
+ * "assistant is broken". It never calls OpenAI — it only reports whether
+ * the key is present and whether a proxy is configured.
+ */
+assistantRouter.get('/status', authMiddleware, (_req: Request, res: Response) => {
+  const hasKey = Boolean((process.env.OPENAI_API_KEY ?? '').trim());
+  const proxyUrl =
+    (process.env.OPENAI_PROXY_URL ??
+      process.env.HTTPS_PROXY ??
+      process.env.https_proxy ??
+      process.env.HTTP_PROXY ??
+      process.env.http_proxy ??
+      '').trim();
+  res.json({
+    ok: hasKey,
+    model: defaultModel(),
+    hasApiKey: hasKey,
+    proxyConfigured: proxyUrl.length > 0,
+    tools: TOOL_CATALOG.length,
+  });
+});
+
+/**
  * POST /api/assistant
  *
  * Body: AssistantRequest — see types.ts.
@@ -148,13 +174,51 @@ assistantRouter.post(
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Internal error';
       console.error('[assistant] error:', error);
-      sseSend(res, { type: 'error', message });
+      // Translate the two most common network failures into an
+      // actionable message. A raw undici error code means nothing to
+      // an operator; the real cause is almost always "this host has no
+      // direct internet egress and the proxy is not configured".
+      sseSend(res, { type: 'error', message: describeAssistantError(error) });
     } finally {
       sseSend(res, { type: 'done' });
       res.end();
     }
   },
 );
+
+/**
+ * Turn a raw OpenAI/undici error into something an operator can act on.
+ *
+ * The production VPS has no direct internet egress — the OpenAI SDK
+ * timed out with `UND_ERR_CONNECT_TIMEOUT` / `APIConnectionTimeoutError`
+ * until an HTTP proxy was configured (see `llmClient.ts`).
+ */
+function describeAssistantError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const cause = (error as { cause?: { code?: string; message?: string } } | null)?.cause;
+  const code = cause?.code ?? '';
+  const haystack = `${raw} ${code} ${cause?.message ?? ''}`;
+
+  if (/UND_ERR_CONNECT_TIMEOUT|APIConnectionTimeoutError|Connect Timeout/i.test(haystack)) {
+    return (
+      'Cannot reach the OpenAI API (connection timeout). This host most likely has no direct ' +
+      'internet egress — set OPENAI_PROXY_URL (or HTTPS_PROXY) to the site HTTP proxy and restart the backend.'
+    );
+  }
+  if (/ENOTFOUND|EAI_AGAIN/i.test(haystack)) {
+    return 'Cannot resolve api.openai.com — check DNS/egress from the backend container.';
+  }
+  if (/401|invalid_api_key|Incorrect API key/i.test(haystack)) {
+    return 'OpenAI rejected the API key (401). Check OPENAI_API_KEY in secrets.env / .env.';
+  }
+  if (/429|rate limit|quota/i.test(haystack)) {
+    return 'OpenAI rate limit / quota exceeded for this key.';
+  }
+  if (/OPENAI_API_KEY is not set/i.test(haystack)) {
+    return 'OPENAI_API_KEY is not configured for the backend container.';
+  }
+  return raw;
+}
 
 // ─── Confirmation continuation ────────────────────────────────────────────────
 
