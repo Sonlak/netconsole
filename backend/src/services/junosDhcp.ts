@@ -37,6 +37,7 @@
  */
 
 import { Client, type Algorithms } from 'ssh2';
+import { prisma } from '../lib/prisma.js';
 import { buildClientLookup } from './arpAddress.js';
 import { listCollectableDevices } from './collectableDevices.js';
 
@@ -69,6 +70,38 @@ export function dhcpServerHost(): string {
   const explicit = (process.env.DHCP_SERVER_HOST || '').trim();
   if (explicit) return explicit;
   return 'LAB-F6-DS-01';
+}
+
+/**
+ * Resolve the DHCP server to a *reachable address*.
+ *
+ * `dhcpServerHost()` returns the device NAME (e.g. "LAB-F6-DS-01"), but
+ * the lab devices are only reachable by IP (10.10.20.110) — the hostname
+ * does not resolve in the container DNS. Every transport (RESTCONF, SSH)
+ * therefore needs the IP, not the name.
+ *
+ * Order:
+ *   1. `DHCP_SERVER_HOST` when it already looks like an IP → use as-is.
+ *   2. Otherwise look the name up in the `Device` table and use its `ip`.
+ *   3. Fall back to the name (it may still resolve via DNS in other setups).
+ */
+export async function resolveDhcpServerAddress(): Promise<string> {
+  const host = dhcpServerHost();
+
+  // Already an IP literal → nothing to resolve.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host;
+
+  try {
+    const device = await prisma.device.findFirst({
+      where: { name: { equals: host, mode: 'insensitive' } },
+      select: { ip: true },
+    });
+    if (device?.ip) return device.ip;
+  } catch (error) {
+    console.warn('[dhcp] failed to resolve DHCP server device by name:', error);
+  }
+
+  return host;
 }
 
 export function dhcpServerEnabled(): boolean {
@@ -968,7 +1001,7 @@ export type DhcpDashboard = {
  * more — the switch is the only DHCP server.
  */
 export async function getDhcpDashboard(): Promise<DhcpDashboard> {
-  const host = dhcpServerHost();
+  const host = await resolveDhcpServerAddress();
 
   const [poolsResult, leasesResult] = await Promise.all([
     fetchDhcpPools(host),
@@ -1024,7 +1057,7 @@ export async function getDhcpDashboard(): Promise<DhcpDashboard> {
 
   return {
     server: {
-      name: host,
+      name: dhcpServerHost(),
       host,
       reachable: poolsResult.ok || leasesResult.ok,
       source: leasesResult.source,
@@ -1071,7 +1104,7 @@ export async function listDhcpLeases(poolName?: string): Promise<
     note: string;
   }>
 > {
-  const host = dhcpServerHost();
+  const host = await resolveDhcpServerAddress();
   const [poolsResult, leasesResult] = await Promise.all([
     fetchDhcpPools(host),
     fetchDhcpLeases(host),

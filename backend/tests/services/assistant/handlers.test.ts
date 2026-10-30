@@ -75,6 +75,7 @@ vi.mock('../../../src/services/fabricTopology.js', () => ({
 vi.mock('../../../src/services/junosDhcp.js', () => ({
   listDhcpLeases: (...args: unknown[]) => listDhcpLeases(...args),
   getDhcpDashboard: (...args: unknown[]) => getDhcpDashboard(...args),
+  resolveDhcpServerAddress: vi.fn(async () => '10.10.20.110'),
 }));
 vi.mock('../../../src/services/logs.js', () => ({
   listLogs: (...args: unknown[]) => listLogs(...args),

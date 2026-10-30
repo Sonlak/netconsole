@@ -85,6 +85,7 @@ vi.mock('../../src/services/fabricTopology.js', () => ({
 }));
 vi.mock('../../src/services/junosDhcp.js', () => ({
   listDhcpLeases: vi.fn(async () => []),
+  resolveDhcpServerAddress: vi.fn(async () => '10.10.20.110'),
   getDhcpDashboard: vi.fn(async () => ({
     totals: { sites: 0, pools: 0, leased: 0, poolSize: 0 },
     server: { host: 'LAB-F6-DS-01', reachable: false },

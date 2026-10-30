@@ -44,7 +44,7 @@ import {
   getDhcpDashboard,
   listDhcpLeases,
   wipeDhcpPool,
-  dhcpServerHost,
+  resolveDhcpServerAddress,
 } from '../junosDhcp.js';
 import { listLogs, queueLogsCollection } from '../logs.js';
 import { acknowledgeAlert, listAlertRules, listAlerts } from '../logAlerts.js';
@@ -1765,7 +1765,7 @@ async function addDhcpReservationHandler(
     return { ok: false, error: 'ip, mac, pool_name are required' };
   }
   try {
-    const result = await addDhcpLease(dhcpServerHost(), { ip, mac, poolName, hostname });
+    const result = await addDhcpLease(await resolveDhcpServerAddress(), { ip, mac, poolName, hostname });
     return {
       ok: true,
       preview: { ip, mac, poolName, result, message: `Đã ghim DHCP ${mac} → ${ip}.` },
@@ -1782,7 +1782,7 @@ async function deleteDhcpLeaseHandler(
   const ip = String(args.ip ?? '').trim();
   if (!ip) return { ok: false, error: 'ip is required' };
   try {
-    const result = await deleteDhcpLease(dhcpServerHost(), ip);
+    const result = await deleteDhcpLease(await resolveDhcpServerAddress(), ip);
     if (!result.ok) return { ok: false, error: result.error || `Failed to delete lease ${ip}` };
     return { ok: true, preview: { ip, result, message: `Đã xoá DHCP lease ${ip}.` } };
   } catch (e) {
@@ -1802,7 +1802,7 @@ async function fixStaticReservationHandler(
     return { ok: false, error: 'ip, mac, pool_name are required' };
   }
   try {
-    const result = await fixStaticReservation(dhcpServerHost(), { ip, mac, poolName, hostname });
+    const result = await fixStaticReservation(await resolveDhcpServerAddress(), { ip, mac, poolName, hostname });
     if (!result.ok) return { ok: false, error: result.error || 'Failed to pin static reservation' };
     return {
       ok: true,
@@ -1824,7 +1824,7 @@ async function wipeDhcpSubnetHandler(
     const pool = dashboard.pools.find((item) => item.poolName === poolName);
     if (!pool) return { ok: false, error: `Pool ${poolName} not found` };
     if (!pool.interface) return { ok: false, error: `Pool ${poolName} has no known interface` };
-    const result = await wipeDhcpPool(dhcpServerHost(), pool.interface);
+    const result = await wipeDhcpPool(await resolveDhcpServerAddress(), pool.interface);
     if (!result.ok) return { ok: false, error: result.error || 'Failed to wipe pool leases' };
     return {
       ok: true,
@@ -1855,7 +1855,7 @@ async function addDhcpSubnetHandler(
     const dns = Array.isArray(args.dns)
       ? (args.dns as unknown[]).filter((d): d is string => typeof d === 'string')
       : undefined;
-    const result = await addDhcpSubnet(dhcpServerHost(), {
+    const result = await addDhcpSubnet(await resolveDhcpServerAddress(), {
       poolName,
       subnet,
       poolStart,

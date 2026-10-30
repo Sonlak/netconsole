@@ -5,10 +5,10 @@ import {
   addDhcpSubnet,
   deleteDhcpLease,
   deleteDhcpSubnet,
-  dhcpServerHost,
   fixStaticReservation,
   getDhcpDashboard,
   listDhcpLeases,
+  resolveDhcpServerAddress,
   unfixStaticReservation,
   wipeDhcpPool,
 } from '../services/junosDhcp.js';
@@ -81,7 +81,7 @@ dhcpRouter.get('/pools/:poolName/leases', async (req, res) => {
 dhcpRouter.delete('/leases/:ip', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
-    const result = await deleteDhcpLease(dhcpServerHost(), ip);
+    const result = await deleteDhcpLease(await resolveDhcpServerAddress(), ip);
     if (!result.ok) {
       res.status(502).json({ error: result.error || `Failed to delete lease ${ip}` });
       return;
@@ -112,7 +112,7 @@ dhcpRouter.post('/pools/:poolName/wipe', authMiddleware, requireRole('ADMIN'), a
       res.status(400).json({ error: `Pool ${poolName} has no known interface` });
       return;
     }
-    const result = await wipeDhcpPool(dhcpServerHost(), pool.interface);
+    const result = await wipeDhcpPool(await resolveDhcpServerAddress(), pool.interface);
     if (!result.ok) {
       res.status(502).json({ error: result.error || 'Failed to wipe pool leases' });
       return;
@@ -141,7 +141,7 @@ dhcpRouter.post('/leases', authMiddleware, requireRole('OPERATOR', 'ADMIN'), asy
       res.status(400).json({ error: 'ip, mac, poolName are required' });
       return;
     }
-    const result = await addDhcpLease(dhcpServerHost(), {
+    const result = await addDhcpLease(await resolveDhcpServerAddress(), {
       ip: body.ip,
       mac: body.mac,
       poolName: body.poolName,
@@ -167,7 +167,7 @@ dhcpRouter.post('/leases/:ip/fix-static', authMiddleware, requireRole('OPERATOR'
       res.status(400).json({ error: 'mac and poolName are required' });
       return;
     }
-    const result = await fixStaticReservation(dhcpServerHost(), {
+    const result = await fixStaticReservation(await resolveDhcpServerAddress(), {
       ip,
       mac: body.mac,
       poolName: body.poolName,
@@ -193,7 +193,7 @@ dhcpRouter.post('/leases/:ip/unfix-static', authMiddleware, requireRole('OPERATO
       res.status(400).json({ error: 'poolName is required' });
       return;
     }
-    const result = await unfixStaticReservation(dhcpServerHost(), {
+    const result = await unfixStaticReservation(await resolveDhcpServerAddress(), {
       ip,
       poolName: body.poolName,
       mac: body.mac,
@@ -240,7 +240,7 @@ dhcpRouter.post('/pools', authMiddleware, requireRole('ADMIN'), async (req, res)
       res.status(400).json({ error: 'interfaceName is required (e.g. irb.201)' });
       return;
     }
-    const result = await addDhcpSubnet(dhcpServerHost(), {
+    const result = await addDhcpSubnet(await resolveDhcpServerAddress(), {
       poolName: body.poolName,
       subnet: body.subnet,
       poolStart: body.poolStart,
@@ -270,7 +270,7 @@ dhcpRouter.post('/pools', authMiddleware, requireRole('ADMIN'), async (req, res)
 dhcpRouter.delete('/pools/:poolName', authMiddleware, requireRole('ADMIN'), async (req, res) => {
   try {
     const poolName = String(req.params.poolName);
-    const result = await deleteDhcpSubnet(dhcpServerHost(), poolName);
+    const result = await deleteDhcpSubnet(await resolveDhcpServerAddress(), poolName);
     if (!result.ok) {
       res.status(502).json({ error: result.error || 'Failed to delete DHCP pool' });
       return;
