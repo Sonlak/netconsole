@@ -111,6 +111,56 @@ export function dhcpServerEnabled(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Cache
+// ---------------------------------------------------------------------------
+
+/**
+ * The DHCP page fires FOUR calls into the switch: the dashboard (pools +
+ * bindings) and the lease list (pools + bindings) again. Every RESTCONF
+ * round-trip to the QFX costs 1.5-2.5 s, so the tab took ~10 s to load.
+ *
+ * We therefore cache the two switch reads for a short window and share
+ * one in-flight request between concurrent callers (single-flight), so
+ * the second call lands on the cache instead of opening a new RPC.
+ *
+ * The cache is invalidated explicitly after every write (lease delete,
+ * pool add/remove, static reservation change).
+ */
+const CACHE_TTL_MS = Number(process.env.DHCP_CACHE_TTL_MS ?? 20000);
+
+type CacheEntry<T> = { value: T; expiresAt: number };
+
+const poolsCache = new Map<string, CacheEntry<{ ok: boolean; pools: DhcpServerPool[]; error?: string }>>();
+const leasesCache = new Map<
+  string,
+  CacheEntry<{ ok: boolean; leases: DhcpServerLease[]; source: 'restconf' | 'ssh'; error?: string }>
+>();
+
+/** In-flight promises, keyed by host — used for single-flight. */
+const poolsInflight = new Map<string, Promise<PoolsResult>>();
+const leasesInflight = new Map<string, Promise<LeasesResult>>();
+
+type PoolsResult = { ok: boolean; pools: DhcpServerPool[]; error?: string };
+type LeasesResult = {
+  ok: boolean;
+  leases: DhcpServerLease[];
+  source: 'restconf' | 'ssh';
+  error?: string;
+};
+
+function readCache<T>(entry: CacheEntry<T> | undefined): T | undefined {
+  if (!entry) return undefined;
+  if (Date.now() > entry.expiresAt) return undefined;
+  return entry.value;
+}
+
+/** Drop every cached read — called after a write to the switch. */
+export function invalidateDhcpCache(): void {
+  poolsCache.clear();
+  leasesCache.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -642,24 +692,41 @@ function toIsoUtc(text: string): string | null {
 // ---------------------------------------------------------------------------
 
 /** Read the DHCP pool configuration from the switch. */
-export async function fetchDhcpPools(host: string): Promise<{
-  ok: boolean;
-  pools: DhcpServerPool[];
-  error?: string;
-}> {
-  const body =
-    '<get-configuration format="xml">' +
-    '<configuration><access><address-assignment/></access></configuration>' +
-    '</get-configuration>';
-  const result = await callRestRpc(host, body, 25000);
-  if (!result.ok) {
-    return { ok: false, pools: [], error: result.error || 'Failed to read DHCP pools' };
+export async function fetchDhcpPools(host: string): Promise<PoolsResult> {
+  const cached = readCache(poolsCache.get(host));
+  if (cached) return cached;
+
+  const inflight = poolsInflight.get(host);
+  if (inflight) return inflight;
+
+  const request = (async (): Promise<PoolsResult> => {
+    const body =
+      '<get-configuration format="xml">' +
+      '<configuration><access><address-assignment/></access></configuration>' +
+      '</get-configuration>';
+    const result = await callRestRpc(host, body, 25000);
+    if (!result.ok) {
+      return { ok: false, pools: [], error: result.error || 'Failed to read DHCP pools' };
+    }
+    const xml = extractXmlBody(result.raw);
+    if (!xml) {
+      return { ok: false, pools: [], error: 'Empty DHCP pool configuration response' };
+    }
+    return { ok: true, pools: parseAddressAssignmentPools(xml) };
+  })();
+
+  poolsInflight.set(host, request);
+  try {
+    const value = await request;
+    // Only cache successful reads — a transient RPC failure should not
+    // stick around for the whole TTL.
+    if (value.ok) {
+      poolsCache.set(host, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+    }
+    return value;
+  } finally {
+    poolsInflight.delete(host);
   }
-  const xml = extractXmlBody(result.raw);
-  if (!xml) {
-    return { ok: false, pools: [], error: 'Empty DHCP pool configuration response' };
-  }
-  return { ok: true, pools: parseAddressAssignmentPools(xml) };
 }
 
 /**
@@ -669,36 +736,50 @@ export async function fetchDhcpPools(host: string): Promise<{
  * RPC is unavailable (older Junos, or a device without the DHCP server
  * feature) we fall back to `show dhcp server binding detail` over SSH.
  */
-export async function fetchDhcpLeases(host: string): Promise<{
-  ok: boolean;
-  leases: DhcpServerLease[];
-  source: 'restconf' | 'ssh';
-  error?: string;
-}> {
-  const body =
-    '<get-dhcp-server-binding-information ' +
-    'xmlns="http://xml.juniper.net/junos/20.3R1/junos-dhcp-server"><detail/>' +
-    '</get-dhcp-server-binding-information>';
+export async function fetchDhcpLeases(host: string): Promise<LeasesResult> {
+  const cached = readCache(leasesCache.get(host));
+  if (cached) return cached;
 
-  const result = await callRestRpc(host, body, 25000);
-  if (result.ok) {
-    const xml = extractXmlBody(result.raw);
-    if (xml) {
-      return { ok: true, leases: parseDhcpBindings(xml), source: 'restconf' };
+  const inflight = leasesInflight.get(host);
+  if (inflight) return inflight;
+
+  const request = (async (): Promise<LeasesResult> => {
+    const body =
+      '<get-dhcp-server-binding-information ' +
+      'xmlns="http://xml.juniper.net/junos/20.3R1/junos-dhcp-server"><detail/>' +
+      '</get-dhcp-server-binding-information>';
+
+    const result = await callRestRpc(host, body, 25000);
+    if (result.ok) {
+      const xml = extractXmlBody(result.raw);
+      if (xml) {
+        return { ok: true, leases: parseDhcpBindings(xml), source: 'restconf' };
+      }
     }
-  }
 
-  // RESTCONF fallback → SSH.
-  const ssh = await runSshExec(host, 'show dhcp server binding detail', { timeoutMs: 40000 });
-  if (!ssh.ok) {
-    return {
-      ok: false,
-      leases: [],
-      source: 'ssh',
-      error: result.error || ssh.error || 'Failed to read DHCP bindings',
-    };
+    // RESTCONF fallback → SSH.
+    const ssh = await runSshExec(host, 'show dhcp server binding detail', { timeoutMs: 40000 });
+    if (!ssh.ok) {
+      return {
+        ok: false,
+        leases: [],
+        source: 'ssh',
+        error: result.error || ssh.error || 'Failed to read DHCP bindings',
+      };
+    }
+    return { ok: true, leases: parseDhcpBindingsText(ssh.output), source: 'ssh' };
+  })();
+
+  leasesInflight.set(host, request);
+  try {
+    const value = await request;
+    if (value.ok) {
+      leasesCache.set(host, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+    }
+    return value;
+  } finally {
+    leasesInflight.delete(host);
   }
-  return { ok: true, leases: parseDhcpBindingsText(ssh.output), source: 'ssh' };
 }
 
 /**
@@ -773,6 +854,7 @@ export async function deleteDhcpLease(host: string, ip: string): Promise<{
   if (/No binding for specified IP address/i.test(result.output)) {
     return { ok: false, error: `No binding for ${ip}` };
   }
+  invalidateDhcpCache();
   return { ok: true };
 }
 
@@ -789,6 +871,7 @@ export async function wipeDhcpPool(host: string, interfaceName: string): Promise
   if (!result.ok) {
     return { ok: false, error: result.error || 'Failed to clear DHCP bindings' };
   }
+  invalidateDhcpCache();
   return { ok: true };
 }
 
@@ -853,6 +936,7 @@ export async function addDhcpSubnet(host: string, input: DhcpSubnetInput): Promi
   if (!result.ok) {
     return { ok: false, error: result.error || 'Failed to apply DHCP pool configuration', commands };
   }
+  invalidateDhcpCache();
   return { ok: true, commands };
 }
 
@@ -867,6 +951,7 @@ export async function deleteDhcpSubnet(host: string, poolName: string): Promise<
   if (!result.ok) {
     return { ok: false, error: result.error || 'Failed to delete DHCP pool', commands };
   }
+  invalidateDhcpCache();
   return { ok: true, commands };
 }
 
@@ -889,6 +974,7 @@ export async function fixStaticReservation(
   if (!result.ok) {
     return { ok: false, error: result.error || 'Failed to create static reservation', commands };
   }
+  invalidateDhcpCache();
   return { ok: true, commands };
 }
 
@@ -926,6 +1012,7 @@ export async function unfixStaticReservation(
   if (!result.ok) {
     return { ok: false, error: result.error || 'Failed to remove static reservation', commands };
   }
+  invalidateDhcpCache();
   return { ok: true, commands };
 }
 

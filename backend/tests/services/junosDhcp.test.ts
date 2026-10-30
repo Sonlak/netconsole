@@ -11,7 +11,7 @@
  *   2. `get-dhcp-server-binding-information` XML → leases
  *   3. `show dhcp server binding detail` text   → leases (SSH fallback)
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   parseAddressAssignmentPools,
@@ -168,5 +168,49 @@ describe('parseDhcpBindingsText', () => {
 
   it('returns an empty list when there are no bindings', () => {
     expect(parseDhcpBindingsText('Total number of leases: 0')).toEqual([]);
+  });
+});
+
+describe('read cache + single-flight', () => {
+  it('serves a repeated read from the cache and drops it on invalidate', async () => {
+    vi.resetModules();
+    vi.stubEnv('JUNOS_REST_ENABLED', 'true');
+
+    let rpcCalls = 0;
+    const fetchImpl = vi.fn(async () => {
+      rpcCalls += 1;
+      return new Response(
+        '--\n<rpc-reply><configuration><access><address-assignment/></access></configuration></rpc-reply>\n--',
+        { status: 200, headers: { 'Content-Type': 'application/xml' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchImpl);
+
+    const mod = await import('../../src/services/junosDhcp.js');
+
+    const first = await mod.fetchDhcpPools('10.0.0.1');
+    expect(first.ok).toBe(true);
+    expect(rpcCalls).toBe(1);
+
+    // Second read within the TTL must not hit the switch again.
+    const second = await mod.fetchDhcpPools('10.0.0.1');
+    expect(second.ok).toBe(true);
+    expect(rpcCalls).toBe(1);
+
+    // Concurrent callers share one in-flight request.
+    const [a, b] = await Promise.all([
+      mod.fetchDhcpPools('10.0.0.2'),
+      mod.fetchDhcpPools('10.0.0.2'),
+    ]);
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(rpcCalls).toBe(2);
+
+    // A write must invalidate the cached reads.
+    mod.invalidateDhcpCache();
+    await mod.fetchDhcpPools('10.0.0.1');
+    expect(rpcCalls).toBe(3);
+
+    vi.unstubAllGlobals();
   });
 });
