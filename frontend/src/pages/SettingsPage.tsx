@@ -10,7 +10,7 @@ const modules = [
   { name: 'Database', stack: 'PostgreSQL 16', status: 'ready' },
   { name: 'Worker', stack: 'Python · SSH / REST Aruba CX', status: 'later' },
   { name: 'Discovery', stack: 'Scan mgmt → SSH/REST → sync → Generate Config', status: 'ready' },
-  { name: 'Kea DHCP', stack: 'Datacenter HA · relay from NKKN / NTMK', status: 'later' },
+  { name: 'DHCP', stack: 'Junos extended DHCP server trên DS1', status: 'ready' },
 ];
 
 export default function SettingsPage() {
@@ -35,7 +35,7 @@ export default function SettingsPage() {
                         {SITES.map((item) => `${item.code} (${item.floors} floors, VLAN ${item.vlanBase + 1}–${item.vlanBase + item.floors})`).join(' · ')}
                       </Descriptions.Item>
                       <Descriptions.Item label="Per-floor fabric">
-                        Dist 4 links down to SW01/SW02. SW03/SW04 uplink to the SW01/SW02 pair. One VLAN per floor. DHCP relay to Kea DC.
+                        Dist 4 links down to SW01/SW02. SW03/SW04 uplink to the SW01/SW02 pair. One VLAN per floor. DHCP server chạy trên DS1.
                       </Descriptions.Item>
                       <Descriptions.Item label="Initial rollout">
                         Configure mgmt, enable SSH and REST → Discovery scans the mgmt range by site/floor → sync inventory → Generate Config from the app.

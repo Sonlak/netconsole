@@ -83,11 +83,11 @@ vi.mock('../../src/services/macAddress.js', () => ({
 vi.mock('../../src/services/fabricTopology.js', () => ({
   getFabricTopology: vi.fn(async () => ({ nodes: [], links: [] })),
 }));
-vi.mock('../../src/services/keaDhcp.js', () => ({
+vi.mock('../../src/services/junosDhcp.js', () => ({
   listDhcpLeases: vi.fn(async () => []),
   getDhcpDashboard: vi.fn(async () => ({
     totals: { sites: 0, pools: 0, leased: 0, poolSize: 0 },
-    ha: { mode: 'hot-standby', peers: [], active: null },
+    server: { host: 'LAB-F6-DS-01', reachable: false },
     pools: [],
   })),
 }));

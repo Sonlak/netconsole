@@ -37,15 +37,15 @@ import { getMacAddressInventory } from '../macAddress.js';
 import { getArpInventory } from '../arpAddress.js';
 import { getFabricTopology } from '../fabricTopology.js';
 import {
-  addDhcpReservation,
+  addDhcpLease,
   addDhcpSubnet,
   deleteDhcpLease,
   fixStaticReservation,
   getDhcpDashboard,
   listDhcpLeases,
-  unfixStaticReservation,
-  wipeDhcpSubnet,
-} from '../keaDhcp.js';
+  wipeDhcpPool,
+  dhcpServerHost,
+} from '../junosDhcp.js';
 import { listLogs, queueLogsCollection } from '../logs.js';
 import { acknowledgeAlert, listAlertRules, listAlerts } from '../logAlerts.js';
 import { getLatestInterfacesJob, queueInterfaceAction, parseInterfaceActionPayload } from '../interfaces.js';
@@ -254,7 +254,7 @@ async function listDhcpLeasesHandler(
   _ctx: ToolContext,
 ): Promise<ToolResult> {
   let leases = await listDhcpLeases(
-    typeof args.subnet_id === 'number' ? args.subnet_id : undefined,
+    typeof args.pool_name === 'string' && args.pool_name ? args.pool_name : undefined,
   );
 
   if (typeof args.hostname_contains === 'string' && args.hostname_contains) {
@@ -262,19 +262,16 @@ async function listDhcpLeasesHandler(
     leases = leases.filter((l) => l.hostname.toLowerCase().includes(needle));
   }
   if (typeof args.state === 'string' && args.state) {
-    // Kea stateLabel values are 'default' / 'expired-reclaimed' /
-    // 'released' / 'declined'. LLM often asks for the human-friendly
-    // 'active' (which is Kea's 'default') or 'expired' (which is
-    // 'expired-reclaimed'). Normalize aliases so the filter works.
+    // Junos lease states: 'bound' / 'init' / 'init-reboot' / 'selecting' /
+    // 'pending' / 'renewing' / 'rebounding'. The UI also uses 'static' for
+    // pinned reservations. Normalize aliases so the filter works.
     const wanted = args.state.toLowerCase();
     const aliases: Record<string, string[]> = {
-      active: ['default', 'static'],
-      'expired-reclaimed': ['expired-reclaimed'],
-      expired: ['expired-reclaimed'],
-      released: ['released'],
-      declined: ['declined'],
-      default: ['default'],
+      active: ['bound', 'static', 'renewing', 'rebounding'],
+      bound: ['bound', 'renewing', 'rebounding'],
+      expired: ['expired'],
       static: ['static'],
+      reserved: ['static'],
     };
     const matchLabels = (aliases[wanted] ?? [wanted]).map((s) => s.toLowerCase());
     leases = leases.filter((l) => matchLabels.includes(l.stateLabel.toLowerCase()));
@@ -465,8 +462,8 @@ async function getDhcpPoolStatusHandler(
   const dashboard = await getDhcpDashboard();
   let pools = dashboard.pools;
 
-  if (typeof args.subnet_id === 'number') {
-    pools = pools.filter((p) => p.subnetId === args.subnet_id);
+  if (typeof args.pool_name === 'string' && args.pool_name) {
+    pools = pools.filter((p) => p.poolName === args.pool_name);
   }
   if (args.only_high_utilization === true) {
     pools = pools.filter((p) => p.utilization >= 80);
@@ -476,9 +473,9 @@ async function getDhcpPoolStatusHandler(
     ok: true,
     preview: {
       totals: dashboard.totals,
-      ha: dashboard.ha,
+      server: dashboard.server,
       pools: pools.map((p) => ({
-        subnetId: p.subnetId,
+        poolName: p.poolName,
         name: p.name,
         site: p.site,
         vlan: p.vlan,
@@ -925,7 +922,7 @@ async function listDhcpSubnetsHandler(
     preview: {
       total: pools.length,
       pools: pools.map((p) => ({
-        subnetId: p.subnetId,
+        poolName: p.poolName,
         name: p.name,
         site: p.site,
         vlan: p.vlan,
@@ -945,18 +942,18 @@ async function getDhcpSubnetHandler(
   args: Record<string, unknown>,
   _ctx: ToolContext,
 ): Promise<ToolResult> {
-  const subnetId = typeof args.subnet_id === 'number' ? args.subnet_id : Number(args.subnet_id);
-  if (!Number.isFinite(subnetId)) return { ok: false, error: 'subnet_id is required (number)' };
+  const poolName = String(args.pool_name ?? '').trim();
+  if (!poolName) return { ok: false, error: 'pool_name is required' };
 
   const dashboard = await getDhcpDashboard();
-  const pool = dashboard.pools.find((p) => p.subnetId === subnetId);
-  if (!pool) return { ok: true, preview: { subnetId, found: false } };
+  const pool = dashboard.pools.find((p) => p.poolName === poolName);
+  if (!pool) return { ok: true, preview: { poolName, found: false } };
 
-  const leases = await listDhcpLeases(subnetId);
+  const leases = await listDhcpLeases(poolName);
   return {
     ok: true,
     preview: {
-      subnetId,
+      poolName,
       found: true,
       name: pool.name,
       site: pool.site,
@@ -968,7 +965,7 @@ async function getDhcpSubnetHandler(
       utilization: pool.utilization,
       leases: {
         total: leases.length,
-        active: leases.filter((l) => l.stateLabel === 'default' || l.stateLabel === 'static').length,
+        active: leases.filter((l) => l.stateLabel !== 'static').length,
         reserved: leases.filter((l) => l.reserved).length,
       },
     },
@@ -1762,16 +1759,16 @@ async function addDhcpReservationHandler(
 ): Promise<ToolResult> {
   const ip = String(args.ip ?? '').trim();
   const mac = String(args.mac ?? '').trim();
-  const subnetId = Number(args.subnet_id);
+  const poolName = String(args.pool_name ?? '').trim();
   const hostname = typeof args.hostname === 'string' ? args.hostname : undefined;
-  if (!ip || !mac || !Number.isFinite(subnetId)) {
-    return { ok: false, error: 'ip, mac, subnet_id are required' };
+  if (!ip || !mac || !poolName) {
+    return { ok: false, error: 'ip, mac, pool_name are required' };
   }
   try {
-    const result = await addDhcpReservation({ ip, mac, subnetId, hostname });
+    const result = await addDhcpLease(dhcpServerHost(), { ip, mac, poolName, hostname });
     return {
       ok: true,
-      preview: { ip, mac, subnetId, result, message: `Đã thêm DHCP lease ${mac} → ${ip}.` },
+      preview: { ip, mac, poolName, result, message: `Đã ghim DHCP ${mac} → ${ip}.` },
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
@@ -1785,7 +1782,8 @@ async function deleteDhcpLeaseHandler(
   const ip = String(args.ip ?? '').trim();
   if (!ip) return { ok: false, error: 'ip is required' };
   try {
-    const result = await deleteDhcpLease(ip);
+    const result = await deleteDhcpLease(dhcpServerHost(), ip);
+    if (!result.ok) return { ok: false, error: result.error || `Failed to delete lease ${ip}` };
     return { ok: true, preview: { ip, result, message: `Đã xoá DHCP lease ${ip}.` } };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
@@ -1798,17 +1796,17 @@ async function fixStaticReservationHandler(
 ): Promise<ToolResult> {
   const ip = String(args.ip ?? '').trim();
   const mac = String(args.mac ?? '').trim();
-  const subnetId = Number(args.subnet_id);
+  const poolName = String(args.pool_name ?? '').trim();
   const hostname = typeof args.hostname === 'string' ? args.hostname : undefined;
-  const note = typeof args.note === 'string' ? args.note : undefined;
-  if (!ip || !mac || !Number.isFinite(subnetId)) {
-    return { ok: false, error: 'ip, mac, subnet_id are required' };
+  if (!ip || !mac || !poolName) {
+    return { ok: false, error: 'ip, mac, pool_name are required' };
   }
   try {
-    const result = await fixStaticReservation({ ip, mac, subnetId, hostname, note });
+    const result = await fixStaticReservation(dhcpServerHost(), { ip, mac, poolName, hostname });
+    if (!result.ok) return { ok: false, error: result.error || 'Failed to pin static reservation' };
     return {
       ok: true,
-      preview: { ip, mac, subnetId, result, message: `Đã ghim static ${mac} → ${ip}.` },
+      preview: { ip, mac, poolName, result, message: `Đã ghim static ${mac} → ${ip}.` },
     };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
@@ -1819,11 +1817,19 @@ async function wipeDhcpSubnetHandler(
   args: Record<string, unknown>,
   _ctx: ToolContext,
 ): Promise<ToolResult> {
-  const subnetId = Number(args.subnet_id);
-  if (!Number.isFinite(subnetId)) return { ok: false, error: 'subnet_id is required' };
+  const poolName = String(args.pool_name ?? '').trim();
+  if (!poolName) return { ok: false, error: 'pool_name is required' };
   try {
-    const result = await wipeDhcpSubnet(subnetId);
-    return { ok: true, preview: { subnetId, result, message: `Đã WIPE tất cả lease trong subnet ${subnetId}.` } };
+    const dashboard = await getDhcpDashboard();
+    const pool = dashboard.pools.find((item) => item.poolName === poolName);
+    if (!pool) return { ok: false, error: `Pool ${poolName} not found` };
+    if (!pool.interface) return { ok: false, error: `Pool ${poolName} has no known interface` };
+    const result = await wipeDhcpPool(dhcpServerHost(), pool.interface);
+    if (!result.ok) return { ok: false, error: result.error || 'Failed to wipe pool leases' };
+    return {
+      ok: true,
+      preview: { poolName, result, message: `Đã WIPE tất cả lease trong pool ${poolName}.` },
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'unknown error' };
   }
@@ -1833,27 +1839,39 @@ async function addDhcpSubnetHandler(
   args: Record<string, unknown>,
   _ctx: ToolContext,
 ): Promise<ToolResult> {
-  const subnetId = Number(args.subnet_id);
+  const poolName = String(args.pool_name ?? '').trim();
   const subnet = String(args.subnet ?? '').trim();
   const poolStart = String(args.pool_start ?? '').trim();
   const poolEnd = String(args.pool_end ?? '').trim();
   const gateway = String(args.gateway ?? '').trim();
-  if (!Number.isFinite(subnetId) || !subnet || !poolStart || !poolEnd || !gateway) {
-    return { ok: false, error: 'subnet_id, subnet, pool_start, pool_end, gateway are required' };
+  const interfaceName = String(args.interface_name ?? '').trim();
+  if (!poolName || !subnet || !poolStart || !poolEnd || !gateway || !interfaceName) {
+    return {
+      ok: false,
+      error: 'pool_name, subnet, pool_start, pool_end, gateway, interface_name are required',
+    };
   }
   try {
-    const dns = Array.isArray(args.dns) ? (args.dns as unknown[]).filter((d): d is string => typeof d === 'string') : undefined;
-    const result = await addDhcpSubnet({
-      subnetId, subnet, poolStart, poolEnd, gateway, dns,
-      site: typeof args.site === 'string' ? args.site : undefined,
-      vlan: typeof args.vlan === 'number' ? args.vlan : undefined,
-      name: typeof args.name === 'string' ? args.name : undefined,
+    const dns = Array.isArray(args.dns)
+      ? (args.dns as unknown[]).filter((d): d is string => typeof d === 'string')
+      : undefined;
+    const result = await addDhcpSubnet(dhcpServerHost(), {
+      poolName,
+      subnet,
+      poolStart,
+      poolEnd,
+      gateway,
+      dns,
+      domainName: typeof args.domain_name === 'string' ? args.domain_name : undefined,
+      leaseTime: typeof args.lease_time === 'number' ? args.lease_time : undefined,
+      interfaceName,
     });
+    if (!result.ok) return { ok: false, error: result.error || 'Failed to add DHCP pool' };
     return {
       ok: true,
       preview: {
-        subnetId, subnet, poolStart, poolEnd, gateway, result,
-        message: `Đã thêm subnet ${subnetId} (${subnet}) vào Kea config.`,
+        poolName, subnet, poolStart, poolEnd, gateway, result,
+        message: `Đã thêm DHCP pool ${poolName} (${subnet}) trên switch.`,
       },
     };
   } catch (e) {

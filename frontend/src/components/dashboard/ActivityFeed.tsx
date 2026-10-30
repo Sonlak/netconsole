@@ -13,7 +13,7 @@ import type { ReactNode } from 'react';
 import { Timestamp } from '@/components/display/Timestamp';
 import { JOB_TYPE_LABELS, type Job } from '@/types/job';
 import type { Device } from '@/types/device';
-import type { DhcpHaPeer, DhcpPool } from '@/types/dhcp';
+import type { DhcpPool, DhcpServer } from '@/types/dhcp';
 
 type Severity = 0 | 1 | 2 | 3 | 4 | 5;
 
@@ -54,7 +54,7 @@ const ICON_BY_TONE: Record<string, ReactNode> = {
 export function buildActivityItems(input: {
   healthError: Error | null;
   dhcpError: Error | null;
-  dhcpHaPeers: DhcpHaPeer[];
+  dhcpServer: DhcpServer | null;
   devices: Device[];
   failedJobs: Job[];
   dhcpPools: DhcpPool[];
@@ -70,17 +70,15 @@ export function buildActivityItems(input: {
       href: '/',
     });
   }
-  for (const peer of input.dhcpHaPeers) {
-    if (!peer.reachable) {
-      items.push({
-        key: `kea-${peer.name}`,
-        severity: 0,
-        icon: ICON_BY_TONE.kea,
-        title: `Kea peer unreachable`,
-        detail: `${peer.name} · ${peer.role}${peer.state ? ` · ${peer.state}` : ''}`,
-        href: '/dhcp',
-      });
-    }
+  if (input.dhcpServer && !input.dhcpServer.reachable) {
+    items.push({
+      key: `dhcp-server-${input.dhcpServer.name}`,
+      severity: 0,
+      icon: ICON_BY_TONE.kea,
+      title: 'DHCP server unreachable',
+      detail: `${input.dhcpServer.name} · ${input.dhcpServer.host}`,
+      href: '/dhcp',
+    });
   }
   if (input.dhcpError) {
     items.push({
@@ -139,12 +137,12 @@ export function buildActivityItems(input: {
   for (const pool of input.dhcpPools) {
     if (pool.utilization >= 70) {
       items.push({
-        key: `pool-${pool.subnetId}`,
+        key: `pool-${pool.poolName}`,
         severity: pool.utilization >= 85 ? 3 : 5,
         icon: ICON_BY_TONE.pool,
         title: `${pool.site} ${pool.name}`,
         detail: `${pool.utilization}% · ${pool.leased}/${pool.poolSize} leased`,
-        href: `/dhcp?site=${pool.site}&pool=${pool.subnetId}`,
+        href: `/dhcp?site=${pool.site}&pool=${pool.poolName}`,
       });
     }
   }

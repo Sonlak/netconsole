@@ -16,6 +16,7 @@ sys.path.insert(0, "/usr/local/lib/netconsole")
 
 import interface_state
 import syslog_buffer
+import dhcp_server
 
 
 def _load_device_env() -> dict[str, str]:
@@ -136,6 +137,27 @@ class JunosRestHandler(BaseHTTPRequestHandler):
             self._json(200, log_payload())
             return
 
+        # ── DHCP local server (Kea replacement) ──────────────────────────
+        # The backend reads pools via <get-configuration> and bindings via
+        # <get-dhcp-server-binding-information><detail/></...>.
+        if path in {"/rpc/get-dhcp-server-binding-information", "/rpc/get-dhcp-server-binding-information/"}:
+            body = dhcp_server.bindings_xml().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path in {"/rpc/get-configuration", "/rpc/get-configuration/"}:
+            body = dhcp_server.pools_xml().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/cli/show-log":
             body = show_log_text()
             encoded = body.encode("utf-8")
@@ -157,6 +179,8 @@ class JunosRestHandler(BaseHTTPRequestHandler):
                         "get-arp-table-information",
                         "get-interface-information",
                         "get-log-information",
+                        "get-dhcp-server-binding-information",
+                        "get-configuration",
                     ],
                 },
             )

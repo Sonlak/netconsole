@@ -72,7 +72,7 @@ vi.mock('../../../src/services/macAddress.js', () => ({
 vi.mock('../../../src/services/fabricTopology.js', () => ({
   getFabricTopology: (...args: unknown[]) => getFabricTopology(...args),
 }));
-vi.mock('../../../src/services/keaDhcp.js', () => ({
+vi.mock('../../../src/services/junosDhcp.js', () => ({
   listDhcpLeases: (...args: unknown[]) => listDhcpLeases(...args),
   getDhcpDashboard: (...args: unknown[]) => getDhcpDashboard(...args),
 }));
@@ -266,29 +266,29 @@ describe('get_device_interfaces', () => {
 });
 
 describe('list_dhcp_leases', () => {
-  it('passes subnet_id through and trims to limit', async () => {
+  it('passes pool_name through and trims to limit', async () => {
     const leases = Array.from({ length: 60 }, (_, i) => ({
       ip: `10.10.20.${i + 1}`,
       mac: `aa:bb:cc:00:00:${i.toString(16).padStart(2, '0')}`,
       hostname: `host-${i}`,
       clientDevice: '',
       clientPort: '',
-      subnetId: 1,
+      poolName: 'V201',
       subnet: '10.10.20.0/24',
-      vlan: 10,
+      vlan: 201,
       site: 'NKKN',
       validLifetime: 3600,
       cltt: 0,
       expiresAt: null,
-      state: 0,
+      state: 'bound',
       stateLabel: 'active',
       reserved: false,
       note: '',
     }));
     listDhcpLeases.mockResolvedValueOnce(leases);
-    const result = await HANDLERS.list_dhcp_leases({ subnet_id: 1, limit: 10 }, ctx);
+    const result = await HANDLERS.list_dhcp_leases({ pool_name: 'V201', limit: 10 }, ctx);
     expect(result.ok).toBe(true);
-    expect(listDhcpLeases).toHaveBeenCalledWith(1);
+    expect(listDhcpLeases).toHaveBeenCalledWith('V201');
     const preview = result.preview as { total: number; returned: number; truncated: boolean };
     expect(preview.total).toBe(60);
     expect(preview.returned).toBe(10);
@@ -299,18 +299,18 @@ describe('list_dhcp_leases', () => {
 describe('get_dhcp_pool_status', () => {
   it('returns dashboard pools + flags high utilization', async () => {
     getDhcpDashboard.mockResolvedValueOnce({
-      totals: { sites: 2, pools: 5, leased: 100, poolSize: 200 },
-      ha: { mode: 'hot-standby', peers: [], active: 'kea-primary' },
+      totals: { sites: 1, pools: 2, leased: 95, poolSize: 200 },
+      server: { host: 'LAB-F6-DS-01', reachable: true },
       pools: [
-        { subnetId: 1, name: 's1', site: 'NKKN', vlan: 10, subnet: '10.10.20.0/24', pool: '10.10.20.10-10.10.20.100', gateway: '10.10.20.1', leased: 90, poolSize: 90, utilization: 100 },
-        { subnetId: 2, name: 's2', site: 'NKKN', vlan: 20, subnet: '10.10.30.0/24', pool: '10.10.30.10-10.10.30.100', gateway: '10.10.30.1', leased: 5, poolSize: 90, utilization: 5.6 },
+        { poolName: 'V201', name: 'V201', site: 'NKKN', vlan: 201, subnet: '10.10.20.0/24', pool: '10.10.20.10-10.10.20.100', gateway: '10.10.20.1', leased: 90, poolSize: 90, utilization: 100 },
+        { poolName: 'V202', name: 'V202', site: 'NKKN', vlan: 202, subnet: '10.10.30.0/24', pool: '10.10.30.10-10.10.30.100', gateway: '10.10.30.1', leased: 5, poolSize: 90, utilization: 5.6 },
       ],
     });
     const result = await HANDLERS.get_dhcp_pool_status({ only_high_utilization: true }, ctx);
     expect(result.ok).toBe(true);
-    const preview = result.preview as { pools: Array<{ subnetId: number }> };
+    const preview = result.preview as { pools: Array<{ poolName: string }> };
     expect(preview.pools).toHaveLength(1);
-    expect(preview.pools[0].subnetId).toBe(1);
+    expect(preview.pools[0].poolName).toBe('V201');
   });
 });
 

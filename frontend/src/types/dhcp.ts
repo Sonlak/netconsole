@@ -1,15 +1,22 @@
 export type DhcpPool = {
-  subnetId: number;
+  /** Junos pool name (e.g. "V201"). */
+  poolName: string;
+  /** Display name — derived from the VLAN. */
   name: string;
   site: string;
   vlan: number;
   subnet: string;
+  /** Inclusive dynamic range, "start-end". */
   pool: string;
   gateway: string;
   dns: string[];
   leased: number;
   poolSize: number;
   utilization: number;
+  /** Number of static reservations in this pool. */
+  reserved: number;
+  /** IRB the local server is attached to ("irb.201"). */
+  interface: string;
 };
 
 export type DhcpSiteSummary = {
@@ -29,95 +36,30 @@ export type DhcpGateway = {
 };
 
 /**
- * Kea peer (one site) in the DC↔DR HA pair.
- *
- * `site` distinguishes the physical locations (DC = primary, DR = backup)
- * and is what the UI uses for labels and color coding. `role` is the
- * Kea-level role (primary = serving DHCP, standby = passive).
+ * The DHCP server. Since the Kea HA pair was removed (2026-10-30) the
+ * distribution switch (DS1) is the only DHCP server in the network.
  */
-export type DhcpHaPeer = {
+export type DhcpServer = {
+  /** Device name (e.g. "LAB-F6-DS-01"). */
   name: string;
-  site: 'DC' | 'DR';
-  role: string;
-  url: string;
+  /** IP / hostname used to reach it. */
+  host: string;
+  /** Whether the switch answered the last query. */
   reachable: boolean;
-  /**
-   * Kea HA hook state. Possible values:
-   *   "waiting" | "syncing" | "hot-standby" | "load-balancing" |
-   *   "partner-down" | "unavailable" | "communication-recovered" | "terminated"
-   */
-  state?: string;
-  scopes?: string[];
-  lastHeartbeatAt?: string | null;
-  uptimeInRole?: number;
-};
-
-export type DhcpHa = {
-  mode: string;
-  peers: DhcpHaPeer[];
-  /** Site that is currently serving DHCP: 'DC' | 'DR' | null. */
-  active: 'DC' | 'DR' | null;
+  /** Where the lease data came from: "restconf" | "ssh". */
+  source: string;
 };
 
 export type DhcpDashboard = {
+  server: DhcpServer;
   sites: DhcpSiteSummary[];
   pools: DhcpPool[];
   gateways: DhcpGateway[];
-  ha: DhcpHa;
   totals: {
     sites: number;
     pools: number;
     leased: number;
     poolSize: number;
-  };
-};
-
-/** Detailed HA state returned by /api/dhcp/ha-state. */
-export type HaStateSnapshot = {
-  activeSite: 'DC' | 'DR' | null;
-  peers: DhcpHaPeer[];
-  recommendedAction: 'none' | 'switchover-to-dc' | 'switchover-to-dr' | 'investigate';
-  reason: string;
-  capturedAt: string;
-  /**
-   * "hot-standby" — DC↔DR pair with the libdhcp_ha hook loaded.
-   * "standalone"  — single Kea server, no DR peer configured.
-   */
-  mode?: 'hot-standby' | 'standalone';
-};
-
-/** Auto-failback scheduler status (in-memory on the backend). */
-export type AutoFailbackStatus = {
-  enabled: boolean;
-  lastCheckedAt: string | null;
-  lastFailoverAt: string | null;
-  lastFailbackAt: string | null;
-  lastFailbackReason: string | null;
-  lastFailbackFrom: 'DC' | 'DR' | null;
-  lastFailbackTo: 'DC' | 'DR' | null;
-  cooldownRemainingSeconds: number;
-  stabilityRequiredSeconds: number;
-  nextCheckAt: string | null;
-  recentEvents: Array<{
-    at: string;
-    kind: 'failover' | 'failback' | 'switchover' | 'check' | 'skip';
-    from: 'DC' | 'DR' | null;
-    to: 'DC' | 'DR' | null;
-    reason: string;
-  }>;
-};
-
-export type HaStateResponse = {
-  ha: HaStateSnapshot;
-  autoFailback: AutoFailbackStatus;
-};
-
-export type SwitchoverResult = {
-  ok: boolean;
-  result: {
-    result: number;
-    text: string;
-    beforeState: HaStateSnapshot;
   };
 };
 
@@ -127,14 +69,17 @@ export type DhcpLease = {
   hostname: string;
   clientDevice: string;
   clientPort: string;
-  subnetId: number;
+  /** Junos pool that owns the lease. */
+  poolName: string;
   subnet?: string;
   site?: string;
   vlan?: number;
   validLifetime: number;
   cltt: number | null;
   expiresAt: string | null;
-  state: number;
+  /** Raw platform state ("BOUND", "INIT", ...). */
+  state: string;
+  /** Normalised state ("bound", "static", ...). */
   stateLabel: string;
   reserved?: boolean;
   note?: string;

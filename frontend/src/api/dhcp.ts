@@ -1,10 +1,4 @@
-import type {
-  AutoFailbackStatus,
-  DhcpDashboard,
-  DhcpLease,
-  HaStateResponse,
-  SwitchoverResult,
-} from '../types/dhcp';
+import type { DhcpDashboard, DhcpLease, DhcpServer } from '../types/dhcp';
 import { authJsonFetch, authFetch, handleResponse } from './http';
 
 const API_BASE = '/api/dhcp';
@@ -14,48 +8,16 @@ export async function fetchDhcpDashboard(): Promise<DhcpDashboard> {
   return handleResponse<DhcpDashboard>(response);
 }
 
-export async function fetchHaState(): Promise<HaStateResponse> {
-  const response = await authFetch(`${API_BASE}/ha-state`);
-  return handleResponse<HaStateResponse>(response);
+export async function fetchDhcpServer(): Promise<{
+  server: DhcpServer;
+  totals: DhcpDashboard['totals'];
+}> {
+  const response = await authFetch(`${API_BASE}/server`);
+  return handleResponse(response);
 }
 
-export async function fetchAutoFailbackStatus(): Promise<AutoFailbackStatus> {
-  const response = await authFetch(`${API_BASE}/auto-failback`);
-  return handleResponse<AutoFailbackStatus>(response);
-}
-
-export async function setAutoFailback(enabled: boolean): Promise<AutoFailbackStatus> {
-  const response = await authJsonFetch<{ ok: true; status: AutoFailbackStatus }>(
-    `${API_BASE}/auto-failback`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    },
-  );
-  return response.status;
-}
-
-export async function triggerSwitchover(currentPrimary: 'DC' | 'DR'): Promise<SwitchoverResult> {
-  const response = await authJsonFetch<SwitchoverResult>(`${API_BASE}/switchover`, {
-    method: 'POST',
-    body: JSON.stringify({ currentPrimary }),
-  });
-  return response;
-}
-
-export async function triggerAutoFailbackCheck(): Promise<AutoFailbackStatus> {
-  const response = await authJsonFetch<{ ok: true; status: AutoFailbackStatus }>(
-    `${API_BASE}/auto-failback/check`,
-    {
-      method: 'POST',
-      body: JSON.stringify({}),
-    },
-  );
-  return response.status;
-}
-
-export async function fetchPoolLeases(subnetId: number): Promise<DhcpLease[]> {
-  const response = await authFetch(`${API_BASE}/pools/${subnetId}/leases`);
+export async function fetchPoolLeases(poolName: string): Promise<DhcpLease[]> {
+  const response = await authFetch(`${API_BASE}/pools/${encodeURIComponent(poolName)}/leases`);
   const payload = await handleResponse<{ leases: DhcpLease[] }>(response);
   return payload.leases;
 }
@@ -65,15 +27,17 @@ export async function deleteDhcpLease(ip: string): Promise<void> {
   await handleResponse(response);
 }
 
-export async function wipePoolLeases(subnetId: number): Promise<void> {
-  const response = await authFetch(`${API_BASE}/pools/${subnetId}/wipe`, { method: 'POST' });
+export async function wipePoolLeases(poolName: string): Promise<void> {
+  const response = await authFetch(`${API_BASE}/pools/${encodeURIComponent(poolName)}/wipe`, {
+    method: 'POST',
+  });
   await handleResponse(response);
 }
 
 export async function addDhcpLease(input: {
   ip: string;
   mac: string;
-  subnetId: number;
+  poolName: string;
   hostname?: string;
 }): Promise<void> {
   await authJsonFetch(`${API_BASE}/leases`, {
@@ -85,31 +49,53 @@ export async function addDhcpLease(input: {
 export async function fixStaticDhcpLease(input: {
   ip: string;
   mac: string;
-  subnetId: number;
+  poolName: string;
   hostname?: string;
-  note?: string;
 }): Promise<void> {
   await authJsonFetch(`${API_BASE}/leases/${encodeURIComponent(input.ip)}/fix-static`, {
     method: 'POST',
     body: JSON.stringify({
       mac: input.mac,
-      subnetId: input.subnetId,
+      poolName: input.poolName,
       hostname: input.hostname,
-      note: input.note,
     }),
   });
 }
 
 export async function unfixStaticDhcpLease(input: {
   ip: string;
-  subnetId: number;
+  poolName: string;
   mac?: string;
 }): Promise<void> {
   await authJsonFetch(`${API_BASE}/leases/${encodeURIComponent(input.ip)}/unfix-static`, {
     method: 'POST',
     body: JSON.stringify({
-      subnetId: input.subnetId,
+      poolName: input.poolName,
       mac: input.mac,
     }),
   });
+}
+
+export async function addDhcpPool(input: {
+  poolName: string;
+  subnet: string;
+  poolStart: string;
+  poolEnd: string;
+  gateway: string;
+  dns?: string[];
+  domainName?: string;
+  leaseTime?: number;
+  interfaceName: string;
+}): Promise<void> {
+  await authJsonFetch(`${API_BASE}/pools`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteDhcpPool(poolName: string): Promise<void> {
+  const response = await authFetch(`${API_BASE}/pools/${encodeURIComponent(poolName)}`, {
+    method: 'DELETE',
+  });
+  await handleResponse(response);
 }

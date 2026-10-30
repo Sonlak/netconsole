@@ -25,8 +25,7 @@ import { startLogRetentionCleanup } from './services/logRetention.js';
 import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { scheduleNetboxSync } from './services/netboxSync.js';
-import { startKeccFailbackScheduler, stopKeaFailbackScheduler } from './services/keaFailback.js';
-import { isHaEnabled, isDrConfigured } from './services/keaDhcp.js';
+import { dhcpServerEnabled, dhcpServerHost } from './services/junosDhcp.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
@@ -230,22 +229,12 @@ const httpServer = app.listen(port, () => {
     console.log('NetBox sync scheduler disabled (set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable)');
   }
 
-  // Kea DC↔DR auto-failback scheduler. The scheduler is always started
-  // (so the /api/dhcp/auto-failback status endpoint works) but only
-  // ACTUALLY triggers switchovers when KEA_AUTO_FAILBACK=true AND the
-  // runtime flag (toggleable via API) is also true. Both must be set
-  // to avoid accidentally swapping primary during maintenance.
-  startKeccFailbackScheduler();
-  const keaFailbackWanted = process.env.KEA_AUTO_FAILBACK === 'true';
+  // DHCP is served by the distribution switch (Junos extended DHCP local
+  // server). Kea was removed on 2026-10-30 — there is no HA pair, no
+  // failback scheduler and no control agent to talk to. The switch is the
+  // single source of truth for pools, leases and static reservations.
   console.log(
-    `Kea auto-failback scheduler enabled (env flag: ${keaFailbackWanted ? 'on' : 'off (toggleable via API)'})`,
-  );
-  // 2026-10-27: make the deployment topology explicit in the startup log.
-  // "HA on but no DR peer" and "HA off" look identical from the outside
-  // but behave completely differently (the latter never fails over).
-  console.log(
-    `Kea HA topology: haEnabled=${isHaEnabled()} drConfigured=${isDrConfigured()} ` +
-      `drUrl=${process.env.KEA_STANDBY_API_URL || '(unset)'}`,
+    `DHCP server: enabled=${dhcpServerEnabled()} host=${dhcpServerHost()}`,
   );
 
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
@@ -371,16 +360,10 @@ app.get('/api/health', (_req, res) => {
     logRetentionDays,
     jobRetentionDays,
     syslogUdpPort,
-    keaApiUrl: process.env.KEA_API_URL || null,
-    keaStandbyApiUrl: process.env.KEA_STANDBY_API_URL || null,
-    // NEW 2026-10-27: the backend must agree with the Kea server on
-    // whether the DC↔DR HA pair exists. A standalone Kea (no libdhcp_ha
-    // hook) answers `ha-heartbeat` with result=3, which used to be read
-    // as "DC unreachable" and made the prod dashboard point at a DR peer
-    // that was never configured.
-    keaHaEnabled: isHaEnabled(),
-    keaDrConfigured: isDrConfigured(),
-    keaAutoFailback: process.env.KEA_AUTO_FAILBACK === 'true',
+    // DHCP now runs on the distribution switch (Junos extended DHCP local
+    // server). Kea was removed on 2026-10-30 — no control agent, no HA.
+    dhcpServerEnabled: dhcpServerEnabled(),
+    dhcpServerHost: dhcpServerHost(),
     netboxEnabled: netboxSyncIntervalSeconds > 0,
     netboxSyncIntervalSeconds: netboxSyncIntervalSeconds > 0 ? netboxSyncIntervalSeconds : null,
     // Read version from package.json (written at build time by docker-compose)
@@ -442,14 +425,6 @@ async function gracefulShutdown(signal: string) {
       console.log('Syslog UDP receiver closed');
     } catch (error) {
       console.error('[shutdown] syslog receiver error:', error);
-    }
-
-    // Stop Kea failback scheduler (no in-flight action, just clear the interval)
-    try {
-      stopKeaFailbackScheduler();
-      console.log('Kea failback scheduler stopped');
-    } catch (error) {
-      console.error('[shutdown] kea-failback scheduler error:', error);
     }
 
     // Close database connection

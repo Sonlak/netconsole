@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, "/usr/local/lib/netconsole")
 
 import interface_state
+import dhcp_server
 
 
 def _load_device_env() -> dict[str, str]:
@@ -83,6 +84,11 @@ def replace_running_config(content: str) -> str:
         extra = apply_linux.apply_set_config(text)
     except Exception as exc:  # noqa: BLE001 - lab dataplane best-effort
         extra = f"dataplane warn: {exc}\n"
+    # A committed config may add/remove DHCP pools — reload the local server.
+    try:
+        extra += dhcp_server.refresh() + "\n"
+    except Exception as exc:  # noqa: BLE001 - lab dataplane best-effort
+        extra += f"dhcp warn: {exc}\n"
     return "commit complete\n" + extra
 
 
@@ -100,6 +106,10 @@ def rollback_running_config() -> str:
         extra = apply_linux.apply_set_config(previous)
     except Exception as exc:  # noqa: BLE001 - lab dataplane best-effort
         extra = f"dataplane warn: {exc}\n"
+    try:
+        extra += dhcp_server.refresh() + "\n"
+    except Exception as exc:  # noqa: BLE001 - lab dataplane best-effort
+        extra += f"dhcp warn: {exc}\n"
     return "rollback complete\n" + extra
 
 
@@ -129,7 +139,7 @@ def _forwarding_options_block() -> str:
 forwarding-options {{
     helpers {{
         bootp {{
-            description "DHCP relay to Kea";
+            description "DHCP relay";
 {server_lines}
             interface {{
 {iface_lines}
@@ -144,7 +154,7 @@ def _forwarding_options_set() -> str:
     servers = interface_state.dhcp_relay_servers()
     if not servers:
         return ""
-    lines = ['set forwarding-options helpers bootp description "DHCP relay to Kea"']
+    lines = ['set forwarding-options helpers bootp description "DHCP relay"']
     for ip in servers:
         lines.append(f"set forwarding-options helpers bootp server {ip}")
     for iface in interface_state.load_interfaces():
@@ -294,6 +304,10 @@ def help_text() -> str:
   show interfaces terse
   show configuration interfaces <if>
   ping <host> [count <n>]
+  show dhcp server binding detail
+  show dhcp server statistics
+  clear dhcp server binding <ip>
+  clear dhcp server binding interface <irb.N>
   set interfaces <if> disable
   delete interfaces <if> disable
   set interfaces <if> unit 0 family ethernet-switching interface-mode access
@@ -331,6 +345,11 @@ def handle_command(raw: str) -> str | None:
         return interface_state.format_terse()
     if lower == "ping" or lower.startswith("ping "):
         return run_ping(command)
+
+    # DHCP local server (Kea replacement) — see dhcp_server.py.
+    dhcp_output = dhcp_server.cli_command(command)
+    if dhcp_output is not None:
+        return dhcp_output
 
     m_show_cfg = re.match(r"^show\s+configuration\s+interfaces\s+(\S+)$", lower)
     if m_show_cfg:

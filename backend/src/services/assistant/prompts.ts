@@ -261,9 +261,9 @@ trong bản đồ này, PHẢI nói thẳng "hệ thống không lưu X" thay v�
 - KHÔNG có: MAC table, ARP, packet counters (counters nằm ở timeseries, tool khác)
 
 ### DHCP lease — list_dhcp_leases
-- \`ip\`, \`mac\`, \`hostname\`, \`subnetId\`, \`state\`, \`expiresAt\`
-- State: 'default' (=active), 'expired-reclaimed' (=expired), 'released', 'declined', 'static'
-- ⚠️ Đây là bảng DHCP do Kea cấp phát, KHÔNG phải bảng ARP. Nếu user hỏi
+- \`ip\`, \`mac\`, \`hostname\`, \`poolName\`, \`subnet\`, \`state\`, \`expiresAt\`
+- State: 'bound' (=active), 'static' (ghim cố định), 'init', 'expired'
+- ⚠️ Đây là bảng DHCP do switch (Junos) cấp phát, KHÔNG phải bảng ARP. Nếu user hỏi
   "xem ARP" / "MAC đã học" thì dùng list_arp_entries / list_mac_entries, KHÔNG
   dùng tool này (dễ nhầm vì cùng là network table).
 
@@ -595,16 +595,16 @@ const listDhcpLeases: CatalogEntry = {
   function: {
     name: 'list_dhcp_leases',
     description:
-      'Liệt kê DHCP lease. Có thể filter theo subnet (ID), hostname, hoặc ' +
-      'state (active/expired/released). Mặc định trả 50 lease mới nhất. ' +
-      'Returns: mảng leases với các field { ip, mac, hostname, subnet, subnetId, state, expiresAt }.',
+      'Liệt kê DHCP lease. Có thể filter theo pool (VD: "V201"), hostname, hoặc ' +
+      'state (active/bound/static). Mặc định trả 50 lease mới nhất. ' +
+      'Returns: mảng leases với các field { ip, mac, hostname, poolName, subnet, state, expiresAt }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        subnet_id: {
-          type: 'number',
-          description: 'ID subnet (xem get_dhcp_pool_status để biết ID). Tùy chọn.',
+        pool_name: {
+          type: 'string',
+          description: 'Tên pool Junos (xem get_dhcp_pool_status). Tùy chọn.',
         },
         hostname_contains: {
           type: 'string',
@@ -612,11 +612,10 @@ const listDhcpLeases: CatalogEntry = {
         },
         state: {
           type: 'string',
-          enum: ['active', 'default', 'static', 'expired', 'expired-reclaimed', 'released', 'declined'],
+          enum: ['active', 'bound', 'static', 'expired'],
           description:
-            'Filter theo state. LLM-friendly: "active" (match "default" + "static" — tức lease còn sống), ' +
-            '"expired" (match "expired-reclaimed"). Kea thật: "default" / "static" / "expired-reclaimed" / ' +
-            '"released" / "declined".',
+            'Filter theo state. "active" = lease đang bind (bound) + static. ' +
+            '"static" = ghim cố định. "expired" = lease hết hạn.',
         },
         limit: {
           type: 'number',
@@ -637,15 +636,15 @@ const getDhcpPoolStatus: CatalogEntry = {
     description:
       'Tổng quan DHCP pool: tỷ lệ sử dụng, số IP đã cấp, gateway/DNS. ' +
       'Dùng khi user hỏi "subnet nào sắp hết IP" hoặc "tình trạng DHCP". ' +
-      'Returns: { totals, ha (HA status Kea pair), pools[] } — mỗi pool có ' +
-      '{ subnetId, name, site, vlan, subnet, pool, gateway, dns, leased, utilization }.',
+      'Returns: { totals, server, pools[] } — mỗi pool có ' +
+      '{ poolName, name, site, vlan, subnet, pool, gateway, leased, utilization }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        subnet_id: {
-          type: 'number',
-          description: 'ID subnet cụ thể. Tùy chọn — bỏ qua để lấy tất cả.',
+        pool_name: {
+          type: 'string',
+          description: 'Tên pool cụ thể (VD: "V201"). Tùy chọn — bỏ qua để lấy tất cả.',
         },
         only_high_utilization: {
           type: 'boolean',
@@ -1029,11 +1028,11 @@ const listDhcpSubnets: CatalogEntry = {
   function: {
     name: 'list_dhcp_subnets',
     description:
-      'Liệt kê DHCP subnet với pool, gateway, DNS, vlan, site, utilization. ' +
+      'Liệt kê DHCP pool với subnet, gateway, DNS, vlan, site, utilization. ' +
       'Khác với get_dhcp_pool_status (chỉ trả % utilization), tool này trả đầy đủ ' +
-      'thông tin subnet (subnet CIDR, pool range, reservations count). ' +
-      'Returns: { total, pools[] } — mỗi pool có { subnetId, name, site, vlan, ' +
-      'subnet, pool, gateway, dns, leased, utilization, options }.',
+      'thông tin pool. ' +
+      'Returns: { total, pools[] } — mỗi pool có { poolName, name, site, vlan, ' +
+      'subnet, pool, gateway, dns, leased, utilization }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1041,7 +1040,7 @@ const listDhcpSubnets: CatalogEntry = {
         site: { type: 'string', description: 'Filter theo site. Tùy chọn.' },
         only_high_utilization: {
           type: 'boolean',
-          description: 'Chỉ trả subnet có utilization >= 80%. Mặc định false.',
+          description: 'Chỉ trả pool có utilization >= 80%. Mặc định false.',
         },
       },
     },
@@ -1056,16 +1055,16 @@ const getDhcpSubnet: CatalogEntry = {
   function: {
     name: 'get_dhcp_subnet',
     description:
-      'Chi tiết 1 DHCP subnet: pool range, gateway, DNS, tất cả host reservations, ' +
-      'lease hiện tại, utilization. Dùng khi user hỏi cụ thể về 1 subnet. ' +
-      'Returns: { subnetId, found, name, site, vlan, subnet, pool, gateway, dns, ' +
-      'utilization, leases[], reservations[] }.',
+      'Chi tiết 1 DHCP pool: pool range, gateway, DNS, static reservations, ' +
+      'lease hiện tại, utilization. Dùng khi user hỏi cụ thể về 1 pool. ' +
+      'Returns: { poolName, found, name, site, vlan, subnet, pool, gateway, dns, ' +
+      'utilization, leases }.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['subnet_id'],
+      required: ['pool_name'],
       properties: {
-        subnet_id: { type: 'number', description: 'Subnet ID (xem list_dhcp_subnets)' },
+        pool_name: { type: 'string', description: 'Tên pool Junos (xem list_dhcp_subnets)' },
       },
     },
   },
@@ -1094,7 +1093,7 @@ const listArpEntries: CatalogEntry = {
       'Liệt kê bảng ARP (IP ↔ MAC) đã được collect gần nhất trên các thiết bị managed. ' +
       'Đây là tool ĐÚNG cho các câu hỏi kiểu "xem ARP toàn hệ thống", "xuất file ARP", ' +
       '"ARP chi tiết thiết bị X", "có bao nhiêu MAC đã học", v.v. — KHÔNG dùng ' +
-      'list_dhcp_leases (DHCP lease là bảng khác, do Kea cấp phát). ' +
+      'list_dhcp_leases (DHCP lease là bảng khác, do switch cấp phát). ' +
       'Returns: { total, returned, truncated, deviceCount, devicesWithData, ' +
       'lastUpdatedAt, rows[] } — mỗi row có { ip, mac, hostname, interface, flags, ' +
       'deviceName, deviceIp, site, floor, collectedAt, clientDevice, clientPort }. ' +
@@ -1612,24 +1611,23 @@ const addDhcpReservation: CatalogEntry = {
   function: {
     name: 'add_dhcp_reservation',
     description:
-      'Thêm 1 DHCP lease thủ công (host reservation): gán IP cố định cho MAC. ' +
-      'KHÔNG tạo static reservation (chỉ lease4-add, không ghi vào config). ' +
-      'Dùng khi cần cấp IP nhanh không qua reservation vĩnh viễn.',
+      'Ghim IP cố định cho một MAC (static reservation) trên DHCP server của switch. ' +
+      'Junos không có "lease tạm" — ghim là cách duy nhất để cấp IP cố định.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['ip', 'mac', 'subnet_id'],
+      required: ['ip', 'mac', 'pool_name'],
       properties: {
         ip: { type: 'string', description: 'IPv4' },
         mac: { type: 'string', description: 'MAC (lowercase, có dấu `:`)' },
-        subnet_id: { type: 'number', description: 'Subnet ID' },
+        pool_name: { type: 'string', description: 'Tên pool Junos (VD: "V201")' },
         hostname: { type: 'string', description: 'Tùy chọn' },
       },
     },
   },
   readonly: false,
   requiresRole: 'OPERATOR',
-  confirmSummary: (args) => `Thêm DHCP lease: ${args.mac ?? '?'} → ${args.ip ?? '?'} (subnet ${args.subnet_id ?? '?'})`,
+  confirmSummary: (args) => `Ghim DHCP: ${args.mac ?? '?'} → ${args.ip ?? '?'} (pool ${args.pool_name ?? '?'})`,
 };
 
 const deleteDhcpLease: CatalogEntry = {
@@ -1637,7 +1635,7 @@ const deleteDhcpLease: CatalogEntry = {
   function: {
     name: 'delete_dhcp_lease',
     description:
-      'Xoá 1 DHCP lease (gọi lease4-del trên Kea). Thiết bị sẽ phải renew để lấy IP mới.',
+      'Xoá 1 DHCP lease (clear binding trên switch). Thiết bị sẽ phải renew để lấy IP mới.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1657,19 +1655,18 @@ const fixStaticReservation: CatalogEntry = {
   function: {
     name: 'fix_static_reservation',
     description:
-      'Ghim IP thành static reservation (vĩnh viễn): lưu vào Kea config ' +
-      '(config-set + config-write), tạo lease4-update. ' +
+      'Ghim IP thành static reservation trên switch: ghi vào config ' +
+      '`access address-assignment pool <P> family inet host <NAME> hardware-address <MAC> ip-address <IP>`. ' +
       'Sau khi ghim, MAC sẽ luôn nhận IP này.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['ip', 'mac', 'subnet_id'],
+      required: ['ip', 'mac', 'pool_name'],
       properties: {
         ip: { type: 'string' },
         mac: { type: 'string' },
-        subnet_id: { type: 'number' },
+        pool_name: { type: 'string', description: 'Tên pool Junos (VD: "V201")' },
         hostname: { type: 'string', description: 'Tùy chọn' },
-        note: { type: 'string', description: 'Note tự do (max 200 chars). VD: "Camera tầng 3"' },
       },
     },
   },
@@ -1683,20 +1680,20 @@ const wipeDhcpSubnet: CatalogEntry = {
   function: {
     name: 'wipe_dhcp_subnet',
     description:
-      'Xoá TẤT CẢ lease trong 1 subnet (gọi lease4-wipe trên Kea). ' +
+      'Xoá TẤT CẢ lease trong 1 pool (clear dhcp server binding interface <irb>). ' +
       'KHÔNG xoá static reservation. KHÔNG undo được. CẢNH BÁO user rõ ràng.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['subnet_id'],
+      required: ['pool_name'],
       properties: {
-        subnet_id: { type: 'number' },
+        pool_name: { type: 'string', description: 'Tên pool Junos (VD: "V201")' },
       },
     },
   },
   readonly: false,
   requiresRole: 'ADMIN',
-  confirmSummary: (args) => `WIPE toàn bộ lease subnet ${args.subnet_id ?? '?'} (KHÔNG UNDO)`,
+  confirmSummary: (args) => `WIPE toàn bộ lease pool ${args.pool_name ?? '?'} (KHÔNG UNDO)`,
 };
 
 const addDhcpSubnet: CatalogEntry = {
@@ -1704,32 +1701,32 @@ const addDhcpSubnet: CatalogEntry = {
   function: {
     name: 'add_dhcp_subnet',
     description:
-      'Tạo subnet DHCP mới trong Kea config (config-set + config-write). ' +
-      'Cần: subnet_id, subnet (CIDR), pool range, gateway, DNS, site, vlan. ' +
-      'CẢNH BÁO: thay đổi config Kea — sẽ áp dụng ngay, có thể ảnh hưởng DHCP server.',
+      'Tạo pool DHCP mới trên switch (Junos extended DHCP local server). ' +
+      'Cần: pool_name, subnet (CIDR), pool range, gateway, DNS, interface_name. ' +
+      'CẢNH BÁO: thay đổi config switch — sẽ áp dụng ngay, có thể ảnh hưởng DHCP server.',
     parameters: {
       type: 'object',
       additionalProperties: false,
-      required: ['subnet_id', 'subnet', 'pool_start', 'pool_end', 'gateway'],
+      required: ['pool_name', 'subnet', 'pool_start', 'pool_end', 'gateway', 'interface_name'],
       properties: {
-        subnet_id: { type: 'number', description: 'ID unique. VD: 100' },
+        pool_name: { type: 'string', description: 'Tên pool Junos. VD: "V205"' },
         subnet: { type: 'string', description: 'CIDR. VD: 10.20.1.0/24' },
         pool_start: { type: 'string', description: 'IP đầu pool. VD: 10.20.1.10' },
         pool_end: { type: 'string', description: 'IP cuối pool. VD: 10.20.1.254' },
         gateway: { type: 'string', description: 'Gateway. VD: 10.20.1.1' },
-        dns: { type: 'array', items: { type: 'string' }, description: 'DNS servers. Mặc định [8.8.8.8, 8.8.4.4]' },
-        site: { type: 'string', description: 'Site code' },
-        vlan: { type: 'number', description: 'VLAN ID' },
-        name: { type: 'string', description: 'Tên subnet. Mặc định: "subnet-<id>"' },
+        dns: { type: 'array', items: { type: 'string' }, description: 'DNS servers. Mặc định [8.8.8.8, 1.1.1.1]' },
+        domain_name: { type: 'string', description: 'Domain name tùy chọn' },
+        lease_time: { type: 'number', description: 'Lease time (giây). Mặc định 28800' },
+        interface_name: { type: 'string', description: 'IRB gắn pool. VD: "irb.201"' },
       },
     },
   },
   readonly: false,
   requiresRole: 'ADMIN',
   confirmSummary: (args) => {
-    const id = args.subnet_id ?? '?';
+    const id = args.pool_name ?? '?';
     const s = args.subnet ?? '?';
-    return `Thêm subnet DHCP ${id} (${s}) vào Kea`;
+    return `Thêm pool DHCP ${id} (${s})`;
   },
 };
 
@@ -2337,7 +2334,7 @@ const listNetboxIpAddresses: CatalogEntry = {
       'Dùng khi user hỏi "IP 10.10.20.50 nằm ở thiết bị nào trong NetBox" (dùng search), ' +
       '"thiết bị X có IP nào trong NetBox" (dùng netbox_device_id). ' +
       'LƯU Ý: tool này query IPAM của NetBox, KHÔNG phải DHCP lease. Để xem DHCP lease ' +
-      '(Kea), dùng list_dhcp_leases. ' +
+      '(switch), dùng list_dhcp_leases. ' +
       'Returns: mảng addresses.',
     parameters: {
       type: 'object',

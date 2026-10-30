@@ -1,13 +1,25 @@
 # Kea DHCP HA Multi-Site Design (DC + DR)
 
-> **Status:** Phase 1–2 partially implemented. The DC↔DR 1+1 hot-standby pair
-> exists on the dev/lab stack. **Prod runs standalone** (no DR host yet).
-> **Date:** 2026-09-17 (design), 2026-10-27 (standalone-mode contract)
+> **Status:** ⚠️ **OBSOLETE — 2026-10-30.** Kea was removed entirely and DHCP
+> now runs on the distribution switch (Junos extended DHCP local server).
+> There is **no HA**: no Kea container, no control agent, no DC↔DR pair, no
+> auto-failback. This file is kept for historical context only.
+>
+> **The current design lives in `backend/src/services/junosDhcp.ts`** (header
+> comment documents the Junos Evo platform quirks) and in gotcha #17/#18 of
+> `AGENTS.md`. See `docs/agents/20-dhcp-on-switch.md` for the replacement.
+>
+> **Date:** 2026-09-17 (design), 2026-10-27 (standalone-mode contract),
+> 2026-10-30 (obsoleted by the Kea removal)
 > **Author:** Agent review
 
 ---
 
-## Deployment topology contract (2026-10-27)
+## Historical: deployment topology contract (2026-10-27)
+
+> Everything in this section described the Kea container's env contract. It
+> no longer applies — there is no Kea container and no `KEA_*` env var in
+> `docker-compose.app.yml` any more.
 
 The backend and the Kea container must agree on whether a DR peer exists.
 Two env vars drive this, both set in `docker-compose.app.yml`:

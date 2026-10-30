@@ -1,6 +1,10 @@
 # NetConsole app stack for production server.
-# Kea DHCPv4 HA with hot-standby on Docker custom bridge.
-# DHCP relay from EVE-NG should send to private NIC 10.10.20.20:67 (not public IP).
+#
+# DHCP: Kea was removed on 2026-10-30. The DHCP server now runs on the
+# distribution switch (Junos extended DHCP local server, DS1). The
+# backend talks to it over RESTCONF/SSH — see
+# backend/src/services/junosDhcp.ts. There is no Kea container, no
+# control agent and no HA pair in this stack any more.
 #
 # Phase 1 + 2 changes (2026-10-14):
 #   * Backend now has healthcheck + stop_grace_period — docker compose
@@ -34,8 +38,6 @@ networks:
 
 volumes:
   netconsole_pgdata:
-  kea_dc_leases:
-  kea_dr_leases:
 
 services:
   postgres:
@@ -57,82 +59,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # kea-dc1 = DC primary → HA peer = kea-dr1 (DR site, Tailscale IP)
-  # Topology: 1+1 hot-standby. DC active, DR standby. Both bind :67 (DR
-  # only binds on promote). Switch relay points to both 10.10.20.20 (DC)
-  # and 10.10.20.30 (DR); the alive one responds.
-  #
-  # Peer URL = Tailscale IP of the DR host. Kea HA heartbeat goes via
-  # :8000 (control agent). Tailscale ensures reachability across the
-  # public Internet without opening ports on the public NIC.
-  kea-dc1:
-    build:
-      context: ./lab/kea
-    container_name: netconsole-kea-dc
-    hostname: kea-dc1
-    restart: unless-stopped
-    privileged: true
-    environment:
-      KEA_SERVER_NAME: kea-dc1
-      KEA_SERVER_URL: "${KEA_SERVER_URL:-10.10.20.20}"
-      KEA_SERVER_ROLE: "primary"
-      # KEA_HA_ENABLED (2026-10-22): prod sets this to "false" via .env so
-      # the container renders a standalone DHCP4 with NO libdhcp_ha hook.
-      # Reason: the DR host does not exist yet, and prod's kea-dc1 was
-      # pointed at the SAME peer (10.10.20.30) that the dev/lab VPS's
-      # kea-dc1 already uses as its partner -- two "primary" servers sharing
-      # one peer is an invalid hot-standby topology and the HA state machine
-      # stalls. Re-enable this (together with KEA_PEER_URL) in the same
-      # commit that builds the real DR server. Dev/lab leaves it unset ->
-      # defaults to "true", unchanged.
-      KEA_HA_ENABLED: "${KEA_HA_ENABLED:-true}"
-      KEA_PEER_NAME: kea-dr1
-      # DR control agent — reachable via DC's same lab subnet
-      # (10.10.20.0/24 is shared between the two VPSes). Kea HA heartbeat
-      # goes over :8001 (host port) on the DR's lab NIC, not :8000.
-      # Unused while KEA_HA_ENABLED=false.
-      KEA_PEER_URL: "${KEA_PEER_URL:-http://10.10.20.30:8001/}"
-      KEA_PEER_ROLE: standby
-      # Faster HA timing for failback in <30s. Trade-off: 2x heartbeat traffic.
-      KEA_HEARTBEAT_DELAY_MS: "5000"
-      KEA_MAX_RESPONSE_DELAY_MS: "10000"
-      KEA_MAX_ACK_DELAY_MS: "2000"
-      KEA_SEED_LEASES: "false"
-      KEA_DATA_MAP: ""
-      KEA_HOST_OCTET: "2"
-      DHCP_RELAY_VIA: "172.31.0.254"
-    volumes:
-      - kea_dc_leases:/var/lib/kea
-    networks:
-      netconsole:
-        ipv4_address: 172.31.0.10
-    ports:
-      # DC DHCP server — :67 on 10.10.20.20 (DC host's lab NIC).
-      # Switch DHCP helper-address includes this IP.
-      - "${KEA_HOST_IP:-10.10.20.20}:67:67/udp"
-      # Control agent for backend/dashboard/monitoring. Bound on the
-      # private NIC so the backend (172.31.0.3) and DR kea (via Tailscale)
-      # can both reach it without exposing on the public IP.
-      - "${KEA_HOST_IP:-10.10.20.20}:8001:8000"
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 25
-
-  # NOTE: kea-dr1 is NOT deployed on the DC host. It runs on the DR VPS
-  # (10.10.20.30) via docker-compose.kea-dr.yml. The DC kea-dc1 reaches
-  # it via the shared lab subnet using KEA_PEER_URL above. Lease
-  # replication happens over the same link via libdhcp_ha.so.
-  #
-  # If you need to run both kea-dc1 and kea-dr1 on the same host for
-  # local testing, use docker-compose.lab.yml (single-host variant) and
-  # override the peer URLs to the local Docker bridge IPs.
-
   # Redis cache layer (Phase 2 — 2026-10-14).
   # Used for:
   #   * hot-read cache on /api/devices (read-through, 30s TTL)
@@ -146,7 +72,8 @@ services:
     # service at the same IP — caused "failed to set up container networking:
     # Address already in use" on every deploy since commit 3adfd01.
     # .23 was free (allocted: .2 postgres, .3 backend, .5 frontend,
-    # .10/.11 kea, .20 netbox-postgres, .21 netbox-redis, .22 netbox).
+    # .10/.11 were the old kea IPs, .20 netbox-postgres, .21 netbox-redis,
+    # .22 netbox).
     image: redis:7-alpine
     container_name: netconsole-redis
     restart: unless-stopped
@@ -197,8 +124,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      kea-dc1:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://netconsole:netconsole@172.31.0.2:5432/netconsole?schema=public
@@ -272,33 +197,13 @@ services:
       NXOS_API_VERIFY_TLS: "false"
       NXOS_API_USER: ${NXOS_API_USER:?NXOS_API_USER must be set}
       NXOS_API_PASSWORD: ${NXOS_API_PASSWORD:?NXOS_API_PASSWORD must be set}
-      KEA_API_URL: http://172.31.0.10:8000/
-      # DR control agent — same lab subnet as DC (10.10.20.0/24 shared
-      # between the two VPSes via router/site-to-site). Container exposes
-      # 10.10.20.30:8001 (host) -> 8000 (container). Backend (172.31.0.3)
-      # reaches it through the host's routing table.
-      #
-      # Overridable via .env: on a deployment with NO DR site (prod), set
-      # KEA_HA_ENABLED=false — the backend then stops probing this URL
-      # entirely instead of talking to an unrelated Kea instance.
-      # NOTE: `${VAR-default}` (no colon) on purpose — an explicitly EMPTY
-      # value in .env must stay empty. `${VAR:-default}` would silently
-      # substitute the dev URL back in.
-      KEA_STANDBY_API_URL: ${KEA_STANDBY_API_URL-http://10.10.20.30:8001/}
-      KEA_TIMEOUT_MS: "5000"
-      # Mirrors the flag the kea-dc1 container uses to decide whether to
-      # load the libdhcp_ha hook. The backend MUST agree with the Kea
-      # server: a standalone Kea answers `ha-heartbeat` with result=3
-      # ("unsupported command"), which used to be read as "DC down" and
-      # handed the active site to a DR peer that was never configured.
-      KEA_HA_ENABLED: ${KEA_HA_ENABLED:-true}
-      # Auto-failback: when DC recovers after a failover, scheduler
-      # will call ha-switch-partner to swap primary back to DC.
-      # Disabled by default until the DR pair is deployed in production.
-      KEA_AUTO_FAILBACK: "true"
-      KEA_FAILBACK_STABILITY_SECONDS: "300"
-      KEA_FAILBACK_COOLDOWN_SECONDS: "3600"
-      KEA_FAILBACK_CHECK_INTERVAL_SECONDS: "30"
+      # DHCP server = the distribution switch (Junos extended DHCP local
+      # server). Kea was removed 2026-10-30, so there are no control-agent
+      # env vars any more — the backend reaches the switch over RESTCONF
+      # (8443) / SSH (22). Override DHCP_SERVER_HOST to point at a
+      # different switch (e.g. LAB-F6-DS-01).
+      DHCP_SERVER_HOST: "${DHCP_SERVER_HOST:-LAB-F6-DS-01}"
+      DHCP_SERVER_ENABLED: "true"
       # NetBox sync — set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable
       # the periodic sync. The worker reads NETBOX_URL / NETBOX_TOKEN
       # to know where to push. Both should be set; if either is empty
@@ -316,7 +221,7 @@ services:
       # from backend/worker. Every sync therefore failed silently (backend
       # logged "bulk sync applied: updated=0 failed=0" on every cycle, and
       # with 0 devices imported the failure never surfaced in the UI).
-      # Port 8080 inside the netbox container; 8001 is taken by kea's
+      # Port 8080 inside the netbox container; 8001 was the old kea
       # control channel on the host.
       # NetBox sync — SECURITY (C10, see docs/agents/16-security-audit-preprod.md):
       # tokens are now in `secrets.env`, not in this file. Reference via
@@ -384,11 +289,11 @@ services:
       # `10.10.20.0/24,127.0.0.0/8`). Anything from the public NIC
       # is dropped at the iptables level (see deploy.yml's "Open
       # iptables" step).
-      - "${KEA_HOST_IP:-10.10.20.20}:1514:1514/udp"
+      - "${LAB_HOST_IP:-10.10.20.20}:1514:1514/udp"
     # Resource cap (added 2026-09-18). Backend holds long-lived SSH
     # sockets for every interactive terminal session (one per WS
     # connection) — without a cap, a runaway admin or memory leak can
-    # starve Postgres / Kea / worker on the same VPS. cpus=1.5 still
+      # starve Postgres / worker on the same VPS. cpus=1.5 still
     # leaves headroom for collect jobs; 1g memory is ~5× the measured
     # peak (229MiB during ARP collect). Tuned via deploy.yml restart
     # if real workload pushes past these limits.
@@ -499,7 +404,7 @@ services:
       # `docker exec netbox-netbox python manage.py drf_create_token admin`.
       # Use the VPS public IP so the worker can reach NetBox through the
       # host port mapping (8080 → 8080 inside the netbox container).
-      # Port 8080 chosen because 8001 is occupied by kea-primary.
+      # Port 8080 chosen because 8001 was occupied by kea-primary.
       # SECURITY (C10): NETBOX_TOKEN pulled from secrets.env. The
       # worker reaches NetBox over the docker bridge at its static IP
       # 172.31.0.22 - NOT 127.0.0.1, which inside a container is the

@@ -15,7 +15,7 @@ export const CONFIG_TEMPLATES: ConfigTemplateMeta[] = [
   {
     id: 'dist',
     label: 'Distribution (L2/L3)',
-    description: 'SVI VLAN 201–203 (tầng 1–3), VRRP .254, DHCP relay → Kea, OSPF Area 10, RSTP',
+    description: 'SVI VLAN 201–203 (tầng 1–3), VRRP .254, DHCP server trên DS1, OSPF Area 10, RSTP',
   },
   {
     id: 'access',
@@ -82,7 +82,6 @@ function distTemplate(device: DeviceLike): string {
   const prio = isDs1 ? '200' : '100';
   const rstp = isDs1 ? '4k' : '8k';
   const role = isDs1 ? 'MASTER' : 'BACKUP';
-  const kea = '10.10.20.20';
 
   const svi = (vlan: number, floor: number) => {
     const ip = `10.1.${vlan}.${oct}`;
@@ -96,13 +95,48 @@ function distTemplate(device: DeviceLike): string {
       `set interfaces irb unit ${vlan} family inet address ${ip}/24 vrrp-group ${vlan} priority ${prio}`,
       `set interfaces irb unit ${vlan} family inet address ${ip}/24 vrrp-group ${vlan} preempt`,
       `set interfaces irb unit ${vlan} family inet address ${ip}/24 vrrp-group ${vlan} accept-data`,
-      `set forwarding-options helpers bootp interface irb.${vlan}`,
     ].join('\n');
   };
 
+  /**
+   * DHCP runs on DS1 as a Junos extended DHCP local server.
+   * DS2 is a backup distribution switch with NO DHCP config at all — no
+   * relay (the old `forwarding-options helpers bootp` to Kea is gone).
+   */
+  const dhcpServer = isDs1
+    ? [
+        '## --- DHCP server (Junos extended DHCP local server) ---',
+        'set system services dhcp-local-server group NETCONSOLE-DHCP interface irb.201',
+        'set system services dhcp-local-server group NETCONSOLE-DHCP interface irb.202',
+        'set system services dhcp-local-server group NETCONSOLE-DHCP interface irb.203',
+        'set system services dhcp-local-server group NETCONSOLE-DHCP interface irb.204',
+        'set access address-assignment pool V201 family inet network 10.1.201.0/24',
+        'set access address-assignment pool V201 family inet range V201R low 10.1.201.10 high 10.1.201.254',
+        'set access address-assignment pool V201 family inet dhcp-attributes router 10.1.201.254',
+        'set access address-assignment pool V201 family inet dhcp-attributes name-server 10.10.20.20',
+        'set access address-assignment pool V201 family inet dhcp-attributes maximum-lease-time 28800',
+        'set access address-assignment pool V202 family inet network 10.1.202.0/24',
+        'set access address-assignment pool V202 family inet range V202R low 10.1.202.10 high 10.1.202.254',
+        'set access address-assignment pool V202 family inet dhcp-attributes router 10.1.202.254',
+        'set access address-assignment pool V202 family inet dhcp-attributes name-server 10.10.20.20',
+        'set access address-assignment pool V202 family inet dhcp-attributes maximum-lease-time 28800',
+        'set access address-assignment pool V203 family inet network 10.1.203.0/24',
+        'set access address-assignment pool V203 family inet range V203R low 10.1.203.10 high 10.1.203.254',
+        'set access address-assignment pool V203 family inet dhcp-attributes router 10.1.203.254',
+        'set access address-assignment pool V203 family inet dhcp-attributes name-server 10.10.20.20',
+        'set access address-assignment pool V203 family inet dhcp-attributes maximum-lease-time 28800',
+        'set access address-assignment pool V204 family inet network 10.1.204.0/24',
+        'set access address-assignment pool V204 family inet range V204R low 10.1.204.10 high 10.1.204.254',
+        'set access address-assignment pool V204 family inet dhcp-attributes router 10.1.204.254',
+        'set access address-assignment pool V204 family inet dhcp-attributes name-server 10.10.20.20',
+        'set access address-assignment pool V204 family inet dhcp-attributes maximum-lease-time 28800',
+        '## --- end DHCP server ---',
+      ].join('\n')
+    : '## DS2 carries no DHCP config — DS1 is the only DHCP server.';
+
   return `## ${device.name} (${device.ip}) — Distribution ${role}
 ## Keep mgmt: vlan mgmt / irb.10 / ge-0/0/9 — do not delete.
-## Client VLAN 201/202/203 = Tang 1/2/3. GW VIP .254. DHCP relay ${kea}
+## Client VLAN 201/202/203 = Tang 1/2/3. GW VIP .254. DHCP server on DS1.
 
 set interfaces lo0 unit 0 family inet address ${lo}/32
 set routing-options router-id ${lo}
@@ -131,9 +165,7 @@ ${svi(201, 1)}
 ${svi(202, 2)}
 ${svi(203, 3)}
 
-set forwarding-options helpers bootp description "DHCP relay to Kea"
-set forwarding-options helpers bootp server ${kea}
-set forwarding-options helpers bootp relay-agent-option
+${dhcpServer}
 
 set protocols ospf area 0.0.0.10 interface lo0.0 passive
 set protocols ospf area 0.0.0.10 interface irb.201 passive

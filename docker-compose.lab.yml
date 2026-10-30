@@ -1,7 +1,9 @@
 # Blank managed lab — topology wired, NO device dataplane config.
 # Devices: mgmt IP + SSH/REST (admin/Admin@123, root/Juniper) for NetConsole manage.
 # Push OSPF/VRRP/VLAN/DHCP-relay/etc. from the app later.
-# Kea + app stack unchanged (HA on mgmt).
+# DHCP: served by the distribution switch itself (Junos extended DHCP local
+# server) — Kea was removed 2026-10-30, there is no DHCP container and no
+# HA pair any more.
 
 networks:
   lab-net:
@@ -66,8 +68,6 @@ networks:
 
 volumes:
   netconsole_pgdata:
-  kea_primary_leases:
-  kea_standby_leases:
   frontend_node_modules:
 
 x-dhcp-pc: &dhcp_pc
@@ -345,102 +345,42 @@ services:
       - "127.0.0.1:8445:8445"
       - "127.0.0.1:8446:8446"
 
-  kea-dhcp1:
-    build:
-      context: ./lab/kea
-    container_name: lab-kea-primary
-    hostname: kea-primary
-    restart: unless-stopped
-    privileged: true
-    environment:
-      KEA_SERVER_NAME: kea-primary
-      KEA_SEED_LEASES: "false"
-      KEA_DATA_MAP: ""
-      KEA_HOST_OCTET: "2"
-    volumes: [kea_primary_leases:/var/lib/kea]
-    networks:
-      lab-net:
-        ipv4_address: 172.30.0.21
-    ports: ["8001:8000"]
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 25
-
-  kea-dhcp2:
-    build:
-      context: ./lab/kea
-    container_name: lab-kea-standby
-    hostname: kea-standby
-    restart: unless-stopped
-    environment:
-      KEA_SERVER_NAME: kea-standby
-      KEA_SEED_LEASES: "false"
-      KEA_DATA_MAP: ""
-      KEA_HOST_OCTET: "3"
-    volumes: [kea_standby_leases:/var/lib/kea]
-    networks:
-      lab-net:
-        ipv4_address: 172.30.0.22
-    ports: ["8002:8000"]
-    depends_on: [kea-dhcp1]
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf -X POST http://127.0.0.1:8000/ -H 'Content-Type: application/json' -d '{\"command\":\"version-get\",\"service\":[\"dhcp4\"]}' >/dev/null",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 25
-
   # PCs wait for DHCP after you push relay/VRRP/SVI from the app
   vpc5:
     <<: *dhcp_pc
     container_name: lab-vpc5
     hostname: VPC5
     networks: [vlan201]
-    depends_on: [kea-dhcp1]
 
   vpc10:
     <<: *dhcp_pc
     container_name: lab-vpc10
     hostname: VPC10
     networks: [vlan201]
-    depends_on: [kea-dhcp1]
 
   vpc6:
     <<: *dhcp_pc
     container_name: lab-vpc6
     hostname: VPC6
     networks: [vlan202]
-    depends_on: [kea-dhcp1]
 
   vpc11:
     <<: *dhcp_pc
     container_name: lab-vpc11
     hostname: VPC11
     networks: [vlan202]
-    depends_on: [kea-dhcp1]
 
   vpc9:
     <<: *dhcp_pc
     container_name: lab-vpc9
     hostname: VPC9
     networks: [vlan203]
-    depends_on: [kea-dhcp1]
 
   vpc12:
     <<: *dhcp_pc
     container_name: lab-vpc12
     hostname: VPC12
     networks: [vlan203]
-    depends_on: [kea-dhcp1]
 
   backend:
     build:
@@ -451,8 +391,6 @@ services:
       postgres:
         condition: service_healthy
       sw-core-01:
-        condition: service_healthy
-      kea-dhcp1:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://netconsole:netconsole@postgres:5432/netconsole?schema=public
@@ -465,9 +403,11 @@ services:
       LAB_SSH_PORT: "22"
       MAC_COLLECT_INTERVAL_SECONDS: "120"
       ARP_COLLECT_INTERVAL_SECONDS: "120"
-      KEA_API_URL: http://kea-dhcp1:8000/
-      KEA_STANDBY_API_URL: http://kea-dhcp2:8000/
-      KEA_TIMEOUT_MS: "5000"
+      # DHCP server = the distribution switch (Junos extended DHCP local
+      # server). Kea was removed 2026-10-30. In this lab stack the
+      # simulated DS1 answers the same RESTCONF/SSH shape.
+      DHCP_SERVER_HOST: "${DHCP_SERVER_HOST:-sw-ds-01}"
+      DHCP_SERVER_ENABLED: "true"
     ports: ["3000:3000"]
     networks: [lab-net]
 

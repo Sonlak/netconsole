@@ -13,17 +13,17 @@ import type { DhcpDashboard } from '@/types/dhcp';
 import { errorMessage } from '@/lib/errors';
 
 /**
- * KeaSummary — replaces the original "Kea HA / pool pressure" tile with a
- * richer mini-dashboard that actually uses the data the API already returns.
+ * DhcpSummary — mini-dashboard for the DHCP tile on the main dashboard.
  *
  * Layout:
- *   - Banner: HA mode + active peer (uses dhcp.ha.{mode,active,peers}).
- *   - 4-stat strip: sites · pools · leased · poolSize (uses dhcp.totals).
+ *   - Server banner: which switch serves DHCP + reachability.
+ *   - 4-stat strip: pools · leased · poolSize · utilization.
  *   - Top 3 hottest pools as proportional progress bars.
- *   - Error state if the API call failed; empty state if Kea is reachable
- *     but returned no pools.
+ *
+ * The Kea HA banner is gone — the distribution switch is the only
+ * DHCP server (no DC↔DR pair, no failover state).
  */
-export function KeaSummary({
+export function DhcpSummary({
   data,
   error,
   loading,
@@ -45,8 +45,8 @@ export function KeaSummary({
 
   if (error && !data) {
     return (
-      <div className="nc-kea-summary">
-        <Header href={href} title="Kea DHCP" />
+      <div className="nc-dhcp-summary">
+        <Header href={href} title="DHCP" />
         <Alert
           type="error"
           showIcon
@@ -54,7 +54,7 @@ export function KeaSummary({
           description={errorMessage(error)}
           action={
             reload ? (
-              <a onClick={reload} className="nc-kea-retry">
+              <a onClick={reload} className="nc-dhcp-retry">
                 Retry
               </a>
             ) : null
@@ -67,9 +67,9 @@ export function KeaSummary({
 
   if (!data) {
     return (
-      <div className="nc-kea-summary">
-        <Header href={href} title="Kea DHCP" />
-        <div className="nc-kea-empty">
+      <div className="nc-dhcp-summary">
+        <Header href={href} title="DHCP" />
+        <div className="nc-dhcp-empty">
           <WifiOutlined />
           <Typography.Text type="secondary">
             {loading ? 'Loading DHCP dashboard…' : 'DHCP not attached'}
@@ -80,46 +80,33 @@ export function KeaSummary({
   }
 
   return (
-    <div className="nc-kea-summary">
-      <Header href={href} title="Kea DHCP" />
+    <div className="nc-dhcp-summary">
+      <Header href={href} title="DHCP" />
 
-      <div className="nc-kea-ha">
-        <Typography.Text type="secondary" className="nc-kea-ha-label">
-          HA mode · <span className="nc-kea-ha-mode">{data.ha.mode}</span>
-          {data.ha.active ? (
-            <>
-              {' · '}
-              <span className={`nc-kea-ha-active nc-kea-ha-active-${data.ha.active.toLowerCase()}`}>
-                {data.ha.active} active
-              </span>
-            </>
-          ) : null}
+      <div className="nc-dhcp-ha">
+        <Typography.Text type="secondary" className="nc-dhcp-ha-label">
+          Server ·{' '}
+          <span className="nc-dhcp-ha-mode">{data.server?.name ?? 'unknown'}</span>
         </Typography.Text>
-        <div className="nc-kea-peers">
-          {(data.ha.peers ?? []).map((peer) => (
-            <Tooltip
-              key={peer.name}
-              title={`${peer.site} · ${peer.url}${peer.state ? ` · ${peer.state}` : ''}`}
-            >
-              <div className="nc-kea-peer">
-                <StatusDot meta={peerStatusMeta(peer.reachable)} />
-                <div className="nc-kea-peer-meta">
-                  <span className="nc-kea-peer-name">{peer.site}</span>
-                  <span className="nc-kea-peer-role">
-                    {peer.state || peer.role}
-                    {data.ha.active === peer.site ? ' · active' : ''}
-                  </span>
-                </div>
+        <div className="nc-dhcp-peers">
+          <Tooltip title={`${data.server?.host ?? ''} · ${data.server?.source ?? ''}`}>
+            <div className="nc-dhcp-peer">
+              <StatusDot meta={peerStatusMeta(data.server?.reachable ?? false)} />
+              <div className="nc-dhcp-peer-meta">
+                <span className="nc-dhcp-peer-name">{data.server?.name ?? '—'}</span>
+                <span className="nc-dhcp-peer-role">
+                  {data.server?.reachable ? 'reachable' : 'unreachable'}
+                </span>
               </div>
-            </Tooltip>
-          ))}
+            </div>
+          </Tooltip>
         </div>
       </div>
 
-      <div className="nc-kea-stats">
-        <Stat label="Sites" value={totals.sites} />
+      <div className="nc-dhcp-stats">
         <Stat label="Pools" value={totals.pools} />
         <Stat label="Leased" value={totals.leased} />
+        <Stat label="Pool size" value={totals.poolSize} />
         <Stat
           label="Pool util"
           value={`${utilization}%`}
@@ -128,16 +115,16 @@ export function KeaSummary({
       </div>
 
       {hottestPools.length > 0 ? (
-        <div className="nc-kea-pools">
-          <Typography.Text type="secondary" className="nc-kea-pools-label">
+        <div className="nc-dhcp-pools">
+          <Typography.Text type="secondary" className="nc-dhcp-pools-label">
             <ClusterOutlined style={{ marginRight: 6 }} />
             Hottest pools
           </Typography.Text>
-          <ul className="nc-kea-pools-list">
+          <ul className="nc-dhcp-pools-list">
             {hottestPools.map((pool) => (
-              <li key={`${pool.site}-${pool.subnetId}`}>
-                <Link to={`/dhcp?site=${pool.site}&pool=${pool.subnetId}`} className="nc-kea-pool-row">
-                  <span className="nc-kea-pool-name">{pool.site} · {pool.name}</span>
+              <li key={`${pool.site}-${pool.poolName}`}>
+                <Link to={`/dhcp?site=${pool.site}&pool=${pool.poolName}`} className="nc-dhcp-pool-row">
+                  <span className="nc-dhcp-pool-name">{pool.site} · {pool.name}</span>
                   <Progress
                     percent={pool.utilization}
                     size="small"
@@ -167,12 +154,12 @@ export function KeaSummary({
 
 function Header({ href, title }: { href: string; title: string }) {
   return (
-    <div className="nc-kea-head">
+    <div className="nc-dhcp-head">
       <Typography.Text strong>
         <ApiOutlined style={{ marginRight: 6 }} />
         {title}
       </Typography.Text>
-      <Link to={href} className="nc-kea-cta">
+      <Link to={href} className="nc-dhcp-cta">
         Open DHCP <ArrowRightOutlined />
       </Link>
     </div>
@@ -189,9 +176,9 @@ function Stat({
   tone?: 'default' | 'success' | 'warning' | 'error';
 }) {
   return (
-    <div className="nc-kea-stat">
-      <div className="nc-kea-stat-label">{label}</div>
-      <div className={`nc-kea-stat-value${tone !== 'default' ? ` is-${tone}` : ''}`}>{value}</div>
+    <div className="nc-dhcp-stat">
+      <div className="nc-dhcp-stat-label">{label}</div>
+      <div className={`nc-dhcp-stat-value${tone !== 'default' ? ` is-${tone}` : ''}`}>{value}</div>
     </div>
   );
 }

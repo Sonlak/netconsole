@@ -14,7 +14,7 @@ import { fetchJobs } from '@/api/jobs';
 import { ActivityFeed, buildActivityItems } from '@/components/dashboard/ActivityFeed';
 import { FabricMiniMap } from '@/components/dashboard/FabricMiniMap';
 import { HeroLink, HeroStatusBanner } from '@/components/dashboard/HeroStatusBanner';
-import { KeaSummary } from '@/components/dashboard/KeaSummary';
+import { DhcpSummary } from '@/components/dashboard/DhcpSummary';
 import { MetricCard } from '@/components/dashboard/MetricCard';
 import { EmptyState } from '@/components/common/EmptyState';
 import { ErrorState } from '@/components/common/ErrorState';
@@ -36,7 +36,7 @@ const AUTO_REFRESH_MS = 15000;
 /**
  * Site health severity used by the hero banner.
  *
- *  err    — at least one critical offline device or Kea peer unreachable.
+ *  err    — at least one critical offline device or the DHCP server unreachable.
  *  warn   — at least one offline device, pool at warning, or failed jobs.
  *  ok     — nothing in the loaded window.
  *
@@ -149,7 +149,7 @@ export default function DashboardPage() {
       buildActivityItems({
         healthError,
         dhcpError,
-        dhcpHaPeers: dhcp?.ha?.peers ?? [],
+        dhcpServer: dhcp?.server ?? null,
         devices: scoped,
         failedJobs,
         dhcpPools: dhcp?.pools ?? [],
@@ -160,7 +160,7 @@ export default function DashboardPage() {
   // Hero severity — fail-soft: if we cannot confirm green we say warn.
   const heroSeverity: HeroSeverity = useMemo(() => {
     if (healthError) return 'err';
-    if (dhcp?.ha?.peers?.some((p) => !p.reachable)) return 'err';
+    if (dhcp && !dhcp.server?.reachable) return 'err';
     const offline = stats.offline;
     const anyFailed = failedJobs.length > 0;
     const anyPoolHigh = (dhcp?.pools ?? []).some((p) => p.utilization >= 85);
@@ -267,19 +267,19 @@ export default function DashboardPage() {
           {dhcp ? (
             <HealthChip
               icon={<WifiOutlined />}
-              label="Kea"
-              failed={dhcp.ha.peers.some((p) => !p.reachable)}
+              label="DHCP"
+              failed={!dhcp.server?.reachable}
               text={
-                dhcp.ha.active
-                  ? `${dhcp.ha.mode} · ${dhcp.ha.active} active`
-                  : dhcp.ha.peers.every((p) => p.reachable)
-                    ? 'All peers reachable'
-                    : 'Peer unreachable'
+                dhcp.server?.reachable
+                  ? `${dhcp.server.name} · reachable`
+                  : 'Server unreachable'
               }
-              peerDots={dhcp.ha.peers.map((p) => ({ name: p.name, meta: peerStatusMeta(p.reachable) }))}
+              peerDots={[
+                { name: dhcp.server?.name ?? 'dhcp', meta: peerStatusMeta(dhcp.server?.reachable ?? false) },
+              ]}
             />
           ) : (
-            <HealthChip icon={<WifiOutlined />} label="Kea" text={widgetsLoading ? '…' : '—'} />
+            <HealthChip icon={<WifiOutlined />} label="DHCP" text={widgetsLoading ? '…' : '—'} />
           )}
           <RefreshIndicator refreshing={devicesRefreshing || widgetsLoading} lastUpdatedAt={lastUpdatedAt} />
         </Flex>
@@ -418,11 +418,11 @@ export default function DashboardPage() {
           {dhcpError && !dhcp ? (
             <ErrorState title="DHCP unavailable" error={dhcpError} onRetry={() => void loadWidgets()} />
           ) : dhcp ? (
-            <KeaSummary data={dhcp} error={null} loading={widgetsLoading && !dhcpLoaded} reload={() => void loadWidgets(true)} />
+            <DhcpSummary data={dhcp} error={null} loading={widgetsLoading && !dhcpLoaded} reload={() => void loadWidgets(true)} />
           ) : widgetsLoading && !dhcpLoaded ? (
             <PageSkeleton />
           ) : (
-            <EmptyState title="DHCP not attached" description="Kea dashboard has no data yet." />
+            <EmptyState title="DHCP not attached" description="DHCP dashboard has no data yet." />
           )}
         </Card>
       </div>

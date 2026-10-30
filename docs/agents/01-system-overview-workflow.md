@@ -341,7 +341,7 @@ backend/src/
 │   ├── eosApi.ts           # Arista EOS API client
 │   ├── iosxeRest.ts        # Cisco IOS-XE RESTCONF client
 │   ├── junosRest.ts        # Juniper Junos REST API client
-│   ├── keaDhcp.ts          # Kea DHCP REST API client
+│   ├── junosDhcp.ts          # Junos DHCP local server client (was keaDhcp.ts)
 │   │
 │   └── labSsh.ts           # Lab device SSH (for Web terminal)
 │

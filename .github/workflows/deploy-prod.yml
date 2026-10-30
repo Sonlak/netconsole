@@ -40,7 +40,7 @@ env:
   COMPOSE_FILE: /opt/netconsole/docker-compose.app.yml
   NETBOX_COMPOSE_FILE: /opt/netconsole/docker-compose.netbox.yml
   COMPOSE_PROJECT: netconsole
-  DEPLOY_SERVICES: "backend worker frontend redis kea-dc1"
+  DEPLOY_SERVICES: "backend worker frontend redis"
 
 jobs:
   deploy:
@@ -224,42 +224,26 @@ jobs:
           : > "$DEPLOY_DIR/.env"
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> "$DEPLOY_DIR/.env"
           echo "OPENAI_MODEL=gpt-4o-mini" >> "$DEPLOY_DIR/.env"
-          # Lab-NIC IP of THIS host (prod). docker-compose.app.yml publishes
-          # kea DHCP :67, kea ctrl-agent :8001 and the backend syslog :1514
-          # on ${KEA_HOST_IP}. Hardcoded to the dev VPS's 10.10.20.20, Docker
-          # refuses to bind it here ("cannot assign requested address") and
-          # kea-dc1 never starts -> backend (depends_on kea healthy) never
-          # starts -> deploy fails. Dev keeps the default (10.10.20.20).
+          # LAB_HOST_IP (2026-10-30): the backend syslog receiver :1514
+          # is published on ${LAB_HOST_IP}. Hardcoded to the dev VPS's
+          # 10.10.20.20, Docker refuses to bind it here ("cannot assign
+          # requested address") and the backend never starts.
           #
-          # CHANGED 2026-10-22: the switch's DHCP relay points at
+          # The value must stay in sync with the switch's syslog target
+          # and with the iptables allowlist below.
+          #
+          # CHANGED 2026-10-22: the switch's syslog target is
           # 192.168.81.171 (ens33, the LAN office NIC) - NOT the lab NIC
           # 10.10.20.40. Verified on the host:
-          #   ens33 = 192.168.81.171/24   <- LAN văn phòng (relay target)
-          #   ens34 = 10.10.20.40/24       <- lab subnet (peer + syslog src)
-          # The old value 10.10.20.40 published DHCP on the wrong NIC, so
-          # the switch could never reach the relay helper address.
-          echo "KEA_HOST_IP=192.168.81.171" >> "$DEPLOY_DIR/.env"
-          # Kea HA "this server" URL - the peer uses it to reach us.
-          echo "KEA_SERVER_URL=192.168.81.171" >> "$DEPLOY_DIR/.env"
-          # KEA_HA_ENABLED=false (2026-10-22): prod's kea-dc1 runs as a
-          # STANDALONE DHCP4 server - the libdhcp_ha hook is not loaded.
-          #
-          # Why: the DR host does not exist yet, and prod's kea-dc1 was
-          # pointed at 10.10.20.30 - the SAME peer the dev/lab VPS's
-          # kea-dc1 already uses. Two servers both configured as `primary`
-          # sharing one peer is an invalid hot-standby topology; Kea flags
-          # the peer mismatch and the state machine stalls. The operator
-          # confirmed: prod runs standalone until the DR server is built.
-          # Re-enable (together with KEA_PEER_URL) in the same commit that
-          # brings up the DR host.
-          echo "KEA_HA_ENABLED=false" >> "$DEPLOY_DIR/.env"
-          # KEA_STANDBY_API_URL= (2026-10-27): prod has NO DR peer, so the
-          # backend must not have one to talk to. The compose default points
-          # at 10.10.20.30 - the DEV lab host - so with the default in place
-          # the prod backend probed the dev server's Kea, reported it as a
-          # live "DR active" peer, and logged bogus failover events. Empty
-          # value (compose uses ${VAR-default}, no colon) keeps it empty.
-          echo "KEA_STANDBY_API_URL=" >> "$DEPLOY_DIR/.env"
+          #   ens33 = 192.168.81.171/24   <- LAN văn phòng
+          #   ens34 = 10.10.20.40/24       <- lab subnet (syslog src)
+          echo "LAB_HOST_IP=192.168.81.171" >> "$DEPLOY_DIR/.env"
+          # DHCP_SERVER_HOST (2026-10-30): Kea was removed — the DHCP
+          # server now runs on the distribution switch (Junos extended
+          # DHCP local server). The backend reads pools/leases over
+          # RESTCONF/SSH from this host. Point it at the DS that runs
+          # `set system services dhcp-local-server`.
+          echo "DHCP_SERVER_HOST=LAB-F6-DS-01" >> "$DEPLOY_DIR/.env"
           # OPENAI_PROXY_URL (2026-10-29): prod has NO direct internet
           # egress — every outbound connection must go through the site
           # HTTP proxy (see /etc/environment + /etc/profile.d/proxy.sh on
@@ -289,7 +273,7 @@ jobs:
           fi
 
           # Syslog ingress filter (M1). Devices send syslog to the
-          # published :1514 on ${KEA_HOST_IP}. CHANGED 2026-10-22: the
+          # published :1514 on ${LAB_HOST_IP}. CHANGED 2026-10-22: the
           # published address moved from 10.10.20.40 to 192.168.81.171,
           # and the real device fleet sits on the office LAN
           # 192.168.81.0/24 - so BOTH subnets must be allowed, otherwise
@@ -433,43 +417,28 @@ jobs:
             echo "Frontend HTTPS $code"; docker logs --tail 30 netconsole-frontend || true; exit 1
           fi
 
-      - name: Verify kea + postgres untouched
+      - name: Verify postgres untouched
         run: |
           docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" \
-            --filter "name=netconsole-kea-primary" --filter "name=netconsole-kea-standby" \
             --filter "name=netconsole-postgres" \
             --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
 
-      - name: Verify prod Kea serves no lab subnets
+      - name: Verify DHCP server reachable from the backend
         run: |
           set -euo pipefail
-          # 2026-10-28: prod used to serve the LAB subnet list
-          # (10.1.201.0/24 ... 10.1.204.0/24) because the list was baked
-          # into the image template, so the prod console showed the dev
-          # pools. The list now comes from lab/kea/subnets.prod.json.
-          # This step fails the deploy if any lab subnet reappears.
-          LAB_SUBNETS="10.1.201. 10.1.202. 10.1.203. 10.1.204."
-          # The control agent is published on ${KEA_HOST_IP}:8001 (not on
-          # 127.0.0.1), so probe it INSIDE the container where it listens
-          # on 127.0.0.1:8000.
-          RESP="$(docker exec netconsole-kea-dc curl -sf --max-time 5 -X POST http://127.0.0.1:8000/ \
-            -H 'Content-Type: application/json' \
-            -d '{"command":"config-get","service":["dhcp4"]}' 2>/dev/null || true)"
-          if [ -z "$RESP" ]; then
-            echo "::warning::Kea control agent not answering on 127.0.0.1:8001 — skipping subnet check"
-            exit 0
+          # 2026-10-30: Kea was removed — DHCP runs on the distribution
+          # switch (Junos extended DHCP local server). This probe asks the
+          # backend for the DHCP dashboard; a failure here means the switch
+          # is unreachable or has no DHCP pool configured.
+          RESP="$(docker exec netconsole-backend node -e "
+            const { getDhcpDashboard } = await import('/app/dist/services/junosDhcp.js');
+            const d = await getDhcpDashboard();
+            console.log(JSON.stringify({ server: d.server, pools: d.pools.length }));
+          " 2>&1 || true)"
+          echo "$RESP"
+          if ! echo "$RESP" | grep -q '"pools"'; then
+            echo "::warning::backend could not read the DHCP dashboard from the switch — check DHCP_SERVER_HOST"
           fi
-          echo "$RESP" > /tmp/kea-config.json
-          POOL_SUBNETS="$(python3 -c "import json;d=json.load(open('/tmp/kea-config.json'));print(chr(10).join(s.get('subnet','') for s in d[0].get('arguments',{}).get('Dhcp4',{}).get('subnet4',[])))" 2>/dev/null || true)"
-          echo "Configured subnets:"
-          echo "${POOL_SUBNETS:-<none>}"
-          for bad in $LAB_SUBNETS; do
-            if echo "$POOL_SUBNETS" | grep -q "$bad"; then
-              echo "::error::prod Kea is serving LAB subnet $bad — aborting deploy"
-              exit 1
-            fi
-          done
-          echo "OK: no lab subnets configured on prod"
 
       - name: Verify AI assistant can reach OpenAI
         run: |
@@ -596,14 +565,6 @@ jobs:
           - service: frontend
             context: frontend
             dockerfile: frontend/Dockerfile.prod
-          # kea is built here instead of on the VPS: the production VPS has
-          # no direct internet egress, and Docker does not forward the
-          # client's proxy env into `docker build`, so a local kea build
-          # on the runner cannot run `apt-get update` (see
-          # docker-compose.app.prod.yml for the full explanation).
-          - service: kea
-            context: lab/kea
-            dockerfile: lab/kea/Dockerfile
 
     steps:
       - uses: actions/checkout@v4

@@ -1,31 +1,25 @@
+import { Router } from 'express';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
 import {
-  startKeccFailbackScheduler,
-  stopKeaFailbackScheduler,
-  triggerKeaFailbackCheck,
-  getAutoFailbackStatus,
-  setAutoFailbackEnabled,
-  type KEA_FAILBACK_RUNTIME,
-} from '../services/keaFailback.js';
-import {
-  type KeaTarget,
-  addDhcpReservation,
+  addDhcpLease,
   addDhcpSubnet,
   deleteDhcpLease,
   deleteDhcpSubnet,
+  dhcpServerHost,
   fixStaticReservation,
   getDhcpDashboard,
-  getHaState,
-  isDrConfigured,
   listDhcpLeases,
-  switchHaPartner,
   unfixStaticReservation,
-  wipeDhcpSubnet,
-} from '../services/keaDhcp.js';
-import { authMiddleware, requireRole } from '../middleware/auth.js';
-import { Router } from 'express';
+  wipeDhcpPool,
+} from '../services/junosDhcp.js';
 
 export const dhcpRouter = Router();
 
+/**
+ * DHCP is served by the distribution switch (Junos extended DHCP local
+ * server). There is no HA pair any more, so the dashboard is a single
+ * round-trip that reads the pools + bindings straight from the switch.
+ */
 dhcpRouter.get('/dashboard', async (_req, res) => {
   try {
     res.json(await getDhcpDashboard());
@@ -37,119 +31,27 @@ dhcpRouter.get('/dashboard', async (_req, res) => {
 });
 
 /**
- * Detailed HA state snapshot for the operator UI. Includes the auto-failback
- * status (in-memory) so the dashboard can show "auto-failback: ON" and
- * "last failback: 2h ago" in one round-trip.
+ * The DHCP server identity + reachability. Replaces the old Kea
+ * DC↔DR `ha-state` endpoint.
  */
-dhcpRouter.get('/ha-state', async (_req, res) => {
+dhcpRouter.get('/server', async (_req, res) => {
   try {
-    const haState = await getHaState();
-    const autoFailback = getAutoFailbackStatus();
-    res.json({ ha: haState, autoFailback });
+    const dashboard = await getDhcpDashboard();
+    res.json({ server: dashboard.server, totals: dashboard.totals });
   } catch (error) {
     res.status(502).json({
-      error: error instanceof Error ? error.message : 'Failed to load HA state',
+      error: error instanceof Error ? error.message : 'Failed to load DHCP server state',
     });
   }
 });
 
 /**
- * Manual HA switchover. Operator picks the CURRENT primary; the API
- * sends `ha-switch-partner` to that site, which gracefully demotes it
- * and promotes the other site. Brief ~1-3s gap where no server serves.
- *
- * Body: { currentPrimary: 'DC' | 'DR' }
- *
- * Use case:
- *   - DC recovered but auto-failback disabled → ops can trigger manually
- *   - DR is being decommissioned → switch back to DC first
- *   - Testing / drill
+ * List leases. Optional `pool` filter (Junos pool name, e.g. "V201").
  */
-dhcpRouter.post('/switchover', authMiddleware, requireRole('ADMIN'), async (req, res) => {
-  const body = req.body as { currentPrimary?: string };
-  if (body.currentPrimary !== 'DC' && body.currentPrimary !== 'DR') {
-    res.status(400).json({ error: 'currentPrimary must be "DC" or "DR"' });
-    return;
-  }
-  // 400 (not 502): there is no DR peer to switch over to on a standalone
-  // deployment. This is a configuration state, not an upstream failure.
-  if (!isDrConfigured()) {
-    res.status(400).json({
-      error:
-        'Kea HA is not configured on this deployment — no DR peer. ' +
-        'Set KEA_STANDBY_API_URL and enable the libdhcp_ha hook first.',
-    });
-    return;
-  }
-  try {
-    const result = await switchHaPartner(body.currentPrimary);
-    if (result.result !== 0) {
-      res.status(502).json({
-        error: result.text || 'Kea rejected ha-switch-partner',
-        result,
-      });
-      return;
-    }
-    res.json({ ok: true, result });
-  } catch (error) {
-    res.status(502).json({
-      error: error instanceof Error ? error.message : 'Switchover failed',
-    });
-  }
-});
-
-/**
- * Get current auto-failback state.
- */
-dhcpRouter.get('/auto-failback', async (_req, res) => {
-  res.json(getAutoFailbackStatus());
-});
-
-/**
- * Enable / disable auto-failback at runtime (no backend restart needed).
- * Body: { enabled: boolean }
- *
- * When enabled: scheduler polls every 30s, calls ha-switch-partner when
- *   DC is healthy and DR has been active for the stability window.
- * When disabled: scheduler still runs but never triggers a switchover.
- */
-dhcpRouter.post('/auto-failback', authMiddleware, requireRole('ADMIN'), async (req, res) => {
-  const body = req.body as { enabled?: boolean };
-  if (typeof body.enabled !== 'boolean') {
-    res.status(400).json({ error: 'enabled (boolean) is required' });
-    return;
-  }
-  setAutoFailbackEnabled(body.enabled);
-  res.json({ ok: true, status: getAutoFailbackStatus() });
-});
-
-/**
- * Force an immediate failback-scheduler check (instead of waiting for
- * the next tick). Useful for ops to verify "is the scheduler healthy?"
- * or to retry after a missed check.
- */
-dhcpRouter.post('/auto-failback/check', authMiddleware, requireRole('ADMIN'), async (_req, res) => {
-  try {
-    await triggerKeaFailbackCheck('manual');
-    res.json({ ok: true, status: getAutoFailbackStatus() });
-  } catch (error) {
-    res.status(502).json({
-      error: error instanceof Error ? error.message : 'Check failed',
-    });
-  }
-});
-
 dhcpRouter.get('/leases', async (req, res) => {
   try {
-    const subnetId =
-      typeof req.query.subnetId === 'string' && req.query.subnetId
-        ? Number(req.query.subnetId)
-        : undefined;
-    if (subnetId != null && !Number.isFinite(subnetId)) {
-      res.status(400).json({ error: 'Invalid subnetId' });
-      return;
-    }
-    res.json({ leases: await listDhcpLeases(subnetId) });
+    const pool = typeof req.query.pool === 'string' && req.query.pool ? req.query.pool : undefined;
+    res.json({ leases: await listDhcpLeases(pool) });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to load leases',
@@ -157,14 +59,10 @@ dhcpRouter.get('/leases', async (req, res) => {
   }
 });
 
-dhcpRouter.get('/pools/:subnetId/leases', async (req, res) => {
+dhcpRouter.get('/pools/:poolName/leases', async (req, res) => {
   try {
-    const subnetId = Number(req.params.subnetId);
-    if (!Number.isFinite(subnetId)) {
-      res.status(400).json({ error: 'Invalid subnetId' });
-      return;
-    }
-    res.json({ subnetId, leases: await listDhcpLeases(subnetId) });
+    const poolName = String(req.params.poolName);
+    res.json({ poolName, leases: await listDhcpLeases(poolName) });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to load pool leases',
@@ -172,17 +70,23 @@ dhcpRouter.get('/pools/:subnetId/leases', async (req, res) => {
   }
 });
 
-// SECURITY (C3, C5, see docs/agents/16-security-audit-preprod.md):
-// wipe/add/delete DHCP lease endpoints can DoS every device on a
-// subnet (bank branches lose IP). Mount-level authMiddleware applies
-// (so login required), but VIEWER must NOT trigger these. Wiping a
-// pool is the most destructive — restrict to ADMIN; mutations to a
-// single lease go through OPERATOR+.
+/**
+ * SECURITY (C3, C5, see docs/agents/16-security-audit-preprod.md):
+ * clearing DHCP leases can knock every device on a subnet offline
+ * (bank branches lose IP). Mount-level authMiddleware applies (so login
+ * is required), but VIEWER must NOT trigger these. Wiping a whole pool is
+ * the most destructive — restrict to ADMIN; a single lease goes through
+ * OPERATOR+.
+ */
 dhcpRouter.delete('/leases/:ip', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
-    const result = await deleteDhcpLease(ip);
-    res.json({ ok: true, result });
+    const result = await deleteDhcpLease(dhcpServerHost(), ip);
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || `Failed to delete lease ${ip}` });
+      return;
+    }
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to delete lease',
@@ -190,15 +94,30 @@ dhcpRouter.delete('/leases/:ip', authMiddleware, requireRole('OPERATOR', 'ADMIN'
   }
 });
 
-dhcpRouter.post('/pools/:subnetId/wipe', authMiddleware, requireRole('ADMIN'), async (req, res) => {
+/**
+ * Wipe every lease of a pool. We clear the bindings on the pool's
+ * interface rather than "deleting a subnet" — the pool itself stays
+ * configured, only the leases are dropped.
+ */
+dhcpRouter.post('/pools/:poolName/wipe', authMiddleware, requireRole('ADMIN'), async (req, res) => {
   try {
-    const subnetId = Number(req.params.subnetId);
-    if (!Number.isFinite(subnetId)) {
-      res.status(400).json({ error: 'Invalid subnetId' });
+    const poolName = String(req.params.poolName);
+    const dashboard = await getDhcpDashboard();
+    const pool = dashboard.pools.find((item) => item.poolName === poolName);
+    if (!pool) {
+      res.status(404).json({ error: `Pool ${poolName} not found` });
       return;
     }
-    const result = await wipeDhcpSubnet(subnetId);
-    res.json({ ok: true, result });
+    if (!pool.interface) {
+      res.status(400).json({ error: `Pool ${poolName} has no known interface` });
+      return;
+    }
+    const result = await wipeDhcpPool(dhcpServerHost(), pool.interface);
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to wipe pool leases' });
+      return;
+    }
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to wipe pool leases',
@@ -206,25 +125,33 @@ dhcpRouter.post('/pools/:subnetId/wipe', authMiddleware, requireRole('ADMIN'), a
   }
 });
 
+/**
+ * Pin an IP to a MAC. On Junos this is a static reservation
+ * (`access address-assignment pool ... host ...`).
+ */
 dhcpRouter.post('/leases', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const body = req.body as {
       ip?: string;
       mac?: string;
-      subnetId?: number;
+      poolName?: string;
       hostname?: string;
     };
-    if (!body.ip || !body.mac || body.subnetId == null) {
-      res.status(400).json({ error: 'ip, mac, subnetId are required' });
+    if (!body.ip || !body.mac || !body.poolName) {
+      res.status(400).json({ error: 'ip, mac, poolName are required' });
       return;
     }
-    const result = await addDhcpReservation({
+    const result = await addDhcpLease(dhcpServerHost(), {
       ip: body.ip,
       mac: body.mac,
-      subnetId: Number(body.subnetId),
+      poolName: body.poolName,
       hostname: body.hostname,
     });
-    res.status(201).json({ ok: true, result });
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to add lease' });
+      return;
+    }
+    res.status(201).json({ ok: true });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to add lease',
@@ -235,24 +162,22 @@ dhcpRouter.post('/leases', authMiddleware, requireRole('OPERATOR', 'ADMIN'), asy
 dhcpRouter.post('/leases/:ip/fix-static', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
-    const body = req.body as {
-      mac?: string;
-      subnetId?: number;
-      hostname?: string;
-      note?: string;
-    };
-    if (!body.mac || body.subnetId == null) {
-      res.status(400).json({ error: 'mac and subnetId are required' });
+    const body = req.body as { mac?: string; poolName?: string; hostname?: string };
+    if (!body.mac || !body.poolName) {
+      res.status(400).json({ error: 'mac and poolName are required' });
       return;
     }
-    const result = await fixStaticReservation({
+    const result = await fixStaticReservation(dhcpServerHost(), {
       ip,
       mac: body.mac,
-      subnetId: Number(body.subnetId),
+      poolName: body.poolName,
       hostname: body.hostname,
-      note: body.note,
     });
-    res.json({ ok: true, result });
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to fix static IP' });
+      return;
+    }
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to fix static IP',
@@ -263,17 +188,21 @@ dhcpRouter.post('/leases/:ip/fix-static', authMiddleware, requireRole('OPERATOR'
 dhcpRouter.post('/leases/:ip/unfix-static', authMiddleware, requireRole('OPERATOR', 'ADMIN'), async (req, res) => {
   try {
     const ip = String(req.params.ip);
-    const body = req.body as { subnetId?: number; mac?: string };
-    if (body.subnetId == null) {
-      res.status(400).json({ error: 'subnetId is required' });
+    const body = req.body as { poolName?: string; mac?: string };
+    if (!body.poolName) {
+      res.status(400).json({ error: 'poolName is required' });
       return;
     }
-    const result = await unfixStaticReservation({
+    const result = await unfixStaticReservation(dhcpServerHost(), {
       ip,
-      subnetId: Number(body.subnetId),
+      poolName: body.poolName,
       mac: body.mac,
     });
-    res.json({ ok: true, result });
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to unfix static IP' });
+      return;
+    }
+    res.json({ ok: true });
   } catch (error) {
     res.status(502).json({
       error: error instanceof Error ? error.message : 'Failed to unfix static IP',
@@ -281,61 +210,75 @@ dhcpRouter.post('/leases/:ip/unfix-static', authMiddleware, requireRole('OPERATO
   }
 });
 
-// POST /api/dhcp/subnets — add a new subnet to Kea config (ADMIN only)
-dhcpRouter.post('/subnets', authMiddleware, requireRole('ADMIN'), async (req, res) => {
+/**
+ * Add a new DHCP pool to the switch (ADMIN only).
+ *
+ * Body:
+ *   { poolName, subnet, poolStart, poolEnd, gateway, dns?, domainName?,
+ *     leaseTime?, interfaceName }
+ */
+dhcpRouter.post('/pools', authMiddleware, requireRole('ADMIN'), async (req, res) => {
   try {
     const body = req.body as {
-      subnetId?: number;
+      poolName?: string;
       subnet?: string;
       poolStart?: string;
       poolEnd?: string;
       gateway?: string;
       dns?: string[];
-      site?: string;
-      vlan?: number;
-      name?: string;
+      domainName?: string;
+      leaseTime?: number;
+      interfaceName?: string;
     };
-    if (!body.subnetId || !body.subnet || !body.poolStart || !body.poolEnd || !body.gateway) {
+    if (!body.poolName || !body.subnet || !body.poolStart || !body.poolEnd || !body.gateway) {
       res.status(400).json({
-        error: 'subnetId, subnet (CIDR), poolStart, poolEnd, gateway are required',
+        error: 'poolName, subnet (CIDR), poolStart, poolEnd, gateway are required',
       });
       return;
     }
-    const result = await addDhcpSubnet({
-      subnetId: Number(body.subnetId),
+    if (!body.interfaceName) {
+      res.status(400).json({ error: 'interfaceName is required (e.g. irb.201)' });
+      return;
+    }
+    const result = await addDhcpSubnet(dhcpServerHost(), {
+      poolName: body.poolName,
       subnet: body.subnet,
       poolStart: body.poolStart,
       poolEnd: body.poolEnd,
       gateway: body.gateway,
       dns: body.dns,
-      site: body.site,
-      vlan: body.vlan,
-      name: body.name,
+      domainName: body.domainName,
+      leaseTime: body.leaseTime,
+      interfaceName: body.interfaceName,
     });
-    res.status(201).json({ ok: true, ...result });
-  } catch (error) {
-    res.status(502).json({
-      error: error instanceof Error ? error.message : 'Failed to add subnet',
-    });
-  }
-});
-
-// DELETE /api/dhcp/subnets/:subnetId — remove a subnet entirely (ADMIN only)
-dhcpRouter.delete('/subnets/:subnetId', authMiddleware, requireRole('ADMIN'), async (req, res) => {
-  try {
-    const subnetId = Number(req.params.subnetId);
-    if (!Number.isFinite(subnetId)) {
-      res.status(400).json({ error: 'Invalid subnetId' });
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to add DHCP pool' });
       return;
     }
-    const result = await deleteDhcpSubnet(subnetId);
-    res.json({ ok: true, ...result });
+    res.status(201).json({ ok: true });
   } catch (error) {
     res.status(502).json({
-      error: error instanceof Error ? error.message : 'Failed to delete subnet',
+      error: error instanceof Error ? error.message : 'Failed to add DHCP pool',
     });
   }
 });
 
-// Re-export the runtime handle so server.ts can wire up the scheduler.
-export type { KEA_FAILBACK_RUNTIME };
+/**
+ * Remove a DHCP pool from the switch (ADMIN only).
+ * WARNING: this also drops the pool's static reservations.
+ */
+dhcpRouter.delete('/pools/:poolName', authMiddleware, requireRole('ADMIN'), async (req, res) => {
+  try {
+    const poolName = String(req.params.poolName);
+    const result = await deleteDhcpSubnet(dhcpServerHost(), poolName);
+    if (!result.ok) {
+      res.status(502).json({ error: result.error || 'Failed to delete DHCP pool' });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({
+      error: error instanceof Error ? error.message : 'Failed to delete DHCP pool',
+    });
+  }
+});

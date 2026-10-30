@@ -76,5 +76,11 @@ write_blank_inventory
 if [ -f /var/lib/netconsole/running.set ]; then
   PYTHONPATH=/usr/local/lib/netconsole python3 /usr/local/lib/netconsole/apply_linux.py || true
 fi
+# DHCP local server (Kea replacement, 2026-10-30): start dnsmasq when the
+# running config declares `access address-assignment pool` entries.
+PYTHONPATH=/usr/local/lib/netconsole python3 -c "
+import dhcp_server
+print('[dhcp] ' + dhcp_server.refresh())
+" 2>/dev/null || true
 python3 /usr/local/bin/junos_rest_server.py &
 exec /usr/sbin/sshd -D -e

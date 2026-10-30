@@ -32,7 +32,7 @@ import { StaleDataBanner } from '@/components/common/StaleDataBanner';
 import { DataTableShell } from '@/components/data-table/DataTableShell';
 import { DataTableToolbar } from '@/components/data-table/DataTableToolbar';
 import { TableFreshness } from '@/components/data-table/TableFreshness';
-import { KeaHaCard } from '@/components/dashboard/KeaHaCard';
+import { DhcpServerCard } from '@/components/dashboard/DhcpServerCard';
 import { IpAddress, MacAddress, MonoValue } from '@/components/display/MonoValue';
 import { Timestamp } from '@/components/display/Timestamp';
 import { dhcpUtilMeta } from '@/design/status';
@@ -71,10 +71,10 @@ export default function DhcpPage() {
     }
   }, []);
 
-  const loadLeases = useCallback(async (subnetId: number, silent = false) => {
+  const loadLeases = useCallback(async (poolName: string, silent = false) => {
     if (!silent) setLeasesLoading(true);
     try {
-      setLeases(await fetchPoolLeases(subnetId));
+      setLeases(await fetchPoolLeases(poolName));
       setLeasesError(null);
       setLeasesLoaded(true);
     } catch (cause) {
@@ -95,9 +95,9 @@ export default function DhcpPage() {
   }, [dashboard, site]);
 
   const selectedPool = useMemo(() => {
-    const id = Number(poolParam);
-    if (!Number.isFinite(id)) return null;
-    return filteredPools.find((pool) => pool.subnetId === id) ?? dashboard?.pools?.find((pool) => pool.subnetId === id) ?? null;
+    const name = poolParam;
+    if (!name) return null;
+    return filteredPools.find((pool) => pool.poolName === name) ?? dashboard?.pools?.find((pool) => pool.poolName === name) ?? null;
   }, [dashboard, filteredPools, poolParam]);
 
   useEffect(() => {
@@ -106,23 +106,22 @@ export default function DhcpPage() {
     }
   }, [patch, selectedPool, site]);
 
-  const selectedSubnetId = selectedPool?.subnetId;
+  const selectedPoolName = selectedPool?.poolName;
 
   useEffect(() => {
-    if (selectedSubnetId == null) {
+    if (selectedPoolName == null) {
       setLeasesLoaded(false);
       return;
     }
-    void loadLeases(selectedSubnetId);
-  }, [selectedSubnetId, loadLeases]);
+    void loadLeases(selectedPoolName);
+  }, [selectedPoolName, loadLeases]);
 
   const selectPool = (pool: DhcpPool) => {
-    patch({ pool: String(pool.subnetId), site: pool.site });
+    patch({ pool: pool.poolName, site: pool.site });
   };
 
   const openFixStatic = (record: DhcpLease) => {
     setFixTarget(record);
-    fixForm.setFieldsValue({ note: record.note || '' });
     setFixOpen(true);
   };
 
@@ -146,10 +145,10 @@ export default function DhcpPage() {
         await unfixStaticDhcpLease({
           ip: record.ip,
           mac: record.mac,
-          subnetId: record.subnetId,
+          poolName: record.poolName,
         });
         message.success(`Đã bỏ fix IP ${record.ip}`);
-        if (selectedPool) await loadLeases(selectedPool.subnetId, true);
+        if (selectedPool) await loadLeases(selectedPool.poolName, true);
         await loadDashboard(true);
       },
     });
@@ -160,7 +159,7 @@ export default function DhcpPage() {
       title: `Delete lease ${record.ip}?`,
       content: (
         <div>
-          Call Kea lease4-del for {record.ip} / {record.mac}
+          Clear DHCP binding for {record.ip} / {record.mac}
           {selectedPool ? ` in ${selectedPool.name}` : ''}.
         </div>
       ),
@@ -169,7 +168,7 @@ export default function DhcpPage() {
       onOk: async () => {
         await deleteDhcpLease(record.ip);
         message.success(`Deleted lease ${record.ip}`);
-        if (selectedPool) await loadLeases(selectedPool.subnetId, true);
+        if (selectedPool) await loadLeases(selectedPool.poolName, true);
         await loadDashboard(true);
       },
     });
@@ -187,9 +186,9 @@ export default function DhcpPage() {
       okText: 'Wipe pool',
       okButtonProps: { danger: true },
       onOk: async () => {
-        await wipePoolLeases(selectedPool.subnetId);
+        await wipePoolLeases(selectedPool.poolName);
         message.success('Wiped leases');
-        await loadLeases(selectedPool.subnetId, true);
+        await loadLeases(selectedPool.poolName, true);
         await loadDashboard(true);
       },
     });
@@ -223,22 +222,22 @@ export default function DhcpPage() {
         <>
           <Row gutter={[12, 12]} style={{ marginBottom: 12 }}>
             <Col xs={24} lg={9}>
-              <KeaHaCard />
+              <DhcpServerCard />
             </Col>
             <Col xs={24} lg={15}>
               <Card bordered={false} size="small" title="Pools">
                 {filteredPools.length === 0 ? (
                   <EmptyState
                     title="No pools"
-                    description="This Kea server has no DHCP pool configured yet. Add a subnet to start serving addresses."
+                    description="This DHCP server has no pool configured yet. Add a pool to start serving addresses."
                   />
                 ) : (
                   <Row gutter={[8, 8]}>
                     {filteredPools.map((pool) => {
-                      const active = selectedPool?.subnetId === pool.subnetId;
+                      const active = selectedPool?.poolName === pool.poolName;
                       const util = dhcpUtilMeta(pool.utilization);
                       return (
-                        <Col xs={24} md={12} xl={8} key={pool.subnetId}>
+                        <Col xs={24} md={12} xl={8} key={pool.poolName}>
                           <Card
                             size="small"
                             hoverable
@@ -276,7 +275,7 @@ export default function DhcpPage() {
             </Col>
           </Row>
 
-          <StaleDataBanner error={leasesLoaded ? leasesError : null} onRetry={() => selectedPool && void loadLeases(selectedPool.subnetId, true)} />
+          <StaleDataBanner error={leasesLoaded ? leasesError : null} onRetry={() => selectedPool && void loadLeases(selectedPool.poolName, true)} />
           <DataTableShell
             title={selectedPool ? `Leases · ${selectedPool.name}` : 'Leases'}
             count={selectedPool ? leases.length : 0}
@@ -287,7 +286,7 @@ export default function DhcpPage() {
                   <Button
                     icon={<PlusOutlined />}
                     onClick={() => {
-                      form.setFieldsValue({ subnetId: selectedPool.subnetId, ip: '', mac: '', hostname: '' });
+                      form.setFieldsValue({ poolName: selectedPool.poolName, ip: '', mac: '', hostname: '' });
                       setAddOpen(true);
                     }}
                   >
@@ -296,7 +295,7 @@ export default function DhcpPage() {
                   <Button danger icon={<DeleteOutlined />} onClick={confirmWipePool}>
                     Wipe pool
                   </Button>
-                  <Button icon={<ReloadOutlined />} loading={leasesLoading} onClick={() => void loadLeases(selectedPool.subnetId)}>
+                  <Button icon={<ReloadOutlined />} loading={leasesLoading} onClick={() => void loadLeases(selectedPool.poolName)}>
                     Refresh
                   </Button>
                 </Space>
@@ -306,7 +305,7 @@ export default function DhcpPage() {
             {!selectedPool ? (
               <EmptyState title="Select a pool" description="Choose a DHCP pool to load leases." />
             ) : leasesError && !leasesLoaded ? (
-              <ErrorState title="Could not load leases" error={leasesError} onRetry={() => void loadLeases(selectedPool.subnetId)} />
+              <ErrorState title="Could not load leases" error={leasesError} onRetry={() => void loadLeases(selectedPool.poolName)} />
             ) : (
               <Table
                 rowKey={(record) => `${record.ip}-${record.mac}`}
@@ -393,17 +392,17 @@ export default function DhcpPage() {
           await addDhcpLease({
             ip: values.ip,
             mac: values.mac,
-            subnetId: Number(values.subnetId),
+            poolName: values.poolName,
             hostname: values.hostname,
           });
           message.success(`Added lease ${values.ip}`);
           setAddOpen(false);
-          if (selectedPool) await loadLeases(selectedPool.subnetId, true);
+          if (selectedPool) await loadLeases(selectedPool.poolName, true);
           await loadDashboard(true);
         }}
       >
         <Form form={form} layout="vertical">
-          <Form.Item name="subnetId" label="Subnet ID" rules={[{ required: true }]}>
+          <Form.Item name="poolName" label="Pool" rules={[{ required: true }]}>
             <Input disabled />
           </Form.Item>
           <Form.Item name="ip" label="IP address" rules={[{ required: true, message: 'Enter IP' }]}>
@@ -429,18 +428,17 @@ export default function DhcpPage() {
         }}
         onOk={async () => {
           if (!fixTarget) return;
-          const values = await fixForm.validateFields();
+          await fixForm.validateFields();
           await fixStaticDhcpLease({
             ip: fixTarget.ip,
             mac: fixTarget.mac,
-            subnetId: fixTarget.subnetId,
+            poolName: fixTarget.poolName,
             hostname: fixTarget.hostname || undefined,
-            note: values.note,
           });
           message.success(`Fixed static IP ${fixTarget.ip} ↔ ${fixTarget.mac}`);
           setFixOpen(false);
           setFixTarget(null);
-          if (selectedPool) await loadLeases(selectedPool.subnetId, true);
+          if (selectedPool) await loadLeases(selectedPool.poolName, true);
           await loadDashboard(true);
         }}
       >
@@ -451,9 +449,6 @@ export default function DhcpPage() {
               <Typography.Text code>{fixTarget.mac}</Typography.Text>
               {fixTarget.hostname ? <> ({fixTarget.hostname})</> : null}.
             </Typography.Paragraph>
-            <Form.Item name="note" label="Note" extra="Ghi chú cho reservation này (tùy chọn, tối đa 200 ký tự).">
-              <Input.TextArea rows={3} maxLength={200} showCount placeholder="VD: VPC5 lab / máy kế toán" />
-            </Form.Item>
           </Form>
         ) : null}
       </Modal>

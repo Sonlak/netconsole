@@ -1,6 +1,15 @@
 # Phase 3 -- Kea DC↔DR Standby Stack (IMPLEMENTED 2026-10-17)
 
-> **Mục tiêu**: Mô hình 1+1 hot-standby giữa DC (kea-dc1) và DR (kea-dr1).
+> **⚠️ OBSOLETE — 2026-10-30.** Kea was removed entirely and DHCP now runs on
+> the distribution switch (Junos extended DHCP local server). There is **no
+> HA**: no Kea container, no control agent, no DC↔DR pair, no auto-failback
+> scheduler, no `kea-dr1` host. This file is kept for historical context
+> only.
+>
+> **The current design lives in `docs/agents/20-dhcp-on-switch.md`** and in
+> `backend/src/services/junosDhcp.ts`.
+>
+> **Mục tiêu (historical)**: Mô hình 1+1 hot-standby giữa DC (kea-dc1) và DR (kea-dr1).
 > Active ở DC, standby ở DR. Có scheduler auto-failback khi DC recover.
 > **Backend (NetConsole) chạy ở DC**, giao tiếp với DR qua Tailscale.
 

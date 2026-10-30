@@ -30,10 +30,13 @@
 # while backend/worker/frontend built fine (they are built by the CI
 # job on a GitHub-hosted runner, which does have direct egress).
 #
-# kea-dc1 is therefore built by the same push-images CI job and pulled
-# from GHCR here, exactly like the other three services. Local dev still
-# uses docker-compose.app.yml alone (with `build:`), so the dev VPS keeps
-# building kea locally as before.
+# kea-dc1 was therefore built by the same push-images CI job and pulled
+# from GHCR here, exactly like the other three services.
+#
+# 2026-10-30: Kea was REMOVED entirely — DHCP now runs on the
+# distribution switch (Junos extended DHCP local server). There is no
+# kea service in docker-compose.app.yml any more, so there is nothing
+# to override here.
 #
 # Image tag: pinned to the running commit SHA. The deploy runs
 # SEQUENTIALLY after push-images (`needs: push-images` in the
@@ -53,22 +56,3 @@ services:
   frontend:
     image: ghcr.io/sonlak/netconsole-frontend:${GITHUB_SHA:-main}
     pull_policy: always
-
-  kea-dc1:
-    image: ghcr.io/sonlak/netconsole-kea:${GITHUB_SHA:-main}
-    pull_policy: always
-    # Subnet list (2026-10-28): the kea image ships the LAB subnet list
-    # (10.1.201.0/24 ... 10.1.204.0/24) as its default because that is the
-    # dev/lab topology. Production has NOT onboarded any real bank subnet
-    # yet, so prod mounts an EMPTY list — otherwise the prod dashboard
-    # showed the lab pools and prod Kea would answer for lab subnets.
-    #
-    # The file is synced to /opt/netconsole/lab/kea/subnets.prod.json by
-    # the rsync step in deploy-prod.yml (lab/kea is not excluded).
-    volumes:
-      # Only the subnet file is mounted here; the base compose file
-      # already declares the `kea_dc_leases` volume for /var/lib/kea and
-      # docker compose merges the two `volumes` lists by target path.
-      - ./lab/kea/subnets.prod.json:/etc/kea/subnets.json:ro
-    environment:
-      KEA_SUBNETS_FILE: /etc/kea/subnets.json

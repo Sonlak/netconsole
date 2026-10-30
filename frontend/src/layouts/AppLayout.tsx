@@ -39,7 +39,7 @@ const { Header, Sider, Content } = Layout;
 type NavDef = { key: string; label: string; hint: string; icon: ReactNode };
 
 const NAV: NavDef[] = [
-  { key: '/', label: 'Dashboard', hint: 'Exceptions · queue · Kea', icon: <DashboardOutlined /> },
+  { key: '/', label: 'Dashboard', hint: 'Exceptions · queue · DHCP', icon: <DashboardOutlined /> },
   { key: '/devices', label: 'Devices', hint: 'NKKN · NTMK inventory', icon: <CloudServerOutlined /> },
   { key: '/discovery', label: 'Discovery', hint: 'Scan mgmt ranges', icon: <RadarChartOutlined /> },
   { key: '/fabric', label: 'Floors / Fabric', hint: 'Core · Dist · Access', icon: <ApartmentOutlined /> },
@@ -48,7 +48,7 @@ const NAV: NavDef[] = [
   { key: '/logs', label: 'Logs', hint: 'Syslog · severity · facility', icon: <FileSearchOutlined /> },
   { key: '/interfaces', label: 'Ports', hint: 'Device ports · shut / VLAN', icon: <ApiOutlined /> },
   { key: '/generate-config', label: 'Config Studio', hint: 'Draft · commit · rollback', icon: <FileTextOutlined /> },
-  { key: '/dhcp', label: 'DHCP', hint: 'Kea DC · relay', icon: <WifiOutlined /> },
+  { key: '/dhcp', label: 'DHCP', hint: 'DS1 · pools · leases', icon: <WifiOutlined /> },
   { key: '/jobs', label: 'Jobs', hint: 'Recent activity · last 1000', icon: <UnorderedListOutlined /> },
   { key: '/netbox-import', label: 'NetBox Import', hint: 'CSV · copy between instances', icon: <DatabaseOutlined /> },
   { key: '/settings', label: 'Settings', hint: 'Architecture & theme', icon: <SettingOutlined /> },
@@ -65,7 +65,7 @@ const PAGE_META: Record<string, { title: string; subtitle: string }> = {
   '/logs': { title: 'Device logs', subtitle: 'Syslog · severity · facility' },
   '/interfaces': { title: 'Ports', subtitle: 'Device ports · shut / VLAN' },
   '/generate-config': { title: 'Config Studio', subtitle: 'Running · draft · commit' },
-  '/dhcp': { title: 'DHCP', subtitle: 'Kea datacenter' },
+  '/dhcp': { title: 'DHCP', subtitle: 'Junos DHCP server trên DS1' },
   '/netbox-import': { title: 'NetBox Import', subtitle: 'CSV · copy between instances' },
   '/settings': { title: 'Settings', subtitle: 'Architecture and theme' },
 };

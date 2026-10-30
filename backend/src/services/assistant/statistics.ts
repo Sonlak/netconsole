@@ -16,7 +16,7 @@
  */
 
 import { prisma } from '../../lib/prisma.js';
-import { getDhcpDashboard } from '../keaDhcp.js';
+import { getDhcpDashboard } from '../junosDhcp.js';
 import { JobStatus, JobType } from '@prisma/client';
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -462,9 +462,9 @@ const arpLatest: Stat = {
 
 const dhcpOverview: Stat = {
   name: 'dhcp_overview',
-  label: 'Tổng quan DHCP (Kea live)',
+  label: 'Tổng quan DHCP (switch live)',
   description:
-    'Số subnet/pool, tổng lease, HA status, top subnets theo utilization.',
+    'Số pool, tổng lease, top pool theo utilization.',
   category: 'dhcp',
   scoped: false,
   compute: async () => {
@@ -472,11 +472,11 @@ const dhcpOverview: Stat = {
     const top = [...dashboard.pools]
       .sort((a, b) => b.utilization - a.utilization)
       .slice(0, 5)
-      .map((p) => ({ subnetId: p.subnetId, name: p.name, utilization: p.utilization, leased: p.leased }));
+      .map((p) => ({ poolName: p.poolName, name: p.name, utilization: p.utilization, leased: p.leased }));
     return {
-      ha: dashboard.ha,
+      server: dashboard.server,
       totals: dashboard.totals,
-      subnetCount: dashboard.pools.length,
+      poolCount: dashboard.pools.length,
       topUtilized: top,
     };
   },
