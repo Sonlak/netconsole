@@ -204,6 +204,11 @@ services:
       # different switch (e.g. LAB-F6-DS-01).
       DHCP_SERVER_HOST: "${DHCP_SERVER_HOST:-LAB-F6-DS-01}"
       DHCP_SERVER_ENABLED: "true"
+      # Keep the DHCP cache warm in the background — the QFX answers a
+      # RESTCONF round-trip in 1-3 s, so a cold tab load would stall.
+      # 0 disables the refresher (the request-time cache stays on).
+      DHCP_REFRESH_INTERVAL_SECONDS: "${DHCP_REFRESH_INTERVAL_SECONDS:-60}"
+      DHCP_CACHE_TTL_MS: "${DHCP_CACHE_TTL_MS:-20000}"
       # NetBox sync — set NETBOX_SYNC_INTERVAL_SECONDS > 0 to enable
       # the periodic sync. The worker reads NETBOX_URL / NETBOX_TOKEN
       # to know where to push. Both should be set; if either is empty

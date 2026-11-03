@@ -91,12 +91,20 @@ export async function resolveDhcpServerAddress(): Promise<string> {
   // Already an IP literal → nothing to resolve.
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host;
 
+  // The device IP rarely changes — cache it so the DHCP tab does not pay
+  // a DB round-trip on every request.
+  const cached = readCache(addressCache);
+  if (cached) return cached;
+
   try {
     const device = await prisma.device.findFirst({
       where: { name: { equals: host, mode: 'insensitive' } },
       select: { ip: true },
     });
-    if (device?.ip) return device.ip;
+    if (device?.ip) {
+      addressCache = { value: device.ip, expiresAt: Date.now() + CACHE_TTL_MS };
+      return device.ip;
+    }
   } catch (error) {
     console.warn('[dhcp] failed to resolve DHCP server device by name:', error);
   }
@@ -130,15 +138,15 @@ const CACHE_TTL_MS = Number(process.env.DHCP_CACHE_TTL_MS ?? 20000);
 
 type CacheEntry<T> = { value: T; expiresAt: number };
 
-const poolsCache = new Map<string, CacheEntry<{ ok: boolean; pools: DhcpServerPool[]; error?: string }>>();
-const leasesCache = new Map<
-  string,
-  CacheEntry<{ ok: boolean; leases: DhcpServerLease[]; source: 'restconf' | 'ssh'; error?: string }>
->();
+const poolsCache = new Map<string, CacheEntry<PoolsResult>>();
+const leasesCache = new Map<string, CacheEntry<LeasesResult>>();
 
 /** In-flight promises, keyed by host — used for single-flight. */
 const poolsInflight = new Map<string, Promise<PoolsResult>>();
 const leasesInflight = new Map<string, Promise<LeasesResult>>();
+
+/** Cached IP of the DHCP server device. */
+let addressCache: CacheEntry<string> | undefined;
 
 type PoolsResult = { ok: boolean; pools: DhcpServerPool[]; error?: string };
 type LeasesResult = {
@@ -158,6 +166,7 @@ function readCache<T>(entry: CacheEntry<T> | undefined): T | undefined {
 export function invalidateDhcpCache(): void {
   poolsCache.clear();
   leasesCache.clear();
+  addressCache = undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -692,9 +701,14 @@ function toIsoUtc(text: string): string | null {
 // ---------------------------------------------------------------------------
 
 /** Read the DHCP pool configuration from the switch. */
-export async function fetchDhcpPools(host: string): Promise<PoolsResult> {
-  const cached = readCache(poolsCache.get(host));
-  if (cached) return cached;
+export async function fetchDhcpPools(
+  host: string,
+  options?: { force?: boolean },
+): Promise<PoolsResult> {
+  if (!options?.force) {
+    const cached = readCache(poolsCache.get(host));
+    if (cached) return cached;
+  }
 
   const inflight = poolsInflight.get(host);
   if (inflight) return inflight;
@@ -736,9 +750,14 @@ export async function fetchDhcpPools(host: string): Promise<PoolsResult> {
  * RPC is unavailable (older Junos, or a device without the DHCP server
  * feature) we fall back to `show dhcp server binding detail` over SSH.
  */
-export async function fetchDhcpLeases(host: string): Promise<LeasesResult> {
-  const cached = readCache(leasesCache.get(host));
-  if (cached) return cached;
+export async function fetchDhcpLeases(
+  host: string,
+  options?: { force?: boolean },
+): Promise<LeasesResult> {
+  if (!options?.force) {
+    const cached = readCache(leasesCache.get(host));
+    if (cached) return cached;
+  }
 
   const inflight = leasesInflight.get(host);
   if (inflight) return inflight;
@@ -1273,4 +1292,66 @@ export async function listDhcpLeases(poolName?: string): Promise<
 
   const filtered = poolName ? rows.filter((row) => row.poolName === poolName) : rows;
   return filtered.sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+}
+
+// ---------------------------------------------------------------------------
+// Background refresher
+// ---------------------------------------------------------------------------
+
+/**
+ * Keep the DHCP cache warm.
+ *
+ * A RESTCONF round-trip to the QFX costs 1-3 s and the switch latency is
+ * not predictable, so even with the request cache a user opening the DHCP
+ * tab right after a TTL expiry waits for the switch. The refresher polls
+ * in the background so the cache is normally already populated when the
+ * user asks for it — the tab then renders from the cache instantly.
+ *
+ * `DHCP_REFRESH_INTERVAL_SECONDS` (default 60) controls the poll period.
+ * Set it to 0 to disable the refresher and rely on the request-time cache.
+ */
+let refreshTimer: NodeJS.Timeout | null = null;
+
+async function refreshDhcpCacheOnce(): Promise<void> {
+  const host = await resolveDhcpServerAddress();
+  const [pools, leases] = await Promise.all([
+    fetchDhcpPools(host, { force: true }),
+    fetchDhcpLeases(host, { force: true }),
+  ]);
+  if (!pools.ok && !leases.ok) {
+    console.warn(
+      '[dhcp] background refresh failed:',
+      pools.error || leases.error || 'DHCP server unreachable',
+    );
+  }
+}
+
+export function scheduleDhcpRefresh(intervalSeconds: number): void {
+  if (refreshTimer) return;
+  if (!dhcpServerEnabled()) {
+    console.log('[dhcp] DHCP_SERVER_ENABLED=false; refresh scheduler disabled');
+    return;
+  }
+  const intervalMs = Math.max(intervalSeconds, 15) * 1000;
+  console.log(`[dhcp] background refresh every ${intervalMs / 1000}s`);
+
+  // First run after a short delay so the boot sequence has finished.
+  setTimeout(() => {
+    void refreshDhcpCacheOnce().catch((err) =>
+      console.error('[dhcp] first background refresh failed:', err),
+    );
+  }, 20000);
+
+  refreshTimer = setInterval(() => {
+    void refreshDhcpCacheOnce().catch((err) =>
+      console.error('[dhcp] background refresh failed:', err),
+    );
+  }, intervalMs);
+}
+
+export function stopDhcpRefresh(): void {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
 }

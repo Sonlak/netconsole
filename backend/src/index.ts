@@ -25,7 +25,11 @@ import { startLogRetentionCleanup } from './services/logRetention.js';
 import { startJobRetentionCleanup } from './services/jobRetention.js';
 import { startSyslogReceiver, stopSyslogReceiver } from './services/syslogReceiver.js';
 import { scheduleNetboxSync } from './services/netboxSync.js';
-import { dhcpServerEnabled, dhcpServerHost } from './services/junosDhcp.js';
+import {
+  dhcpServerEnabled,
+  dhcpServerHost,
+  scheduleDhcpRefresh,
+} from './services/junosDhcp.js';
 import { configCompareRouter } from './routes/configCompare.js';
 import { generateConfigRouter } from './routes/generateConfig.js';
 import { templatesRouter } from './routes/templates.js';
@@ -163,6 +167,10 @@ const jobRetentionDays = Number(process.env.JOB_RETENTION_DAYS) || 30;
 // collect intervals; tune lower for small fleets or higher for very
 // large ones (the worker's per-job timeout will catch stuck syncs).
 const netboxSyncIntervalSeconds = Number(process.env.NETBOX_SYNC_INTERVAL_SECONDS) || 0;
+// DHCP background refresher — keeps the switch-read cache warm so the
+// DHCP tab renders from the cache instead of waiting 1-3 s per RESTCONF
+// round-trip. 0 disables the refresher (the request-time cache stays on).
+const dhcpRefreshIntervalSeconds = Number(process.env.DHCP_REFRESH_INTERVAL_SECONDS ?? 60);
 
 // Graceful shutdown support
 let isShuttingDown = false;
@@ -236,6 +244,14 @@ const httpServer = app.listen(port, () => {
   console.log(
     `DHCP server: enabled=${dhcpServerEnabled()} host=${dhcpServerHost()}`,
   );
+
+  // Keep the DHCP cache warm in the background — the QFX answers a
+  // RESTCONF round-trip in 1-3 s, which is too slow for a tab load.
+  if (dhcpRefreshIntervalSeconds > 0) {
+    scheduleDhcpRefresh(dhcpRefreshIntervalSeconds);
+  } else {
+    console.log('DHCP background refresh disabled (set DHCP_REFRESH_INTERVAL_SECONDS > 0 to enable)');
+  }
 
   console.log(`CORS allowed origins: ${CORS_ORIGINS.join(', ')}`);
 
