@@ -133,8 +133,12 @@ export function dhcpServerEnabled(): boolean {
  *
  * The cache is invalidated explicitly after every write (lease delete,
  * pool add/remove, static reservation change).
+ *
+ * The TTL must be LONGER than the background refresh interval
+ * (`DHCP_REFRESH_INTERVAL_SECONDS`, default 60 s), otherwise the cache
+ * expires between two refreshes and the user hits the switch anyway.
  */
-const CACHE_TTL_MS = Number(process.env.DHCP_CACHE_TTL_MS ?? 20000);
+const CACHE_TTL_MS = Number(process.env.DHCP_CACHE_TTL_MS ?? 90000);
 
 type CacheEntry<T> = { value: T; expiresAt: number };
 

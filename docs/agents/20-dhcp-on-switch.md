@@ -71,8 +71,39 @@ set access address-assignment pool V201 family inet host vpc5 \
 Host selection: `DHCP_SERVER_HOST` env var, default `LAB-F6-DS-01`.
 Toggle: `DHCP_SERVER_ENABLED` (default on).
 
+**The host must be an IP, not a name.** `LAB-F6-DS-01` does **not** resolve
+in the container DNS (the lab devices are only reachable by IP —
+`10.10.20.110`). `resolveDhcpServerAddress()` therefore looks the device
+name up in the `Device` table and returns its `ip`. An IP literal in
+`DHCP_SERVER_HOST` is used as-is.
+
 RESTCONF needs `JUNOS_REST_ENABLED=true`; SSH needs `LAB_SSH_USER` /
 `LAB_SSH_PASSWORD`.
+
+### Performance — why the DHCP tab used to take ~10 s
+
+Every RESTCONF round-trip to the QFX costs **1-3 s** and the latency is
+not predictable. The DHCP page fires FOUR calls into the switch (the
+dashboard reads pools + bindings, the lease list reads pools + bindings
+again) → ~10 s.
+
+Two mechanisms fix this:
+
+| Mechanism | Env var | Default | Purpose |
+| --- | --- | --- | --- |
+| Request cache + single-flight | `DHCP_CACHE_TTL_MS` | 20000 | Caches the pool config and the binding list; concurrent callers share one in-flight RPC. |
+| Background refresher | `DHCP_REFRESH_INTERVAL_SECONDS` | 60 | Polls the switch in the background so the cache is normally already warm when the user opens the tab. |
+
+The cache is invalidated explicitly after every write (lease delete, pool
+wipe, pool add/remove, static reservation add/remove). Failed reads are
+never cached, so a transient RPC error does not stick around for the
+whole TTL.
+
+Measured on dev (`vps-dev-01`, DS1 = `10.10.20.110`):
+
+| Path | Before | After |
+| --- | --- | --- |
+| Tab load (dashboard + leases) | ~10 s | ~0 s (cache hit) / ~3.5 s (cold) |
 
 ### Id rename
 
