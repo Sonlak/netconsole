@@ -197,6 +197,50 @@ jobs:
           done
           echo "secrets.env OK"
 
+          # WORKER_AUTH_TOKEN EXPIRY CHECK (2026-11-19).
+          #
+          # The worker token is a JWT with a 24h TTL. When it expires,
+          # every worker gets `401 Unauthorized` on GET /api/jobs/queue
+          # and EVERY job of EVERY device stays PENDING forever -- the
+          # whole app goes quiet with no obvious error.
+          #
+          # Until now this step only checked that the value was
+          # non-empty, so an expired token passed CI and landed on prod.
+          # We now decode the `exp` claim and fail the deploy if the
+          # token is already expired or expires within 2 hours.
+          token_exp=$(python3 - <<'PYEOF'
+          import base64, json, sys
+          token = ""
+          for line in open("secrets.env", encoding="utf-8"):
+              if line.startswith("WORKER_AUTH_TOKEN="):
+                  token = line.split("=", 1)[1].strip()
+                  break
+          if not token:
+              print("0"); sys.exit(0)
+          try:
+              payload = token.split(".")[1]
+              payload += "=" * (-len(payload) % 4)
+              data = json.loads(base64.urlsafe_b64decode(payload))
+              print(int(data.get("exp", 0)))
+          except Exception:
+              print("0")
+          PYEOF
+          )
+          now_epoch=$(date +%s)
+          if [ "${token_exp:-0}" -le "$now_epoch" ]; then
+            echo "::error::WORKER_AUTH_TOKEN is EXPIRED (exp=$token_exp, now=$now_epoch)."
+            echo "::error::Every worker will get 401 on /api/jobs/queue and all jobs will stall."
+            echo "::error::Fix on the VPS: ./scripts/rotate_secrets.sh  (then re-encrypt secrets.env.enc + commit + push)"
+            exit 1
+          fi
+          ttl_hours=$(( (token_exp - now_epoch) / 3600 ))
+          if [ "$ttl_hours" -lt 2 ]; then
+            echo "::error::WORKER_AUTH_TOKEN expires in ${ttl_hours}h (< 2h). Rotate it before deploying."
+            echo "::error::Fix on the VPS: ./scripts/rotate_secrets.sh  (then re-encrypt secrets.env.enc + commit + push)"
+            exit 1
+          fi
+          echo "WORKER_AUTH_TOKEN OK (TTL ~${ttl_hours}h)"
+
       - name: Build & restart app services
         working-directory: ${{ env.DEPLOY_DIR }}
         env:
@@ -442,7 +486,7 @@ jobs:
 
       - name: Verify AI assistant can reach OpenAI
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # 2026-10-29: the AI assistant never worked on prod — the VPS has
           # no direct internet egress and Node's built-in fetch (undici)
           # does not read HTTPS_PROXY, so the OpenAI SDK timed out.
@@ -452,6 +496,15 @@ jobs:
           # This probe does a REAL (tiny) streaming completion through the
           # same code path the assistant uses, so a broken proxy config is
           # caught at deploy time instead of by the operator.
+          #
+          # 2026-11-19: the probe is now a WARNING, not a hard failure.
+          # The OpenAI key is an external credential with its own expiry
+          # (the key in GH secrets expired on 2026-11-19 and took the
+          # whole deploy + auto-rollback down with it, even though the
+          # application itself was perfectly healthy). A dead LLM key must
+          # NOT roll back the console — the operator fixes the key in
+          # GH secrets and redeploys.
+          set +e
           docker exec netconsole-backend node -e "
             const { defaultModel } = await import('/app/dist/services/assistant/llmClient.js');
             const { streamChat } = await import('/app/dist/services/assistant/llmClient.js');
@@ -468,9 +521,17 @@ jobs:
             if (!text.trim()) { console.error('EMPTY RESPONSE'); process.exit(1); }
             console.log('Assistant OK ->', JSON.stringify(text.trim()));
           " 2>&1 | tee /tmp/assistant-probe.log
+          set -e
           if ! grep -q 'Assistant OK' /tmp/assistant-probe.log; then
-            echo "::error::AI assistant cannot reach the OpenAI API — check OPENAI_PROXY_URL / OPENAI_API_KEY"
-            exit 1
+            echo "::warning::AI assistant cannot reach the OpenAI API — check OPENAI_PROXY_URL / OPENAI_API_KEY"
+            echo "::warning::The console itself is deployed and healthy; only the LLM assistant is degraded."
+            echo "::warning::Update the OPENAI_API_KEY GitHub secret and re-run this workflow to restore it."
+            echo "## ⚠️ AI assistant probe failed (non-blocking)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The **AI assistant** could not reach OpenAI (expired/invalid key or proxy issue)." >> $GITHUB_STEP_SUMMARY
+            echo "The deployment itself succeeded — the console is healthy." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Assistant probe OK"
           fi
 
       - name: Save deploy marker (for future auto-rollback)

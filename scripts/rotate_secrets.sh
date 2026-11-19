@@ -96,7 +96,16 @@ fi
 
 # 1. Generate a fresh JWT_SECRET (48 bytes base64 = 64 chars; >= 32
 #    is the security floor enforced by middleware/auth.ts).
-NEW_JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+#
+# openssl is NOT installed on the prod VPS (verified 2026-11-19 — the
+# script died with "openssl: command not found"), so fall back to
+# python3's `secrets` module which is always present.
+if command -v openssl >/dev/null 2>&1; then
+  NEW_JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')
+else
+  echo "==> openssl not found — using python3 secrets module instead"
+  NEW_JWT_SECRET=$(python3 -c 'import base64,secrets; print(base64.b64encode(secrets.token_bytes(48)).decode())')
+fi
 
 # 2. Mint a fresh WORKER_AUTH_TOKEN signed with the new secret.
 #    (WORKER_TTL_HOURS bounded above.)
@@ -201,34 +210,40 @@ docker compose -p netconsole \
 
 # 7. Health check.
 echo "Waiting for backend to come back up..."
+# Probe the PUBLISHED port (127.0.0.1:3000), not the container IP.
+# Host -> container-bridge traffic is dropped by the FORWARD/Tailscale
+# rules on the VPS, so 172.31.0.3 is unreachable from the runner host.
+# This is the same path the deploy workflow uses (see deploy-prod.yml
+# "Wait for backend healthy"). The old 172.31.0.3 probe never succeeded
+# on prod and made the rotation look like it had failed.
 for i in $(seq 1 30); do
-    if curl -sf -o /dev/null --max-time 3 http://172.31.0.3:3000/api/health; then
-      echo "✅ Backend healthy after ${i} attempt(s)"
-      echo
-      echo "⚠️  All user sessions invalidated. Users must log in again."
-      echo "Worker token TTL: ${WORKER_TTL_HOURS}h (rotated)."
-      echo
-      # P1 hardening: secrets.env is now SOPS-encrypted in git. The plaintext
-      # file we just rotated lives only on the VPS. To make the new values
-      # durable across deploys, the operator must re-encrypt and commit.
-      if [ -f "/opt/netconsole/secrets.env.enc" ]; then
-        echo "==> Re-encrypt secrets.env → secrets.env.enc?"
-        echo "    Run on the VPS (requires age key at /opt/netconsole/.sops-age-key.txt):"
-        echo "      SOPS_AGE_KEY_CMD=\"\$(cat /opt/netconsole/.sops-age-key.txt)\" \\"
-        echo "        ./scripts/sops_decrypt.sh   # already done; backs up the OLD encrypted file"
-        echo "      # Re-encrypt in place (overwrites secrets.env.enc):"
-        echo "      sops --input-type=dotenv --output-type=dotenv \\"
-        echo "        --encrypt secrets.env > secrets.env.enc"
-        echo "      # Then commit + push from the VPS:"
-        echo "      cd /opt/netconsole"
-        echo "      git add secrets.env.enc"
-        echo "      git commit -m 'chore: rotate JWT_SECRET + WORKER_AUTH_TOKEN'"
-        echo "      git push origin main"
+    if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:3000/api/health; then
+        echo "✅ Backend healthy after ${i} attempt(s)"
         echo
-        echo "    (Or run ./scripts/sops_encrypt.sh from your local machine after"
-        echo "     scp-ing the new secrets.env to your dev box.)"
-      fi
-      exit 0
+        echo "⚠️  All user sessions invalidated. Users must log in again."
+        echo "Worker token TTL: ${WORKER_TTL_HOURS}h (rotated)."
+        echo
+        # P1 hardening: secrets.env is now SOPS-encrypted in git. The plaintext
+        # file we just rotated lives only on the VPS. To make the new values
+        # durable across deploys, the operator must re-encrypt and commit.
+        if [ -f "/opt/netconsole/secrets.env.enc" ]; then
+            echo "==> Re-encrypt secrets.env → secrets.env.enc?"
+            echo "    Run on the VPS (requires age key at /opt/netconsole/.sops-age-key.txt):"
+            echo "      SOPS_AGE_KEY_CMD=\"\$(cat /opt/netconsole/.sops-age-key.txt)\" \\"
+            echo "        ./scripts/sops_decrypt.sh   # already done; backs up the OLD encrypted file"
+            echo "      # Re-encrypt in place (overwrites secrets.env.enc):"
+            echo "      sops --input-type=dotenv --output-type=dotenv \\"
+            echo "        --encrypt secrets.env > secrets.env.enc"
+            echo "      # Then commit + push from the VPS:"
+            echo "      cd /opt/netconsole"
+            echo "      git add secrets.env.enc"
+            echo "      git commit -m 'chore: rotate JWT_SECRET + WORKER_AUTH_TOKEN'"
+            echo "      git push origin main"
+            echo
+            echo "    (Or run ./scripts/sops_encrypt.sh from your local machine after"
+            echo "     scp-ing the new secrets.env to your dev box.)"
+        fi
+        exit 0
     fi
     sleep 2
 done
