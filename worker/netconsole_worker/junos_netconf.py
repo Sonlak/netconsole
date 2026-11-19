@@ -39,6 +39,37 @@ logger = logging.getLogger(__name__)
 #: NETCONF message terminator (RFC 4741 §4.1).
 _NC_END = "]]>]]>"
 
+#: Matches the ``<rpc-reply>`` subtree of a raw NETCONF exchange.
+#:
+#: A raw NETCONF reply from a Junos device contains **two** top-level XML
+#: elements: the session ``<hello>`` and then the ``<rpc-reply>``.  That
+#: makes the document *multi-root*, so ``xml.etree.ElementTree.fromstring``
+#: raises ``ParseError: junk after document element`` and every parser
+#: downstream silently returns 0 rows.
+#:
+#: Fixing this at the source (extract the ``<rpc-reply>`` subtree so the
+#: XML has a single root) is what makes the whole NETCONF path usable —
+#: verified on a live QFX5120 running Junos 23.4R2-S8.13 on 2026-11-19,
+#: where ARP went from 0 entries to 19, MAC 0 -> 9, interfaces 0 -> 23.
+_RPC_REPLY_RE = re.compile(r"<rpc-reply\b.*?</rpc-reply>", re.DOTALL)
+
+
+def extract_rpc_reply(raw: str) -> str:
+    """Return the ``<rpc-reply>`` subtree of a raw NETCONF exchange.
+
+    Falls back to the raw text when no ``<rpc-reply>`` is present (e.g. the
+    device replied with a bare ``<ok/>``).  The result always has a single
+    XML root so it can be handed straight to ``ET.fromstring``.
+    """
+    if not raw:
+        return ""
+    m = _RPC_REPLY_RE.search(raw)
+    if m:
+        return m.group(0)
+    # Bare <ok/> or error-only replies — strip the trailing ]]>]]> terminator
+    # so the fragment stays parseable.
+    return raw.replace(_NC_END, "").strip()
+
 
 def _build_hello() -> str:
     return (
@@ -203,21 +234,18 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
         and "<error-message" not in raw_lower
     ):
         return True, ""
-    # <get-system-uptime-information> and other read-only RPCs don't carry
-    # <ok/> either — they ship data payloads. Treat any reply that has a known
-    # data element and no error markers as success.  Use raw_ns_stripped so
-    # prefixed elements (e.g. <nc:system-uptime-information>) also match.
+    # Read-only operational RPCs don't carry <ok/> either — they ship a
+    # data payload.  The element name varies per RPC (e.g.
+    # <arp-table-information>, <ethernet-switching-table-information>,
+    # <l2ng-l2ald-vlan-instance-information>), so instead of enumerating
+    # them we accept ANY reply that carries an <rpc-reply> envelope with
+    # content and no error markers.  An unsupported RPC always comes back
+    # as <rpc-error>, which the checks above already caught.
     if (
-        (
-            "<system-uptime-information" in raw_ns_stripped
-            or "<system-information" in raw_ns_stripped
-            or "<software-information" in raw_ns_stripped
-            or "<chassis-inventory" in raw_ns_stripped
-            or "<interface-information" in raw_ns_stripped
-            or "<lldp-neighbors-information" in raw_ns_stripped
-        )
+        "<rpc-reply" in raw_lower
         and "<rpc-error" not in raw_lower
         and "<error-message" not in raw_lower
+        and "<bad-element" not in raw_lower
     ):
         return True, ""
     return False, "Unknown NETCONF error"
@@ -301,7 +329,8 @@ def fetch_interface_configuration(
     rpc_ok, err = _parse_ok_error(raw)
     if not rpc_ok:
         return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
-    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
+    reply = extract_rpc_reply(raw)
+    return {"ok": True, "stage": "rpc", "error": None, "payload": reply, "raw": reply}
 
 
 def fetch_system_uptime_cli(
@@ -403,7 +432,10 @@ def fetch_full_configuration(
     rpc_ok, err = _parse_ok_error(raw)
     if not rpc_ok:
         return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
-    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
+    # Hand back ONLY the <rpc-reply> subtree — the raw exchange is
+    # multi-root (<hello> + <rpc-reply>) and would fail XML parsing.
+    reply = extract_rpc_reply(raw)
+    return {"ok": True, "stage": "rpc", "error": None, "payload": reply, "raw": reply}
 
 
 def fetch_system_uptime(
@@ -426,4 +458,147 @@ def fetch_system_uptime(
     rpc_ok, err = _parse_ok_error(raw)
     if not rpc_ok:
         return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
-    return {"ok": True, "stage": "rpc", "error": None, "payload": raw, "raw": raw}
+    reply = extract_rpc_reply(raw)
+    return {"ok": True, "stage": "rpc", "error": None, "payload": reply, "raw": reply}
+
+
+# ---------------------------------------------------------------------------
+# Operational RPCs (read path)
+# ---------------------------------------------------------------------------
+#
+# The RPC *names* below are the ones the running Junos release actually
+# implements.  The shorter aliases used by the Junos REST API do NOT exist
+# as NETCONF operations — e.g. ``<get-arp-table/>`` is rejected with
+# ``<bad-element>get-arp-table</bad-element>`` / "syntax error", while
+# ``<get-arp-table-information/>`` works.
+#
+# Verified on QFX5120 / Junos 23.4R2-S8.13 (2026-11-19):
+#     get-arp-table-information                 OK  0.6s
+#     get-ethernet-switching-table-information OK  0.6s
+#     get-interface-information                 OK  1.9s
+#     get-vlan-information                      OK  0.6s
+#     get-lldp-neighbors-information            OK  0.6s
+#     get-system-uptime-information             OK  1.0s
+#     get-log-information                       FAIL (not an operation)
+#     get-chassis-inventory-information        FAIL (not an operation)
+
+
+def fetch_operational(
+    host: str,
+    rpc_body: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Run one operational NETCONF RPC and return the ``<rpc-reply>`` XML.
+
+    Returns the same dict shape as the other ``fetch_*`` helpers in this
+    module so callers can treat RESTCONF and NETCONF interchangeably.
+    """
+    rpc = f'<?xml version="1.0" encoding="UTF-8"?><rpc>{rpc_body}</rpc>'
+    ok, raw, _ms = _run_nc_rpc(host, port, username, password, rpc, timeout=timeout)
+    if not ok:
+        return {"ok": False, "stage": "rpc", "error": raw, "payload": "", "raw": ""}
+    rpc_ok, err = _parse_ok_error(raw)
+    if not rpc_ok:
+        return {"ok": False, "stage": "rpc", "error": err, "payload": "", "raw": raw}
+    reply = extract_rpc_reply(raw)
+    return {"ok": True, "stage": "rpc", "error": None, "payload": reply, "raw": reply}
+
+
+def fetch_arp_table(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Fetch the ARP table via NETCONF ``<get-arp-table-information/>``."""
+    return fetch_operational(
+        host, "<get-arp-table-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_ethernet_switching_table(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Fetch the MAC table via NETCONF ``<get-ethernet-switching-table-information/>``."""
+    return fetch_operational(
+        host, "<get-ethernet-switching-table-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_interface_information(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 45.0,
+) -> dict[str, Any]:
+    """Fetch interface state via NETCONF ``<get-interface-information/>``."""
+    return fetch_operational(
+        host, "<get-interface-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_vlan_information(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Fetch VLAN state via NETCONF ``<get-vlan-information/>``."""
+    return fetch_operational(
+        host, "<get-vlan-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_lldp_neighbors(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Fetch LLDP neighbours via NETCONF ``<get-lldp-neighbors-information/>``."""
+    return fetch_operational(
+        host, "<get-lldp-neighbors-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_system_information(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """Fetch host identity via NETCONF ``<get-system-information/>``.
+
+    The reply carries ``<host-name>``, ``<os-name>``, ``<os-version>`` and
+    ``<hardware-model>`` — everything ``probe_identity`` needs, in ~2 KB
+    and ~0.6 s, versus the ~55 KB / ~0.7 s of a full
+    ``<get-configuration format="set"/>``.
+    """
+    return fetch_operational(
+        host, "<get-system-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )

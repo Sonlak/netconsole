@@ -62,14 +62,24 @@ def parse_junos_lldp_neighbors(output: str) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Juniper: NETCONF XML "get-lldp-interface-information"
+# Juniper: NETCONF XML LLDP
+#
+# Junos exposes two different LLDP RPCs depending on the release:
+#
+#   * `<get-lldp-interface-information/>` (older / cRPD lab images) with
+#     tags `<lldp-local-port>`, `<lldp-chassis-id>`.
+#   * `<get-lldp-neighbors-information/>` (Junos 23.x, e.g. QFX5120
+#     23.4R2-S8.13 — verified 2026-11-19) with tags
+#     `<lldp-local-port-id>`, `<lldp-remote-chassis-id>`.
+#
+# The parser below accepts BOTH tag spellings so it works across releases.
 #
 #   <lldp-neighbor-information>
-#     <lldp-local-port>ge-0/0/1</lldp-local-port>
-#     <lldp-remote-system-name>LAB-F1-DS01</lldp-remote-system-name>
-#     <lldp-remote-port-id>ge-0/0/1</lldp-remote-port-id>
+#     <lldp-local-port-id>et-0/0/1</lldp-local-port-id>
+#     <lldp-local-parent-interface-name>ae1</lldp-local-parent-interface-name>
+#     <lldp-remote-chassis-id>54:bf:55:53:06:00</lldp-remote-chassis-id>
 #     <lldp-remote-port-description>Uplink to distribution</lldp-remote-port-description>
-#     <lldp-chassis-id>00:00:5e:00:53:01</lldp-chassis-id>
+#     <lldp-remote-system-name>LAB-F1-DS01</lldp-remote-system-name>
 #   </lldp-neighbor-information>
 # ---------------------------------------------------------------------------
 
@@ -78,13 +88,15 @@ _LLDP_NEIGHBOR_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _LLDP_FIELD_RE = re.compile(
-    r"<(?P<key>lldp-local-port|lldp-remote-system-name|lldp-remote-port-id|lldp-remote-port-description|lldp-chassis-id)>(?P<val>[^<]*)</(?P=key)>",
+    r"<(?P<key>lldp-local-port|lldp-local-port-id|lldp-local-parent-interface-name"
+    r"|lldp-remote-system-name|lldp-remote-port-id|lldp-remote-port-description"
+    r"|lldp-chassis-id|lldp-remote-chassis-id)>(?P<val>[^<]*)</(?P=key)>",
     re.IGNORECASE,
 )
 
 
 def parse_junos_lldp_neighbors_xml(raw: str) -> list[dict[str, str]]:
-    """Parse Junos NETCONF `get-lldp-interface-information` XML output."""
+    """Parse Junos NETCONF LLDP XML output (either RPC variant)."""
     entries: list[dict[str, str]] = []
     for block in _LLDP_NEIGHBOR_RE.findall(raw):
         fields: dict[str, str] = {}
@@ -92,15 +104,23 @@ def parse_junos_lldp_neighbors_xml(raw: str) -> list[dict[str, str]]:
             fields[m[0].lower()] = m[1].strip()
         if not fields:
             continue
+        local_port = fields.get("lldp-local-port") or fields.get("lldp-local-port-id", "")
+        parent = fields.get("lldp-local-parent-interface-name", "")
+        # Keep the raw local port id (e.g. "et-0/0/1"): it is the same
+        # naming the `interfaces` inventory uses, so the topology linker can
+        # match LLDP records against interface descriptions.  The parent
+        # (e.g. "ae1") is reported separately.
+        chassis = fields.get("lldp-chassis-id") or fields.get("lldp-remote-chassis-id", "")
         entries.append({
-            "localPort": fields.get("lldp-local-port", ""),
+            "localPort": local_port,
+            "localParent": parent,
             "remoteDeviceId": fields.get("lldp-remote-system-name", ""),
             # Port Description is operator text, not the remote interface ID.
             # Leave remotePort empty when Junos omits Port ID; the reciprocal
             # LLDP advertisement can still supply the peer's localPort.
             "remotePort": fields.get("lldp-remote-port-id", ""),
             "portDescription": fields.get("lldp-remote-port-description", ""),
-            "chassisId": fields.get("lldp-chassis-id", ""),
+            "chassisId": chassis,
         })
     return entries
 

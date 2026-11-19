@@ -181,19 +181,30 @@ def xml_to_set_format(payload: Any) -> str:
 def netconf_get_configuration_to_set(payload: Any) -> str:
     """Parse a NETCONF `<get-configuration>` reply to set-format.
 
-    The reply is nested XML that ``xml_to_set_format`` converts to set lines.
-    Falls back to ``parse_configuration_set`` in case the payload is already
-    in flat set-format text (e.g. from a RESTCONF fallback path).
+    Two reply shapes are possible:
+
+    1. **Flat set-format text** — when the RPC asked for ``format="set"``,
+       Junos wraps the raw ``set ...`` lines in ``<configuration-set>``.
+       This is what a real QFX5120 returns, and it is the *authoritative*
+       representation (it preserves Junos' own ordering and quoting).
+    2. **Nested XML** — the classic hierarchical reply, which
+       ``xml_to_set_format`` converts to set lines.
+
+    The flat form is tried FIRST.  Running ``xml_to_set_format`` over a
+    ``<configuration-set>`` payload treats the whole blob as a single leaf
+    and emits a garbage line like
+    ``set configuration-set "set version 23.4R2-S8.13"`` — which looks
+    plausible but is not a valid config.
 
     Replies that contain only noise (e.g. ``<ok/>``, ``<rpc-reply>`` with
     no configuration) return an empty string.
     """
+    flat = parse_configuration_set(payload)
+    if flat and not _is_noise_output(flat):
+        return flat
     result = xml_to_set_format(payload)
     if result and not _is_noise_output(result):
         return result
-    fallback = parse_configuration_set(payload)
-    if fallback:
-        return fallback
     return ""
 
 

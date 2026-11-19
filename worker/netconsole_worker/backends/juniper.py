@@ -26,10 +26,18 @@ from netconsole_worker.junos_rest import (
     rollback_configuration as rest_rollback_configuration,
 )
 from netconsole_worker.junos_netconf import (
+    _parse_ok_error,
+    extract_rpc_reply,
+    fetch_arp_table as nc_fetch_arp_table,
+    fetch_ethernet_switching_table as nc_fetch_ethernet_switching_table,
     fetch_full_configuration as nc_fetch_full_configuration,
     fetch_interface_configuration as nc_fetch_interface_configuration,
+    fetch_interface_information as nc_fetch_interface_information,
+    fetch_lldp_neighbors as nc_fetch_lldp_neighbors,
+    fetch_system_information as nc_fetch_system_information,
     fetch_system_uptime as nc_fetch_system_uptime,
     fetch_system_uptime_cli as nc_fetch_system_uptime_cli,
+    fetch_vlan_information as nc_fetch_vlan_information,
     rollback_configuration as nc_rollback_configuration,
 )
 from netconsole_worker.models import DeviceInfo
@@ -52,6 +60,7 @@ from netconsole_worker.parsers.interface_set import (
     validate_interface_name,
 )
 from netconsole_worker.parsers.mac_table_rpc import parse_mac_table_rpc
+from netconsole_worker.parsers.junos_leaf import local_name, parse_xml_root
 from netconsole_worker.parsers.show_arp import parse_juniper_arp_table
 from netconsole_worker.parsers.show_interfaces import (
     parse_interface_information_rpc,
@@ -73,6 +82,42 @@ from netconsole_worker.ssh_client import run_ssh_command
 logger = logging.getLogger(__name__)
 
 
+def _parse_system_information(payload: Any) -> dict[str, str]:
+    """Extract identity fields from a Junos `<get-system-information>` reply.
+
+    The reply looks like:
+
+        <system-information>
+          <host-name>NTMK-CORE-QFX5120</host-name>
+          <os-name>JUNOS</os-name>
+          <os-version>23.4R2-S8.13</os-version>
+          <hardware-model>qfx5120-32c</hardware-model>
+        </system-information>
+
+    Returns a dict with the keys ``hostname``, ``version``, ``model`` and
+    ``osName`` — empty strings for anything the device did not report.
+    """
+    root = parse_xml_root(payload)
+    if root is None:
+        return {}
+    out: dict[str, str] = {}
+    mapping = {
+        "host-name": "hostname",
+        "os-name": "osName",
+        "os-version": "version",
+        "junos-version": "version",
+        "hardware-model": "model",
+    }
+    for element in root.iter():
+        key = mapping.get(local_name(element.tag))
+        if not key:
+            continue
+        text = (element.text or "").strip()
+        if text and not out.get(key):
+            out[key] = text
+    return out
+
+
 def _rest_creds(config: Any) -> dict[str, Any]:
     return {
         "username": config.juniper.user or config.ssh_user,
@@ -81,6 +126,22 @@ def _rest_creds(config: Any) -> dict[str, Any]:
         "port": config.juniper.port,
         "verify_tls": config.juniper.verify_tls,
     }
+
+
+def _rest_reachable(config: Any, ip: str) -> bool:
+    """Cheap TCP probe of the RESTCONF port before attempting a REST call.
+
+    Some Junos deployments never accept TCP on 8443 — the SYN is silently
+    dropped by the Junos management subsystem rather than refused
+    (verified 2026-11-19 on NTMK-CORE-QFX5120: 8443 = DROP, 22/830 = OPEN).
+    Without this probe every read job burns the full REST connect timeout
+    (18 s) before falling through to NETCONF.
+
+    A 1.5 s probe turns that 18 s stall into 1.5 s.
+    """
+    if not config.juniper.enabled:
+        return False
+    return probe_rest_or_netconf(ip, config.juniper.port, timeout=1.5)
 
 
 def _set_commands(config: str) -> list[str]:
@@ -169,7 +230,7 @@ class JuniperBackend(DeviceBackend):
         rest_error: str | None = None
         creds = _rest_creds(self.config)
 
-        if self.config.juniper.enabled:
+        if self.config.juniper.enabled and _rest_reachable(self.config, device.ip):
             rest_result = fetch_interface_information(
                 device.ip,
                 **creds,
@@ -205,6 +266,58 @@ class JuniperBackend(DeviceBackend):
                 rest_error = "Junos REST returned no interfaces (parser empty)"
             else:
                 rest_error = rest_result["error"] or "Junos REST request failed"
+
+        # --- NETCONF SSH (830) ---
+        # RESTCONF on 8443 is not reachable on every Junos deployment: some
+        # vendors drop the SYN at the Junos subsystem level (verified
+        # 2026-11-19 on NTMK-CORE-QFX5120 — 8443 DROP while 22/830 are
+        # fine).  NETCONF-over-SSH on 830 is the reliable read path.
+        if self.config.junos_netconf_ssh:
+            nc_result = nc_fetch_interface_information(
+                device.ip,
+                username=creds["username"],
+                password=creds["password"],
+                port=self.config.junos_netconf_ssh_port,
+                timeout=45.0,
+            )
+            if nc_result["ok"]:
+                interfaces = parse_interface_information_rpc(nc_result["payload"] or nc_result["raw"])
+                if interfaces:
+                    # VLAN membership + switching mode live in the running
+                    # config, so pull that over NETCONF too.
+                    nc_cfg = nc_fetch_full_configuration(
+                        device.ip,
+                        username=creds["username"],
+                        password=creds["password"],
+                        port=self.config.junos_netconf_ssh_port,
+                        timeout=45.0,
+                    )
+                    set_text = ""
+                    if nc_cfg["ok"]:
+                        set_text = parse_configuration_set(nc_cfg["payload"] or nc_cfg["raw"])
+                    nc_vlan = nc_fetch_vlan_information(
+                        device.ip,
+                        username=creds["username"],
+                        password=creds["password"],
+                        port=self.config.junos_netconf_ssh_port,
+                        timeout=30.0,
+                    )
+                    if nc_vlan["ok"]:
+                        apply_vlan_membership(
+                            interfaces,
+                            parse_vlan_information_rpc(nc_vlan["payload"] or nc_vlan["raw"]),
+                        )
+                    apply_switching_modes(interfaces, parse_switching_mode_from_set(set_text))
+                    apply_interface_descriptions(interfaces, parse_interface_descriptions_from_set(set_text))
+                    return {
+                        "implemented": True,
+                        "source": "junos-netconf-ssh",
+                        "message": "Junos NETCONF interface information OK",
+                        "command": "get-interface-information + get-vlan-information + get-configuration",
+                        "interfaces": interfaces,
+                        "raw": compact_raw(nc_result["raw"]),
+                        "restError": rest_error,
+                    }
 
         if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show interfaces terse"
@@ -249,7 +362,7 @@ class JuniperBackend(DeviceBackend):
         rest_error: str | None = None
         creds = _rest_creds(self.config)
 
-        if self.config.juniper.enabled:
+        if self.config.juniper.enabled and _rest_reachable(self.config, device.ip):
             rest_result = fetch_arp_table(device.ip, **creds)
             if rest_result["ok"]:
                 entries = parse_arp_table_rpc(rest_result["payload"] or rest_result["raw"])
@@ -264,6 +377,27 @@ class JuniperBackend(DeviceBackend):
                     "raw": compact_raw(rest_result["raw"]),
                 }
             rest_error = rest_result["error"] or "Junos REST request failed"
+
+        # --- NETCONF SSH (830) --- — see get_interfaces for the rationale.
+        if self.config.junos_netconf_ssh:
+            nc_result = nc_fetch_arp_table(
+                device.ip,
+                username=creds["username"],
+                password=creds["password"],
+                port=self.config.junos_netconf_ssh_port,
+                timeout=30.0,
+            )
+            if nc_result["ok"]:
+                entries = parse_arp_table_rpc(nc_result["payload"] or nc_result["raw"])
+                return {
+                    "implemented": True,
+                    "source": "junos-netconf-ssh",
+                    "message": "Junos NETCONF ARP table OK" if entries else "Junos NETCONF ARP table OK (empty)",
+                    "command": "get-arp-table-information",
+                    "entries": entries,
+                    "raw": compact_raw(nc_result["raw"]),
+                    "restError": rest_error,
+                }
 
         if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show arp"
@@ -305,7 +439,7 @@ class JuniperBackend(DeviceBackend):
         rest_error: str | None = None
         creds = _rest_creds(self.config)
 
-        if self.config.juniper.enabled:
+        if self.config.juniper.enabled and _rest_reachable(self.config, device.ip):
             rest_result = fetch_ethernet_switching_table(device.ip, **creds)
             if rest_result["ok"]:
                 entries = parse_mac_table_rpc(rest_result["payload"] or rest_result["raw"])
@@ -320,6 +454,27 @@ class JuniperBackend(DeviceBackend):
                     "raw": compact_raw(rest_result["raw"]),
                 }
             rest_error = rest_result["error"] or "Junos REST request failed"
+
+        # --- NETCONF SSH (830) --- — see get_interfaces for the rationale.
+        if self.config.junos_netconf_ssh:
+            nc_result = nc_fetch_ethernet_switching_table(
+                device.ip,
+                username=creds["username"],
+                password=creds["password"],
+                port=self.config.junos_netconf_ssh_port,
+                timeout=30.0,
+            )
+            if nc_result["ok"]:
+                entries = parse_mac_table_rpc(nc_result["payload"] or nc_result["raw"])
+                return {
+                    "implemented": True,
+                    "source": "junos-netconf-ssh",
+                    "message": "Junos NETCONF MAC table OK" if entries else "Junos NETCONF MAC table OK (empty)",
+                    "command": "get-ethernet-switching-table-information",
+                    "entries": entries,
+                    "raw": compact_raw(nc_result["raw"]),
+                    "restError": rest_error,
+                }
 
         if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
             command = "show ethernet-switching table"
@@ -359,9 +514,10 @@ class JuniperBackend(DeviceBackend):
 
     def get_config(self, device: DeviceInfo) -> dict[str, Any]:
         rest_error: str | None = None
+        nc_error: str | None = None
         creds = _rest_creds(self.config)
 
-        if self.config.juniper.enabled:
+        if self.config.juniper.enabled and _rest_reachable(self.config, device.ip):
             rest_result = fetch_configuration(device.ip, **creds)
             if rest_result["ok"]:
                 config = parse_configuration_set(rest_result["payload"] or rest_result["raw"])
@@ -383,7 +539,36 @@ class JuniperBackend(DeviceBackend):
                 }
             rest_error = rest_result["error"] or "Junos REST get-configuration failed"
 
-        if self.config.junos_ssh_fallback and self.config.ssh_enabled and rest_error:
+        # --- NETCONF SSH (830) --- — see get_interfaces for the rationale.
+        if self.config.junos_netconf_ssh:
+            nc_result = nc_fetch_full_configuration(
+                device.ip,
+                username=creds["username"],
+                password=creds["password"],
+                port=self.config.junos_netconf_ssh_port,
+                timeout=45.0,
+            )
+            if nc_result["ok"]:
+                config = parse_configuration_set(nc_result["payload"] or nc_result["raw"])
+                if not config:
+                    config = netconf_get_configuration_to_set(nc_result["payload"] or nc_result["raw"])
+                if config:
+                    identity = parse_identity_from_set_config(config)
+                    return {
+                        "implemented": True,
+                        "source": "junos-netconf-ssh",
+                        "config": config,
+                        "hostname": identity.get("hostname") or "",
+                        "version": identity.get("version") or "",
+                        "command": "get-configuration format=set (NETCONF)",
+                        "message": f"Collected running config from {device.name} via NETCONF SSH",
+                        "restError": rest_error,
+                    }
+                nc_error = "NETCONF get-configuration returned no config"
+            else:
+                nc_error = nc_result.get("error") or "NETCONF get-configuration failed"
+
+        if self.config.ssh_enabled:
             ssh_result = run_ssh_command(
                 host=device.ip,
                 username=self.config.ssh_user,
@@ -392,7 +577,12 @@ class JuniperBackend(DeviceBackend):
                 command="show configuration | display set",
             )
             if not ssh_result["sshOk"]:
-                raise RuntimeError(ssh_result["error"] or rest_error or "SSH get-config failed")
+                raise RuntimeError(
+                    ssh_result["error"]
+                    or nc_error
+                    or rest_error
+                    or "GET_CONFIG requires JUNOS_REST or LAB_SSH"
+                )
             identity = parse_identity_from_set_config(ssh_result["output"] or "")
             return {
                 "implemented": True,
@@ -402,9 +592,15 @@ class JuniperBackend(DeviceBackend):
                 "version": identity.get("version") or "",
                 "message": f"Collected running config from {device.name}",
                 "restError": rest_error,
+                "netconfError": nc_error,
             }
 
-        raise RuntimeError(rest_error or "GET_CONFIG requires JUNOS_REST or LAB_SSH")
+        raise RuntimeError(
+            (rest_error and nc_error and f"RESTCONF: {rest_error} | NETCONF SSH: {nc_error}")
+            or nc_error
+            or rest_error
+            or "GET_CONFIG requires JUNOS_REST or LAB_SSH"
+        )
 
     # -- WRITE -------------------------------------------------------------
 
@@ -1122,6 +1318,30 @@ class JuniperBackend(DeviceBackend):
             # is stale vs. API completely down. Doesn't affect the gate.
             message = message + " (uptime fetch skipped: no responsive transport)"
 
+        # Device identity (hostname / model / version) — pulled via
+        # NETCONF <get-system-information/>.  That reply carries
+        # <host-name>, <os-name>, <os-version> and <hardware-model> in
+        # ~2 KB / ~0.6 s, versus the ~55 KB of a full
+        # <get-configuration format="set"/> — and it avoids the SSH
+        # port-22 auth.log noise entirely.
+        if self.config.junos_netconf_ssh and netconf_open:
+            ident = nc_fetch_system_information(
+                device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.junos_netconf_ssh_port,
+                timeout=15.0,
+            )
+            if ident["ok"]:
+                fields = _parse_system_information(ident["payload"] or ident["raw"])
+                for key, value in fields.items():
+                    if value:
+                        parsed[key] = value
+                if fields.get("version"):
+                    parsed["showVersion"] = fields["version"]
+                if fields.get("hostname"):
+                    parsed["source"] = "netconf-ssh"
+
         return {
             "checks": {
                 "ping": True,
@@ -1130,7 +1350,7 @@ class JuniperBackend(DeviceBackend):
                 "showVersion": False,
                 "showRun": False,
             },
-            "showVersion": "",
+            "showVersion": parsed.get("showVersion", ""),
             "showRun": "",
             "parsed": parsed,
             "source": source,
@@ -1147,30 +1367,47 @@ class JuniperBackend(DeviceBackend):
         plain SSH CLI connections to port 22.
         """
         # --- Try NETCONF-over-SSH (port 830, no auth.log noise) ---
+        nc_error: str | None = None
         if self.config.junos_netconf_ssh:
             from netconsole_worker.junos_netconf import _run_nc_rpc
 
-            rpc = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                "<rpc>"
+            # Junos 23.x exposes `<get-lldp-neighbors-information/>`; the
+            # older `<get-lldp-interface-information/>` is rejected with
+            # "syntax error" on a QFX5120 running 23.4R2-S8.13
+            # (verified 2026-11-19).  Try the modern one first, then the
+            # legacy one for older images (cRPD lab).
+            rpc_bodies = (
+                "<get-lldp-neighbors-information/>",
                 "<get-lldp-interface-information "
-                'xmlns="http://xml.juniper.net/junos/release/junos-lldp"/>'
-                "</rpc>"
+                'xmlns="http://xml.juniper.net/junos/release/junos-lldp"/>',
             )
-            ok, raw, ms = _run_nc_rpc(
-                device.ip,
-                self.config.junos_netconf_ssh_port,
-                self.config.ssh_user,
-                self.config.ssh_password,
-                rpc,
-                timeout=20.0,
-            )
-            if ok:
-                neighbors = parse_junos_lldp_neighbors_xml(raw)
+            for rpc_body in rpc_bodies:
+                rpc = (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    f"<rpc>{rpc_body}</rpc>"
+                )
+                ok, raw, ms = _run_nc_rpc(
+                    device.ip,
+                    self.config.junos_netconf_ssh_port,
+                    self.config.ssh_user,
+                    self.config.ssh_password,
+                    rpc,
+                    timeout=20.0,
+                )
+                if not ok:
+                    nc_error = raw
+                    continue
+                # A transport-level success is not enough — the device may
+                # still answer with <rpc-error><error-message>syntax error.
+                rpc_ok, err = _parse_ok_error(raw)
+                if not rpc_ok:
+                    nc_error = err or "NETCONF LLDP RPC rejected"
+                    continue
+                neighbors = parse_junos_lldp_neighbors_xml(extract_rpc_reply(raw))
                 return {
                     "implemented": True,
                     "source": "netconf-ssh",
-                    "command": "get-lldp-interface-information",
+                    "command": rpc_body.strip("<>").split()[0],
                     "neighbors": neighbors,
                     "message": (
                         f"LLDP NETCONF OK ({len(neighbors)} neighbours)"
@@ -1189,20 +1426,34 @@ class JuniperBackend(DeviceBackend):
                 "message": "SSH not enabled (LAB_SSH=false) and NETCONF SSH not enabled",
             }
 
-        ssh_result = run_ssh_command(
-            host=device.ip,
-            username=self.config.ssh_user,
-            password=self.config.ssh_password,
-            port=self.config.ssh_port,
-            command="show lldp neighbors",
-            timeout=20,
-        )
+        # run_ssh_command can raise (paramiko transport errors such as
+        # "Connection reset by peer" when the device rate-limits rapid
+        # successive logins).  A fallback path must never blow up the
+        # whole job — degrade to an empty result with the error attached.
+        try:
+            ssh_result = run_ssh_command(
+                host=device.ip,
+                username=self.config.ssh_user,
+                password=self.config.ssh_password,
+                port=self.config.ssh_port,
+                command="show lldp neighbors",
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001 - fallback must not raise
+            return {
+                "implemented": False,
+                "source": "ssh-cli",
+                "neighbors": [],
+                "message": f"LLDP SSH failed: {exc}",
+                "netconfError": nc_error,
+            }
         if not ssh_result["sshOk"]:
             return {
                 "implemented": False,
                 "source": "ssh-cli",
                 "neighbors": [],
                 "message": f"LLDP SSH failed: {ssh_result['error']}",
+                "netconfError": nc_error,
             }
 
         from netconsole_worker.parsers.show_lldp_neighbors import (

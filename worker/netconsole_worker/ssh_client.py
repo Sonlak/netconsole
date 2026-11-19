@@ -387,7 +387,18 @@ def run_ssh_command(
     WITHOUT invalidating the pool entry — the transport is still healthy.
     """
     pool = get_pool()
-    entry = pool.borrow(host, port, username, password, timeout=timeout)
+    # `borrow()` opens the connection when the pool has no entry.  That can
+    # raise (e.g. "Error reading SSH protocol banner" / "Connection reset by
+    # peer" when the device rate-limits rapid successive logins), and the
+    # caller must never see a raw exception bubble out of a read job.
+    # Historically the borrow call sat outside the retry loop, so any
+    # transport-level failure during connect escaped as a Python
+    # exception and failed the whole job instead of returning a clean
+    # `sshOk: False` result.
+    try:
+        entry = pool.borrow(host, port, username, password, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - lab boundary
+        return {"sshOk": False, "output": "", "error": str(exc)}
     # Retry budget for transient device-side resource shortage. Tuned to
     # 3 attempts × (0.3s + 0.6s + 1.2s) = ~2.1s of total wait, which keeps
     # the job within the worker watchdog (45s) while letting the device
