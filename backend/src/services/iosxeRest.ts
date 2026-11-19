@@ -111,6 +111,44 @@ function normalizeMac(mac: string): string {
   return `${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${hex.slice(6, 8)}:${hex.slice(8, 10)}:${hex.slice(10, 12)}`.toLowerCase();
 }
 
+/**
+ * Strip the IOSexec HTML wrapper down to plain CLI text.
+ *
+ * The IOS "IOSexec" web interface returns the command output wrapped in
+ * `<DT>` / `<DD>` / `<LI>` tags. A naive `<[^>]+>` removal collapses
+ * everything onto one line, which breaks the line-based regexes in
+ * `parseIosShowVersion` (e.g. `^\s*Model Number\s*:` needs the line
+ * to start with the key).
+ *
+ * So we first turn every block-level / table-cell closing tag into a
+ * newline, THEN drop the remaining tags. That way each
+ * `<DT>line1</DT><DT>line2</DT>` becomes `line1\nline2`.
+ *
+ * Mirrors `worker/netconsole_worker/backends/ios.py::_strip_html`.
+ */
+function stripIosHtml(text: string): string {
+  const unescaped = text
+    .replace(/&#34;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ');
+
+  const withNewlines = unescaped
+    .replace(/<\/(?:DT|DD|LI|TR|P|DIV|DL)(?:\s[^>]*)?>/gi, '\n')
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\s*hr\s*\/?>/gi, '\n');
+
+  const stripped = withNewlines.replace(/<[^>]+>/g, '');
+
+  return stripped
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .join('\n')
+    .trim();
+}
+
 function parseIosxeArpEntries(payload: unknown): IosxeArpEntry[] {
   if (!payload || typeof payload !== 'object') return [];
   const record = payload as Record<string, unknown>;
@@ -875,30 +913,30 @@ export async function probeIosxeRestIdentity(host: string): Promise<{
  *   - RESTCONF responds but returns empty identity, OR
  *   - The device is IOS classic (15.x), which has no RESTCONF/NETCONF at all.
  *
- * Endpoint: `GET https://<host>:<port>/level/15/exec/-/show/version` with
- * HTTP Basic auth (level 15 / privileged exec). The IOS HTTP server returns
- * an HTML page; the command output lives inside a single `<PRE>...</PRE>`
- * block, which we extract and parse.
+ * PROTOCOL (2026-11-19 fix): the IOS "IOSexec" web interface does NOT
+ * return command output on a plain GET of `/level/15/exec/-/<command>`.
+ * That URL only renders the **menu** page. The real flow is:
  *
- * Tested against IOS 15.2 vios_l2 (LAB-F3-AS-01 / 10.10.20.211) on
- * 2026-09-16. The HTML has the structure:
+ *   1. `GET /level/15/exec/-`  → the form page; carries a `csrf_token`
+ *      hidden input.
+ *   2. `POST /level/15/exec/-` with body
+ *      `command=<cmd>&command_url=/level/15/exec/-&CMD=Command&csrf_token=<tok>`
+ *      → the response embeds the CLI output.
  *
- *   <TITLE>LAB-F3-AS-01 /level/15/exec/-/show/version</TITLE>
- *   ...
- *   <PRE>
- *   Cisco IOS Software, vios_l2 Software (vios_l2-ADVENTERPRISEK9-M), ...
- *   Copyright (c) 1986-2020 by Cisco Systems, Inc.
- *   ...
- *   ROM: Bootstrap program is IOSv
- *   LAB-F3-AS-01 uptime is 1 hour, 6 minutes
- *   System returned to ROM by reload
- *   System image file is "flash0:/vios_l2-adventerprisek9-m"
- *   ...
- *   </PRE>
+ * On IOS 15.2 (LAB-F3-AS-01, vios_l2) the old GET-only implementation
+ * happened to work because that image inlines the output in the first
+ * `<PRE>` block. On IOS-XE 17.3 (Catalyst C9200) it does NOT — the GET
+ * returns only "command completed." and no output at all, which made
+ * the probe report `ok: true` with an EMPTY identity (hostname only,
+ * no model / version / serial).
  *
- * No RESTCONF is invoked. Works on IOS 12.x, 15.x, and IOS-XE 16/17
- * whenever `ip http secure-server` is enabled. Gated on
- * `IOSXE_API_ENABLED=true` (same env as RESTCONF — shares creds).
+ * Verified 2026-11-19 against NTMK-AS-T02-01-C9200 (10.1.250.21):
+ * GET → 1330 bytes of menu HTML; POST → 4586 bytes with the full
+ * `show version` text.
+ *
+ * Works on IOS 12.x, 15.x and IOS-XE 16/17 whenever `ip http
+ * secure-server` is enabled. Gated on `IOSXE_API_ENABLED=true` (same
+ * env as RESTCONF — shares creds).
  */
 export async function probeIosHttpExecIdentity(host: string): Promise<{
   ok: boolean;
@@ -911,18 +949,63 @@ export async function probeIosHttpExecIdentity(host: string): Promise<{
   }
 
   const cfg = iosxeConfig();
-  const url = `${cfg.scheme}://${host}:${cfg.port}/level/15/exec/-/show/version`;
+  const base = `${cfg.scheme}://${host}:${cfg.port}/level/15/exec/-`;
   const auth = Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
+  const basicHeaders = {
+    Authorization: `Basic ${auth}`,
+    Accept: 'text/html,application/xhtml+xml',
+  };
 
+  // STEP 1 — GET the exec form to obtain the CSRF token.
+  let formHtml: string;
+  try {
+    const resp = await fetch(base, {
+      method: 'GET',
+      headers: basicHeaders,
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!resp.ok) {
+      return { ok: false, fields: null, error: `IOS HTTP exec HTTP ${resp.status}` };
+    }
+    formHtml = await resp.text();
+  } catch (error) {
+    return {
+      ok: false,
+      fields: null,
+      error: error instanceof Error ? error.message : 'IOS HTTP exec failed',
+    };
+  }
+
+  const csrfMatch =
+    /csrf_token["'\s]+VALUE=["']([A-F0-9]+)["']/i.exec(formHtml) ??
+    /csrf_token[^>]*value="([A-F0-9]+)"/i.exec(formHtml);
+  if (!csrfMatch) {
+    return {
+      ok: false,
+      fields: null,
+      raw: formHtml.slice(0, 500),
+      error: 'IOS HTTP exec: no CSRF token in form page',
+    };
+  }
+  const csrf = csrfMatch[1];
+
+  // STEP 2 — POST the command with the CSRF token.
   let html: string;
   try {
-    const resp = await fetch(url, {
-      method: 'GET',
+    const body = new URLSearchParams({
+      command: 'show version',
+      command_url: '/level/15/exec/-',
+      CMD: 'Command',
+      csrf_token: csrf,
+    }).toString();
+    const resp = await fetch(base, {
+      method: 'POST',
       headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: 'text/html,application/xhtml+xml',
+        ...basicHeaders,
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      signal: AbortSignal.timeout(20000),
+      body,
+      signal: AbortSignal.timeout(25000),
     });
     if (!resp.ok) {
       return { ok: false, fields: null, error: `IOS HTTP exec HTTP ${resp.status}` };
@@ -932,16 +1015,40 @@ export async function probeIosHttpExecIdentity(host: string): Promise<{
     return {
       ok: false,
       fields: null,
-      error: error instanceof Error ? error.message : 'IOS HTTP exec failed',
+      error: error instanceof Error ? error.message : 'IOS HTTP exec POST failed',
     };
   }
 
-  // Extract the first <PRE>...</PRE> block — that holds the command output.
-  const preMatch = /<PRE>([\s\S]*?)<\/PRE>/i.exec(html);
-  if (!preMatch) {
-    return { ok: false, fields: null, raw: html.slice(0, 500), error: 'IOS HTTP exec: no <PRE> in response' };
+  // Extract the command output. The POST response nests the output
+  // between the `csrf_token` hidden input and the closing `</DL><HR>`:
+  //
+  //   <INPUT TYPE=HIDDEN NAME=csrf_token VALUE="..."><DL>
+  //   <DT>...output...
+  //   </DL><HR>
+  //
+  // On older IOS the output sits directly in the first `<PRE>` block,
+  // so we fall back to that shape when the structured extraction
+  // yields nothing.
+  let output = '';
+  const structured =
+    /hidden_command[^>]*><INPUT[^>]*csrf_token[^>]*value="[A-F0-9]+"[^>]*>\s*([\s\S]*?)<\/DL><HR/i.exec(
+      html,
+    );
+  if (structured) {
+    output = stripIosHtml(structured[1]);
   }
-  const output = preMatch[1];
+  if (!output.trim()) {
+    const preMatch = /<PRE>([\s\S]*?)<\/PRE>/i.exec(html);
+    if (preMatch) output = stripIosHtml(preMatch[1]);
+  }
+  if (!output.trim()) {
+    return {
+      ok: false,
+      fields: null,
+      raw: html.slice(0, 500),
+      error: 'IOS HTTP exec: no command output in response',
+    };
+  }
 
   // The HTML <TITLE> reliably holds the hostname followed by the request path:
   //   `<TITLE>LAB-F3-AS-01 /level/15/exec/-/show/version</TITLE>`
@@ -979,15 +1086,24 @@ export async function probeIosHttpExecIdentity(host: string): Promise<{
   const versionMatch = output.match(/Version\s+([\d.()A-Za-z0-9:]+)/);
   if (versionMatch) fields.version = versionMatch[1].trim();
 
-  // Model — try physical-chassis banner first (`Cisco IOS Software, C2900
-  // Software (...)`), then fall back to `Bootstrap program is <MODEL>`
-  // for IOSv / virtual images.
-  const bannerLine = output
-    .split('\n')
-    .find((l) => /Cisco Internetwork Operating System|Cisco IOS Software/i.test(l));
-  if (bannerLine) {
-    const modelTok = bannerLine.match(/,\s+([A-Z][\w-]+)\s+Software\s+\(/);
-    if (modelTok) fields.model = modelTok[1];
+  // Model — three sources, in order:
+  //   1. `Model Number : C9200L-48T-4X`  (IOS-XE 17.x Catalyst / ISR —
+  //      the only reliable source on C9200, whose banner does NOT match
+  //      the " <MODEL> Software ( ... ) " pattern).
+  //   2. Physical-chassis banner (`Cisco IOS Software, C2900 Software (...)`).
+  //   3. `Bootstrap program is <MODEL>` for IOSv / virtual images.
+  const modelNumberMatch = output.match(/^\s*Model Number\s*:\s*(\S+)/m);
+  if (modelNumberMatch) {
+    fields.model = modelNumberMatch[1].trim();
+  }
+  if (!fields.model) {
+    const bannerLine = output
+      .split('\n')
+      .find((l) => /Cisco Internetwork Operating System|Cisco IOS Software/i.test(l));
+    if (bannerLine) {
+      const modelTok = bannerLine.match(/,\s+([A-Z][\w-]+)\s+Software\s+\(/);
+      if (modelTok) fields.model = modelTok[1];
+    }
   }
   if (!fields.model) {
     const bootMatch = output.match(/Bootstrap program is (\S+)/);

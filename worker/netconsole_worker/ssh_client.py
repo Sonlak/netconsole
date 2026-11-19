@@ -1058,6 +1058,27 @@ def _ns(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
+def _find_first_text(elem, leaf_name: str) -> str:
+    """Return the text of the first descendant leaf named `leaf_name`.
+
+    Namespace-agnostic on purpose: the IOS-XE `switchport` subtree lives
+    in the `Cisco-IOS-XE-switch` namespace while the surrounding
+    interface block is in `Cisco-IOS-XE-native`, so a namespace-qualified
+    `find()` misses it. The leaf is also nested one level deeper than in
+    the IOS 15 shape (`<vlan><vlan>20</vlan></vlan>` vs `<vlan>20</vlan>`),
+    so we search recursively.
+
+    Returns "" when the leaf is absent or has no text.
+    """
+    for sub in elem.iter():
+        if _ns(sub.tag) != leaf_name:
+            continue
+        text = (sub.text or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _xml_to_ios_text(elem, indent: int = 0) -> list[str]:
     """Recursively serialize a lxml element into IOS CLI-style lines.
 
@@ -1118,36 +1139,50 @@ def _xml_to_ios_text(elem, indent: int = 0) -> list[str]:
             for sub in child:
                 stag = _ns(sub.tag)
                 if stag == "allowed-vlan":
-                    v = sub.find("{%s}vlans" % _NS_NATIVE)
-                    if v is not None:
-                        lines.append(
-                            f"{pad}switchport trunk allowed vlan "
-                            f"{(v.text or '').strip()}"
-                        )
+                    v = _find_first_text(sub, "vlans")
+                    if v:
+                        lines.append(f"{pad}switchport trunk allowed vlan {v}")
                         continue
                 if stag == "native-vlan":
-                    v = sub.find("{%s}vlan" % _NS_NATIVE)
-                    if v is not None:
-                        lines.append(
-                            f"{pad}switchport trunk native vlan "
-                            f"{(v.text or '').strip()}"
-                        )
+                    v = _find_first_text(sub, "vlan")
+                    if v:
+                        lines.append(f"{pad}switchport trunk native vlan {v}")
                         continue
             continue
 
         if tag == "access":
-            # <access><vlan>20</vlan></access> → " switchport access vlan 20"
-            for sub in child:
-                if _ns(sub.tag) == "vlan":
-                    lines.append(
-                        f"{pad}switchport access vlan {(sub.text or '').strip()}"
-                    )
+            # <access><vlan><vlan>20</vlan></vlan></access>
+            #     or <access><vlan>20</vlan></access>
+            # → " switchport access vlan 20"
+            #
+            # NOTE (2026-11-19): on IOS-XE the whole `switchport`
+            # subtree lives in the `Cisco-IOS-XE-switch` namespace,
+            # NOT `Cisco-IOS-XE-native`, and the VLAN leaf is nested
+            # one level deeper (`<vlan><vlan>20</vlan></vlan>`).
+            # The old code looked only at the direct children and
+            # printed an empty VLAN. We now search recursively and
+            # ignore namespaces entirely.
+            v = _find_first_text(child, "vlan")
+            if v:
+                lines.append(f"{pad}switchport access vlan {v}")
             continue
 
         if tag == "mode":
             # <mode>access</mode> or <mode>trunk</mode> inside <switchport>
             # → " switchport mode access"
-            lines.append(f"{pad}switchport mode {text}")
+            #
+            # On IOS-XE the mode is a PRESENCE container:
+            #   <mode xmlns="...IOS-XE-switch"><access/></mode>
+            # so `text` is empty — we must read the child element name.
+            mode_value = text
+            if not mode_value:
+                for sub in child:
+                    stag = _ns(sub.tag)
+                    if stag in ("access", "trunk"):
+                        mode_value = stag
+                        break
+            if mode_value:
+                lines.append(f"{pad}switchport mode {mode_value}")
             continue
 
         if not children:
@@ -1172,6 +1207,61 @@ def _xml_to_ios_text(elem, indent: int = 0) -> list[str]:
     return lines
 
 
+def _nc_reply_root(rpc_reply_root):
+    """Extract the lxml root element from whatever ncclient handed us.
+
+    ncclient's API changed across versions and the two shapes behave
+    very differently:
+
+      - ``manager.get_config()`` / ``manager.get()`` return a
+        ``GetConfigReply`` / ``GetReply`` object that exposes
+        ``.data_xml`` (a **str** of the ``<data>`` element) and
+        ``.data`` (an lxml ``_Element``).
+
+      - ``conn.dispatch(rpc)`` with a hand-built RPC returns a plain
+        ``RPCReply`` object that has **NEITHER** ``.data_xml`` NOR
+        ``.data`` — only ``.xml`` (the full ``<rpc-reply>`` document
+        as a str). This is the shape we get on ncclient >= 0.7.x.
+
+    The old code only looked at ``.data_xml`` and fell back to the
+    RPCReply object itself, so on ncclient 0.7.1 the caller ended up
+    calling ``.findall()`` on an ``RPCReply`` and blew up with
+    ``'RPCReply' object has no attribute 'findall'`` (verified against
+    a live C9200 running IOS-XE 17.3.5 on 2026-11-19).
+
+    Resolution order:
+      1. ``.data``      — already an lxml element (ncclient < 0.7)
+      2. ``.data_xml``  — a str of the ``<data>`` element (ncclient < 0.7)
+      3. ``.xml``       — a str of the whole ``<rpc-reply>`` (ncclient >= 0.7)
+      4. the object itself, if it already looks like an lxml element
+    """
+    from lxml import etree
+
+    # 1. lxml element straight from ncclient.
+    data = getattr(rpc_reply_root, "data", None)
+    if data is not None and hasattr(data, "findall"):
+        return data
+
+    # 2/3. XML text — try the narrower <data> payload first, then the
+    # full <rpc-reply> document.
+    for attr in ("data_xml", "xml"):
+        text = getattr(rpc_reply_root, attr, None)
+        if not text or not isinstance(text, (str, bytes)):
+            continue
+        try:
+            return etree.fromstring(text.encode() if isinstance(text, str) else text)
+        except Exception:
+            continue
+
+    # 4. Already an lxml element / element tree.
+    if hasattr(rpc_reply_root, "getroottree"):
+        return rpc_reply_root.getroottree().getroot()
+    if hasattr(rpc_reply_root, "findall"):
+        return rpc_reply_root
+
+    return None
+
+
 def _nc_data_to_ios_text(rpc_reply_root) -> str:
     """Walk a ncclient RPCReply / lxml Element tree and emit IOS-style text.
 
@@ -1184,9 +1274,10 @@ def _nc_data_to_ios_text(rpc_reply_root) -> str:
     lines: list[str] = []
 
     # ncclient may give us an RPCReply object or already an lxml root.
-    root = getattr(rpc_reply_root, "data_xml", None) or rpc_reply_root
-    if hasattr(root, "getroottree"):
-        root = root.getroottree().getroot()
+    # See `_nc_reply_root` for the version-dependent attribute matrix.
+    root = _nc_reply_root(rpc_reply_root)
+    if root is None:
+        return "(no interface block returned by NETCONF)"
     if isinstance(root, str):
         try:
             root = etree.fromstring(root.encode())

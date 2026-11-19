@@ -578,6 +578,22 @@ export function parseIosShowVersion(output: string): {
     const modelTok = bannerLine.match(/,\s+([A-Z][\w-]+)\s+Software\s+\(/);
     if (modelTok) parsed.model = modelTok[1];
   }
+
+  // MODEL (2026-11-19) — IOS-XE 17.x Catalyst (C9200 / C9300 / C9500)
+  // does NOT match the banner regex above: its banner reads
+  //   "Cisco IOS Software [Amsterdam], Catalyst L3 Switch Software
+  //    (CAT9K_LITE_IOSXE), Version 17.3.5, ..."
+  // — there is no " <MODEL> Software ( ... ) " pattern. The real model
+  // lives further down in the hardware block as:
+  //   "Model Number                       : C9200L-48T-4X"
+  // Also covers IOS-XE routers (ISR/ASR) that print the same line.
+  // Verified on NTMK-AS-T02-01-C9200 (10.1.250.21) against real
+  // `show version` output.
+  const modelNumberMatch = output.match(/^\s*Model Number\s*:\s*(\S+)/m);
+  if (modelNumberMatch) {
+    parsed.model = modelNumberMatch[1];
+  }
+
   // Fall back to IOSv / virtual model if banner didn't yield a real model.
   if (!parsed.model) {
     const bootMatch = output.match(/Bootstrap program is (\S+)/);
