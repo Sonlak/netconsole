@@ -33,7 +33,7 @@ from netconsole_worker.junos_netconf import (
     fetch_full_configuration as nc_fetch_full_configuration,
     fetch_interface_configuration as nc_fetch_interface_configuration,
     fetch_interface_information as nc_fetch_interface_information,
-    fetch_lldp_neighbors as nc_fetch_lldp_neighbors,
+    fetch_lldp_neighbors as nc_fetch_lldp_neighbors,  # noqa: F401 - re-exported for callers
     fetch_system_information as nc_fetch_system_information,
     fetch_system_uptime as nc_fetch_system_uptime,
     fetch_system_uptime_cli as nc_fetch_system_uptime_cli,

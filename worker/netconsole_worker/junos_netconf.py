@@ -184,12 +184,6 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
     """
     raw_lower = raw.lower()
 
-    # Strip namespace prefixes so element-name checks work regardless of
-    # whether the device returns <element> or <nc:element> / <junos:element>.
-    # We remove  "prefix:"  from opening tags and closing tags only — this
-    # leaves xmlns attributes and their values untouched.
-    raw_ns_stripped = re.sub(r"</?[\w.-]+:", lambda m: m.group(0).rpartition(":")[0] + ":", raw_lower)
-
     # Extract any error message first — if present, this takes precedence
     # over a generic <ok/> that may appear in the same <rpc-reply>.
     m = re.search(
