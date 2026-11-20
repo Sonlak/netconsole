@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Standard-format message:
@@ -80,8 +80,18 @@ def _parse_timestamp(value: str | None) -> datetime | None:
                 f"{now_local.year} {std_match.group(1)} {int(std_match.group(2))} {std_match.group(3)}",
                 "%Y %b %d %H:%M:%S",
             )
-            # If parse says "in the future", assume previous year
-            if parsed_naive > now_local:
+            # Roll the year back ONLY when the entry is more than a day in
+            # the future.  A naive "in the future → previous year" rule
+            # misfires whenever the collector's clock runs in a DIFFERENT
+            # timezone than the device: on a +07 device read by a UTC
+            # collector, "Nov 20 09:45" looked 6h ahead of "now" and got
+            # stamped 2025 instead of 2026 (verified 2026-11-20 on
+            # NTMK-CORE-QFX5120).
+            #
+            # A real cross-year entry (e.g. "Dec 31 23:00" read on Jan 1)
+            # is months ahead, so a 1-day threshold separates the two cases
+            # cleanly.
+            if parsed_naive - now_local > timedelta(days=1):
                 parsed_naive = parsed_naive.replace(year=parsed_naive.year - 1)
             # Attach UTC since we parsed in the same local clock that produced "now"
             return parsed_naive.replace(tzinfo=timezone.utc)

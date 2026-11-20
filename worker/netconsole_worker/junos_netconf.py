@@ -245,6 +245,99 @@ def _parse_ok_error(raw: str) -> tuple[bool, str]:
     return False, "Unknown NETCONF error"
 
 
+def apply_set_configuration(
+    host: str,
+    commands: list[str],
+    *,
+    username: str,
+    password: str,
+    log: str = "",
+    port: int = 830,
+    timeout: float = 90.0,
+) -> dict[str, Any]:
+    """Load + commit a list of Junos ``set``/``delete`` commands over NETCONF.
+
+    This is the NETCONF-SSH equivalent of ``junos_rest.apply_set_configuration``
+    and is the ONLY working write path on devices where RESTCONF (8443) is
+    unreachable.
+
+    RPC shape (verified live on a QFX5120 / Junos 23.4R2-S8.13,
+    2026-11-20)::
+
+        <load-configuration format="text" action="set">
+          <configuration-set>set ...\\n</configuration-set>
+        </load-configuration>
+        <commit-configuration/>
+
+    Notes:
+      - ``format="text"`` + ``<configuration-set>`` is required.
+        ``format="set"`` is rejected by the Junos NETCONF daemon with
+        "expecting configuration/configuration-text".
+      - The load RPC replies ``<ok/>`` — NOT ``<rpc-ok/>``.
+      - The commit RPC replies ``<commit-success/>`` (with a
+        ``<commit-results>`` body) on success.
+      - On a commit failure we issue ``<discard-changes/>`` so the device
+        does not keep a half-loaded candidate database (gotcha #15b).
+
+    Returns ``{ok, stage, error, raw, loadMs, commitMs}``.
+    """
+    from xml.sax.saxutils import escape
+
+    body = "\n".join(commands)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    load_rpc = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rpc><load-configuration format="text" action="set">'
+        f"<configuration-set>{escape(body)}</configuration-set>"
+        "</load-configuration></rpc>"
+    )
+    commit_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><commit-configuration/></rpc>'
+    discard_rpc = '<?xml version="1.0" encoding="UTF-8"?><rpc><discard-changes/></rpc>'
+
+    load_timeout = max(15.0, timeout * 0.30)
+    commit_timeout = max(30.0, timeout - load_timeout)
+
+    load_started = time.monotonic()
+    ok, load_raw, _ = _run_nc_rpc(
+        host, port, username, password, load_rpc, timeout=load_timeout
+    )
+    load_ms = int((time.monotonic() - load_started) * 1000)
+    if not ok:
+        return {"ok": False, "stage": "load", "error": load_raw, "raw": "", "loadMs": load_ms}
+    ok, err = _parse_ok_error(load_raw)
+    if not ok:
+        return {"ok": False, "stage": "load", "error": err, "raw": load_raw, "loadMs": load_ms}
+
+    commit_started = time.monotonic()
+    ok, commit_raw, _ = _run_nc_rpc(
+        host, port, username, password, commit_rpc, timeout=commit_timeout
+    )
+    commit_ms = int((time.monotonic() - commit_started) * 1000)
+    if not ok:
+        _run_nc_rpc(host, port, username, password, discard_rpc, timeout=10)
+        return {
+            "ok": False, "stage": "commit", "error": commit_raw, "raw": load_raw,
+            "loadMs": load_ms, "commitMs": commit_ms,
+        }
+    ok, err = _parse_ok_error(commit_raw)
+    if not ok:
+        _run_nc_rpc(host, port, username, password, discard_rpc, timeout=10)
+        return {
+            "ok": False, "stage": "commit", "error": err, "raw": load_raw,
+            "loadMs": load_ms, "commitMs": commit_ms,
+        }
+
+    return {
+        "ok": True,
+        "stage": "commit",
+        "error": None,
+        "raw": load_raw + "\n" + commit_raw,
+        "loadMs": load_ms,
+        "commitMs": commit_ms,
+    }
+
+
 def rollback_configuration(
     host: str,
     *,
@@ -587,12 +680,38 @@ def fetch_system_information(
 ) -> dict[str, Any]:
     """Fetch host identity via NETCONF ``<get-system-information/>``.
 
-    The reply carries ``<host-name>``, ``<os-name>``, ``<os-version>`` and
-    ``<hardware-model>`` — everything ``probe_identity`` needs, in ~2 KB
-    and ~0.6 s, versus the ~55 KB / ~0.7 s of a full
-    ``<get-configuration format="set"/>``.
+    The reply carries ``<host-name>``, ``<os-name>``, ``<os-version>``,
+    ``<hardware-model>`` and ``<serial-number>`` — everything
+    ``probe_identity`` needs, in ~2 KB and ~0.6 s, versus the ~55 KB /
+    ~0.7 s of a full ``<get-configuration format="set"/>``.
     """
     return fetch_operational(
         host, "<get-system-information/>",
+        username=username, password=password, port=port, timeout=timeout,
+    )
+
+
+def fetch_chassis_inventory(
+    host: str,
+    *,
+    username: str,
+    password: str,
+    port: int = 830,
+    timeout: float = 25.0,
+) -> dict[str, Any]:
+    """Fetch the chassis inventory via NETCONF ``<get-chassis-inventory/>``.
+
+    The reply carries one ``<serial-number>`` per chassis/module.  On a
+    QFX5120 virtual chassis it lists the master serial first, then the
+    member serial, then a bunch of ``BUILTIN`` placeholders and the
+    per-port transceiver serials — ``parse_chassis_serial`` picks the
+    first non-placeholder.
+
+    Note: the RPC name is ``<get-chassis-inventory/>`` (no
+    ``-information`` suffix) — ``<get-chassis-inventory-information/>``
+    does not exist and is rejected with "syntax error".
+    """
+    return fetch_operational(
+        host, "<get-chassis-inventory/>",
         username=username, password=password, port=port, timeout=timeout,
     )
